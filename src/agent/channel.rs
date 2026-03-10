@@ -111,6 +111,16 @@ pub struct ChannelState {
     pub logs_dir: std::path::PathBuf,
     /// Prompt snapshot store for debugging prompt construction.
     pub prompt_snapshot_store: Option<Arc<crate::agent::prompt_snapshot::PromptSnapshotStore>>,
+    /// Shared live transcript cache for running workers. When a worker is
+    /// cancelled via `handle.abort()`, we drain its accumulated transcript
+    /// steps from this cache and persist them to the DB so that cancelled
+    /// workers still have their transcript available for review.
+    ///
+    /// This Arc is shared with `ApiState` — the event loop populates it from
+    /// `ToolStarted`/`ToolCompleted` events as they flow through the system.
+    /// Defaults to a standalone empty map when the API layer is not active.
+    pub live_worker_transcripts:
+        Arc<RwLock<HashMap<String, Vec<crate::conversation::worker_transcript::TranscriptStep>>>>,
 }
 
 impl ChannelState {
@@ -152,8 +162,68 @@ impl ChannelState {
             return Err(format!("Worker {worker_id} not found"));
         }
 
+        // Drain the live transcript before aborting so we can persist it.
+        // The abort kills the worker future, so persist_transcript() inside the
+        // worker's run() method will never execute. We compensate here.
+        let live_steps = self
+            .live_worker_transcripts
+            .write()
+            .await
+            .remove(&worker_id.to_string());
+
         if let Some(handle) = handle {
             handle.abort();
+        }
+
+        // Persist whatever transcript was accumulated from ToolStarted/ToolCompleted
+        // events. This is a best-effort snapshot — it won't include the worker's
+        // internal reasoning text (which only exists in the Rig history) but it
+        // captures every tool call and result, which is the most useful part.
+        if let Some(steps) = &live_steps
+            && !steps.is_empty()
+        {
+            let transcript_blob = crate::conversation::worker_transcript::serialize_steps(steps);
+            let worker_id_str = worker_id.to_string();
+            let pool = self.deps.sqlite_pool.clone();
+            // Count tool calls from the transcript steps.
+            let tool_calls: i64 = steps
+                .iter()
+                .map(|step| match step {
+                    crate::conversation::worker_transcript::TranscriptStep::Action { content } => {
+                        content
+                            .iter()
+                            .filter(|c| {
+                                matches!(
+                                c,
+                                crate::conversation::worker_transcript::ActionContent::ToolCall {
+                                    ..
+                                }
+                            )
+                            })
+                            .count() as i64
+                    }
+                    _ => 0,
+                })
+                .sum();
+            // Fire-and-forget DB write (consistent with the existing pattern
+            // documented in AGENTS.md under "Fire-and-forget DB writes").
+            tokio::spawn(async move {
+                if let Err(error) = sqlx::query(
+                    "UPDATE worker_runs SET transcript = ?, tool_calls = ? WHERE id = ? AND transcript IS NULL",
+                )
+                .bind(&transcript_blob)
+                .bind(tool_calls)
+                .bind(&worker_id_str)
+                .execute(&pool)
+                .await
+                {
+                    tracing::warn!(
+                        %error,
+                        worker_id = %worker_id_str,
+                        "failed to persist cancelled worker transcript"
+                    );
+                }
+            });
         }
 
         let reason = crate::summarize_first_non_empty_line(reason, crate::EVENT_SUMMARY_MAX_CHARS);
@@ -449,6 +519,7 @@ impl Channel {
             screenshot_dir,
             logs_dir,
             prompt_snapshot_store,
+            live_worker_transcripts: Arc::new(RwLock::new(HashMap::new())),
         };
 
         // Each channel gets its own isolated tool server to avoid races between

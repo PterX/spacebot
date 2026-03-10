@@ -1,4 +1,5 @@
 export const BASE_PATH: string = (window as any).__SPACEBOT_BASE_PATH || "";
+export const IS_TAURI: boolean = !!(window as any).__TAURI_INTERNALS__;
 const API_BASE = BASE_PATH + "/api";
 
 export interface StatusResponse {
