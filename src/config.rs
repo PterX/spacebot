@@ -1745,6 +1745,87 @@ maintenance_merge_similarity_threshold = 1.1
     }
 
     #[test]
+    fn validate_mixed_valid_and_invalid_bindings_filters_correctly() {
+        let messaging = MessagingConfig {
+            discord: None,
+            slack: None,
+            telegram: Some(TelegramConfig {
+                enabled: true,
+                token: "tok".into(),
+                instances: vec![TelegramInstanceConfig {
+                    name: "support".into(),
+                    enabled: true,
+                    token: "tok2".into(),
+                    dm_allowed_users: vec![],
+                }],
+                dm_allowed_users: vec![],
+            }),
+            email: None,
+            webhook: None,
+            twitch: None,
+            signal: None,
+        };
+        let bindings = vec![
+            // Valid: default adapter with credentials
+            Binding {
+                agent_id: "agent-a".into(),
+                channel: "telegram".into(),
+                adapter: None,
+                guild_id: None,
+                workspace_id: None,
+                chat_id: None,
+                channel_ids: vec![],
+                require_mention: false,
+                dm_allowed_users: vec![],
+            },
+            // Invalid: references a non-existent named adapter
+            Binding {
+                agent_id: "agent-b".into(),
+                channel: "telegram".into(),
+                adapter: Some("ghost".into()),
+                guild_id: None,
+                workspace_id: None,
+                chat_id: None,
+                channel_ids: vec![],
+                require_mention: false,
+                dm_allowed_users: vec![],
+            },
+            // Valid: references an existing named adapter
+            Binding {
+                agent_id: "agent-c".into(),
+                channel: "telegram".into(),
+                adapter: Some("support".into()),
+                guild_id: None,
+                workspace_id: None,
+                chat_id: None,
+                channel_ids: vec![],
+                require_mention: false,
+                dm_allowed_users: vec![],
+            },
+            // Invalid: no discord config at all
+            Binding {
+                agent_id: "agent-d".into(),
+                channel: "discord".into(),
+                adapter: None,
+                guild_id: None,
+                workspace_id: None,
+                chat_id: None,
+                channel_ids: vec![],
+                require_mention: false,
+                dm_allowed_users: vec![],
+            },
+        ];
+        let result = validate_named_messaging_adapters(&messaging, bindings).unwrap();
+        assert_eq!(
+            result.len(),
+            2,
+            "only the two valid bindings should survive"
+        );
+        assert_eq!(result[0].agent_id, "agent-a");
+        assert_eq!(result[1].agent_id, "agent-c");
+    }
+
+    #[test]
     fn validate_missing_messaging_config_skipped() {
         let messaging = MessagingConfig {
             discord: None,
