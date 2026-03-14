@@ -1562,11 +1562,18 @@ impl Binding {
                 .get("twitch_channel")
                 .and_then(|v| v.as_str());
 
+            // Also check Mattermost channel ID
+            let mattermost_channel = message
+                .metadata
+                .get("mattermost_channel_id")
+                .and_then(|v| v.as_str());
+
             let direct_match = message_channel
                 .as_ref()
                 .is_some_and(|id| self.channel_ids.contains(id))
                 || slack_channel.is_some_and(|id| self.channel_ids.contains(&id.to_string()))
-                || twitch_channel.is_some_and(|id| self.channel_ids.contains(&id.to_string()));
+                || twitch_channel.is_some_and(|id| self.channel_ids.contains(&id.to_string()))
+                || mattermost_channel.is_some_and(|id| self.channel_ids.contains(&id.to_string()));
             let parent_match = parent_channel
                 .as_ref()
                 .is_some_and(|id| self.channel_ids.contains(id));
@@ -1653,6 +1660,7 @@ impl Binding {
             "slack" => "slack_mentions_or_replies_to_bot",
             "twitch" => "twitch_mentions_or_replies_to_bot",
             "telegram" => "telegram_mentions_or_replies_to_bot",
+            "mattermost" => "mattermost_mentions_or_replies_to_bot",
             // Unknown platforms: if require_mention is set, default to
             // requiring a mention (safe default).
             _ => return false,
