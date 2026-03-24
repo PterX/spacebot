@@ -35,7 +35,7 @@ function RootLayout() {
 
 	return (
 		<TopBarProvider>
-			<div className="flex h-screen flex-col bg-app">
+			<div className="flex h-screen flex-col overflow-hidden bg-app">
 				<TopBar />
 				<ConnectionBanner state={connectionState} hasData={hasData} />
 				<div className="flex min-h-0 flex-1">
