@@ -92,7 +92,7 @@ struct ExecutionGuard(Arc<std::sync::atomic::AtomicBool>);
 
 impl Drop for ExecutionGuard {
     /// SAFETY: This is the only place that writes to this AtomicBool, and all reads
-    /// use `Acquire` ordering (see line 406). The `Release` store here establishes
+    /// use `Acquire` ordering (see line 436). The `Release` store here establishes
     /// a happens-before relationship with those acquire loads, ensuring the flag
     /// is properly cleared when observed by other threads.
     fn drop(&mut self) {
