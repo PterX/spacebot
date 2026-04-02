@@ -925,10 +925,7 @@ async fn update_azure_provider(
     request: ProviderUpdateRequest,
     normalized_model: &str,
 ) -> Result<Json<ProviderUpdateResponse>, StatusCode> {
-    let base_url = request
-        .base_url
-        .as_ref()
-        .ok_or_else(|| StatusCode::BAD_REQUEST)?;
+    let base_url = request.base_url.as_ref().ok_or(StatusCode::BAD_REQUEST)?;
     let normalized_base_url = base_url.trim().trim_end_matches('/');
 
     if !normalized_base_url.ends_with(".openai.azure.com") {
@@ -941,7 +938,7 @@ async fn update_azure_provider(
     let api_version = request
         .api_version
         .as_ref()
-        .ok_or_else(|| StatusCode::BAD_REQUEST)?;
+        .ok_or(StatusCode::BAD_REQUEST)?;
     let api_version_regex = regex::Regex::new(r"^\d{4}-\d{2}-\d{2}(-preview)?$").map_err(|e| {
         tracing::error!(error = %e, "failed to compile api_version regex");
         StatusCode::INTERNAL_SERVER_ERROR
@@ -954,10 +951,7 @@ async fn update_azure_provider(
         }));
     }
 
-    let deployment = request
-        .deployment
-        .as_ref()
-        .ok_or_else(|| StatusCode::BAD_REQUEST)?;
+    let deployment = request.deployment.as_ref().ok_or(StatusCode::BAD_REQUEST)?;
     let deployment_regex = regex::Regex::new(r"^[a-zA-Z0-9.-]+$").map_err(|e| {
         tracing::error!(error = %e, "failed to compile deployment regex");
         StatusCode::INTERNAL_SERVER_ERROR
@@ -1299,10 +1293,7 @@ pub(super) async fn test_provider_model(
     }
 
     if normalized_provider == "azure" {
-        let base_url = request
-            .base_url
-            .as_ref()
-            .ok_or_else(|| StatusCode::BAD_REQUEST)?;
+        let base_url = request.base_url.as_ref().ok_or(StatusCode::BAD_REQUEST)?;
         let normalized_base_url = base_url.trim().trim_end_matches('/');
 
         if !normalized_base_url.ends_with(".openai.azure.com") {
@@ -1318,7 +1309,7 @@ pub(super) async fn test_provider_model(
         let api_version = request
             .api_version
             .as_ref()
-            .ok_or_else(|| StatusCode::BAD_REQUEST)?;
+            .ok_or(StatusCode::BAD_REQUEST)?;
         let api_version_regex =
             regex::Regex::new(r"^\d{4}-\d{2}-\d{2}(-preview)?$").map_err(|e| {
                 tracing::error!(error = %e, "failed to compile api_version regex");
@@ -1336,10 +1327,7 @@ pub(super) async fn test_provider_model(
             }));
         }
 
-        let deployment = request
-            .deployment
-            .as_ref()
-            .ok_or_else(|| StatusCode::BAD_REQUEST)?;
+        let deployment = request.deployment.as_ref().ok_or(StatusCode::BAD_REQUEST)?;
         let deployment_regex = regex::Regex::new(r"^[a-zA-Z0-9.-]+$").map_err(|e| {
             tracing::error!(error = %e, "failed to compile deployment regex");
             StatusCode::INTERNAL_SERVER_ERROR
@@ -1543,14 +1531,12 @@ pub(super) async fn delete_provider(
 
         if let Some(llm) = doc.get_mut("llm")
             && let Some(llm_table) = llm.as_table_mut()
+            && let Some(provider_table) = llm_table.get_mut("provider")
+            && let Some(provider_tbl) = provider_table.as_table_mut()
         {
-            if let Some(provider_table) = llm_table.get_mut("provider")
-                && let Some(provider_tbl) = provider_table.as_table_mut()
-            {
-                provider_tbl.remove("azure");
-                if provider_tbl.is_empty() {
-                    llm_table.remove("provider");
-                }
+            provider_tbl.remove("azure");
+            if provider_tbl.is_empty() {
+                llm_table.remove("provider");
             }
         }
 

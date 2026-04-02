@@ -1322,9 +1322,10 @@ impl SpacebotModel {
             ApiType::Azure => {
                 // Azure handles its own endpoint construction in the call() match
                 // This fallback should not be reached for Azure
-                return Err(CompletionError::ProviderError(format!(
+                return Err(CompletionError::ProviderError(
                     "Azure provider should use the dedicated Azure endpoint construction in call()"
-                )));
+                        .to_string(),
+                ));
             }
             ApiType::Anthropic => {
                 return Err(CompletionError::ProviderError(format!(
