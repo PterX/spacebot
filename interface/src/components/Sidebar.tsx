@@ -21,7 +21,7 @@ import { CSS } from "@dnd-kit/utilities";
 import { api, getApiBase } from "@/api/client";
 import type { ChannelLiveState } from "@/hooks/useChannelLiveState";
 import { useAgentOrder } from "@/hooks/useAgentOrder";
-import { House, TreeStructure, Wrench, CheckSquare, GearSix, DotsThree, ChatCircleDots, Broadcast, Brain, Lightning, CalendarDots } from "@phosphor-icons/react";
+import { House, TreeStructure, Wrench, CheckSquare, GearSix, DotsThree, ChatCircleDots, Broadcast, Brain, Lightning, CalendarDots, SlidersHorizontal } from "@phosphor-icons/react";
 import { CircleButton, SelectPill } from "@spacedrive/primitives";
 import { CreateAgentDialog } from "@/components/CreateAgentDialog";
 import { ProfileAvatar } from "@/components/ProfileAvatar";
@@ -36,6 +36,7 @@ const agentSubItems = [
 	{ path: "memories", icon: Brain, label: "Memory" },
 	{ path: "skills", icon: Lightning, label: "Skills" },
 	{ path: "cron", icon: CalendarDots, label: "Schedule" },
+	{ path: "config", icon: SlidersHorizontal, label: "Config" },
 ] as const;
 
 interface SortableAgentItemProps {

@@ -59,7 +59,7 @@ export function WorkerColumn({worker}: {worker: OrchestrationWorker}) {
 			</div>
 
 			{/* OpenCode embed */}
-			<div className="flex flex-1 flex-col overflow-hidden">
+			<div className="flex flex-1 bg-app flex-col overflow-hidden">
 				<OpenCodeEmbed
 					port={worker.opencode_port!}
 					sessionId={worker.opencode_session_id ?? worker.id}
