@@ -632,9 +632,9 @@ mod tests {
 
     #[test]
     fn test_content_hash_differs_for_different_content() {
-        let hash1 = content_hash("hello world!");
+        let hash1 = content_hash("hello world");
         let hash2 = content_hash("hello world!");
-        assert_eq!(hash1, hash2);
+        assert_ne!(hash1, hash2);
     }
 
     /// Regression test for #48: when any chunk errors, had_failure must be true
