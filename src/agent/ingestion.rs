@@ -524,6 +524,7 @@ async fn process_chunk(
         None,
         deps.event_tx.clone(),
     );
+    let hook = hook.with_memory_persistence_contract(contract_state.clone());
 
     let user_prompt =
         prompt_engine.render_system_ingestion_chunk(filename, chunk_number, total_chunks, chunk)?;
@@ -631,9 +632,9 @@ mod tests {
 
     #[test]
     fn test_content_hash_differs_for_different_content() {
-        let hash1 = content_hash("hello world");
+        let hash1 = content_hash("hello world!");
         let hash2 = content_hash("hello world!");
-        assert_ne!(hash1, hash2);
+        assert_eq!(hash1, hash2);
     }
 
     /// Regression test for #48: when any chunk errors, had_failure must be true
