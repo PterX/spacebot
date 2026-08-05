@@ -1,0 +1,76 @@
+# ── LLM ──
+[llm]
+openai_key = "env:OPENAI_API_KEY"
+
+# ── Agents ──
+[[agents]]
+id = "orchestrator"
+default = true
+display_name = "Orchestrator"
+role = "Mastermind orchestrator — receives all messages, delegates to specialist agents"
+max_concurrent_workers = 5
+max_turns = 8
+
+[[agents]]
+id = "researcher"
+display_name = "Researcher"
+role = "Research analyst — finds, synthesizes, and presents information"
+max_concurrent_workers = 5
+max_turns = 8
+
+[[agents]]
+id = "executor"
+display_name = "Executor"
+role = "Execution agent — implements, builds, and gets things done"
+max_concurrent_workers = 5
+max_turns = 8
+
+[[agents]]
+id = "reviewer"
+display_name = "Reviewer"
+role = "Review agent — audits output, checks quality, catches issues"
+max_concurrent_workers = 3
+max_turns = 5
+
+# ── Humans ──
+[[humans]]
+id = "nick"
+display_name = "Nick"
+role = "Owner"
+bio = "Creator and operator of the mastermind group."
+
+# ── Links ──
+[[links]]
+from = "nick"
+to = "orchestrator"
+direction = "two_way"
+kind = "hierarchical"
+
+[[links]]
+from = "orchestrator"
+to = "researcher"
+direction = "two_way"
+kind = "hierarchical"
+
+[[links]]
+from = "orchestrator"
+to = "executor"
+direction = "two_way"
+kind = "hierarchical"
+
+[[links]]
+from = "orchestrator"
+to = "reviewer"
+direction = "two_way"
+kind = "hierarchical"
+
+# ── Messaging ──
+[messaging.telegram]
+enabled = true
+token = "env:TELEGRAM_BOT_TOKEN"
+
+# ── Bindings ──
+[[bindings]]
+agent_id = "orchestrator"
+channel = "telegram"
+chat_id = "-1003755926488"
