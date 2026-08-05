@@ -1,7 +1,8 @@
 import {useState, useEffect} from "react";
 import {useMutation, useQueryClient} from "@tanstack/react-query";
 import {api} from "@/api/client";
-import {Button, Input, Switch} from "@spacedrive/primitives";
+import {Button, Input} from "@spacedrive/primitives";
+import {Toggle as Switch} from "@/ui/Toggle";
 import type {GlobalSettingsSectionProps} from "./types";
 
 export function ServerSection({settings, isLoading}: GlobalSettingsSectionProps) {

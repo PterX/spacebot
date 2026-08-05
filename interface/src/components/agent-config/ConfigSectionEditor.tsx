@@ -7,8 +7,8 @@ import {
 	SelectValue,
 	SelectContent,
 	SelectItem,
-	Switch,
 } from "@spacedrive/primitives";
+import {Toggle as Switch} from "@/ui/Toggle";
 import {ModelSelect} from "@/components/ModelSelect";
 import {TagInput} from "@/components/TagInput";
 import {supportsAdaptiveThinking} from "./utils";

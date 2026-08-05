@@ -34,7 +34,7 @@ import {
 	SelectContent,
 	SelectItem,
 } from "@spacedrive/primitives";
-import {Switch} from "@spacedrive/primitives";
+import {Toggle as Switch} from "@/ui/Toggle";
 
 // -- Helpers --
 
