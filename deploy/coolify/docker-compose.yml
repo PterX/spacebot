@@ -25,6 +25,7 @@ services:
       - "19898:19898"
     volumes:
       - spacebot-data:/data
+      - spacebot-repo:/workspace/spacebot
       - ./config.toml:/data/config.toml:ro
       - ./agents/orchestrator/SOUL.md:/data/agents/orchestrator/SOUL.md:ro
       - ./agents/orchestrator/IDENTITY.md:/data/agents/orchestrator/IDENTITY.md:ro
@@ -41,8 +42,12 @@ services:
     environment:
       - SPACEBOT_DIR=/data
       - SPACEBOT_DEPLOYMENT=docker
+      - SPACEBOT_REPO_ENABLED=${SPACEBOT_REPO_ENABLED:-true}
+      - SPACEBOT_REPO_URL=${SPACEBOT_REPO_URL:-https://github.com/mdcnick/spacebot.git}
+      - SPACEBOT_REPO_REF=${SPACEBOT_REPO_REF:-local/spacebot-fix/2026-08-05-toggle-radix-state-fix}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
 
 volumes:
   spacebot-data:
+  spacebot-repo:

@@ -24,6 +24,7 @@ display_name = "Executor"
 role = "Execution agent — implements, builds, and gets things done"
 max_concurrent_workers = 5
 max_turns = 8
+workspace = "/workspace/spacebot"
 
 [[agents]]
 id = "reviewer"
