@@ -20,8 +20,10 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
+      # Toolchain pinned to match rust-toolchain.toml — bump both together.
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.97.1
           components: clippy
 
       - uses: Swatinem/rust-cache@v2
@@ -40,6 +42,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.97.1
           components: rustfmt
 
       - name: cargo fmt
@@ -55,6 +58,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
 
       - uses: Swatinem/rust-cache@v2
 
