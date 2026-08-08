@@ -75,6 +75,12 @@ gate-pr-ci-fast: preflight-ci
 build-opencode-embed:
     ./scripts/build-opencode-embed.sh
 
+# Cross-compile for aarch64 Linux (Raspberry Pi, ARM servers).
+# Requires: cargo install cross --locked
+# Output: target/aarch64-unknown-linux-gnu/release/spacebot
+build-aarch64:
+    SPACEBOT_SKIP_FRONTEND_BUILD=1 cross build --target aarch64-unknown-linux-gnu --release
+
 # Build the spacebot binary and copy it into the Tauri sidecar
 # binaries directory with the correct target-triple suffix.
 bundle-sidecar:
