@@ -1,9 +1,12 @@
 //! Database connection management and migrations.
 
 use crate::error::{DbError, Result};
+
 use anyhow::Context as _;
 use sqlx::SqlitePool;
+
 use std::path::Path;
+use std::sync::Arc;
 
 /// Database connections bundle for per-agent databases.
 pub struct Db {
@@ -17,13 +20,23 @@ pub struct Db {
     pub redb: Arc<redb::Database>,
 }
 
-use std::sync::Arc;
-
 impl Db {
     /// Connect to all databases and run migrations.
     pub async fn connect(data_dir: &Path) -> Result<Self> {
-        // SQLite
-        let sqlite_url = format!("sqlite:{}?mode=rwc", data_dir.join("spacebot.db").display());
+        // SQLite — per-agent agent.db. If an old spacebot.db exists from
+        // before the rename, move it to agent.db.
+        let agent_db = data_dir.join("agent.db");
+        let legacy_db = data_dir.join("spacebot.db");
+        if legacy_db.exists() && !agent_db.exists() {
+            std::fs::rename(&legacy_db, &agent_db).with_context(|| {
+                format!(
+                    "failed to rename legacy per-agent DB {} -> {}",
+                    legacy_db.display(),
+                    agent_db.display()
+                )
+            })?;
+        }
+        let sqlite_url = format!("sqlite:{}?mode=rwc", agent_db.display());
         let sqlite = SqlitePool::connect(&sqlite_url)
             .await
             .with_context(|| "failed to connect to SQLite")?;
@@ -65,4 +78,43 @@ impl Db {
         self.sqlite.close().await;
         // LanceDB and redb close automatically when dropped
     }
+}
+
+/// Connect to the instance-level spacebot database and run its migrations.
+///
+/// The instance database lives at `{instance_dir}/data/spacebot.db` and holds
+/// data shared across all agents: tasks, projects, repos, worktrees. This
+/// replaces per-agent task and project tables.
+///
+/// If an old `tasks.db` exists from before the rename, it is moved to
+/// `spacebot.db` first.
+pub async fn connect_instance_db(data_dir: &Path) -> Result<SqlitePool> {
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("failed to create data directory: {}", data_dir.display()))?;
+
+    let db_path = data_dir.join("spacebot.db");
+    let legacy_tasks_db = data_dir.join("tasks.db");
+    if legacy_tasks_db.exists() && !db_path.exists() {
+        std::fs::rename(&legacy_tasks_db, &db_path).with_context(|| {
+            format!(
+                "failed to rename legacy tasks.db -> spacebot.db at {}",
+                data_dir.display()
+            )
+        })?;
+    }
+    let url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    let pool = SqlitePool::connect(&url).await.with_context(|| {
+        format!(
+            "failed to connect to instance database: {}",
+            db_path.display()
+        )
+    })?;
+
+    sqlx::migrate!("./migrations/global")
+        .run(&pool)
+        .await
+        .with_context(|| "failed to run instance database migrations")?;
+
+    Ok(pool)
 }

@@ -4,12 +4,14 @@
 //! background processes: `spawn_branch_from_state`, `spawn_worker_from_state`,
 //! and `spawn_opencode_worker_from_state`.
 
-use crate::agent::branch::Branch;
+use crate::agent::branch::{Branch, BranchExecutionConfig};
 use crate::agent::channel::ChannelState;
 use crate::agent::channel_prompt::TemporalContext;
-use crate::agent::worker::Worker;
+use crate::agent::worker::{Worker, WorkerOutcome};
+use crate::conversation::settings::{WorkerContextMode, WorkerHistoryMode};
 use crate::error::{AgentError, Error as SpacebotError};
-use crate::{AgentDeps, BranchId, ChannelId, ProcessEvent, WorkerId};
+use crate::tools::{BranchToolProfile, MemoryPersistenceContractState};
+use crate::{AgentDeps, BranchId, ChannelId, ProcessEvent, ProcessType, WorkerId};
 use futures::FutureExt as _;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -34,7 +36,10 @@ pub(crate) fn reserve_worker_slot_local(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerCompletionKind {
     Success,
+    Partial,
     Cancelled,
+    Timeout,
+    Blocked,
     Failed,
 }
 
@@ -66,11 +71,44 @@ impl WorkerCompletionError {
     }
 }
 
-fn classify_worker_completion_result(
-    result: std::result::Result<String, WorkerCompletionError>,
+fn classify_worker_completion(
+    outcome: std::result::Result<WorkerOutcome, WorkerCompletionError>,
 ) -> (String, WorkerCompletionKind) {
-    match result {
-        Ok(text) => (text, WorkerCompletionKind::Success),
+    match outcome {
+        Ok(WorkerOutcome::Success { result }) => (result, WorkerCompletionKind::Success),
+        Ok(WorkerOutcome::Partial {
+            result,
+            segments_run,
+        }) => (
+            format!(
+                "{result}\n\n(reached max segments after {segments_run} attempts — partial result)"
+            ),
+            WorkerCompletionKind::Partial,
+        ),
+        Ok(WorkerOutcome::Cancelled { reason }) => (
+            format!("Worker cancelled: {reason}"),
+            WorkerCompletionKind::Cancelled,
+        ),
+        Ok(WorkerOutcome::Timeout {
+            elapsed_secs,
+            segments_run,
+        }) => (
+            format!(
+                "Worker exceeded {elapsed_secs}s wall-clock timeout after {segments_run} segments."
+            ),
+            WorkerCompletionKind::Timeout,
+        ),
+        Ok(WorkerOutcome::Blocked { reason, url, .. }) => {
+            let body = match url {
+                Some(url) => format!("Worker blocked: {} at {url}", reason.describe()),
+                None => format!("Worker blocked: {}", reason.describe()),
+            };
+            (body, WorkerCompletionKind::Blocked)
+        }
+        Ok(WorkerOutcome::Failed { reason }) => (
+            format!("Worker failed: {reason}"),
+            WorkerCompletionKind::Failed,
+        ),
         Err(WorkerCompletionError::Cancelled { reason }) => (
             format!("Worker cancelled: {reason}"),
             WorkerCompletionKind::Cancelled,
@@ -84,15 +122,18 @@ fn classify_worker_completion_result(
 
 fn completion_flags(kind: WorkerCompletionKind) -> (bool, bool) {
     let notify = true;
-    let success = matches!(kind, WorkerCompletionKind::Success);
+    let success = matches!(
+        kind,
+        WorkerCompletionKind::Success | WorkerCompletionKind::Partial
+    );
     (notify, success)
 }
 
-/// Normalize worker completion into event payload fields.
-pub(crate) fn map_worker_completion_result(
-    result: std::result::Result<String, WorkerCompletionError>,
+/// Normalize a worker outcome (or terminal error) into event payload fields.
+pub(crate) fn map_worker_completion(
+    outcome: std::result::Result<WorkerOutcome, WorkerCompletionError>,
 ) -> (String, bool, bool) {
-    let (result_text, kind) = classify_worker_completion_result(result);
+    let (result_text, kind) = classify_worker_completion(outcome);
     let (notify, success) = completion_flags(kind);
     (result_text, notify, success)
 }
@@ -112,6 +153,11 @@ fn build_worker_status_text(
     Some(system_info.render_for_worker(&current_time_line))
 }
 
+#[derive(Debug, Clone)]
+struct BranchSpawnOptions {
+    profile: BranchToolProfile,
+}
+
 /// Spawn a branch from a ChannelState. Used by the BranchTool.
 pub async fn spawn_branch_from_state(
     state: &ChannelState,
@@ -120,11 +166,23 @@ pub async fn spawn_branch_from_state(
     let description = description.into();
     let rc = &state.deps.runtime_config;
     let prompt_engine = rc.prompts.load();
+    let routing = rc.routing.load();
+    let model_name = routing.resolve(ProcessType::Branch, None).to_string();
+    let tool_use_enforcement = rc.tool_use_enforcement.load();
+    let wiki_enabled = state.deps.wiki_store.is_some();
     let system_prompt = prompt_engine
         .render_branch_prompt(
             &rc.instance_dir.display().to_string(),
             &rc.workspace_dir.display().to_string(),
+            wiki_enabled,
         )
+        .and_then(|prompt| {
+            prompt_engine.maybe_append_tool_use_enforcement(
+                prompt,
+                tool_use_enforcement.as_ref(),
+                &model_name,
+            )
+        })
         .map_err(|e| AgentError::Other(anyhow::anyhow!("{e}")))?;
 
     spawn_branch(
@@ -134,6 +192,9 @@ pub async fn spawn_branch_from_state(
         &system_prompt,
         &description,
         "branch",
+        BranchSpawnOptions {
+            profile: BranchToolProfile::Default,
+        },
     )
     .await
 }
@@ -147,9 +208,21 @@ pub(crate) async fn spawn_memory_persistence_branch(
     state: &ChannelState,
     deps: &AgentDeps,
 ) -> std::result::Result<BranchId, AgentError> {
+    let contract_state = Arc::new(MemoryPersistenceContractState::default());
+
     let prompt_engine = deps.runtime_config.prompts.load();
+    let routing = deps.runtime_config.routing.load();
+    let model_name = routing.resolve(ProcessType::Branch, None).to_string();
+    let tool_use_enforcement = deps.runtime_config.tool_use_enforcement.load();
     let system_prompt = prompt_engine
         .render_static("memory_persistence")
+        .and_then(|prompt| {
+            prompt_engine.maybe_append_tool_use_enforcement(
+                prompt,
+                tool_use_enforcement.as_ref(),
+                &model_name,
+            )
+        })
         .map_err(|e| AgentError::Other(anyhow::anyhow!("{e}")))?;
     let prompt = prompt_engine
         .render_system_memory_persistence()
@@ -162,6 +235,13 @@ pub(crate) async fn spawn_memory_persistence_branch(
         &system_prompt,
         "persisting memories...",
         "memory_persistence_branch",
+        BranchSpawnOptions {
+            profile: BranchToolProfile::MemoryPersistence {
+                contract_state,
+                working_memory: Some(state.deps.working_memory.clone()),
+                channel_id: Some(state.channel_id.to_string()),
+            },
+        },
     )
     .await
 }
@@ -215,7 +295,14 @@ async fn spawn_branch(
     system_prompt: &str,
     status_label: &str,
     dispatch_type: &'static str,
+    branch_options: BranchSpawnOptions,
 ) -> std::result::Result<BranchId, AgentError> {
+    let BranchSpawnOptions { profile } = branch_options;
+    let memory_persistence_contract = match &profile {
+        BranchToolProfile::MemoryPersistence { contract_state, .. } => Some(contract_state.clone()),
+        BranchToolProfile::Default => None,
+    };
+
     let max_branches = **state.deps.runtime_config.max_concurrent_branches.load();
     {
         let branches = state.active_branches.read().await;
@@ -243,6 +330,10 @@ async fn spawn_branch(
         state.conversation_logger.clone(),
         state.channel_store.clone(),
         crate::conversation::ProcessRunLogger::new(state.deps.sqlite_pool.clone()),
+        profile,
+        state.deps.api_state.clone(),
+        state.deps.wiki_store.clone(),
+        state.deps.sandbox.clone(),
     );
     let branch_max_turns = **state.deps.runtime_config.branch_max_turns.load();
 
@@ -253,7 +344,14 @@ async fn spawn_branch(
         system_prompt,
         history,
         tool_server,
-        branch_max_turns,
+        BranchExecutionConfig {
+            max_turns: branch_max_turns,
+            memory_persistence_contract,
+        },
+        state
+            .model_overrides
+            .resolve_model("branch")
+            .map(String::from),
     );
 
     let branch_id = branch.id;
@@ -273,6 +371,11 @@ async fn spawn_branch(
         channel_id = %state.channel_id,
         description = %description,
     );
+    // Acquire the write lock before spawning so the event loop cannot process
+    // BranchResult (which also takes a write lock) before we insert the handle.
+    // Without this, a fast-completing branch sends BranchResult before the
+    // insert, causing `was_active` to be false and suppressing the retrigger.
+    let mut branches = state.active_branches.write().await;
     let handle = tokio::spawn(
         async move {
             if let Err(error) = branch.run(&prompt).await {
@@ -283,7 +386,7 @@ async fn spawn_branch(
                 // Layer 2: regex-based redaction of unknown secret patterns.
                 let raw = format!("Branch failed: {error}");
                 let conclusion = if let Some(store) = secrets_snapshot.as_ref() {
-                    crate::secrets::scrub::scrub_with_store(&raw, store)
+                    crate::secrets::scrub::scrub_with_store(&raw, store, &agent_id)
                 } else {
                     raw
                 };
@@ -298,11 +401,8 @@ async fn spawn_branch(
         }
         .instrument(branch_span),
     );
-
-    {
-        let mut branches = state.active_branches.write().await;
-        branches.insert(branch_id, handle);
-    }
+    branches.insert(branch_id, handle);
+    drop(branches);
 
     {
         let mut status = state.status_block.write().await;
@@ -398,19 +498,116 @@ async fn release_task_reservation(state: &ChannelState, task: &str) {
     state.reserved_tasks.write().await.remove(&normalized);
 }
 
+/// Build pre-rendered project context for injection into worker/channel prompts.
+///
+/// Fetches all active projects with their repos and worktrees, converts them
+/// to prompt-friendly structs, and renders via the projects_context template.
+/// Returns `None` if no projects exist or if rendering fails.
+pub async fn build_project_context(
+    deps: &AgentDeps,
+    prompt_engine: &crate::prompts::engine::PromptEngine,
+) -> Option<String> {
+    use crate::prompts::engine::{ProjectContext, ProjectRepoContext, ProjectWorktreeContext};
+
+    let store = &deps.project_store;
+    let projects = match store
+        .list_projects(Some(crate::projects::ProjectStatus::Active))
+        .await
+    {
+        Ok(projects) => projects,
+        Err(error) => {
+            tracing::warn!(%error, "failed to load projects for prompt injection");
+            return None;
+        }
+    };
+
+    if projects.is_empty() {
+        return None;
+    }
+
+    let mut contexts = Vec::with_capacity(projects.len());
+    for project in &projects {
+        let repos = match store.list_repos(&project.id).await {
+            Ok(repos) => repos,
+            Err(error) => {
+                tracing::warn!(%error, project_id = %project.id, "failed to load repos for project");
+                Vec::new()
+            }
+        };
+
+        let worktrees = match store.list_worktrees_with_repos(&project.id).await {
+            Ok(worktrees) => worktrees,
+            Err(error) => {
+                tracing::warn!(%error, project_id = %project.id, "failed to load worktrees for project");
+                Vec::new()
+            }
+        };
+
+        contexts.push(ProjectContext {
+            name: project.name.clone(),
+            root_path: project.root_path.clone(),
+            description: if project.description.is_empty() {
+                None
+            } else {
+                Some(project.description.clone())
+            },
+            tags: project.tags.clone(),
+            repos: repos
+                .into_iter()
+                .map(|repo| ProjectRepoContext {
+                    name: repo.name.clone(),
+                    path: repo.path.clone(),
+                    default_branch: repo.default_branch.clone(),
+                    remote_url: if repo.remote_url.is_empty() {
+                        None
+                    } else {
+                        Some(repo.remote_url.clone())
+                    },
+                })
+                .collect(),
+            worktrees: worktrees
+                .into_iter()
+                .map(|wt| ProjectWorktreeContext {
+                    name: wt.worktree.name.clone(),
+                    path: wt.worktree.path.clone(),
+                    branch: wt.worktree.branch.clone(),
+                    repo_name: wt.repo_name.clone(),
+                })
+                .collect(),
+        });
+    }
+
+    match prompt_engine.render_projects_context(contexts) {
+        Ok(rendered) => {
+            let rendered = rendered.trim().to_string();
+            if rendered.is_empty() {
+                None
+            } else {
+                Some(rendered)
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to render projects context");
+            None
+        }
+    }
+}
+
 /// Spawn a worker from a ChannelState. Used by the SpawnWorkerTool.
 pub async fn spawn_worker_from_state(
     state: &ChannelState,
     task: impl Into<String>,
     interactive: bool,
     suggested_skills: &[&str],
+    worker_context: &WorkerContextMode,
 ) -> std::result::Result<WorkerId, AgentError> {
     check_worker_limit(state).await?;
     let task = task.into();
     reserve_task_if_unique(state, &task).await?;
     ensure_dispatch_readiness(state, "worker");
 
-    let result = spawn_worker_inner(state, &task, interactive, suggested_skills).await;
+    let result =
+        spawn_worker_inner(state, &task, interactive, suggested_skills, worker_context).await;
 
     // Release the reservation regardless of success or failure.
     // On success the task is now in the status block; on failure it needs cleanup.
@@ -426,6 +623,7 @@ async fn spawn_worker_inner(
     task: &str,
     interactive: bool,
     suggested_skills: &[&str],
+    worker_context: &WorkerContextMode,
 ) -> std::result::Result<WorkerId, AgentError> {
     let rc = &state.deps.runtime_config;
     let prompt_engine = rc.prompts.load();
@@ -439,11 +637,15 @@ async fn spawn_worker_inner(
     // Collect tool secret names so the worker template can list available credentials.
     let secrets_guard = rc.secrets.load();
     let tool_secret_names = match (*secrets_guard).as_ref() {
-        Some(store) => store.tool_secret_names(),
+        Some(store) => store.tool_secret_names(&state.deps.agent_id),
         None => Vec::new(),
     };
 
     let browser_config = (**rc.browser_config.load()).clone();
+    let routing = rc.routing.load();
+    let model_name = routing.resolve(ProcessType::Worker, None).to_string();
+    let tool_use_enforcement = rc.tool_use_enforcement.load();
+    let project_context = build_project_context(&state.deps, &prompt_engine).await;
     let worker_system_prompt = prompt_engine
         .render_worker_prompt(
             &rc.instance_dir.display().to_string(),
@@ -455,6 +657,8 @@ async fn spawn_worker_inner(
             &tool_secret_names,
             browser_config.persist_session,
             worker_status_text,
+            worker_context.wiki_write && state.deps.wiki_store.is_some(),
+            project_context,
         )
         .map_err(|e| AgentError::Other(anyhow::anyhow!("{e}")))?;
     let skills = rc.skills.load();
@@ -474,6 +678,71 @@ async fn spawn_worker_inner(
         }
     };
 
+    // Append tool-use enforcement after skills so it's the last instruction
+    // in the preamble ("last instruction wins").
+    let mut system_prompt = prompt_engine
+        .maybe_append_tool_use_enforcement(
+            system_prompt,
+            tool_use_enforcement.as_ref(),
+            &model_name,
+        )
+        .map_err(|e| AgentError::Other(anyhow::anyhow!("{e}")))?;
+
+    // Inject memory context based on worker_context settings
+    if worker_context.memory.ambient_enabled() {
+        // Get knowledge synthesis and working memory
+        let knowledge_synthesis = state.deps.runtime_config.knowledge_synthesis.load();
+        let wm_config = **state.deps.runtime_config.working_memory.load();
+        let timezone = state.deps.working_memory.timezone();
+
+        if let Ok(working_memory) = crate::memory::working::render_working_memory(
+            &state.deps.working_memory,
+            state.channel_id.as_ref(),
+            &wm_config,
+            timezone,
+        )
+        .await
+        {
+            system_prompt.push_str("\n\n## Agent's Knowledge\n");
+            system_prompt.push_str(&knowledge_synthesis.to_string());
+            if !working_memory.is_empty() {
+                system_prompt.push_str("\n\n## Recent Activity\n");
+                system_prompt.push_str(&working_memory);
+            }
+        }
+    }
+
+    // Inject conversation history if needed
+    let initial_history: Vec<rig::message::Message> = match worker_context.history {
+        WorkerHistoryMode::None => Vec::new(),
+        WorkerHistoryMode::Summary => {
+            // TODO: Generate an LLM-based summary of conversation history.
+            tracing::warn!(
+                "WorkerHistoryMode::Summary is not yet implemented, worker will receive no history"
+            );
+            Vec::new()
+        }
+        WorkerHistoryMode::Recent(n) => {
+            let history = state.history.read().await;
+            history
+                .iter()
+                .rev()
+                .take(n as usize)
+                .rev()
+                .cloned()
+                .collect()
+        }
+        WorkerHistoryMode::Full => {
+            let history = state.history.read().await;
+            history.clone()
+        }
+    };
+
+    let worker_model_override = state
+        .model_overrides
+        .resolve_model("worker")
+        .map(String::from);
+
     let worker = if interactive {
         let (worker, input_tx, inject_tx) = Worker::new_interactive(
             Some(state.channel_id.clone()),
@@ -484,6 +753,10 @@ async fn spawn_worker_inner(
             state.screenshot_dir.clone(),
             brave_search_key.clone(),
             state.logs_dir.clone(),
+            initial_history,
+            worker_context.memory,
+            worker_context.wiki_write,
+            worker_model_override,
         );
         let worker_id = worker.id;
         state
@@ -507,6 +780,10 @@ async fn spawn_worker_inner(
             state.screenshot_dir.clone(),
             brave_search_key,
             state.logs_dir.clone(),
+            initial_history,
+            worker_context.memory,
+            worker_context.wiki_write,
+            worker_model_override,
         );
         state
             .worker_injections
@@ -554,6 +831,17 @@ async fn spawn_worker_inner(
             directory: None,
         })
         .ok();
+
+    state
+        .deps
+        .working_memory
+        .emit(
+            crate::memory::WorkingMemoryEventType::WorkerSpawned,
+            format!("Worker spawned: {task}"),
+        )
+        .channel(state.channel_id.to_string())
+        .importance(0.6)
+        .record();
 
     tracing::info!(worker_id = %worker_id, task = %task, interactive, "worker spawned");
 
@@ -720,7 +1008,9 @@ async fn spawn_opencode_worker_inner(
                 });
             }
 
-            Ok::<String, SpacebotError>(result.result_text)
+            Ok::<WorkerOutcome, SpacebotError>(WorkerOutcome::Success {
+                result: result.result_text,
+            })
         }
         .instrument(worker_span),
     );
@@ -747,6 +1037,17 @@ async fn spawn_opencode_worker_inner(
         })
         .ok();
 
+    state
+        .deps
+        .working_memory
+        .emit(
+            crate::memory::WorkingMemoryEventType::WorkerSpawned,
+            format!("Worker spawned (opencode): {task}"),
+        )
+        .channel(state.channel_id.to_string())
+        .importance(0.6)
+        .record();
+
     tracing::info!(worker_id = %worker_id, task = %task, interactive, "OpenCode worker spawned");
 
     Ok(worker_id)
@@ -771,7 +1072,7 @@ pub(crate) fn spawn_worker_task<F>(
     future: F,
 ) -> tokio::task::JoinHandle<()>
 where
-    F: std::future::Future<Output = crate::Result<String>> + Send + 'static,
+    F: std::future::Future<Output = crate::Result<WorkerOutcome>> + Send + 'static,
 {
     tokio::spawn(async move {
         #[cfg(feature = "metrics")]
@@ -783,36 +1084,25 @@ where
             .with_label_values(&[&*agent_id])
             .inc();
 
-        let outcome = std::panic::AssertUnwindSafe(future).catch_unwind().await;
-        let worker_result: std::result::Result<String, WorkerCompletionError> = match outcome {
-            Ok(Ok(text)) => {
-                // Scrub tool secret values from the result before it reaches
-                // the channel. The channel never sees raw secret values.
-                // Layer 1: exact-match redaction of known secrets from the store.
-                // Layer 2: regex-based redaction of unknown secret patterns.
-                let scrubbed = if let Some(store) = &secrets_store {
-                    crate::secrets::scrub::scrub_with_store(&text, store)
-                } else {
-                    text
-                };
-                let scrubbed = crate::secrets::scrub::scrub_leaks(&scrubbed);
-                Ok(scrubbed)
-            }
-            Ok(Err(error)) => {
-                let failure = WorkerCompletionError::from_spacebot_error(error);
-                match failure {
-                    WorkerCompletionError::Cancelled { .. } => Err(failure),
-                    WorkerCompletionError::Failed { message } => {
-                        let scrubbed = if let Some(store) = &secrets_store {
-                            crate::secrets::scrub::scrub_with_store(&message, store)
-                        } else {
-                            message
-                        };
-                        let scrubbed = crate::secrets::scrub::scrub_leaks(&scrubbed);
-                        Err(WorkerCompletionError::Failed { message: scrubbed })
-                    }
+        let raw = std::panic::AssertUnwindSafe(future).catch_unwind().await;
+        let scrub = |text: String| -> String {
+            let layer1 = if let Some(store) = &secrets_store {
+                crate::secrets::scrub::scrub_with_store(&text, store, &agent_id)
+            } else {
+                text
+            };
+            crate::secrets::scrub::scrub_leaks(&layer1)
+        };
+        let worker_result: std::result::Result<WorkerOutcome, WorkerCompletionError> = match raw {
+            Ok(Ok(outcome)) => Ok(scrub_outcome(outcome, &scrub)),
+            Ok(Err(error)) => match WorkerCompletionError::from_spacebot_error(error) {
+                WorkerCompletionError::Cancelled { reason } => {
+                    Err(WorkerCompletionError::Cancelled { reason })
                 }
-            }
+                WorkerCompletionError::Failed { message } => Err(WorkerCompletionError::Failed {
+                    message: scrub(message),
+                }),
+            },
             Err(panic_payload) => {
                 let panic_message = crate::agent::panic_payload_to_string(&*panic_payload);
                 tracing::error!(
@@ -825,11 +1115,17 @@ where
                 )))
             }
         };
-        let (result_text, kind) = classify_worker_completion_result(worker_result);
+        let (result_text, kind) = classify_worker_completion(worker_result);
         match kind {
-            WorkerCompletionKind::Success => {}
+            WorkerCompletionKind::Success | WorkerCompletionKind::Partial => {}
             WorkerCompletionKind::Cancelled => {
                 tracing::info!(worker_id = %worker_id, result = %result_text, "worker cancelled");
+            }
+            WorkerCompletionKind::Timeout => {
+                tracing::warn!(worker_id = %worker_id, result = %result_text, "worker timed out");
+            }
+            WorkerCompletionKind::Blocked => {
+                tracing::warn!(worker_id = %worker_id, result = %result_text, "worker blocked");
             }
             WorkerCompletionKind::Failed => {
                 tracing::error!(worker_id = %worker_id, result = %result_text, "worker failed");
@@ -858,6 +1154,58 @@ where
             success,
         });
     })
+}
+
+/// Apply scrubbing to any text content carried by a `WorkerOutcome`.
+fn scrub_outcome<F>(outcome: WorkerOutcome, scrub: &F) -> WorkerOutcome
+where
+    F: Fn(String) -> String,
+{
+    match outcome {
+        WorkerOutcome::Success { result } => WorkerOutcome::Success {
+            result: scrub(result),
+        },
+        WorkerOutcome::Partial {
+            result,
+            segments_run,
+        } => WorkerOutcome::Partial {
+            result: scrub(result),
+            segments_run,
+        },
+        WorkerOutcome::Cancelled { reason } => WorkerOutcome::Cancelled { reason },
+        WorkerOutcome::Timeout {
+            elapsed_secs,
+            segments_run,
+        } => WorkerOutcome::Timeout {
+            elapsed_secs,
+            segments_run,
+        },
+        WorkerOutcome::Blocked {
+            reason,
+            url,
+            mut evidence,
+        } => {
+            // Scrub URL too — query params and path segments routinely
+            // carry bearer tokens / session ids. The blocked URL flows
+            // into WorkerComplete.result and channel logs, so an
+            // un-scrubbed URL is a credential-leak path.
+            let url = url.map(scrub);
+            if let Some(snippet) = evidence.html_snippet.take() {
+                evidence.html_snippet = Some(scrub(snippet));
+            }
+            if let Some(final_url) = evidence.final_url.take() {
+                evidence.final_url = Some(scrub(final_url));
+            }
+            WorkerOutcome::Blocked {
+                reason,
+                url,
+                evidence,
+            }
+        }
+        WorkerOutcome::Failed { reason } => WorkerOutcome::Failed {
+            reason: scrub(reason),
+        },
+    }
 }
 
 /// Resume an idle interactive worker into a channel's state after restart.
@@ -965,7 +1313,9 @@ pub async fn resume_idle_worker_into_state(
                             }
                         });
                     }
-                    Ok::<String, SpacebotError>(result.result_text)
+                    Ok::<WorkerOutcome, SpacebotError>(WorkerOutcome::Success {
+                result: result.result_text,
+            })
                 }
                 .instrument(worker_span),
             );
@@ -1017,10 +1367,14 @@ pub async fn resume_idle_worker_into_state(
             let sandbox_write_allowlist = state.deps.sandbox.prompt_write_allowlist();
             let secrets_guard = rc.secrets.load();
             let tool_secret_names = match (*secrets_guard).as_ref() {
-                Some(store) => store.tool_secret_names(),
+                Some(store) => store.tool_secret_names(&state.deps.agent_id),
                 None => Vec::new(),
             };
             let browser_config = (**rc.browser_config.load()).clone();
+            let routing = rc.routing.load();
+            let model_name = routing.resolve(ProcessType::Worker, None).to_string();
+            let tool_use_enforcement = rc.tool_use_enforcement.load();
+            let project_context = build_project_context(&state.deps, &prompt_engine).await;
             let system_prompt = prompt_engine
                 .render_worker_prompt(
                     &rc.instance_dir.display().to_string(),
@@ -1032,7 +1386,16 @@ pub async fn resume_idle_worker_into_state(
                     &tool_secret_names,
                     browser_config.persist_session,
                     worker_status_text,
+                    false, // resumed workers use original context; wiki not re-injected
+                    project_context,
                 )
+                .and_then(|prompt| {
+                    prompt_engine.maybe_append_tool_use_enforcement(
+                        prompt,
+                        tool_use_enforcement.as_ref(),
+                        &model_name,
+                    )
+                })
                 .map_err(|error| format!("failed to render worker prompt: {error}"))?;
             let brave_search_key = (**rc.brave_search_key.load()).clone();
 
@@ -1123,7 +1486,7 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkerCompletionError, map_worker_completion_result, spawn_worker_task};
+    use super::{WorkerCompletionError, WorkerOutcome, map_worker_completion, spawn_worker_task};
     use crate::{ProcessEvent, WorkerId};
     use std::sync::Arc;
     use std::time::Duration;
@@ -1133,12 +1496,54 @@ mod tests {
     #[test]
     fn cancelled_errors_are_classified_as_cancelled_results() {
         let (text, notify, success) =
-            map_worker_completion_result(Err(WorkerCompletionError::Cancelled {
+            map_worker_completion(Err(WorkerCompletionError::Cancelled {
                 reason: "user requested".to_string(),
             }));
         assert_eq!(text, "Worker cancelled: user requested");
         assert!(notify);
         assert!(!success);
+    }
+
+    #[test]
+    fn timeout_outcome_is_classified_as_unsuccessful() {
+        let (text, notify, success) = map_worker_completion(Ok(WorkerOutcome::Timeout {
+            elapsed_secs: 1800,
+            segments_run: 7,
+        }));
+        assert_eq!(
+            text,
+            "Worker exceeded 1800s wall-clock timeout after 7 segments."
+        );
+        assert!(notify);
+        assert!(!success);
+    }
+
+    #[test]
+    fn blocked_outcome_is_classified_as_unsuccessful() {
+        use crate::agent::worker::{BlockEvidence, BlockReason};
+        let (text, notify, success) = map_worker_completion(Ok(WorkerOutcome::Blocked {
+            reason: BlockReason::Captcha {
+                provider: "cloudflare-turnstile".to_string(),
+            },
+            url: Some("https://example.com/signup".to_string()),
+            evidence: Box::new(BlockEvidence::default()),
+        }));
+        assert!(text.contains("captcha"));
+        assert!(text.contains("https://example.com/signup"));
+        assert!(notify);
+        assert!(!success);
+    }
+
+    #[test]
+    fn partial_outcome_is_classified_as_successful() {
+        let (text, notify, success) = map_worker_completion(Ok(WorkerOutcome::Partial {
+            result: "partial body".to_string(),
+            segments_run: 10,
+        }));
+        assert!(text.contains("partial body"));
+        assert!(text.contains("max segments"));
+        assert!(notify);
+        assert!(success);
     }
 
     #[tokio::test]
@@ -1154,7 +1559,7 @@ mod tests {
             None,
             "builtin",
             async {
-                Err::<String, crate::Error>(
+                Err::<WorkerOutcome, crate::Error>(
                     crate::error::AgentError::Cancelled {
                         reason: "user requested".to_string(),
                     }
@@ -1199,7 +1604,11 @@ mod tests {
             Some(channel_id.clone()),
             None,
             "builtin",
-            async { Ok::<String, crate::Error>("result".to_string()) },
+            async {
+                Ok::<WorkerOutcome, crate::Error>(WorkerOutcome::Success {
+                    result: "result".to_string(),
+                })
+            },
         );
 
         let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())

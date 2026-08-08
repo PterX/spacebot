@@ -6,8 +6,9 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct GlobalSettingsResponse {
+    company_name: String,
     brave_search_key: Option<String>,
     api_enabled: bool,
     api_port: u16,
@@ -17,7 +18,7 @@ pub(super) struct GlobalSettingsResponse {
     ssh_enabled: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct OpenCodeSettingsResponse {
     enabled: bool,
     path: String,
@@ -27,15 +28,16 @@ pub(super) struct OpenCodeSettingsResponse {
     permissions: OpenCodePermissionsResponse,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct OpenCodePermissionsResponse {
     edit: String,
     bash: String,
     webfetch: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub(super) struct GlobalSettingsUpdate {
+    company_name: Option<String>,
     brave_search_key: Option<String>,
     api_enabled: Option<bool>,
     api_port: Option<u16>,
@@ -45,7 +47,7 @@ pub(super) struct GlobalSettingsUpdate {
     ssh_enabled: Option<bool>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub(super) struct OpenCodeSettingsUpdate {
     enabled: Option<bool>,
     path: Option<String>,
@@ -55,174 +57,203 @@ pub(super) struct OpenCodeSettingsUpdate {
     permissions: Option<OpenCodePermissionsUpdate>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub(super) struct OpenCodePermissionsUpdate {
     edit: Option<String>,
     bash: Option<String>,
     webfetch: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct GlobalSettingsUpdateResponse {
     success: bool,
     message: String,
     requires_restart: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct RawConfigResponse {
     content: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub(super) struct RawConfigUpdateRequest {
     content: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct RawConfigUpdateResponse {
     success: bool,
     message: String,
 }
 
+#[utoipa::path(
+    get,
+    path = "/settings",
+    responses(
+        (status = 200, body = GlobalSettingsResponse),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "settings",
+)]
 pub(super) async fn get_global_settings(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<GlobalSettingsResponse>, StatusCode> {
     let config_path = state.config_path.read().await.clone();
 
-    let (brave_search_key, api_enabled, api_port, api_bind, worker_log_mode, opencode, ssh_enabled) =
-        if config_path.exists() {
-            let content = tokio::fs::read_to_string(&config_path)
-                .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            let doc: toml_edit::DocumentMut = content
-                .parse()
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let (
+        company_name,
+        brave_search_key,
+        api_enabled,
+        api_port,
+        api_bind,
+        worker_log_mode,
+        opencode,
+        ssh_enabled,
+    ) = if config_path.exists() {
+        let content = tokio::fs::read_to_string(&config_path).await.map_err(|error| {
+            tracing::error!(%error, path = %config_path.display(), "failed to read config.toml for global settings");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        let doc: toml_edit::DocumentMut = content.parse().map_err(|error| {
+            tracing::error!(%error, "failed to parse config.toml for global settings");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
-            let brave_search = doc
-                .get("defaults")
-                .and_then(|d| d.get("brave_search_key"))
-                .and_then(|v| v.as_str())
-                .and_then(|s| {
-                    if let Some(var) = s.strip_prefix("env:") {
-                        std::env::var(var).ok()
-                    } else {
-                        Some(s.to_string())
-                    }
-                });
+        let company_name = doc
+            .get("instance")
+            .and_then(|i| i.get("company_name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("My Company")
+            .to_string();
 
-            let api_enabled = doc
-                .get("api")
-                .and_then(|a| a.get("enabled"))
+        let brave_search = doc
+            .get("defaults")
+            .and_then(|d| d.get("brave_search_key"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| {
+                if let Some(var) = s.strip_prefix("env:") {
+                    std::env::var(var).ok()
+                } else {
+                    Some(s.to_string())
+                }
+            });
+
+        let api_enabled = doc
+            .get("api")
+            .and_then(|a| a.get("enabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        let api_port = doc
+            .get("api")
+            .and_then(|a| a.get("port"))
+            .and_then(|v| v.as_integer())
+            .and_then(|i| u16::try_from(i).ok())
+            .unwrap_or(19898);
+
+        let api_bind = doc
+            .get("api")
+            .and_then(|a| a.get("bind"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("127.0.0.1")
+            .to_string();
+
+        let worker_log_mode = doc
+            .get("defaults")
+            .and_then(|d| d.get("worker_log_mode"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("errors_only")
+            .to_string();
+
+        let opencode_table = doc.get("defaults").and_then(|d| d.get("opencode"));
+        let opencode_perms = opencode_table.and_then(|o| o.get("permissions"));
+        let opencode = OpenCodeSettingsResponse {
+            enabled: opencode_table
+                .and_then(|o| o.get("enabled"))
                 .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-
-            let api_port = doc
-                .get("api")
-                .and_then(|a| a.get("port"))
+                .unwrap_or(false),
+            path: opencode_table
+                .and_then(|o| o.get("path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("opencode")
+                .to_string(),
+            max_servers: opencode_table
+                .and_then(|o| o.get("max_servers"))
                 .and_then(|v| v.as_integer())
-                .and_then(|i| u16::try_from(i).ok())
-                .unwrap_or(19898);
-
-            let api_bind = doc
-                .get("api")
-                .and_then(|a| a.get("bind"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("127.0.0.1")
-                .to_string();
-
-            let worker_log_mode = doc
-                .get("defaults")
-                .and_then(|d| d.get("worker_log_mode"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("errors_only")
-                .to_string();
-
-            let opencode_table = doc.get("defaults").and_then(|d| d.get("opencode"));
-            let opencode_perms = opencode_table.and_then(|o| o.get("permissions"));
-            let opencode = OpenCodeSettingsResponse {
-                enabled: opencode_table
-                    .and_then(|o| o.get("enabled"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-                path: opencode_table
-                    .and_then(|o| o.get("path"))
+                .and_then(|i| usize::try_from(i).ok())
+                .unwrap_or(5),
+            server_startup_timeout_secs: opencode_table
+                .and_then(|o| o.get("server_startup_timeout_secs"))
+                .and_then(|v| v.as_integer())
+                .and_then(|i| u64::try_from(i).ok())
+                .unwrap_or(30),
+            max_restart_retries: opencode_table
+                .and_then(|o| o.get("max_restart_retries"))
+                .and_then(|v| v.as_integer())
+                .and_then(|i| u32::try_from(i).ok())
+                .unwrap_or(5),
+            permissions: OpenCodePermissionsResponse {
+                edit: opencode_perms
+                    .and_then(|p| p.get("edit"))
                     .and_then(|v| v.as_str())
-                    .unwrap_or("opencode")
+                    .unwrap_or("allow")
                     .to_string(),
-                max_servers: opencode_table
-                    .and_then(|o| o.get("max_servers"))
-                    .and_then(|v| v.as_integer())
-                    .and_then(|i| usize::try_from(i).ok())
-                    .unwrap_or(5),
-                server_startup_timeout_secs: opencode_table
-                    .and_then(|o| o.get("server_startup_timeout_secs"))
-                    .and_then(|v| v.as_integer())
-                    .and_then(|i| u64::try_from(i).ok())
-                    .unwrap_or(30),
-                max_restart_retries: opencode_table
-                    .and_then(|o| o.get("max_restart_retries"))
-                    .and_then(|v| v.as_integer())
-                    .and_then(|i| u32::try_from(i).ok())
-                    .unwrap_or(5),
-                permissions: OpenCodePermissionsResponse {
-                    edit: opencode_perms
-                        .and_then(|p| p.get("edit"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("allow")
-                        .to_string(),
-                    bash: opencode_perms
-                        .and_then(|p| p.get("bash"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("allow")
-                        .to_string(),
-                    webfetch: opencode_perms
-                        .and_then(|p| p.get("webfetch"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("allow")
-                        .to_string(),
-                },
-            };
-
-            let ssh_enabled = doc
-                .get("ssh")
-                .and_then(|s| s.get("enabled"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-
-            (
-                brave_search,
-                api_enabled,
-                api_port,
-                api_bind,
-                worker_log_mode,
-                opencode,
-                ssh_enabled,
-            )
-        } else {
-            (
-                None,
-                true,
-                19898,
-                "127.0.0.1".to_string(),
-                "errors_only".to_string(),
-                OpenCodeSettingsResponse {
-                    enabled: false,
-                    path: "opencode".to_string(),
-                    max_servers: 5,
-                    server_startup_timeout_secs: 30,
-                    max_restart_retries: 5,
-                    permissions: OpenCodePermissionsResponse {
-                        edit: "allow".to_string(),
-                        bash: "allow".to_string(),
-                        webfetch: "allow".to_string(),
-                    },
-                },
-                false,
-            )
+                bash: opencode_perms
+                    .and_then(|p| p.get("bash"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("allow")
+                    .to_string(),
+                webfetch: opencode_perms
+                    .and_then(|p| p.get("webfetch"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("allow")
+                    .to_string(),
+            },
         };
 
+        let ssh_enabled = doc
+            .get("ssh")
+            .and_then(|s| s.get("enabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        (
+            company_name,
+            brave_search,
+            api_enabled,
+            api_port,
+            api_bind,
+            worker_log_mode,
+            opencode,
+            ssh_enabled,
+        )
+    } else {
+        (
+            "My Company".to_string(),
+            None,
+            true,
+            19898,
+            "127.0.0.1".to_string(),
+            "errors_only".to_string(),
+            OpenCodeSettingsResponse {
+                enabled: false,
+                path: "opencode".to_string(),
+                max_servers: 5,
+                server_startup_timeout_secs: 30,
+                max_restart_retries: 5,
+                permissions: OpenCodePermissionsResponse {
+                    edit: "allow".to_string(),
+                    bash: "allow".to_string(),
+                    webfetch: "allow".to_string(),
+                },
+            },
+            false,
+        )
+    };
+
     Ok(Json(GlobalSettingsResponse {
+        company_name,
         brave_search_key,
         api_enabled,
         api_port,
@@ -233,6 +264,16 @@ pub(super) async fn get_global_settings(
     }))
 }
 
+#[utoipa::path(
+    put,
+    path = "/settings",
+    request_body = GlobalSettingsUpdate,
+    responses(
+        (status = 200, body = GlobalSettingsUpdateResponse),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "settings",
+)]
 pub(super) async fn update_global_settings(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<GlobalSettingsUpdate>,
@@ -240,18 +281,27 @@ pub(super) async fn update_global_settings(
     let config_path = state.config_path.read().await.clone();
 
     let content = if config_path.exists() {
-        tokio::fs::read_to_string(&config_path)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        tokio::fs::read_to_string(&config_path).await.map_err(|error| {
+            tracing::error!(%error, path = %config_path.display(), "failed to read config.toml for update");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
     } else {
         String::new()
     };
 
-    let mut doc: toml_edit::DocumentMut = content
-        .parse()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut doc: toml_edit::DocumentMut = content.parse().map_err(|error| {
+        tracing::error!(%error, "failed to parse config.toml for update");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let mut requires_restart = false;
+
+    if let Some(name) = request.company_name {
+        if doc.get("instance").is_none() {
+            doc["instance"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        doc["instance"]["company_name"] = toml_edit::value(name);
+    }
 
     if let Some(key) = request.brave_search_key {
         if doc.get("defaults").is_none() {
@@ -350,7 +400,10 @@ pub(super) async fn update_global_settings(
 
     tokio::fs::write(&config_path, doc.to_string())
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|error| {
+            tracing::error!(%error, path = %config_path.display(), "failed to write config.toml for update");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let reload_path = config_path.clone();
     match tokio::task::spawn_blocking(move || crate::config::Config::load_from_path(&reload_path))
@@ -431,6 +484,14 @@ pub(super) async fn update_global_settings(
 }
 
 /// Return the embedded CHANGELOG.md content.
+#[utoipa::path(
+    get,
+    path = "/changelog",
+    responses(
+        (status = 200, body = serde_json::Value),
+    ),
+    tag = "settings",
+)]
 pub(super) async fn changelog() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "content": crate::self_awareness::changelog_content(),
@@ -438,6 +499,14 @@ pub(super) async fn changelog() -> Json<serde_json::Value> {
 }
 
 /// Return the current update status (from background check).
+#[utoipa::path(
+    get,
+    path = "/update-check",
+    responses(
+        (status = 200, body = crate::update::UpdateStatus),
+    ),
+    tag = "settings",
+)]
 pub(super) async fn update_check(
     State(state): State<Arc<ApiState>>,
 ) -> Json<crate::update::UpdateStatus> {
@@ -446,6 +515,14 @@ pub(super) async fn update_check(
 }
 
 /// Force an immediate update check against GitHub.
+#[utoipa::path(
+    post,
+    path = "/update-check",
+    responses(
+        (status = 200, body = crate::update::UpdateStatus),
+    ),
+    tag = "settings",
+)]
 pub(super) async fn update_check_now(
     State(state): State<Arc<ApiState>>,
 ) -> Json<crate::update::UpdateStatus> {
@@ -455,6 +532,15 @@ pub(super) async fn update_check_now(
 }
 
 /// Pull the new Docker image and recreate this container.
+#[utoipa::path(
+    post,
+    path = "/update-apply",
+    responses(
+        (status = 200, body = serde_json::Value),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "settings",
+)]
 pub(super) async fn update_apply(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -470,6 +556,15 @@ pub(super) async fn update_apply(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/settings/raw",
+    responses(
+        (status = 200, body = RawConfigResponse),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "settings",
+)]
 pub(super) async fn get_raw_config(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<RawConfigResponse>, StatusCode> {
@@ -493,6 +588,17 @@ pub(super) async fn get_raw_config(
     Ok(Json(RawConfigResponse { content }))
 }
 
+#[utoipa::path(
+    put,
+    path = "/settings/raw",
+    request_body = RawConfigUpdateRequest,
+    responses(
+        (status = 200, body = RawConfigUpdateResponse),
+        (status = 400, description = "Validation error"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "settings",
+)]
 pub(super) async fn update_raw_config(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<RawConfigUpdateRequest>,

@@ -1,9 +1,16 @@
 //! SpacebotHook: Prompt hook for channels, branches, and workers.
 
 use crate::hooks::loop_guard::{LoopGuard, LoopGuardConfig, LoopGuardVerdict};
+use crate::tools::{MemoryPersistenceContractState, MemoryPersistenceTerminalOutcome};
 use crate::{AgentId, ChannelId, ProcessEvent, ProcessId, ProcessType};
+use futures::StreamExt;
 use rig::agent::{HookAction, PromptHook, ToolCallHookAction};
-use rig::completion::{CompletionModel, CompletionResponse, Message, Prompt, PromptError};
+use rig::completion::{
+    CompletionModel, CompletionResponse, GetTokenUsage, Message, Prompt, PromptError,
+};
+use rig::message::{AssistantContent, ToolResultContent, UserContent};
+use rig::streaming::{StreamedAssistantContent, StreamingCompletion};
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 /// Controls whether hook-driven tool nudge retries are enabled.
@@ -38,6 +45,7 @@ pub struct SpacebotHook {
     tool_nudge_policy: ToolNudgePolicy,
     completion_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     nudge_request_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    completion_contract_request_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Set to `true` when the worker calls `set_status` with `kind: "outcome"`.
     /// Once signaled, the nudge system allows text-only responses to pass
     /// through as legitimate completions.
@@ -57,6 +65,17 @@ pub struct SpacebotHook {
     /// `prompt_with_tool_nudge_retry` loop reads and clears this buffer to
     /// append the messages to history before re-prompting.
     injected_messages: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    memory_persistence_contract: Option<Arc<MemoryPersistenceContractState>>,
+    tool_call_registry: Option<crate::tools::ToolCallRegistry>,
+    reply_tool_delta_state:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, ReplyToolDeltaState>>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ReplyToolDeltaState {
+    tool_name: Option<String>,
+    raw_args: String,
+    emitted_content: String,
 }
 
 impl SpacebotHook {
@@ -68,8 +87,19 @@ impl SpacebotHook {
     pub const TOOL_NUDGE_REASON: &str = "spacebot_tool_nudge_retry";
     /// PromptCancelled reason used when injected context is pending.
     pub const CONTEXT_INJECTION_REASON: &str = "spacebot_context_injection";
+    /// PromptCancelled reason used for memory-persistence contract retries.
+    pub const MEMORY_PERSISTENCE_CONTRACT_REASON: &str =
+        "spacebot_memory_persistence_contract_retry";
     /// Maximum nudge retries per prompt request.
     pub const TOOL_NUDGE_MAX_RETRIES: usize = 2;
+    /// Maximum completion-contract retries per prompt request.
+    pub const MEMORY_PERSISTENCE_CONTRACT_MAX_RETRIES: usize = 2;
+    /// Prompt used to nudge memory-persistence branches toward a terminal tool outcome.
+    pub const MEMORY_PERSISTENCE_CONTRACT_PROMPT: &str = "You must finish this memory-persistence run by calling memory_persistence_complete. \
+         First recall relevant memories, then save real memories if needed, then call \
+         memory_persistence_complete with either outcome=\"saved\" and exact saved_memory_ids \
+         from successful memory_save calls in this run, or outcome=\"no_memories\" with a short \
+         reason and no saved IDs. Do not invent memory IDs.";
 
     /// Create a new hook.
     pub fn new(
@@ -89,6 +119,9 @@ impl SpacebotHook {
             tool_nudge_policy: ToolNudgePolicy::for_process(process_type),
             completion_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             nudge_request_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            completion_contract_request_active: std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
             outcome_signaled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             nudge_attempts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             loop_guard: std::sync::Arc::new(std::sync::Mutex::new(LoopGuard::new(
@@ -96,12 +129,30 @@ impl SpacebotHook {
             ))),
             inject_rx: None,
             injected_messages: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            memory_persistence_contract: None,
+            tool_call_registry: None,
+            reply_tool_delta_state: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 
     /// Override the default process-scoped nudge policy.
     pub fn with_tool_nudge_policy(mut self, policy: ToolNudgePolicy) -> Self {
         self.tool_nudge_policy = policy;
+        self
+    }
+
+    pub fn with_memory_persistence_contract(
+        mut self,
+        contract_state: Arc<MemoryPersistenceContractState>,
+    ) -> Self {
+        self.memory_persistence_contract = Some(contract_state);
+        self
+    }
+
+    pub fn with_tool_call_registry(mut self, registry: crate::tools::ToolCallRegistry) -> Self {
+        self.tool_call_registry = Some(registry);
         self
     }
 
@@ -144,6 +195,56 @@ impl SpacebotHook {
             .store(active, std::sync::atomic::Ordering::Relaxed);
     }
 
+    pub fn set_completion_contract_request_active(&self, active: bool) {
+        self.completion_contract_request_active
+            .store(active, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn extract_partial_reply_content(raw_args: &str) -> Option<String> {
+        let key_index = raw_args.find("\"content\"")?;
+        let after_key = &raw_args[key_index + "\"content\"".len()..];
+        let colon_index = after_key.find(':')?;
+        let after_colon = &after_key[colon_index + 1..];
+        let quote_index = after_colon.find('"')?;
+        let content_slice = &after_colon[quote_index + 1..];
+
+        let mut result = String::new();
+        let mut chars = content_slice.chars();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' => break,
+                '\\' => {
+                    let Some(escaped) = chars.next() else {
+                        break;
+                    };
+                    match escaped {
+                        '"' => result.push('"'),
+                        '\\' => result.push('\\'),
+                        '/' => result.push('/'),
+                        'b' => result.push('\u{0008}'),
+                        'f' => result.push('\u{000C}'),
+                        'n' => result.push('\n'),
+                        'r' => result.push('\r'),
+                        't' => result.push('\t'),
+                        'u' => {
+                            let hex: String = chars.by_ref().take(4).collect();
+                            if hex.len() == 4
+                                && let Ok(value) = u32::from_str_radix(&hex, 16)
+                                && let Some(decoded) = char::from_u32(value)
+                            {
+                                result.push(decoded);
+                            }
+                        }
+                        other => result.push(other),
+                    }
+                }
+                other => result.push(other),
+            }
+        }
+
+        Some(result)
+    }
+
     /// Return true if a PromptCancelled reason indicates a tool nudge retry.
     pub fn is_tool_nudge_reason(reason: &str) -> bool {
         reason == Self::TOOL_NUDGE_REASON
@@ -152,6 +253,10 @@ impl SpacebotHook {
     /// Return true if a PromptCancelled reason indicates context injection.
     pub fn is_context_injection_reason(reason: &str) -> bool {
         reason == Self::CONTEXT_INJECTION_REASON
+    }
+
+    pub fn is_memory_persistence_contract_reason(reason: &str) -> bool {
+        reason == Self::MEMORY_PERSISTENCE_CONTRACT_REASON
     }
 
     /// Drain and return all buffered injected messages.
@@ -177,6 +282,7 @@ impl SpacebotHook {
     {
         self.reset_tool_nudge_state();
         self.set_tool_nudge_request_active(true);
+        self.set_completion_contract_request_active(false);
 
         let mut current_prompt = std::borrow::Cow::Borrowed(prompt);
         let mut using_tool_nudge_prompt = false;
@@ -239,6 +345,7 @@ impl SpacebotHook {
                     if attempts >= Self::TOOL_NUDGE_MAX_RETRIES {
                         // Retries exhausted — propagate the cancellation.
                         self.set_tool_nudge_request_active(false);
+                        self.set_completion_contract_request_active(false);
                         return result;
                     }
                     Self::prune_tool_nudge_retry_history(
@@ -265,6 +372,7 @@ impl SpacebotHook {
                         );
                     }
                     self.set_tool_nudge_request_active(false);
+                    self.set_completion_contract_request_active(false);
                     return result;
                 }
             }
@@ -339,6 +447,274 @@ impl SpacebotHook {
             .with_history(history)
             .with_hook(self.clone())
             .await
+    }
+
+    /// Prompt once using Rig's streaming path so text/tool deltas reach the hook.
+    pub async fn prompt_once_streaming<M>(
+        &self,
+        agent: &rig::agent::Agent<M>,
+        history: &mut Vec<Message>,
+        prompt: &str,
+        max_turns: usize,
+    ) -> std::result::Result<String, PromptError>
+    where
+        M: CompletionModel + 'static,
+        M::StreamingResponse: GetTokenUsage + Send,
+    {
+        self.reset_tool_nudge_state();
+        self.set_tool_nudge_request_active(false);
+
+        let mut chat_history = history.clone();
+        let prompt_message = Message::from(prompt);
+        chat_history.push(prompt_message.clone());
+
+        let mut current_max_turns = 0usize;
+        let mut last_text_response = String::new();
+        let mut did_call_tool = false;
+
+        loop {
+            let current_prompt = chat_history
+                .last()
+                .cloned()
+                .expect("chat history should always include current prompt");
+
+            if current_max_turns > max_turns + 1 {
+                return Err(PromptError::MaxTurnsError {
+                    max_turns,
+                    chat_history: Box::new(chat_history),
+                    prompt: Box::new(prompt.to_string().into()),
+                });
+            }
+
+            current_max_turns += 1;
+
+            if let HookAction::Terminate { reason } =
+                <SpacebotHook as PromptHook<M>>::on_completion_call(
+                    self,
+                    &current_prompt,
+                    &chat_history[..chat_history.len() - 1],
+                )
+                .await
+            {
+                return Err(PromptError::PromptCancelled {
+                    chat_history: Box::new(chat_history),
+                    reason,
+                });
+            }
+
+            let request = agent
+                .stream_completion(
+                    current_prompt.clone(),
+                    chat_history[..chat_history.len() - 1].to_vec(),
+                )
+                .await
+                .map_err(PromptError::CompletionError)?;
+
+            let mut stream = request
+                .stream()
+                .await
+                .map_err(PromptError::CompletionError)?;
+
+            let mut tool_calls = vec![];
+            let mut tool_results = vec![];
+            let mut is_text_response = false;
+
+            while let Some(content) = stream.next().await {
+                match content.map_err(PromptError::CompletionError)? {
+                    StreamedAssistantContent::Text(text) => {
+                        if !is_text_response {
+                            last_text_response.clear();
+                            is_text_response = true;
+                        }
+                        last_text_response.push_str(&text.text);
+                        if let HookAction::Terminate { reason } =
+                            <SpacebotHook as PromptHook<M>>::on_text_delta(
+                                self,
+                                &text.text,
+                                &last_text_response,
+                            )
+                            .await
+                        {
+                            return Err(PromptError::PromptCancelled {
+                                chat_history: Box::new(chat_history),
+                                reason,
+                            });
+                        }
+                        did_call_tool = false;
+                    }
+                    StreamedAssistantContent::ToolCall {
+                        tool_call,
+                        internal_call_id,
+                    } => {
+                        let tool_args = serde_json::to_string(&tool_call.function.arguments)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        match <SpacebotHook as PromptHook<M>>::on_tool_call(
+                            self,
+                            &tool_call.function.name,
+                            tool_call.call_id.clone(),
+                            &internal_call_id,
+                            &tool_args,
+                        )
+                        .await
+                        {
+                            ToolCallHookAction::Terminate { reason } => {
+                                return Err(PromptError::PromptCancelled {
+                                    chat_history: Box::new(chat_history),
+                                    reason,
+                                });
+                            }
+                            ToolCallHookAction::Skip { reason } => {
+                                tool_calls.push(AssistantContent::ToolCall(tool_call.clone()));
+                                tool_results.push((
+                                    tool_call.id.clone(),
+                                    tool_call.call_id.clone(),
+                                    reason,
+                                ));
+                                did_call_tool = true;
+                            }
+                            ToolCallHookAction::Continue => {
+                                let tool_result = match agent
+                                    .tool_server_handle
+                                    .call_tool(&tool_call.function.name, &tool_args)
+                                    .await
+                                {
+                                    Ok(result) => result,
+                                    Err(error) => error.to_string(),
+                                };
+
+                                if let HookAction::Terminate { reason } =
+                                    <SpacebotHook as PromptHook<M>>::on_tool_result(
+                                        self,
+                                        &tool_call.function.name,
+                                        tool_call.call_id.clone(),
+                                        &internal_call_id,
+                                        &tool_args,
+                                        &tool_result,
+                                    )
+                                    .await
+                                {
+                                    // Flush the current tool call (and any prior
+                                    // accumulated ones from this stream iteration)
+                                    // into chat_history so apply_history_after_turn
+                                    // can extract the reply content from the
+                                    // PromptCancelled error variant.  Without this,
+                                    // the reply tool call is never visible in
+                                    // chat_history and every cancelled turn loses
+                                    // the assistant reply from state.history.
+                                    tool_calls.push(AssistantContent::ToolCall(tool_call.clone()));
+                                    if let Ok(content) =
+                                        rig::OneOrMany::many(std::mem::take(&mut tool_calls))
+                                    {
+                                        chat_history.push(Message::Assistant { id: None, content });
+                                    }
+                                    return Err(PromptError::PromptCancelled {
+                                        chat_history: Box::new(chat_history),
+                                        reason,
+                                    });
+                                }
+
+                                tool_calls.push(AssistantContent::ToolCall(tool_call.clone()));
+                                tool_results.push((
+                                    tool_call.id.clone(),
+                                    tool_call.call_id.clone(),
+                                    tool_result,
+                                ));
+                                did_call_tool = true;
+                            }
+                        }
+                    }
+                    StreamedAssistantContent::ToolCallDelta {
+                        id,
+                        internal_call_id,
+                        content,
+                    } => {
+                        let (name, delta) = match &content {
+                            rig::streaming::ToolCallDeltaContent::Name(name) => {
+                                (Some(name.as_str()), "")
+                            }
+                            rig::streaming::ToolCallDeltaContent::Delta(delta) => {
+                                (None, delta.as_str())
+                            }
+                        };
+                        if let HookAction::Terminate { reason } =
+                            <SpacebotHook as PromptHook<M>>::on_tool_call_delta(
+                                self,
+                                &id,
+                                &internal_call_id,
+                                name,
+                                delta,
+                            )
+                            .await
+                        {
+                            return Err(PromptError::PromptCancelled {
+                                chat_history: Box::new(chat_history),
+                                reason,
+                            });
+                        }
+                    }
+                    StreamedAssistantContent::Final(final_response) => {
+                        if is_text_response {
+                            if let HookAction::Terminate { reason } =
+								<SpacebotHook as PromptHook<M>>::on_stream_completion_response_finish(
+									self,
+									&current_prompt,
+									&final_response,
+								)
+								.await
+							{
+								return Err(PromptError::PromptCancelled {
+									chat_history: Box::new(chat_history),
+									reason,
+								});
+							}
+                            is_text_response = false;
+                        }
+                    }
+                    StreamedAssistantContent::Reasoning(_)
+                    | StreamedAssistantContent::ReasoningDelta { .. } => {
+                        did_call_tool = false;
+                    }
+                }
+            }
+
+            if !tool_calls.is_empty() {
+                chat_history.push(Message::Assistant {
+                    id: None,
+                    content: rig::OneOrMany::many(tool_calls)
+                        .expect("tool call list should not be empty"),
+                });
+            }
+
+            for (id, call_id, tool_result) in tool_results {
+                if let Some(call_id) = call_id {
+                    chat_history.push(Message::User {
+                        content: rig::OneOrMany::one(UserContent::tool_result_with_call_id(
+                            &id,
+                            call_id,
+                            rig::OneOrMany::one(ToolResultContent::text(&tool_result)),
+                        )),
+                    });
+                } else {
+                    chat_history.push(Message::User {
+                        content: rig::OneOrMany::one(UserContent::tool_result(
+                            &id,
+                            rig::OneOrMany::one(ToolResultContent::text(&tool_result)),
+                        )),
+                    });
+                }
+            }
+
+            if !did_call_tool {
+                chat_history.push(Message::Assistant {
+                    id: None,
+                    content: rig::OneOrMany::one(AssistantContent::text(
+                        last_text_response.clone(),
+                    )),
+                });
+                *history = chat_history;
+                return Ok(last_text_response);
+            }
+        }
     }
 
     /// Send a status update event.
@@ -455,21 +831,23 @@ impl SpacebotHook {
         let _ = (tool_name, internal_call_id);
     }
 
-    pub(crate) fn emit_tool_completed_event(&self, tool_name: &str, result: &str) {
+    pub(crate) fn emit_tool_completed_event(&self, tool_name: &str, call_id: String, result: &str) {
         let capped_result =
             crate::tools::truncate_output(result, crate::tools::MAX_TOOL_OUTPUT_BYTES);
-        self.emit_tool_completed_event_from_capped(tool_name, capped_result);
+        self.emit_tool_completed_event_from_capped(tool_name, call_id, capped_result);
     }
 
     pub(crate) fn emit_tool_completed_event_from_capped(
         &self,
         tool_name: &str,
+        call_id: String,
         capped_result: String,
     ) {
         let event = ProcessEvent::ToolCompleted {
             agent_id: self.agent_id.clone(),
             process_id: self.process_id.clone(),
             channel_id: self.channel_id.clone(),
+            call_id,
             tool_name: tool_name.to_string(),
             result: capped_result,
         };
@@ -537,6 +915,74 @@ impl SpacebotHook {
                         | rig::message::AssistantContent::ToolCall(_)
                 )
             })
+    }
+
+    fn should_reject_memory_persistence_completion<M>(
+        &self,
+        response: &CompletionResponse<M::Response>,
+    ) -> bool
+    where
+        M: CompletionModel,
+    {
+        let Some(contract_state) = &self.memory_persistence_contract else {
+            return false;
+        };
+        if !self
+            .completion_contract_request_active
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return false;
+        }
+        if contract_state.has_terminal_outcome() {
+            return false;
+        }
+
+        !response
+            .choice
+            .iter()
+            .any(|content| matches!(content, rig::message::AssistantContent::ToolCall(_)))
+    }
+
+    fn parse_memory_persistence_terminal_outcome(
+        result: &str,
+    ) -> Option<MemoryPersistenceTerminalOutcome> {
+        let parsed = serde_json::from_str::<serde_json::Value>(result).ok()?;
+        if parsed.get("success").and_then(|value| value.as_bool()) != Some(true) {
+            return None;
+        }
+
+        match parsed.get("outcome").and_then(|value| value.as_str()) {
+            Some("saved") => {
+                let saved_memory_ids = parsed
+                    .get("saved_memory_ids")
+                    .and_then(|value| value.as_array())
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| value.as_str())
+                            .map(str::trim)
+                            .filter(|memory_id| !memory_id.is_empty())
+                            .map(ToOwned::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if saved_memory_ids.is_empty() {
+                    return None;
+                }
+                Some(MemoryPersistenceTerminalOutcome::Saved { saved_memory_ids })
+            }
+            Some("no_memories") => {
+                let reason = parsed
+                    .get("reason")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|reason| !reason.is_empty())?;
+                Some(MemoryPersistenceTerminalOutcome::NoMemories {
+                    reason: reason.to_string(),
+                })
+            }
+            _ => None,
+        }
     }
 }
 
@@ -611,6 +1057,12 @@ where
             };
         }
 
+        if self.should_reject_memory_persistence_completion::<M>(response) {
+            return HookAction::Terminate {
+                reason: Self::MEMORY_PERSISTENCE_CONTRACT_REASON.into(),
+            };
+        }
+
         // Emit text content from worker completion responses so the live
         // transcript can show the model's reasoning between tool calls.
         if self.process_type == ProcessType::Worker {
@@ -665,6 +1117,74 @@ where
         HookAction::Continue
     }
 
+    async fn on_tool_call_delta(
+        &self,
+        _tool_call_id: &str,
+        internal_call_id: &str,
+        tool_name: Option<&str>,
+        tool_call_delta: &str,
+    ) -> HookAction {
+        if self.process_type != ProcessType::Channel {
+            return HookAction::Continue;
+        }
+
+        let Some(channel_id) = self.channel_id.clone() else {
+            return HookAction::Continue;
+        };
+
+        let mut guard = match self.reply_tool_delta_state.lock() {
+            Ok(guard) => guard,
+            Err(_) => return HookAction::Continue,
+        };
+
+        let state = guard
+            .entry(internal_call_id.to_string())
+            .or_insert_with(ReplyToolDeltaState::default);
+
+        if let Some(tool_name) = tool_name {
+            state.tool_name = Some(tool_name.to_string());
+        }
+
+        if state.tool_name.as_deref() != Some("reply") {
+            return HookAction::Continue;
+        }
+
+        state.raw_args.push_str(tool_call_delta);
+        let Some(content) = Self::extract_partial_reply_content(&state.raw_args) else {
+            return HookAction::Continue;
+        };
+
+        if !content.starts_with(&state.emitted_content) {
+            return HookAction::Continue;
+        }
+
+        let delta = &content[state.emitted_content.len()..];
+        if delta.is_empty() {
+            return HookAction::Continue;
+        }
+
+        state.emitted_content = content.clone();
+        self.event_tx
+            .send(ProcessEvent::TextDelta {
+                agent_id: self.agent_id.clone(),
+                process_id: self.process_id.clone(),
+                channel_id: Some(channel_id),
+                text_delta: delta.to_string(),
+                aggregated_text: content,
+            })
+            .ok();
+
+        HookAction::Continue
+    }
+
+    async fn on_stream_completion_response_finish(
+        &self,
+        _prompt: &Message,
+        _response: &<M as CompletionModel>::StreamingResponse,
+    ) -> HookAction {
+        HookAction::Continue
+    }
+
     async fn on_tool_call(
         &self,
         tool_name: &str,
@@ -672,6 +1192,11 @@ where
         _internal_call_id: &str,
         args: &str,
     ) -> ToolCallHookAction {
+        if tool_name == "reply"
+            && let Ok(mut guard) = self.reply_tool_delta_state.lock()
+        {
+            guard.remove(_internal_call_id);
+        }
         // Loop guard: check for repetitive tool calling before execution.
         // Runs for all process types. Block → Skip (message becomes tool
         // result), CircuitBreak → Terminate.
@@ -716,10 +1241,20 @@ where
 
         // Send event without blocking. Truncate args to keep broadcast payloads bounded.
         let capped_args = crate::tools::truncate_output(args, 2_000);
+        let call_id = _tool_call_id
+            .clone()
+            .unwrap_or_else(|| _internal_call_id.to_string());
+        if self.process_type == ProcessType::Worker
+            && tool_name == "shell"
+            && let Some(registry) = &self.tool_call_registry
+        {
+            registry.push(&self.process_id, tool_name, call_id.clone());
+        }
         let event = ProcessEvent::ToolStarted {
             agent_id: self.agent_id.clone(),
             process_id: self.process_id.clone(),
             channel_id: self.channel_id.clone(),
+            call_id,
             tool_name: tool_name.to_string(),
             args: capped_args,
         };
@@ -747,6 +1282,11 @@ where
         _args: &str,
         result: &str,
     ) -> HookAction {
+        if tool_name == "reply"
+            && let Ok(mut guard) = self.reply_tool_delta_state.lock()
+        {
+            guard.remove(internal_call_id);
+        }
         let guard_action = self.guard_tool_result(tool_name, result);
         if !matches!(guard_action, HookAction::Continue) {
             self.record_tool_result_metrics(tool_name, internal_call_id);
@@ -773,6 +1313,16 @@ where
             };
         }
 
+        let call_id = _tool_call_id
+            .clone()
+            .unwrap_or_else(|| internal_call_id.to_string());
+        if self.process_type == ProcessType::Worker
+            && tool_name == "shell"
+            && let Some(registry) = &self.tool_call_registry
+        {
+            registry.remove(&self.process_id, tool_name, &call_id);
+        }
+
         // Cap the result stored in the broadcast event to avoid blowing up
         // event subscribers with multi-MB tool results. For worker/branch
         // processes, scrub leak patterns from the event payload so secrets
@@ -781,9 +1331,9 @@ where
             let scrubbed = crate::secrets::scrub::scrub_leaks(result);
             let capped =
                 crate::tools::truncate_output(&scrubbed, crate::tools::MAX_TOOL_OUTPUT_BYTES);
-            self.emit_tool_completed_event_from_capped(tool_name, capped);
+            self.emit_tool_completed_event_from_capped(tool_name, call_id, capped);
         } else {
-            self.emit_tool_completed_event(tool_name, result);
+            self.emit_tool_completed_event(tool_name, call_id, result);
         }
 
         tracing::debug!(
@@ -803,11 +1353,31 @@ where
             guard.record_outcome(tool_name, _args, result);
         }
 
+        let is_tool_error = result.starts_with("Toolset error:");
+
+        // Log tool errors so operators can see when tools fail (including
+        // deserialization errors that happen before the tool's call() method).
+        if is_tool_error {
+            tracing::warn!(
+                process_id = %self.process_id,
+                tool_name = %tool_name,
+                error = %result,
+                "tool call failed"
+            );
+        }
+
+        if !is_tool_error
+            && tool_name == "memory_persistence_complete"
+            && let Some(contract_state) = &self.memory_persistence_contract
+            && let Some(outcome) = Self::parse_memory_persistence_terminal_outcome(result)
+        {
+            contract_state.set_terminal_outcome(outcome);
+        }
+
         // A successful tool call proves the worker is still productive.
         // Reset the consecutive nudge counter so a brief narration blip
         // after many tool calls doesn't exhaust the retry budget.
         // Tool errors (from Rig's error path) don't count as productive.
-        let is_tool_error = result.starts_with("Toolset error:");
         if self.tool_nudge_policy.is_enabled() && !is_tool_error {
             self.nudge_attempts
                 .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -856,11 +1426,14 @@ mod tests {
     use crate::ProcessEvent;
     use crate::llm::SpacebotModel;
     use crate::llm::model::RawResponse;
+    use crate::tools::MemoryPersistenceContractState;
+    use crate::tools::ToolCallRegistry;
     use crate::{ProcessId, ProcessType};
     use rig::OneOrMany;
     use rig::agent::{HookAction, PromptHook};
     use rig::completion::{CompletionResponse, Message, Usage};
     use rig::message::AssistantContent;
+    use std::sync::Arc;
 
     fn make_hook() -> SpacebotHook {
         let (event_tx, _event_rx) = tokio::sync::broadcast::channel(8);
@@ -871,6 +1444,20 @@ mod tests {
             None,
             event_tx,
         )
+    }
+
+    fn make_memory_persistence_hook() -> (SpacebotHook, Arc<MemoryPersistenceContractState>) {
+        let (event_tx, _event_rx) = tokio::sync::broadcast::channel(8);
+        let contract_state = Arc::new(MemoryPersistenceContractState::default());
+        let hook = SpacebotHook::new(
+            std::sync::Arc::<str>::from("agent"),
+            ProcessId::Branch(uuid::Uuid::new_v4()),
+            ProcessType::Branch,
+            None,
+            event_tx,
+        )
+        .with_memory_persistence_contract(contract_state.clone());
+        (hook, contract_state)
     }
 
     fn prompt_message() -> Message {
@@ -1200,6 +1787,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shell_tool_result_clears_registry_entry_after_error() {
+        let (event_tx, _event_rx) = tokio::sync::broadcast::channel(8);
+        let process_id = ProcessId::Worker(uuid::Uuid::new_v4());
+        let registry = ToolCallRegistry::default();
+        let hook = SpacebotHook::new(
+            std::sync::Arc::<str>::from("agent"),
+            process_id.clone(),
+            ProcessType::Worker,
+            None,
+            event_tx,
+        )
+        .with_tool_call_registry(registry.clone());
+
+        let action = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_call(
+            &hook,
+            "shell",
+            Some("call-shell-1".to_string()),
+            "internal_1",
+            "{\"command\":42}",
+        )
+        .await;
+        assert!(matches!(action, rig::agent::ToolCallHookAction::Continue));
+
+        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
+            &hook,
+            "shell",
+            Some("call-shell-1".to_string()),
+            "internal_1",
+            "{\"command\":42}",
+            "ToolsetError: expected string for field command",
+        )
+        .await;
+
+        assert!(registry.take(&process_id, "shell").is_none());
+    }
+
+    #[tokio::test]
     async fn process_scoped_policy_disables_nudge_for_branch() {
         let (event_tx, _event_rx) = tokio::sync::broadcast::channel(8);
         let hook = SpacebotHook::new(
@@ -1372,6 +1996,58 @@ mod tests {
                 ref aggregated_text,
                 ..
             } if text_delta == "hi" && aggregated_text == "hi"
+        ));
+    }
+
+    #[tokio::test]
+    async fn reply_tool_call_delta_emits_process_event() {
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(8);
+        let hook = SpacebotHook::new(
+            std::sync::Arc::<str>::from("agent"),
+            ProcessId::Channel(std::sync::Arc::<str>::from("channel")),
+            ProcessType::Channel,
+            Some(std::sync::Arc::<str>::from("channel")),
+            event_tx,
+        );
+
+        let first = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_call_delta(
+            &hook,
+            "reply-call",
+            "internal-reply",
+            Some("reply"),
+            "{\"content\":\"hel",
+        )
+        .await;
+        let second = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_call_delta(
+            &hook,
+            "reply-call",
+            "internal-reply",
+            None,
+            "lo\"}",
+        )
+        .await;
+
+        assert!(matches!(first, HookAction::Continue));
+        assert!(matches!(second, HookAction::Continue));
+
+        let event = event_rx.recv().await.expect("first reply delta event");
+        assert!(matches!(
+            event,
+            ProcessEvent::TextDelta {
+                ref text_delta,
+                ref aggregated_text,
+                ..
+            } if text_delta == "hel" && aggregated_text == "hel"
+        ));
+
+        let event = event_rx.recv().await.expect("second reply delta event");
+        assert!(matches!(
+            event,
+            ProcessEvent::TextDelta {
+                ref text_delta,
+                ref aggregated_text,
+                ..
+            } if text_delta == "lo" && aggregated_text == "hello"
         ));
     }
 
@@ -1620,5 +2296,157 @@ mod tests {
             ),
             "Nudge should still work when inject_rx is attached but empty"
         );
+    }
+
+    #[tokio::test]
+    async fn memory_persistence_plain_text_completion_is_rejected_without_terminal_tool() {
+        let (hook, _contract_state) = make_memory_persistence_hook();
+        let prompt = prompt_message();
+        hook.set_completion_contract_request_active(true);
+
+        let _ =
+            <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_call(&hook, &prompt, &[])
+                .await;
+        let action = <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_response(
+            &hook,
+            &prompt,
+            &text_response("Saved the memories."),
+        )
+        .await;
+
+        assert!(matches!(
+            action,
+            HookAction::Terminate { ref reason }
+            if reason == SpacebotHook::MEMORY_PERSISTENCE_CONTRACT_REASON
+        ));
+    }
+
+    #[tokio::test]
+    async fn memory_persistence_fabricated_saved_ids_are_rejected() {
+        let (hook, contract_state) = make_memory_persistence_hook();
+        let prompt = prompt_message();
+        hook.set_completion_contract_request_active(true);
+
+        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
+            &hook,
+            "memory_save",
+            None,
+            "internal_1",
+            "{}",
+            "{\"success\":true,\"memory_id\":\"mem_real_1\"}",
+        )
+        .await;
+
+        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
+            &hook,
+            "memory_persistence_complete",
+            None,
+            "internal_2",
+            "{\"outcome\":\"saved\",\"saved_memory_ids\":[\"mem_fake\"]}",
+            "Toolset error: memory_persistence_complete failed: saved_memory_ids mismatch",
+        )
+        .await;
+
+        assert!(
+            !contract_state.has_terminal_outcome(),
+            "terminal outcome must not be recorded for fabricated IDs"
+        );
+
+        let _ =
+            <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_call(&hook, &prompt, &[])
+                .await;
+        let action = <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_response(
+            &hook,
+            &prompt,
+            &text_response("Done."),
+        )
+        .await;
+
+        assert!(matches!(
+            action,
+            HookAction::Terminate { ref reason }
+            if reason == SpacebotHook::MEMORY_PERSISTENCE_CONTRACT_REASON
+        ));
+    }
+
+    #[tokio::test]
+    async fn memory_persistence_saved_outcome_accepts_real_memory_save_ids() {
+        let (hook, contract_state) = make_memory_persistence_hook();
+        let prompt = prompt_message();
+        hook.set_completion_contract_request_active(true);
+
+        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
+            &hook,
+            "memory_save",
+            None,
+            "internal_1",
+            "{}",
+            "{\"success\":true,\"memory_id\":\"mem_real_1\"}",
+        )
+        .await;
+        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
+            &hook,
+            "memory_save",
+            None,
+            "internal_2",
+            "{}",
+            "{\"success\":true,\"memory_id\":\"mem_real_2\"}",
+        )
+        .await;
+
+        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
+            &hook,
+            "memory_persistence_complete",
+            None,
+            "internal_3",
+            "{}",
+            "{\"success\":true,\"outcome\":\"saved\",\"saved_memory_ids\":[\"mem_real_1\",\"mem_real_2\"]}",
+        )
+        .await;
+
+        assert!(contract_state.has_terminal_outcome());
+
+        let _ =
+            <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_call(&hook, &prompt, &[])
+                .await;
+        let action = <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_response(
+            &hook,
+            &prompt,
+            &text_response("Persisted memories."),
+        )
+        .await;
+
+        assert!(matches!(action, HookAction::Continue));
+    }
+
+    #[tokio::test]
+    async fn memory_persistence_no_memories_outcome_is_accepted_without_saves() {
+        let (hook, contract_state) = make_memory_persistence_hook();
+        let prompt = prompt_message();
+        hook.set_completion_contract_request_active(true);
+
+        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
+            &hook,
+            "memory_persistence_complete",
+            None,
+            "internal_1",
+            "{}",
+            "{\"success\":true,\"outcome\":\"no_memories\",\"saved_memory_ids\":[],\"reason\":\"No durable facts found\"}",
+        )
+        .await;
+
+        assert!(contract_state.has_terminal_outcome());
+
+        let _ =
+            <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_call(&hook, &prompt, &[])
+                .await;
+        let action = <SpacebotHook as PromptHook<SpacebotModel>>::on_completion_response(
+            &hook,
+            &prompt,
+            &text_response("No memories persisted."),
+        )
+        .await;
+
+        assert!(matches!(action, HookAction::Continue));
     }
 }

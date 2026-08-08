@@ -11,7 +11,7 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
 pub(super) struct WorkerListQuery {
     agent_id: String,
     #[serde(default = "default_limit")]
@@ -25,13 +25,13 @@ fn default_limit() -> i64 {
     50
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct WorkerListResponse {
     workers: Vec<WorkerListItem>,
     total: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct WorkerListItem {
     id: String,
     task: String,
@@ -48,17 +48,25 @@ pub(super) struct WorkerListItem {
     tool_calls: i64,
     /// OpenCode server port (for workers with an embeddable web UI).
     opencode_port: Option<i32>,
+    /// OpenCode session ID (for workers with an embeddable web UI).
+    opencode_session_id: Option<String>,
+    /// Working directory for OpenCode workers.
+    directory: Option<String>,
     /// Whether this worker accepts follow-up input via route.
     interactive: bool,
+    /// Project ID this worker is linked to.
+    project_id: Option<String>,
+    /// Project name (resolved via join).
+    project_name: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
 pub(super) struct WorkerDetailQuery {
     agent_id: String,
     worker_id: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct WorkerDetailResponse {
     id: String,
     task: String,
@@ -82,6 +90,22 @@ pub(super) struct WorkerDetailResponse {
 }
 
 /// List worker runs for an agent, with live status merged from StatusBlocks.
+#[utoipa::path(
+    get,
+    path = "/agents/workers",
+    params(
+        ("agent_id" = String, Query, description = "Agent ID"),
+        ("limit" = i64, Query, description = "Maximum number of results to return"),
+        ("offset" = i64, Query, description = "Number of results to skip"),
+        ("status" = Option<String>, Query, description = "Filter by worker status"),
+    ),
+    responses(
+        (status = 200, body = WorkerListResponse),
+        (status = 404, description = "Agent not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "workers",
+)]
 pub(super) async fn list_workers(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<WorkerListQuery>,
@@ -100,11 +124,33 @@ pub(super) async fn list_workers(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
+    // Resolve project names from the global ProjectStore (projects live in the
+    // instance DB, not in per-agent DBs, so history.rs can't JOIN them in SQL).
+    let project_names: std::collections::HashMap<String, String> = {
+        let mut names = std::collections::HashMap::new();
+        let mut seen = std::collections::HashSet::new();
+        let store_guard = state.project_store.load();
+        if let Some(store) = store_guard.as_ref() {
+            for row in &rows {
+                let Some(project_id) = row.project_id.as_deref() else {
+                    continue;
+                };
+                if !seen.insert(project_id.to_string()) {
+                    continue;
+                }
+                if let Ok(Some(project)) = store.get_project(project_id).await {
+                    names.insert(project_id.to_string(), project.name);
+                }
+            }
+        }
+        names
+    };
+
     // Build a live status lookup from all channel StatusBlocks
     let live_statuses = {
         let blocks = state.channel_status_blocks.read().await;
         let mut map = std::collections::HashMap::new();
-        for (_channel_id, status_block) in blocks.iter() {
+        for status_block in blocks.values() {
             let block = status_block.read().await;
             for worker in &block.active_workers {
                 map.insert(
@@ -144,7 +190,14 @@ pub(super) async fn list_workers(
                 live_status,
                 tool_calls,
                 opencode_port: row.opencode_port,
+                opencode_session_id: row.opencode_session_id,
+                directory: row.directory,
                 interactive: row.interactive,
+                project_name: row
+                    .project_id
+                    .as_deref()
+                    .and_then(|id| project_names.get(id).cloned()),
+                project_id: row.project_id,
             }
         })
         .collect();
@@ -153,6 +206,20 @@ pub(super) async fn list_workers(
 }
 
 /// Get full detail for a single worker run, including decompressed transcript.
+#[utoipa::path(
+    get,
+    path = "/agents/workers/detail",
+    params(
+        ("agent_id" = String, Query, description = "Agent ID"),
+        ("worker_id" = String, Query, description = "Worker ID"),
+    ),
+    responses(
+        (status = 200, body = WorkerDetailResponse),
+        (status = 404, description = "Agent or worker not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "workers",
+)]
 pub(super) async fn worker_detail(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<WorkerDetailQuery>,

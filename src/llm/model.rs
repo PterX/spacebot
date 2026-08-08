@@ -9,14 +9,22 @@ use crate::llm::routing::{
 use futures::StreamExt as _;
 use rig::completion::{self, CompletionError, CompletionModel, CompletionRequest, GetTokenUsage};
 use rig::message::{
-    AssistantContent, DocumentSourceKind, Image, Message, MimeType, Text, ToolCall, ToolFunction,
-    UserContent,
+    AssistantContent, DocumentSourceKind, Image, Message, MimeType, ReasoningContent, Text,
+    ToolCall, ToolFunction, UserContent,
 };
 use rig::one_or_many::OneOrMany;
+use rig::providers::openai::responses_api::Output as OpenAiResponsesOutput;
+use rig::providers::openai::responses_api::streaming::{
+    ItemChunkKind as OpenAiResponsesItemChunkKind,
+    ResponseChunkKind as OpenAiResponsesResponseChunkKind,
+    StreamingCompletionChunk as OpenAiResponsesStreamingCompletionChunk,
+    StreamingItemDoneOutput as OpenAiResponsesStreamingItemDoneOutput,
+};
 use rig::streaming::{RawStreamingChoice, RawStreamingToolCall, StreamingCompletionResponse};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 const STREAM_REQUEST_TIMEOUT_SECS: u64 = 30 * 60;
 
@@ -53,6 +61,7 @@ pub struct SpacebotModel {
     agent_id: Option<String>,
     process_type: Option<String>,
     worker_type: Option<String>,
+    usage_accumulator: Option<Arc<Mutex<crate::llm::usage::UsageAccumulator>>>,
 }
 
 impl SpacebotModel {
@@ -98,6 +107,15 @@ impl SpacebotModel {
         self
     }
 
+    /// Attach a shared usage accumulator for token tracking.
+    pub fn with_accumulator(
+        mut self,
+        accumulator: Arc<Mutex<crate::llm::usage::UsageAccumulator>>,
+    ) -> Self {
+        self.usage_accumulator = Some(accumulator);
+        self
+    }
+
     async fn provider_config_for_current_model(&self) -> Result<ProviderConfig, CompletionError> {
         let provider_id = self
             .full_model_name
@@ -119,6 +137,11 @@ impl SpacebotModel {
             "openai-chatgpt" => self
                 .llm_manager
                 .get_openai_chatgpt_provider()
+                .await
+                .map_err(|error| CompletionError::ProviderError(error.to_string())),
+            "github-copilot" => self
+                .llm_manager
+                .get_github_copilot_provider()
                 .await
                 .map_err(|error| CompletionError::ProviderError(error.to_string())),
             _ => self
@@ -157,6 +180,83 @@ impl SpacebotModel {
                     display_name,
                     &endpoint,
                     Some(provider_config.api_key.clone()),
+                    &headers,
+                )
+                .await
+            }
+            ApiType::Azure => {
+                // Azure OpenAI Service requires a specific endpoint structure.
+                // Supported domain: *.openai.azure.com (HTTPS only)
+                let base_url = provider_config.base_url.trim_end_matches('/');
+
+                // Validate HTTPS scheme
+                if !base_url.starts_with("https://") {
+                    return Err(CompletionError::ProviderError(format!(
+                        "Invalid Azure endpoint. Azure OpenAI Service requires HTTPS.\n\
+                        \n\
+                        Detected: {}\n\
+                        \n\
+                        The endpoint must use https:// (e.g., https://<resource-name>.openai.azure.com)",
+                        base_url
+                    )));
+                }
+
+                // Validate that the endpoint is actually an Azure OpenAI endpoint
+                if !base_url.ends_with(".openai.azure.com") {
+                    return Err(CompletionError::ProviderError(format!(
+                        "Invalid Azure endpoint. Azure OpenAI Service requires a base_url ending in '.openai.azure.com'.\n\
+                        \n\
+                        Detected: {}\n\
+                        \n\
+                        If you are using Azure AI Foundry (hosting Anthropic, Llama, Mistral, etc.) or other Azure-hosted models,\n\
+                        use the standard OpenAI-compatible provider instead:\n\
+                        - Set api_type = \"openai_chat_completions\"\n\
+                        - Point base_url directly to your endpoint (e.g., https://<resource>.services.ai.azure.com)\n\
+                        - Omit the 'deployment' and 'api_version' fields\n\
+                        \n\
+                        For Azure OpenAI Service, the endpoint must follow this pattern:\n\
+                        https://<resource-name>.openai.azure.com",
+                        base_url
+                    )));
+                }
+
+                let resource = base_url
+                    .trim_start_matches("https://")
+                    .trim_end_matches(".openai.azure.com");
+
+                let deployment = provider_config
+                    .deployment
+                    .as_ref()
+                    .ok_or_else(|| CompletionError::ProviderError(
+                        "Azure deployment name is required. Example: 'gpt-4o', 'gpt-35-turbo', etc.\n\
+                        This is the deployment name you created in the Azure Portal for your OpenAI model."
+                            .to_string()
+                    ))?;
+
+                let api_version = provider_config.api_version.as_ref().ok_or_else(|| {
+                    CompletionError::ProviderError(
+                        "Azure API version is required. Example: '2024-12-01-preview'\n\
+                        Find available API versions in the Azure OpenAI documentation."
+                            .to_string(),
+                    )
+                })?;
+
+                let endpoint = format!(
+                    "https://{}.openai.azure.com/openai/deployments/{}/chat/completions?api-version={}",
+                    resource, deployment, api_version
+                );
+
+                let display_name = provider_config.name.as_deref().unwrap_or("Azure OpenAI");
+
+                // Azure uses "api-key" header instead of Authorization
+                let headers: Vec<(&str, &str)> =
+                    vec![("api-key", provider_config.api_key.as_str())];
+
+                self.call_openai_compatible_with_optional_auth(
+                    request,
+                    display_name,
+                    &endpoint,
+                    None, // No Bearer token needed
                     &headers,
                 )
                 .await
@@ -275,6 +375,7 @@ impl CompletionModel for SpacebotModel {
             agent_id: None,
             process_type: None,
             worker_type: None,
+            usage_accumulator: None,
         }
     }
 
@@ -490,6 +591,24 @@ impl CompletionModel for SpacebotModel {
             }
         }
 
+        // Record usage in the accumulator (if attached).
+        if let Some(ref accumulator) = self.usage_accumulator
+            && let Ok(ref response) = result
+        {
+            let body = &response.raw_response.body;
+            let extended = if self.provider == "anthropic" {
+                crate::llm::usage::ExtendedUsage::from_anthropic_body(body)
+            } else {
+                crate::llm::usage::ExtendedUsage::from_openai_body(body)
+            };
+            let cost =
+                crate::llm::pricing::estimate_cost_extended(&self.full_model_name, &extended);
+            accumulator
+                .lock()
+                .await
+                .add(extended, &self.full_model_name, &self.provider, cost);
+        }
+
         result
     }
 
@@ -524,6 +643,82 @@ impl CompletionModel for SpacebotModel {
                 )
                 .await
             }
+            ApiType::Azure => {
+                // Azure OpenAI Service requires a specific endpoint structure.
+                // Supported domain: *.openai.azure.com (HTTPS only)
+                let base_url = provider_config.base_url.trim_end_matches('/');
+
+                // Validate HTTPS scheme
+                if !base_url.starts_with("https://") {
+                    return Err(CompletionError::ProviderError(format!(
+                        "Invalid Azure endpoint. Azure OpenAI Service requires HTTPS.\n\
+                        \n\
+                        Detected: {}\n\
+                        \n\
+                        The endpoint must use https:// (e.g., https://<resource-name>.openai.azure.com)",
+                        base_url
+                    )));
+                }
+
+                // Validate that the endpoint is actually an Azure OpenAI endpoint
+                if !base_url.ends_with(".openai.azure.com") {
+                    return Err(CompletionError::ProviderError(format!(
+                        "Invalid Azure endpoint. Azure OpenAI Service requires a base_url ending in '.openai.azure.com'.\n\
+                        \n\
+                        Detected: {}\n\
+                        \n\
+                        If you are using Azure AI Foundry (hosting Anthropic, Llama, Mistral, etc.) or other Azure-hosted models,\n\
+                        use the standard OpenAI-compatible provider instead:\n\
+                        - Set api_type = \"openai_chat_completions\"\n\
+                        - Point base_url directly to your endpoint (e.g., https://<resource>.services.ai.azure.com)\n\
+                        - Omit the 'deployment' and 'api_version' fields\n\
+                        \n\
+                        For Azure OpenAI Service, the endpoint must follow this pattern:\n\
+                        https://<resource-name>.openai.azure.com",
+                        base_url
+                    )));
+                }
+
+                let resource = base_url
+                    .trim_start_matches("https://")
+                    .trim_end_matches(".openai.azure.com");
+
+                let deployment = provider_config
+                    .deployment
+                    .as_ref()
+                    .ok_or_else(|| CompletionError::ProviderError(
+                        "Azure deployment name is required. Example: 'gpt-4o', 'gpt-35-turbo', etc.\n\
+                        This is the deployment name you created in the Azure Portal for your OpenAI model."
+                            .to_string()
+                    ))?;
+
+                let api_version = provider_config.api_version.as_ref().ok_or_else(|| {
+                    CompletionError::ProviderError(
+                        "Azure API version is required. Example: '2024-12-01-preview'\n\
+                        Find available API versions in the Azure OpenAI documentation."
+                            .to_string(),
+                    )
+                })?;
+
+                let endpoint = format!(
+                    "https://{}.openai.azure.com/openai/deployments/{}/chat/completions?api-version={}",
+                    resource, deployment, api_version
+                );
+
+                let display_name = provider_config.name.as_deref().unwrap_or("Azure OpenAI");
+
+                let headers: Vec<(&str, &str)> =
+                    vec![("api-key", provider_config.api_key.as_str())];
+
+                self.stream_openai_compatible_with_optional_auth(
+                    request,
+                    display_name,
+                    &endpoint,
+                    None,
+                    &headers,
+                )
+                .await
+            }
             ApiType::KiloGateway => {
                 let endpoint = format!(
                     "{}/chat/completions",
@@ -545,9 +740,13 @@ impl CompletionModel for SpacebotModel {
                 self.stream_openai_compatible(request, "Google Gemini", &provider_config)
                     .await
             }
-            ApiType::Anthropic | ApiType::OpenAiResponses => {
+            ApiType::Anthropic => {
                 let response = self.attempt_completion(request).await?;
                 Ok(stream_from_completion_response(response))
+            }
+            ApiType::OpenAiResponses => {
+                self.stream_openai_responses(request, &provider_config)
+                    .await
             }
         }
     }
@@ -856,6 +1055,293 @@ impl SpacebotModel {
         parse_openai_responses_response(response_body, &provider_label)
     }
 
+    async fn stream_openai_responses(
+        &self,
+        request: CompletionRequest,
+        provider_config: &ProviderConfig,
+    ) -> Result<StreamingCompletionResponse<RawStreamingResponse>, CompletionError> {
+        let base_url = provider_config.base_url.trim_end_matches('/');
+        let is_chatgpt_codex = self.provider == "openai-chatgpt";
+        let responses_url = if is_chatgpt_codex {
+            format!("{base_url}/responses")
+        } else {
+            format!("{base_url}/v1/responses")
+        };
+        let api_key = provider_config.api_key.as_str();
+        let provider_label = provider_config
+            .name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| provider_display_name(&self.provider));
+
+        let input = convert_messages_to_openai_responses(&request.chat_history);
+        let api_model_name = self.remap_model_name_for_api();
+        let mut body = serde_json::json!({
+            "model": api_model_name,
+            "input": input,
+            "stream": true,
+        });
+
+        if let Some(preamble) = &request.preamble {
+            body["instructions"] = serde_json::json!(preamble);
+        } else if is_chatgpt_codex {
+            body["instructions"] = serde_json::json!(
+                "You are Spacebot. Follow instructions exactly and respond concisely."
+            );
+        }
+
+        if !is_chatgpt_codex && let Some(max_tokens) = request.max_tokens {
+            body["max_output_tokens"] = serde_json::json!(max_tokens);
+        }
+
+        if !is_chatgpt_codex && let Some(temperature) = request.temperature {
+            body["temperature"] = serde_json::json!(temperature);
+        }
+
+        if is_chatgpt_codex {
+            body["store"] = serde_json::json!(false);
+        }
+
+        if !request.tools.is_empty() {
+            let tools: Vec<serde_json::Value> = request
+                .tools
+                .iter()
+                .map(|tool_definition| {
+                    serde_json::json!({
+                        "type": "function",
+                        "name": tool_definition.name,
+                        "description": tool_definition.description,
+                        "parameters": tool_definition.parameters,
+                    })
+                })
+                .collect();
+            body["tools"] = serde_json::json!(tools);
+        }
+
+        let openai_account_id = if self.provider == "openai-chatgpt" {
+            self.llm_manager.get_openai_account_id().await
+        } else {
+            None
+        };
+
+        let mut request_builder = self
+            .llm_manager
+            .http_client()
+            .post(&responses_url)
+            .header("authorization", format!("Bearer {api_key}"))
+            .header("content-type", "application/json")
+            .header("accept-encoding", "identity")
+            .timeout(std::time::Duration::from_secs(STREAM_REQUEST_TIMEOUT_SECS));
+        if let Some(account_id) = openai_account_id {
+            request_builder = request_builder.header("ChatGPT-Account-Id", account_id);
+        }
+        if is_chatgpt_codex {
+            request_builder = request_builder
+                .header("originator", "opencode")
+                .header(
+                    "session_id",
+                    format!("spacebot-{}", chrono::Utc::now().timestamp()),
+                )
+                .header(
+                    "user-agent",
+                    format!("spacebot/{}", env!("CARGO_PKG_VERSION")),
+                );
+        }
+
+        let response = request_builder
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| CompletionError::ProviderError(error.to_string()))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let response_text = response
+                .text()
+                .await
+                .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
+
+            return Err(CompletionError::ProviderError(format!(
+                "{provider_label} Responses API error ({status}): {}",
+                parse_openai_error_message(&response_text)
+                    .unwrap_or_else(|| "unknown error".to_string())
+            )));
+        }
+
+        let provider_label = provider_label.to_string();
+        let stream_accumulator = self.usage_accumulator.clone();
+        let stream_model_name = self.full_model_name.clone();
+        let stream_provider = self.provider.clone();
+        let stream = async_stream::stream! {
+            let mut stream = response.bytes_stream();
+            let mut block_buffer = String::new();
+            let mut raw_text = String::new();
+            let mut sse_text = String::new();
+            let mut saw_data_event = false;
+            let mut pending_tool_calls: std::collections::HashMap<String, OpenAiStreamingToolCall> = std::collections::HashMap::new();
+
+            while let Some(chunk_result) = stream.next().await {
+                let chunk = match chunk_result {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        yield Err(CompletionError::ProviderError(format!(
+                            "{provider_label} stream read failed: {error}"
+                        )));
+                        return;
+                    }
+                };
+
+                let chunk_text = String::from_utf8_lossy(&chunk).to_string();
+                if !saw_data_event {
+                    raw_text.push_str(&chunk_text);
+                }
+                block_buffer.push_str(&chunk_text);
+
+                while let Some(block) = extract_sse_block(&mut block_buffer) {
+                    sse_text.push_str(&block);
+                    sse_text.push_str("\n\n");
+
+                    let Some(data) = extract_sse_data_payload(&block) else {
+                        continue;
+                    };
+                    let data = data.trim();
+                    if data.is_empty() || data == "[DONE]" {
+                        continue;
+                    }
+
+                    saw_data_event = true;
+                    let event = match serde_json::from_str::<OpenAiResponsesStreamingCompletionChunk>(data) {
+                        Ok(event) => event,
+                        Err(_) => {
+                            let raw_event = match serde_json::from_str::<serde_json::Value>(data) {
+                                Ok(raw_event) => raw_event,
+                                Err(_) => continue,
+                            };
+                            match process_openai_responses_stream_raw_event(&raw_event, &mut pending_tool_calls) {
+                                Ok(events) => {
+                                    for event in events {
+                                        yield Ok(event);
+                                    }
+                                }
+                                Err(error) => {
+                                    yield Err(error);
+                                    return;
+                                }
+                            }
+                            continue;
+                        }
+                    };
+
+                    match process_openai_responses_stream_event(&event, &mut pending_tool_calls) {
+                        Ok(events) => {
+                            for event in events {
+                                yield Ok(event);
+                            }
+                        }
+                        Err(error) => {
+                            yield Err(error);
+                            return;
+                        }
+                    }
+                }
+            }
+
+            if !block_buffer.trim().is_empty() && let Some(data) = extract_sse_data_payload(&block_buffer) {
+                let data = data.trim();
+                if !data.is_empty() && data != "[DONE]" {
+                    saw_data_event = true;
+                    if let Ok(event) = serde_json::from_str::<OpenAiResponsesStreamingCompletionChunk>(data) {
+                        match process_openai_responses_stream_event(&event, &mut pending_tool_calls) {
+                            Ok(events) => {
+                                for event in events {
+                                    yield Ok(event);
+                                }
+                            }
+                            Err(error) => {
+                                yield Err(error);
+                                return;
+                            }
+                        }
+                    } else if let Ok(raw_event) = serde_json::from_str::<serde_json::Value>(data) {
+                        match process_openai_responses_stream_raw_event(
+                            &raw_event,
+                            &mut pending_tool_calls,
+                        ) {
+                            Ok(events) => {
+                                for event in events {
+                                    yield Ok(event);
+                                }
+                            }
+                            Err(error) => {
+                                yield Err(error);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if saw_data_event {
+                let response_body = match parse_openai_responses_sse_response(&sse_text, &provider_label) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                };
+
+                let parsed_response = match parse_openai_responses_response(response_body.clone(), &provider_label) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                };
+
+                record_streaming_usage(&stream_accumulator, &response_body, &stream_model_name, &stream_provider).await;
+                yield Ok(RawStreamingChoice::FinalResponse(RawStreamingResponse {
+                    body: response_body,
+                    usage: Some(parsed_response.usage),
+                }));
+                return;
+            }
+
+            let response_body = match serde_json::from_str::<serde_json::Value>(&raw_text) {
+                Ok(body) => body,
+                Err(error) => {
+                    yield Err(CompletionError::ProviderError(format!(
+                        "{provider_label} response is neither SSE nor JSON: {error}. Body: {}",
+                        truncate_body(&raw_text)
+                    )));
+                    return;
+                }
+            };
+
+            let parsed_response = match parse_openai_responses_response(response_body.clone(), &provider_label) {
+                Ok(response) => response,
+                Err(error) => {
+                    yield Err(error);
+                    return;
+                }
+            };
+
+            for event in completion_choice_to_streaming_choices(&parsed_response.choice) {
+                yield Ok(event);
+            }
+            if let Some(message_id) = parsed_response.message_id {
+                yield Ok(RawStreamingChoice::MessageId(message_id));
+            }
+            record_streaming_usage(&stream_accumulator, &response_body, &stream_model_name, &stream_provider).await;
+            yield Ok(RawStreamingChoice::FinalResponse(RawStreamingResponse {
+                body: response_body,
+                usage: Some(parsed_response.usage),
+            }));
+        };
+
+        Ok(StreamingCompletionResponse::stream(Box::pin(stream)))
+    }
+
     /// Generic OpenAI-compatible API call.
     /// Used by providers that implement the OpenAI chat completions format.
     #[allow(dead_code)]
@@ -881,6 +1367,14 @@ impl SpacebotModel {
         let endpoint_path = match provider_config.api_type {
             ApiType::OpenAiCompletions | ApiType::OpenAiResponses => "/v1/chat/completions",
             ApiType::OpenAiChatCompletions | ApiType::Gemini => "/chat/completions",
+            ApiType::Azure => {
+                // Azure handles its own endpoint construction in the call() match
+                // This fallback should not be reached for Azure
+                return Err(CompletionError::ProviderError(
+                    "Azure provider should use the dedicated Azure endpoint construction in call()"
+                        .to_string(),
+                ));
+            }
             ApiType::Anthropic => {
                 return Err(CompletionError::ProviderError(format!(
                     "{provider_display_name} is configured with anthropic API type, but this call expects an OpenAI-compatible API"
@@ -1100,6 +1594,9 @@ impl SpacebotModel {
         }
 
         let provider_label = provider_label.to_string();
+        let stream_accumulator = self.usage_accumulator.clone();
+        let stream_model_name = self.full_model_name.clone();
+        let stream_provider = self.provider.clone();
         let stream = async_stream::stream! {
             let mut stream = response.bytes_stream();
             let mut block_buffer = String::new();
@@ -1212,6 +1709,7 @@ impl SpacebotModel {
                     }
                 };
 
+                record_streaming_usage(&stream_accumulator, &response_body, &stream_model_name, &stream_provider).await;
                 yield Ok(RawStreamingChoice::FinalResponse(RawStreamingResponse {
                     body: response_body,
                     usage: Some(parsed_response.usage),
@@ -1245,6 +1743,7 @@ impl SpacebotModel {
                 yield Ok(RawStreamingChoice::MessageId(message_id));
             }
 
+            record_streaming_usage(&stream_accumulator, &response_body, &stream_model_name, &stream_provider).await;
             yield Ok(RawStreamingChoice::FinalResponse(RawStreamingResponse {
                 body: response_body,
                 usage: Some(parsed_response.usage),
@@ -1255,6 +1754,24 @@ impl SpacebotModel {
     }
 }
 // --- Helpers ---
+
+/// Record usage from a streaming response's raw body into the accumulator.
+async fn record_streaming_usage(
+    accumulator: &Option<Arc<Mutex<crate::llm::usage::UsageAccumulator>>>,
+    body: &serde_json::Value,
+    model_name: &str,
+    provider: &str,
+) {
+    if let Some(acc) = accumulator {
+        let extended = if provider == "anthropic" {
+            crate::llm::usage::ExtendedUsage::from_anthropic_body(body)
+        } else {
+            crate::llm::usage::ExtendedUsage::from_openai_body(body)
+        };
+        let cost = crate::llm::pricing::estimate_cost_extended(model_name, &extended);
+        acc.lock().await.add(extended, model_name, provider, cost);
+    }
+}
 
 /// Reverse-map Claude Code canonical tool names back to the original names
 /// from the request's tool definitions.
@@ -1322,6 +1839,10 @@ pub fn convert_messages_to_anthropic(messages: &OneOrMany<Message>) -> Vec<serde
                 (!parts.is_empty())
                     .then(|| serde_json::json!({"role": "assistant", "content": parts}))
             }
+            Message::System { content } => Some(serde_json::json!({
+                "role": "user",
+                "content": content,
+            })),
         })
         .collect()
 }
@@ -1353,9 +1874,14 @@ fn convert_messages_to_openai(
                             }
                         }
                         UserContent::ToolResult(tr) => {
+                            let tool_call_id = tr
+                                .call_id
+                                .as_deref()
+                                .filter(|call_id| !call_id.is_empty())
+                                .unwrap_or(&tr.id);
                             tool_results.push(serde_json::json!({
                                 "role": "tool",
-                                "tool_call_id": tr.id,
+                                "tool_call_id": tool_call_id,
                                 "content": tool_result_content_to_string(&tr.content),
                             }));
                         }
@@ -1381,8 +1907,16 @@ fn convert_messages_to_openai(
 
                 result.extend(tool_results);
             }
+            Message::System { content } => {
+                result.push(serde_json::json!({
+                    "role": "user",
+                    "content": content,
+                }));
+            }
             Message::Assistant { content, .. } => {
                 let mut text_parts = Vec::new();
+                let mut reasoning_parts = Vec::new();
+                let mut saw_reasoning = false;
                 let mut tool_calls = Vec::new();
 
                 for item in content.iter() {
@@ -1390,12 +1924,23 @@ fn convert_messages_to_openai(
                         AssistantContent::Text(t) => {
                             text_parts.push(t.text.clone());
                         }
+                        AssistantContent::Reasoning(reasoning) => {
+                            saw_reasoning = true;
+                            reasoning_parts.extend(collect_reasoning_text_parts(reasoning));
+                        }
                         AssistantContent::ToolCall(tc) => {
-                            // OpenAI expects arguments as a JSON string
+                            // OpenAI expects arguments as a JSON string.
+                            // Prefer call_id (set when replaying Responses-API tool calls
+                            // through chat-completions) to keep assistant and tool IDs aligned.
+                            let preferred_id = tc
+                                .call_id
+                                .as_deref()
+                                .filter(|c| !c.is_empty())
+                                .unwrap_or(&tc.id);
                             let args_string = serde_json::to_string(&tc.function.arguments)
                                 .unwrap_or_else(|_| "{}".to_string());
                             tool_calls.push(serde_json::json!({
-                                "id": tc.id,
+                                "id": preferred_id,
                                 "type": "function",
                                 "function": {
                                     "name": tc.function.name,
@@ -1410,6 +1955,11 @@ fn convert_messages_to_openai(
                 let mut msg = serde_json::json!({"role": "assistant"});
                 if !text_parts.is_empty() {
                     msg["content"] = serde_json::json!(text_parts.join("\n"));
+                } else if !tool_calls.is_empty() || saw_reasoning {
+                    msg["content"] = serde_json::Value::Null;
+                }
+                if saw_reasoning {
+                    msg["reasoning_content"] = serde_json::json!(reasoning_parts.join("\n"));
                 }
                 if !tool_calls.is_empty() {
                     msg["tool_calls"] = serde_json::json!(tool_calls);
@@ -1427,6 +1977,22 @@ fn convert_messages_to_openai(
     }
 
     result
+}
+
+fn collect_reasoning_text_parts(reasoning: &rig::message::Reasoning) -> Vec<String> {
+    reasoning
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            ReasoningContent::Text { text, .. } => (!text.trim().is_empty()).then(|| text.clone()),
+            ReasoningContent::Summary(summary) => {
+                (!summary.trim().is_empty()).then(|| summary.clone())
+            }
+            ReasoningContent::Encrypted(_) | ReasoningContent::Redacted { .. } => None,
+            #[allow(unreachable_patterns)]
+            _ => None,
+        })
+        .collect()
 }
 
 fn convert_messages_to_openai_responses(messages: &OneOrMany<Message>) -> Vec<serde_json::Value> {
@@ -1451,9 +2017,14 @@ fn convert_messages_to_openai_responses(messages: &OneOrMany<Message>) -> Vec<se
                             }
                         }
                         UserContent::ToolResult(tool_result) => {
+                            let call_id = tool_result
+                                .call_id
+                                .as_deref()
+                                .filter(|call_id| !call_id.is_empty())
+                                .unwrap_or(&tool_result.id);
                             result.push(serde_json::json!({
                                 "type": "function_call_output",
-                                "call_id": tool_result.id,
+                                "call_id": call_id,
                                 "output": tool_result_content_to_string(&tool_result.content),
                             }));
                         }
@@ -1468,8 +2039,17 @@ fn convert_messages_to_openai_responses(messages: &OneOrMany<Message>) -> Vec<se
                     }));
                 }
             }
+            Message::System { content } => {
+                result.push(serde_json::json!({
+                    "role": "user",
+                    "content": content,
+                }));
+            }
             Message::Assistant { content, .. } => {
                 let mut text_parts = Vec::new();
+                let mut reasoning_parts = Vec::new();
+                let mut saw_reasoning = false;
+                let mut function_calls = Vec::new();
 
                 for item in content.iter() {
                     match item {
@@ -1479,14 +2059,23 @@ fn convert_messages_to_openai_responses(messages: &OneOrMany<Message>) -> Vec<se
                                 "text": text.text,
                             }));
                         }
+                        AssistantContent::Reasoning(reasoning) => {
+                            saw_reasoning = true;
+                            reasoning_parts.extend(collect_reasoning_text_parts(reasoning));
+                        }
                         AssistantContent::ToolCall(tool_call) => {
                             let arguments = serde_json::to_string(&tool_call.function.arguments)
                                 .unwrap_or_else(|_| "{}".to_string());
-                            result.push(serde_json::json!({
+                            let call_id = tool_call
+                                .call_id
+                                .as_deref()
+                                .filter(|call_id| !call_id.is_empty())
+                                .unwrap_or(&tool_call.id);
+                            function_calls.push(serde_json::json!({
                                 "type": "function_call",
                                 "name": tool_call.function.name,
                                 "arguments": arguments,
-                                "call_id": tool_call.id,
+                                "call_id": call_id,
                             }));
                         }
                         _ => {}
@@ -1494,11 +2083,24 @@ fn convert_messages_to_openai_responses(messages: &OneOrMany<Message>) -> Vec<se
                 }
 
                 if !text_parts.is_empty() {
-                    result.push(serde_json::json!({
+                    let mut message = serde_json::json!({
                         "role": "assistant",
                         "content": text_parts,
+                    });
+                    if saw_reasoning {
+                        message["reasoning_content"] =
+                            serde_json::json!(reasoning_parts.join("\n"));
+                    }
+                    result.push(message);
+                } else if saw_reasoning {
+                    result.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": [],
+                        "reasoning_content": reasoning_parts.join("\n"),
                     }));
                 }
+
+                result.extend(function_calls);
             }
         }
     }
@@ -1644,10 +2246,8 @@ fn stream_from_completion_response(
 
         for content in choice_items {
             match content {
-                AssistantContent::Text(text) => {
-                    if !text.text.is_empty() {
-                        yield Ok(RawStreamingChoice::Message(text.text));
-                    }
+                AssistantContent::Text(text) if !text.text.is_empty() => {
+                    yield Ok(RawStreamingChoice::Message(text.text));
                 }
                 AssistantContent::ToolCall(tool_call) => {
                     yield Ok(RawStreamingChoice::ToolCall(RawStreamingToolCall {
@@ -1715,10 +2315,8 @@ fn completion_choice_to_streaming_choices(
 
     for content in choice.iter() {
         match content {
-            AssistantContent::Text(text) => {
-                if !text.text.is_empty() {
-                    events.push(RawStreamingChoice::Message(text.text.clone()));
-                }
+            AssistantContent::Text(text) if !text.text.is_empty() => {
+                events.push(RawStreamingChoice::Message(text.text.clone()));
             }
             AssistantContent::ToolCall(tool_call) => {
                 events.push(RawStreamingChoice::ToolCall(RawStreamingToolCall {
@@ -1751,12 +2349,9 @@ fn completion_choice_to_streaming_choices(
 }
 
 fn extract_sse_block(buffer: &mut String) -> Option<String> {
-    let (block_end, separator_len) = if let Some(index) = buffer.find("\n\n") {
-        (index, 2)
-    } else if let Some(index) = buffer.find("\r\n\r\n") {
-        (index, 4)
-    } else {
-        return None;
+    let (block_end, separator_len) = match buffer.find("\n\n") {
+        Some(index) => (index, 2),
+        None => (buffer.find("\r\n\r\n")?, 4),
     };
 
     let block = buffer[..block_end].to_string();
@@ -2053,6 +2648,264 @@ fn process_openai_chat_stream_event(
         {
             events.extend(flush_openai_streaming_tool_calls(pending_tool_calls)?);
         }
+    }
+
+    Ok(events)
+}
+
+fn process_openai_responses_stream_event(
+    event: &OpenAiResponsesStreamingCompletionChunk,
+    pending_tool_calls: &mut std::collections::HashMap<String, OpenAiStreamingToolCall>,
+) -> Result<Vec<RawStreamingChoice<RawStreamingResponse>>, CompletionError> {
+    let mut events = Vec::new();
+
+    match event {
+        OpenAiResponsesStreamingCompletionChunk::Delta(chunk) => match &chunk.data {
+            OpenAiResponsesItemChunkKind::OutputItemAdded(
+                OpenAiResponsesStreamingItemDoneOutput {
+                    item: OpenAiResponsesOutput::FunctionCall(function_call),
+                    ..
+                },
+            ) => {
+                let entry = pending_tool_calls
+                    .entry(function_call.id.clone())
+                    .or_default();
+                entry.id = function_call.id.clone();
+                entry.name = function_call.name.clone();
+                events.push(RawStreamingChoice::ToolCallDelta {
+                    id: function_call.id.clone(),
+                    internal_call_id: entry.internal_call_id.clone(),
+                    content: rig::streaming::ToolCallDeltaContent::Name(function_call.name.clone()),
+                });
+            }
+            OpenAiResponsesItemChunkKind::OutputItemAdded(_) => {}
+            OpenAiResponsesItemChunkKind::OutputItemDone(message) => {
+                match message {
+                    OpenAiResponsesStreamingItemDoneOutput {
+                        item: OpenAiResponsesOutput::FunctionCall(function_call),
+                        ..
+                    } => {
+                        let entry = pending_tool_calls
+                            .remove(&function_call.id)
+                            .unwrap_or_default();
+                        events.push(RawStreamingChoice::ToolCall(RawStreamingToolCall {
+                            id: function_call.id.clone(),
+                            internal_call_id: entry.internal_call_id,
+                            call_id: Some(function_call.call_id.clone()),
+                            name: function_call.name.clone(),
+                            arguments: function_call.arguments.clone(),
+                            signature: None,
+                            additional_params: None,
+                        }));
+                    }
+                    OpenAiResponsesStreamingItemDoneOutput {
+                        item: OpenAiResponsesOutput::Message(message),
+                        ..
+                    } => {
+                        events.push(RawStreamingChoice::MessageId(message.id.clone()));
+                    }
+                    OpenAiResponsesStreamingItemDoneOutput {
+                        item:
+                            OpenAiResponsesOutput::Reasoning {
+                                summary,
+                                id,
+                                encrypted_content,
+                                ..
+                            },
+                        ..
+                    } => {
+                        for reasoning_summary in summary {
+                            let rig::providers::openai::responses_api::ReasoningSummary::SummaryText { text } = reasoning_summary;
+                            events.push(RawStreamingChoice::Reasoning {
+                                id: Some(id.clone()),
+                                content: ReasoningContent::Summary(text.clone()),
+                            });
+                        }
+                        if let Some(encrypted_content) = encrypted_content {
+                            events.push(RawStreamingChoice::Reasoning {
+                                id: Some(id.clone()),
+                                content: ReasoningContent::Encrypted(encrypted_content.clone()),
+                            });
+                        }
+                    }
+                }
+            }
+            OpenAiResponsesItemChunkKind::OutputTextDelta(delta)
+            | OpenAiResponsesItemChunkKind::RefusalDelta(delta) => {
+                events.push(RawStreamingChoice::Message(delta.delta.clone()));
+            }
+            OpenAiResponsesItemChunkKind::ReasoningSummaryTextDelta(delta) => {
+                events.push(RawStreamingChoice::ReasoningDelta {
+                    id: None,
+                    reasoning: delta.delta.clone(),
+                });
+            }
+            OpenAiResponsesItemChunkKind::FunctionCallArgsDelta(delta) => {
+                let entry = pending_tool_calls.entry(delta.item_id.clone()).or_default();
+                entry.id = delta.item_id.clone();
+                entry.arguments.push_str(&delta.delta);
+                events.push(RawStreamingChoice::ToolCallDelta {
+                    id: delta.item_id.clone(),
+                    internal_call_id: entry.internal_call_id.clone(),
+                    content: rig::streaming::ToolCallDeltaContent::Delta(delta.delta.clone()),
+                });
+            }
+            _ => {}
+        },
+        OpenAiResponsesStreamingCompletionChunk::Response(chunk) => {
+            if !matches!(
+                chunk.kind,
+                OpenAiResponsesResponseChunkKind::ResponseCompleted
+            ) {
+                return Ok(events);
+            }
+        }
+    }
+
+    Ok(events)
+}
+
+fn process_openai_responses_stream_raw_event(
+    event: &serde_json::Value,
+    pending_tool_calls: &mut std::collections::HashMap<String, OpenAiStreamingToolCall>,
+) -> Result<Vec<RawStreamingChoice<RawStreamingResponse>>, CompletionError> {
+    let mut events = Vec::new();
+    let Some(kind) = event.get("type").and_then(serde_json::Value::as_str) else {
+        return Ok(events);
+    };
+
+    match kind {
+        "response.output_text.delta" | "response.refusal.delta" => {
+            if let Some(delta) = event.get("delta").and_then(serde_json::Value::as_str)
+                && !delta.is_empty()
+            {
+                events.push(RawStreamingChoice::Message(delta.to_string()));
+            }
+        }
+        "response.reasoning_summary_text.delta" => {
+            if let Some(delta) = event.get("delta").and_then(serde_json::Value::as_str)
+                && !delta.is_empty()
+            {
+                events.push(RawStreamingChoice::ReasoningDelta {
+                    id: None,
+                    reasoning: delta.to_string(),
+                });
+            }
+        }
+        "response.output_item.added" => {
+            let Some(item) = event.get("item") else {
+                return Ok(events);
+            };
+            if item.get("type").and_then(serde_json::Value::as_str) == Some("function_call") {
+                let id = item
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let name = item
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if !id.is_empty() && !name.is_empty() {
+                    let entry = pending_tool_calls.entry(id.clone()).or_default();
+                    entry.id = id.clone();
+                    entry.name = name.clone();
+                    events.push(RawStreamingChoice::ToolCallDelta {
+                        id,
+                        internal_call_id: entry.internal_call_id.clone(),
+                        content: rig::streaming::ToolCallDeltaContent::Name(name),
+                    });
+                }
+            }
+        }
+        "response.function_call_arguments.delta" => {
+            let Some(item_id) = event.get("item_id").and_then(serde_json::Value::as_str) else {
+                return Ok(events);
+            };
+            let Some(delta) = event.get("delta").and_then(serde_json::Value::as_str) else {
+                return Ok(events);
+            };
+            let entry = pending_tool_calls.entry(item_id.to_string()).or_default();
+            entry.id = item_id.to_string();
+            entry.arguments.push_str(delta);
+            events.push(RawStreamingChoice::ToolCallDelta {
+                id: item_id.to_string(),
+                internal_call_id: entry.internal_call_id.clone(),
+                content: rig::streaming::ToolCallDeltaContent::Delta(delta.to_string()),
+            });
+        }
+        "response.function_call_arguments.done" => {}
+        "response.output_item.done" => {
+            let Some(item) = event.get("item") else {
+                return Ok(events);
+            };
+            match item.get("type").and_then(serde_json::Value::as_str) {
+                Some("function_call") => {
+                    let id = item
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let name = item
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let call_id = item
+                        .get("call_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned);
+                    let arguments = parse_openai_tool_arguments(
+                        item.get("arguments").unwrap_or(&serde_json::Value::Null),
+                    );
+                    let entry = pending_tool_calls.remove(&id).unwrap_or_default();
+                    events.push(RawStreamingChoice::ToolCall(RawStreamingToolCall {
+                        id,
+                        internal_call_id: entry.internal_call_id,
+                        call_id,
+                        name,
+                        arguments,
+                        signature: None,
+                        additional_params: None,
+                    }));
+                }
+                Some("message") => {
+                    if let Some(id) = item.get("id").and_then(serde_json::Value::as_str) {
+                        events.push(RawStreamingChoice::MessageId(id.to_string()));
+                    }
+                }
+                Some("reasoning") => {
+                    if let Some(id) = item.get("id").and_then(serde_json::Value::as_str) {
+                        if let Some(summary) =
+                            item.get("summary").and_then(serde_json::Value::as_array)
+                        {
+                            for part in summary {
+                                if let Some(text) =
+                                    part.get("text").and_then(serde_json::Value::as_str)
+                                {
+                                    events.push(RawStreamingChoice::Reasoning {
+                                        id: Some(id.to_string()),
+                                        content: ReasoningContent::Summary(text.to_string()),
+                                    });
+                                }
+                            }
+                        }
+                        if let Some(encrypted) = item
+                            .get("encrypted_content")
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            events.push(RawStreamingChoice::Reasoning {
+                                id: Some(id.to_string()),
+                                content: ReasoningContent::Encrypted(encrypted.to_string()),
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
     }
 
     Ok(events)
@@ -2524,10 +3377,11 @@ fn parse_openai_reasoning_fallback(message: &serde_json::Value) -> Option<String
 
 fn collect_openai_text_content(value: &serde_json::Value, text_parts: &mut Vec<String>) {
     match value {
-        serde_json::Value::String(text) => {
-            if !text.trim().is_empty() {
-                text_parts.push(text.to_string());
-            }
+        serde_json::Value::String(text) if !text.is_empty() => {
+            // Use is_empty() instead of trim().is_empty() to preserve whitespace-only
+            // segments. Streaming providers (e.g. Kimi) sometimes send content chunks
+            // that are just spaces; dropping those causes missing spaces in output.
+            text_parts.push(text.to_string());
         }
         serde_json::Value::Array(items) => {
             for item in items {
@@ -2536,17 +3390,17 @@ fn collect_openai_text_content(value: &serde_json::Value, text_parts: &mut Vec<S
         }
         serde_json::Value::Object(map) => {
             if let Some(text) = map.get("text").and_then(serde_json::Value::as_str)
-                && !text.trim().is_empty()
+                && !text.is_empty()
             {
                 text_parts.push(text.to_string());
             }
             if let Some(summary) = map.get("summary").and_then(serde_json::Value::as_str)
-                && !summary.trim().is_empty()
+                && !summary.is_empty()
             {
                 text_parts.push(summary.to_string());
             }
             if let Some(refusal) = map.get("refusal").and_then(serde_json::Value::as_str)
-                && !refusal.trim().is_empty()
+                && !refusal.is_empty()
             {
                 text_parts.push(refusal.to_string());
             }
@@ -2601,6 +3455,61 @@ fn parse_openai_tool_call(tool_call: &serde_json::Value, fallback_id: String) ->
     Some(make_tool_call(id, name.to_string(), arguments))
 }
 
+fn extract_text_content_from_responses_output_item(
+    value: &serde_json::Value,
+    text_parts: &mut Vec<String>,
+) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                extract_text_content_from_responses_output_item(item, text_parts);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if matches!(
+                map.get("type").and_then(serde_json::Value::as_str),
+                Some("function_call") | Some("function_call_output")
+            ) {
+                return;
+            }
+
+            if let Some(text) = map.get("text").and_then(serde_json::Value::as_str)
+                && !text.is_empty()
+            {
+                text_parts.push(text.to_string());
+            }
+            if let Some(summary) = map.get("summary") {
+                collect_openai_text_content(summary, text_parts);
+            }
+            if let Some(refusal) = map.get("refusal") {
+                collect_openai_text_content(refusal, text_parts);
+            }
+            if let Some(content) = map.get("content") {
+                extract_text_content_from_responses_output_item(content, text_parts);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn make_openai_responses_tool_call(
+    id: String,
+    call_id: Option<String>,
+    name: String,
+    arguments: serde_json::Value,
+) -> ToolCall {
+    ToolCall {
+        id,
+        call_id,
+        function: ToolFunction {
+            name: name.trim().to_string(),
+            arguments,
+        },
+        signature: None,
+        additional_params: None,
+    }
+}
+
 fn parse_openai_responses_response(
     body: serde_json::Value,
     provider_label: &str,
@@ -2609,20 +3518,44 @@ fn parse_openai_responses_response(
         .as_array()
         .ok_or_else(|| CompletionError::ResponseError("missing output array".into()))?;
 
+    if output_items.is_empty() {
+        tracing::warn!(
+            provider = %provider_label,
+            status = body["status"].as_str().unwrap_or("unknown"),
+            body = %serde_json::to_string_pretty(&body).unwrap_or_default(),
+            "responses API returned empty output array — dumping full body"
+        );
+    }
+
     let mut assistant_content = Vec::new();
+    let mut fallback_text_parts = Vec::new();
 
     for (index, output_item) in output_items.iter().enumerate() {
         match output_item["type"].as_str() {
             Some("message") => {
                 if let Some(content_items) = output_item["content"].as_array() {
+                    let mut message_output_text = Vec::new();
+                    let mut message_fallback_text = Vec::new();
+
                     for content_item in content_items {
                         if content_item["type"].as_str() == Some("output_text")
                             && let Some(text) = content_item["text"].as_str()
                             && !text.is_empty()
                         {
-                            assistant_content.push(AssistantContent::Text(Text {
-                                text: text.to_string(),
-                            }));
+                            message_output_text.push(text.to_string());
+                        }
+
+                        extract_text_content_from_responses_output_item(
+                            content_item,
+                            &mut message_fallback_text,
+                        );
+                    }
+
+                    if message_output_text.is_empty() {
+                        fallback_text_parts.extend(message_fallback_text);
+                    } else {
+                        for text in message_output_text {
+                            assistant_content.push(AssistantContent::Text(Text { text }));
                         }
                     }
                 }
@@ -2630,29 +3563,53 @@ fn parse_openai_responses_response(
             Some("function_call") => {
                 let call_id = output_item["call_id"]
                     .as_str()
-                    .or_else(|| output_item["id"].as_str())
+                    .filter(|id| !id.is_empty())
+                    .map(ToOwned::to_owned);
+                let id = output_item["id"]
+                    .as_str()
                     .filter(|id| !id.is_empty())
                     .map(ToOwned::to_owned)
+                    .or_else(|| call_id.clone())
                     .unwrap_or_else(|| format!("function_call_{index}"));
                 let name = output_item["name"].as_str().unwrap_or("").to_string();
                 let arguments = parse_openai_tool_arguments(&output_item["arguments"]);
 
-                assistant_content.push(AssistantContent::ToolCall(make_tool_call(
-                    call_id, name, arguments,
-                )));
+                assistant_content.push(AssistantContent::ToolCall(
+                    make_openai_responses_tool_call(id, call_id, name, arguments),
+                ));
             }
-            _ => {}
+            _ => {
+                extract_text_content_from_responses_output_item(
+                    output_item,
+                    &mut fallback_text_parts,
+                );
+            }
+        }
+    }
+
+    let has_text = assistant_content
+        .iter()
+        .any(|content| matches!(content, AssistantContent::Text(_)));
+    if !has_text {
+        for text in fallback_text_parts {
+            assistant_content.push(AssistantContent::Text(Text { text }));
         }
     }
 
     let choice = OneOrMany::many(assistant_content).map_err(|_| {
+        let output_types = output_items
+            .iter()
+            .map(|item| item["type"].as_str().unwrap_or("<missing-type>"))
+            .collect::<Vec<_>>()
+            .join(", ");
         tracing::warn!(
             provider = %provider_label,
             output_items = output_items.len(),
+            output_types = %output_types,
             "empty response from responses API"
         );
         CompletionError::ResponseError(format!(
-            "empty response from {provider_label} Responses API"
+            "empty or unsupported response from {provider_label} Responses API; expected text-bearing message content (output_text/text/summary/refusal/content) or function_call output items; received output types: {output_types}"
         ))
     })?;
 
@@ -2679,6 +3636,28 @@ fn parse_openai_responses_sse_response(
     response_text: &str,
     provider_label: &str,
 ) -> Result<serde_json::Value, CompletionError> {
+    // The `response.completed` event may have an empty `output` array when the
+    // ChatGPT Responses API streams content incrementally.  We accumulate
+    // output items from the delta events and patch them into the completed
+    // response if needed.
+    use serde_json::Value;
+    use std::collections::BTreeMap;
+
+    // output_index → { item skeleton + accumulated text parts keyed by content_index }
+    struct OutputItemAcc {
+        /// The full item snapshot from `response.output_item.done`, if received.
+        done_snapshot: Option<Value>,
+        /// Accumulated text per content_index from delta events.
+        text_parts: BTreeMap<usize, String>,
+        /// Item type from `response.output_item.added`.
+        item_type: Option<String>,
+        /// The skeleton from `response.output_item.added`.
+        added_skeleton: Option<Value>,
+    }
+
+    let mut output_acc: BTreeMap<usize, OutputItemAcc> = BTreeMap::new();
+    let mut completed_response: Option<Value> = None;
+
     for line in response_text.lines() {
         let Some(data) = line.strip_prefix("data: ") else {
             continue;
@@ -2688,21 +3667,101 @@ fn parse_openai_responses_sse_response(
             continue;
         }
 
-        let Ok(event_body) = serde_json::from_str::<serde_json::Value>(data) else {
+        let Ok(event_body) = serde_json::from_str::<Value>(data) else {
             continue;
         };
 
-        if event_body["type"].as_str() == Some("response.completed")
-            && let Some(response) = event_body.get("response")
-        {
-            return Ok(response.clone());
+        match event_body["type"].as_str() {
+            Some("response.output_item.added") => {
+                let idx = event_body["output_index"].as_u64().unwrap_or(0) as usize;
+                let item = &event_body["item"];
+                let entry = output_acc.entry(idx).or_insert_with(|| OutputItemAcc {
+                    done_snapshot: None,
+                    text_parts: BTreeMap::new(),
+                    item_type: None,
+                    added_skeleton: None,
+                });
+                entry.item_type = item["type"].as_str().map(String::from);
+                entry.added_skeleton = Some(item.clone());
+            }
+            Some("response.output_text.delta") => {
+                let idx = event_body["output_index"].as_u64().unwrap_or(0) as usize;
+                let content_idx = event_body["content_index"].as_u64().unwrap_or(0) as usize;
+                let delta = event_body["delta"].as_str().unwrap_or("");
+                let entry = output_acc.entry(idx).or_insert_with(|| OutputItemAcc {
+                    done_snapshot: None,
+                    text_parts: BTreeMap::new(),
+                    item_type: None,
+                    added_skeleton: None,
+                });
+                entry
+                    .text_parts
+                    .entry(content_idx)
+                    .or_default()
+                    .push_str(delta);
+            }
+            Some("response.output_item.done") => {
+                let idx = event_body["output_index"].as_u64().unwrap_or(0) as usize;
+                let entry = output_acc.entry(idx).or_insert_with(|| OutputItemAcc {
+                    done_snapshot: None,
+                    text_parts: BTreeMap::new(),
+                    item_type: None,
+                    added_skeleton: None,
+                });
+                entry.done_snapshot = event_body.get("item").cloned();
+            }
+            Some("response.function_call_arguments.delta") => {
+                // Function call deltas are handled by output_item.done snapshot
+            }
+            Some("response.completed") => {
+                completed_response = event_body.get("response").cloned();
+            }
+            _ => {}
         }
     }
 
-    Err(CompletionError::ProviderError(format!(
-        "{provider_label} Responses SSE stream missing response.completed event.\nBody: {}",
-        truncate_body(response_text)
-    )))
+    let mut response = completed_response.ok_or_else(|| {
+        CompletionError::ProviderError(format!(
+            "{provider_label} Responses SSE stream missing response.completed event.\nBody: {}",
+            truncate_body(response_text)
+        ))
+    })?;
+
+    // If the completed response has an empty output array, reconstruct from
+    // accumulated SSE events.
+    let output_is_empty = response["output"]
+        .as_array()
+        .is_none_or(|arr| arr.is_empty());
+
+    if output_is_empty && !output_acc.is_empty() {
+        let mut reconstructed: Vec<Value> = Vec::new();
+
+        for (_idx, acc) in output_acc {
+            // Prefer the done snapshot (complete item); fall back to
+            // reconstructing from deltas.
+            if let Some(snapshot) = acc.done_snapshot {
+                reconstructed.push(snapshot);
+            } else if !acc.text_parts.is_empty() {
+                // Build a message output item from accumulated text
+                let full_text: String = acc.text_parts.into_values().collect();
+                let content = serde_json::json!([{
+                    "type": "output_text",
+                    "text": full_text,
+                }]);
+                let mut item = acc
+                    .added_skeleton
+                    .unwrap_or_else(|| serde_json::json!({"type": "message", "role": "assistant"}));
+                item["content"] = content;
+                reconstructed.push(item);
+            }
+        }
+
+        if !reconstructed.is_empty() {
+            response["output"] = Value::Array(reconstructed);
+        }
+    }
+
+    Ok(response)
 }
 
 fn parse_openai_error_message(response_text: &str) -> Option<String> {
@@ -2929,6 +3988,39 @@ mod tests {
     }
 
     #[test]
+    fn convert_messages_to_anthropic_maps_system_to_user_role() {
+        let messages = OneOrMany::one(Message::System {
+            content: "You are a helpful assistant".to_string(),
+        });
+        let converted = convert_messages_to_anthropic(&messages);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0]["role"], "user");
+        assert_eq!(converted[0]["content"], "You are a helpful assistant");
+    }
+
+    #[test]
+    fn convert_messages_to_openai_maps_system_to_user_role() {
+        let messages = OneOrMany::one(Message::System {
+            content: "You are a helpful assistant".to_string(),
+        });
+        let converted = convert_messages_to_openai(&messages);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0]["role"], "user");
+        assert_eq!(converted[0]["content"], "You are a helpful assistant");
+    }
+
+    #[test]
+    fn convert_messages_to_openai_responses_maps_system_to_user_role() {
+        let messages = OneOrMany::one(Message::System {
+            content: "You are a helpful assistant".to_string(),
+        });
+        let converted = convert_messages_to_openai_responses(&messages);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0]["role"], "user");
+        assert_eq!(converted[0]["content"], "You are a helpful assistant");
+    }
+
+    #[test]
     fn parse_openai_response_handles_content_array_parts() {
         let body = serde_json::json!({
             "choices": [{
@@ -3021,6 +4113,93 @@ mod tests {
     }
 
     #[test]
+    fn convert_messages_to_openai_preserves_reasoning_for_tool_calls() {
+        let messages = OneOrMany::one(Message::Assistant {
+            id: None,
+            content: OneOrMany::many(vec![
+                AssistantContent::Reasoning(rig::message::Reasoning::multi(vec![
+                    "step one".to_string(),
+                    "step two".to_string(),
+                ])),
+                AssistantContent::tool_call(
+                    "call_1",
+                    "file",
+                    serde_json::json!({"operation": "list", "path": "."}),
+                ),
+            ])
+            .expect("non-empty assistant content"),
+        });
+
+        let converted = convert_messages_to_openai(&messages);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0]["role"], "assistant");
+        assert!(converted[0]["content"].is_null());
+        assert_eq!(converted[0]["reasoning_content"], "step one\nstep two");
+        assert_eq!(converted[0]["tool_calls"][0]["function"]["name"], "file");
+        assert_eq!(
+            converted[0]["tool_calls"][0]["function"]["arguments"],
+            "{\"operation\":\"list\",\"path\":\".\"}"
+        );
+    }
+
+    #[test]
+    fn convert_messages_to_openai_responses_preserves_reasoning_for_tool_calls() {
+        let messages = OneOrMany::one(Message::Assistant {
+            id: None,
+            content: OneOrMany::many(vec![
+                AssistantContent::Reasoning(rig::message::Reasoning::new("inspect identity files")),
+                AssistantContent::tool_call(
+                    "call_1",
+                    "file",
+                    serde_json::json!({"operation": "list", "path": "."}),
+                ),
+            ])
+            .expect("non-empty assistant content"),
+        });
+
+        let converted = convert_messages_to_openai_responses(&messages);
+        assert_eq!(converted.len(), 2);
+        assert_eq!(converted[0]["role"], "assistant");
+        assert_eq!(converted[0]["content"], serde_json::json!([]));
+        assert_eq!(converted[0]["reasoning_content"], "inspect identity files");
+        assert_eq!(converted[1]["type"], "function_call");
+        assert_eq!(converted[1]["name"], "file");
+    }
+
+    #[test]
+    fn convert_messages_to_openai_preserves_empty_reasoning_content_for_redacted_reasoning() {
+        let messages = OneOrMany::one(Message::Assistant {
+            id: None,
+            content: OneOrMany::many(vec![AssistantContent::Reasoning(
+                rig::message::Reasoning::redacted("hidden").with_id("rs_123".to_string()),
+            )])
+            .expect("non-empty assistant content"),
+        });
+
+        let converted = convert_messages_to_openai(&messages);
+        assert_eq!(converted.len(), 1);
+        assert!(converted[0]["content"].is_null());
+        assert_eq!(converted[0]["reasoning_content"], "");
+    }
+
+    #[test]
+    fn convert_messages_to_openai_responses_preserves_empty_reasoning_content_for_redacted_reasoning()
+     {
+        let messages = OneOrMany::one(Message::Assistant {
+            id: None,
+            content: OneOrMany::many(vec![AssistantContent::Reasoning(
+                rig::message::Reasoning::encrypted("ciphertext").with_id("rs_456".to_string()),
+            )])
+            .expect("non-empty assistant content"),
+        });
+
+        let converted = convert_messages_to_openai_responses(&messages);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0]["content"], serde_json::json!([]));
+        assert_eq!(converted[0]["reasoning_content"], "");
+    }
+
+    #[test]
     fn parse_openai_response_empty_error_includes_provider_and_finish_reason() {
         let body = serde_json::json!({
             "choices": [{
@@ -3039,6 +4218,146 @@ mod tests {
         let error = parse_openai_response(body, "OpenRouter").expect_err("should fail");
         assert!(error.to_string().contains("empty response from OpenRouter"));
         assert!(error.to_string().contains("finish_reason: stop"));
+    }
+
+    #[test]
+    fn convert_messages_to_openai_tool_result_prefers_call_id_over_id() {
+        let messages = OneOrMany::one(Message::User {
+            content: OneOrMany::one(UserContent::ToolResult(rig::message::ToolResult {
+                id: "legacy-id".to_string(),
+                call_id: Some("stable-call-id".to_string()),
+                content: OneOrMany::one(rig::message::ToolResultContent::text("ok")),
+            })),
+        });
+
+        let converted = convert_messages_to_openai(&messages);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0]["role"], "tool");
+        assert_eq!(converted[0]["tool_call_id"], "stable-call-id");
+    }
+
+    #[test]
+    fn convert_messages_to_openai_responses_function_call_output_prefers_call_id_over_id() {
+        let messages = OneOrMany::one(Message::User {
+            content: OneOrMany::one(UserContent::ToolResult(rig::message::ToolResult {
+                id: "legacy-id".to_string(),
+                call_id: Some("stable-call-id".to_string()),
+                content: OneOrMany::one(rig::message::ToolResultContent::text("ok")),
+            })),
+        });
+
+        let converted = convert_messages_to_openai_responses(&messages);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0]["type"], "function_call_output");
+        assert_eq!(converted[0]["call_id"], "stable-call-id");
+    }
+
+    #[test]
+    fn convert_messages_to_openai_responses_function_call_prefers_call_id_over_id() {
+        let messages = OneOrMany::one(Message::Assistant {
+            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
+                id: "legacy-id".to_string(),
+                call_id: Some("stable-call-id".to_string()),
+                function: ToolFunction {
+                    name: "reply".to_string(),
+                    arguments: serde_json::json!({"content": "ok"}),
+                },
+                signature: None,
+                additional_params: None,
+            })),
+            id: None,
+        });
+
+        let converted = convert_messages_to_openai_responses(&messages);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0]["type"], "function_call");
+        assert_eq!(converted[0]["call_id"], "stable-call-id");
+    }
+
+    #[test]
+    fn parse_openai_responses_response_parses_fallback_text_without_output_text() {
+        let body = serde_json::json!({
+            "output": [{
+                "type": "message",
+                "content": [{
+                    "type": "reasoning",
+                    "summary": [
+                        {"text": "step 1"},
+                        {"text": "step 2"}
+                    ]
+                }]
+            }],
+            "usage": {
+                "input_tokens": 3,
+                "output_tokens": 2,
+                "input_tokens_details": {"cached_tokens": 0}
+            }
+        });
+
+        let response =
+            parse_openai_responses_response(body, "OpenAI").expect("fallback text should parse");
+        let texts: Vec<_> = response
+            .choice
+            .iter()
+            .filter_map(|content| match content {
+                AssistantContent::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(texts, vec!["step 1".to_string(), "step 2".to_string()]);
+    }
+
+    #[test]
+    fn parse_openai_responses_response_preserves_function_call_call_id_from_completed_response() {
+        let body = serde_json::json!({
+            "output": [{
+                "type": "function_call",
+                "id": "legacy-id",
+                "call_id": "stable-call-id",
+                "name": "reply",
+                "arguments": "{\"content\":\"ok\"}"
+            }],
+            "usage": {
+                "input_tokens": 3,
+                "output_tokens": 2,
+                "input_tokens_details": {"cached_tokens": 0}
+            }
+        });
+
+        let response =
+            parse_openai_responses_response(body, "OpenAI").expect("function call should parse");
+        match response.choice.first_ref() {
+            AssistantContent::ToolCall(tool_call) => {
+                assert_eq!(tool_call.id, "legacy-id");
+                assert_eq!(tool_call.call_id.as_deref(), Some("stable-call-id"));
+                assert_eq!(tool_call.function.name, "reply");
+            }
+            _ => panic!("expected tool call"),
+        }
+    }
+
+    #[test]
+    fn parse_openai_responses_response_unsupported_empty_error_is_actionable_and_provider_specific()
+    {
+        let body = serde_json::json!({
+            "output": [{
+                "type": "unknown_shape",
+                "foo": "bar"
+            }],
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 0,
+                "input_tokens_details": {"cached_tokens": 0}
+            }
+        });
+
+        let error =
+            parse_openai_responses_response(body, "OpenAI").expect_err("should be unsupported");
+        let error_text = error.to_string();
+        assert!(error_text.contains("OpenAI Responses API"));
+        assert!(error_text.contains("output_text/text/summary/refusal/content"));
+        assert!(error_text.contains("unknown_shape"));
     }
 
     #[test]
@@ -3257,6 +4576,86 @@ mod tests {
         assert_eq!(tool_calls[0].name, "file");
         assert_eq!(tool_calls[0].arguments["operation"], "write");
         assert_eq!(tool_calls[0].arguments["content"], "line1\nline2");
+    }
+
+    #[test]
+    fn process_openai_responses_stream_event_emits_text_and_tool_call_deltas() {
+        let mut pending = std::collections::HashMap::new();
+
+        let text_event = OpenAiResponsesStreamingCompletionChunk::Delta(
+            rig::providers::openai::responses_api::streaming::ItemChunk {
+                item_id: Some("msg_1".to_string()),
+                output_index: 0,
+                data: OpenAiResponsesItemChunkKind::OutputTextDelta(
+                    rig::providers::openai::responses_api::streaming::DeltaTextChunk {
+                        content_index: 0,
+                        sequence_number: 1,
+                        delta: "hello".to_string(),
+                    },
+                ),
+            },
+        );
+
+        let tool_name_event = OpenAiResponsesStreamingCompletionChunk::Delta(
+            rig::providers::openai::responses_api::streaming::ItemChunk {
+                item_id: Some("fc_1".to_string()),
+                output_index: 0,
+                data: OpenAiResponsesItemChunkKind::OutputItemAdded(
+                    OpenAiResponsesStreamingItemDoneOutput {
+                        sequence_number: 2,
+                        item: OpenAiResponsesOutput::FunctionCall(
+                            rig::providers::openai::responses_api::OutputFunctionCall {
+                                id: "fc_1".to_string(),
+                                arguments: serde_json::json!({}),
+                                call_id: "call_1".to_string(),
+                                name: "reply".to_string(),
+                                status:
+                                    rig::providers::openai::responses_api::ToolStatus::InProgress,
+                            },
+                        ),
+                    },
+                ),
+            },
+        );
+
+        let tool_args_event = OpenAiResponsesStreamingCompletionChunk::Delta(
+            rig::providers::openai::responses_api::streaming::ItemChunk {
+                item_id: Some("fc_1".to_string()),
+                output_index: 0,
+                data: OpenAiResponsesItemChunkKind::FunctionCallArgsDelta(
+                    rig::providers::openai::responses_api::streaming::DeltaTextChunkWithItemId {
+                        item_id: "fc_1".to_string(),
+                        content_index: 0,
+                        sequence_number: 3,
+                        delta: "{\"content\":\"hi\"}".to_string(),
+                    },
+                ),
+            },
+        );
+
+        let text_events = process_openai_responses_stream_event(&text_event, &mut pending)
+            .expect("text event should parse");
+        assert!(matches!(
+            text_events.first(),
+            Some(RawStreamingChoice::Message(text)) if text == "hello"
+        ));
+
+        let tool_name_events =
+            process_openai_responses_stream_event(&tool_name_event, &mut pending)
+                .expect("tool name event should parse");
+        assert!(matches!(
+            tool_name_events.first(),
+            Some(RawStreamingChoice::ToolCallDelta { id, content, .. })
+                if id == "fc_1" && matches!(content, rig::streaming::ToolCallDeltaContent::Name(name) if name == "reply")
+        ));
+
+        let tool_arg_events = process_openai_responses_stream_event(&tool_args_event, &mut pending)
+            .expect("tool args event should parse");
+        assert!(matches!(
+            tool_arg_events.first(),
+            Some(RawStreamingChoice::ToolCallDelta { id, content, .. })
+                if id == "fc_1" && matches!(content, rig::streaming::ToolCallDeltaContent::Delta(delta) if delta == "{\"content\":\"hi\"}")
+        ));
     }
 
     #[test]

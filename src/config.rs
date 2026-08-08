@@ -15,7 +15,8 @@ pub(crate) use load::resolve_env_value;
 pub use load::set_resolve_secrets_store;
 pub use onboarding::run_onboarding;
 pub use permissions::{
-    DiscordPermissions, SlackPermissions, TelegramPermissions, TwitchPermissions,
+    DiscordPermissions, MattermostPermissions, SignalPermissions, SlackPermissions,
+    TelegramPermissions, TwitchPermissions,
 };
 pub(crate) use providers::default_provider_config;
 pub use runtime::RuntimeConfig;
@@ -59,14 +60,14 @@ mod tests {
 
     impl EnvGuard {
         fn new() -> Self {
-            // NOTE: Keep in sync with provider env vars that affect test behavior
-            const KEYS: [&str; 27] = [
+            const KEYS: &[&str] = &[
                 "SPACEBOT_DIR",
                 "SPACEBOT_DEPLOYMENT",
                 "SPACEBOT_CRON_TIMEZONE",
                 "SPACEBOT_USER_TIMEZONE",
                 "ANTHROPIC_API_KEY",
                 "ANTHROPIC_BASE_URL",
+                "ANTHROPIC_AUTH_TOKEN",
                 "ANTHROPIC_OAUTH_TOKEN",
                 "OPENAI_API_KEY",
                 "OPENROUTER_API_KEY",
@@ -88,14 +89,15 @@ mod tests {
                 "MINIMAX_CN_API_KEY",
                 "MOONSHOT_API_KEY",
                 "ZAI_CODING_PLAN_API_KEY",
+                "GITHUB_COPILOT_API_KEY",
             ];
 
             let vars = KEYS
-                .into_iter()
-                .map(|key| (key, std::env::var(key).ok()))
+                .iter()
+                .map(|&key| (key, std::env::var(key).ok()))
                 .collect::<Vec<_>>();
 
-            for key in KEYS {
+            for &key in KEYS {
                 unsafe {
                     std::env::remove_var(key);
                 }
@@ -520,6 +522,41 @@ bind = "127.0.0.1"
         assert_eq!(config.api.bind, "[::]");
     }
 
+    #[test]
+    fn test_docker_deployment_forces_api_bind_from_toml() {
+        let _lock = env_test_lock().lock();
+        let _env = EnvGuard::new();
+
+        unsafe {
+            std::env::set_var("SPACEBOT_DEPLOYMENT", "docker");
+        }
+
+        let toml = r#"
+[api]
+bind = "127.0.0.1"
+"#;
+
+        let parsed: TomlConfig = toml::from_str(toml).expect("failed to parse test TOML");
+        let config = Config::from_toml(parsed, PathBuf::from(".")).expect("failed to build Config");
+
+        assert_eq!(config.api.bind, "0.0.0.0");
+    }
+
+    #[test]
+    fn test_docker_deployment_forces_api_bind_from_env_defaults() {
+        let _lock = env_test_lock().lock();
+        let _env = EnvGuard::new();
+
+        unsafe {
+            std::env::set_var("SPACEBOT_DEPLOYMENT", "docker");
+        }
+
+        let config = Config::load_from_env(&Config::default_instance_dir())
+            .expect("failed to load config from env");
+
+        assert_eq!(config.api.bind, "0.0.0.0");
+    }
+
     /// Helper to build a minimal `SlackConfig` for permission tests.
     fn slack_config_with_dm_users(dm_allowed_users: Vec<String>) -> SlackConfig {
         SlackConfig {
@@ -541,9 +578,11 @@ bind = "127.0.0.1"
             guild_id: None,
             workspace_id: workspace_id.map(String::from),
             chat_id: None,
+            team_id: None,
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users,
+            settings: None,
         }
     }
 
@@ -1099,6 +1138,49 @@ maintenance_merge_similarity_threshold = 1.1
     }
 
     #[test]
+    fn test_participant_context_defaults_and_overrides_resolution() {
+        let toml = r#"
+[defaults.participant_context]
+enabled = false
+min_participants = 2
+token_budget = 280
+max_participants = 3
+
+[[agents]]
+id = "main"
+"#;
+        let parsed: TomlConfig = toml::from_str(toml).expect("failed to parse test TOML");
+        let config = Config::from_toml(parsed, PathBuf::from(".")).expect("failed to build Config");
+
+        assert!(!config.defaults.participant_context.enabled);
+        assert_eq!(config.defaults.participant_context.min_participants, 2);
+        assert_eq!(config.defaults.participant_context.token_budget, 280);
+        assert_eq!(config.defaults.participant_context.max_participants, 3);
+    }
+
+    #[test]
+    fn test_participant_context_rejects_impossible_bounds() {
+        let toml = r#"
+[defaults.participant_context]
+min_participants = 4
+max_participants = 3
+
+[[agents]]
+id = "main"
+"#;
+        let parsed: TomlConfig = toml::from_str(toml).expect("failed to parse test TOML");
+        let error = Config::from_toml(parsed, PathBuf::from("."))
+            .expect_err("expected invalid participant context bounds to fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("defaults.participant_context.max_participants (3) must be >= defaults.participant_context.min_participants (4)"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn test_work_readiness_requires_warm_state() {
         let readiness = evaluate_work_readiness(
             WarmupConfig::default(),
@@ -1177,7 +1259,8 @@ maintenance_merge_similarity_threshold = 1.1
     }
 
     #[test]
-    fn test_work_readiness_rejects_stale_bulletin() {
+    fn test_work_readiness_allows_old_synthesis() {
+        // Knowledge synthesis is change-driven — staleness no longer blocks readiness.
         let readiness = evaluate_work_readiness(
             WarmupConfig {
                 refresh_secs: 60,
@@ -1193,10 +1276,9 @@ maintenance_merge_similarity_threshold = 1.1
             122_000,
         );
 
-        assert_eq!(readiness.stale_after_secs, 120);
         assert_eq!(readiness.bulletin_age_secs, Some(121));
-        assert!(!readiness.ready);
-        assert_eq!(readiness.reason, Some(WorkReadinessReason::BulletinStale));
+        assert!(readiness.ready, "old synthesis should not block readiness");
+        assert_eq!(readiness.reason, None);
     }
 
     #[test]
@@ -1397,9 +1479,11 @@ maintenance_merge_similarity_threshold = 1.1
             guild_id: None,
             workspace_id: None,
             chat_id: None,
+            team_id: None,
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users: vec![],
+            settings: None,
         };
         assert_eq!(binding.runtime_adapter_key(), "telegram:sales");
     }
@@ -1413,9 +1497,11 @@ maintenance_merge_similarity_threshold = 1.1
             guild_id: None,
             workspace_id: None,
             chat_id: None,
+            team_id: None,
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users: vec![],
+            settings: None,
         };
         assert!(binding.uses_default_adapter());
     }
@@ -1444,9 +1530,11 @@ maintenance_merge_similarity_threshold = 1.1
             guild_id: None,
             workspace_id: None,
             chat_id: None,
+            team_id: None,
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users: vec![],
+            settings: None,
         };
         let message = test_inbound_message("telegram", None);
         assert!(binding_adapter_matches(&binding, &message));
@@ -1461,9 +1549,11 @@ maintenance_merge_similarity_threshold = 1.1
             guild_id: None,
             workspace_id: None,
             chat_id: None,
+            team_id: None,
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users: vec![],
+            settings: None,
         };
         let message = test_inbound_message("telegram", Some("telegram:support"));
         assert!(binding_adapter_matches(&binding, &message));
@@ -1478,9 +1568,11 @@ maintenance_merge_similarity_threshold = 1.1
             guild_id: None,
             workspace_id: None,
             chat_id: None,
+            team_id: None,
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users: vec![],
+            settings: None,
         };
         let message = test_inbound_message("telegram", None);
         assert!(!binding_adapter_matches(&binding, &message));
@@ -1495,9 +1587,11 @@ maintenance_merge_similarity_threshold = 1.1
             guild_id: None,
             workspace_id: None,
             chat_id: None,
+            team_id: None,
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users: vec![],
+            settings: None,
         };
         let message = test_inbound_message("telegram", Some("telegram:support"));
         assert!(!binding_adapter_matches(&binding, &message));
@@ -1512,9 +1606,11 @@ maintenance_merge_similarity_threshold = 1.1
             guild_id: None,
             workspace_id: None,
             chat_id: None,
+            team_id: None,
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users: vec![],
+            settings: None,
         };
         let message = test_inbound_message("telegram", Some("telegram:sales"));
         assert!(!binding_adapter_matches(&binding, &message));
@@ -1539,6 +1635,8 @@ maintenance_merge_similarity_threshold = 1.1
             email: None,
             webhook: None,
             twitch: None,
+            signal: None,
+            mattermost: None,
         };
         let bindings = vec![
             Binding {
@@ -1548,9 +1646,11 @@ maintenance_merge_similarity_threshold = 1.1
                 guild_id: None,
                 workspace_id: None,
                 chat_id: None,
+                team_id: None,
                 channel_ids: vec![],
                 require_mention: false,
                 dm_allowed_users: vec![],
+                settings: None,
             },
             Binding {
                 agent_id: "support-agent".into(),
@@ -1559,16 +1659,20 @@ maintenance_merge_similarity_threshold = 1.1
                 guild_id: None,
                 workspace_id: None,
                 chat_id: None,
+                team_id: None,
                 channel_ids: vec![],
                 require_mention: false,
                 dm_allowed_users: vec![],
+                settings: None,
             },
         ];
-        assert!(validate_named_messaging_adapters(&messaging, &bindings).is_ok());
+        let result = validate_named_messaging_adapters(&messaging, bindings, false)
+            .expect("bindings should be resolvable");
+        assert_eq!(result.len(), 2);
     }
 
     #[test]
-    fn validate_named_adapters_missing_instance() {
+    fn validate_named_adapters_missing_instance_skipped() {
         let messaging = MessagingConfig {
             discord: None,
             slack: None,
@@ -1581,6 +1685,8 @@ maintenance_merge_similarity_threshold = 1.1
             email: None,
             webhook: None,
             twitch: None,
+            signal: None,
+            mattermost: None,
         };
         let bindings = vec![Binding {
             agent_id: "main".into(),
@@ -1589,11 +1695,15 @@ maintenance_merge_similarity_threshold = 1.1
             guild_id: None,
             workspace_id: None,
             chat_id: None,
+            team_id: None,
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users: vec![],
+            settings: None,
         }];
-        assert!(validate_named_messaging_adapters(&messaging, &bindings).is_err());
+        let result = validate_named_messaging_adapters(&messaging, bindings, false)
+            .expect("bindings should be resolvable");
+        assert!(result.is_empty(), "unresolvable binding should be skipped");
     }
 
     #[test]
@@ -1643,6 +1753,8 @@ maintenance_merge_similarity_threshold = 1.1
             }),
             webhook: None,
             twitch: None,
+            signal: None,
+            mattermost: None,
         };
         let bindings = vec![Binding {
             agent_id: "main".into(),
@@ -1651,15 +1763,22 @@ maintenance_merge_similarity_threshold = 1.1
             guild_id: None,
             workspace_id: None,
             chat_id: None,
+            team_id: None,
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users: vec![],
+            settings: None,
         }];
-        assert!(validate_named_messaging_adapters(&messaging, &bindings).is_err());
+        let result = validate_named_messaging_adapters(&messaging, bindings, false)
+            .expect("bindings should be resolvable");
+        assert!(
+            result.is_empty(),
+            "unsupported platform binding should be skipped"
+        );
     }
 
     #[test]
-    fn validate_binding_without_default_adapter_rejected() {
+    fn validate_binding_without_default_adapter_skipped() {
         let messaging = MessagingConfig {
             discord: None,
             slack: None,
@@ -1677,6 +1796,8 @@ maintenance_merge_similarity_threshold = 1.1
             email: None,
             webhook: None,
             twitch: None,
+            signal: None,
+            mattermost: None,
         };
         // Binding targets default adapter, but no default credentials exist
         let bindings = vec![Binding {
@@ -1686,11 +1807,255 @@ maintenance_merge_similarity_threshold = 1.1
             guild_id: None,
             workspace_id: None,
             chat_id: None,
+            team_id: None,
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users: vec![],
+            settings: None,
         }];
-        assert!(validate_named_messaging_adapters(&messaging, &bindings).is_err());
+        let result = validate_named_messaging_adapters(&messaging, bindings, false)
+            .expect("bindings should be resolvable");
+        assert!(
+            result.is_empty(),
+            "binding without default adapter should be skipped"
+        );
+    }
+
+    #[test]
+    fn validate_mixed_valid_and_invalid_bindings_filters_correctly() {
+        let messaging = MessagingConfig {
+            discord: None,
+            slack: None,
+            telegram: Some(TelegramConfig {
+                enabled: true,
+                token: "tok".into(),
+                instances: vec![TelegramInstanceConfig {
+                    name: "support".into(),
+                    enabled: true,
+                    token: "tok2".into(),
+                    dm_allowed_users: vec![],
+                }],
+                dm_allowed_users: vec![],
+            }),
+            email: None,
+            webhook: None,
+            twitch: None,
+            signal: None,
+            mattermost: None,
+        };
+        let bindings = vec![
+            // Valid: default adapter with credentials
+            Binding {
+                agent_id: "agent-a".into(),
+                channel: "telegram".into(),
+                adapter: None,
+                guild_id: None,
+                workspace_id: None,
+                chat_id: None,
+                team_id: None,
+                channel_ids: vec![],
+                require_mention: false,
+                dm_allowed_users: vec![],
+                settings: None,
+            },
+            // Invalid: references a non-existent named adapter
+            Binding {
+                agent_id: "agent-b".into(),
+                channel: "telegram".into(),
+                adapter: Some("ghost".into()),
+                guild_id: None,
+                workspace_id: None,
+                chat_id: None,
+                team_id: None,
+                channel_ids: vec![],
+                require_mention: false,
+                dm_allowed_users: vec![],
+                settings: None,
+            },
+            // Valid: references an existing named adapter
+            Binding {
+                agent_id: "agent-c".into(),
+                channel: "telegram".into(),
+                adapter: Some("support".into()),
+                guild_id: None,
+                workspace_id: None,
+                chat_id: None,
+                team_id: None,
+                channel_ids: vec![],
+                require_mention: false,
+                dm_allowed_users: vec![],
+                settings: None,
+            },
+            // Invalid: no discord config at all
+            Binding {
+                agent_id: "agent-d".into(),
+                channel: "discord".into(),
+                adapter: None,
+                guild_id: None,
+                workspace_id: None,
+                chat_id: None,
+                team_id: None,
+                channel_ids: vec![],
+                require_mention: false,
+                dm_allowed_users: vec![],
+                settings: None,
+            },
+        ];
+        let result = validate_named_messaging_adapters(&messaging, bindings, false)
+            .expect("bindings should be resolvable");
+        assert_eq!(
+            result.len(),
+            2,
+            "only the two valid bindings should survive"
+        );
+        assert_eq!(result[0].agent_id, "agent-a");
+        assert_eq!(result[1].agent_id, "agent-c");
+    }
+
+    #[test]
+    fn validate_missing_messaging_config_skipped() {
+        let messaging = MessagingConfig {
+            discord: None,
+            slack: None,
+            telegram: None,
+            email: None,
+            webhook: None,
+            twitch: None,
+            signal: None,
+            mattermost: None,
+        };
+        let bindings = vec![Binding {
+            agent_id: "main".into(),
+            channel: "telegram".into(),
+            adapter: None,
+            guild_id: None,
+            workspace_id: None,
+            chat_id: None,
+            team_id: None,
+            channel_ids: vec![],
+            require_mention: false,
+            dm_allowed_users: vec![],
+            settings: None,
+        }];
+        let result = validate_named_messaging_adapters(&messaging, bindings, false)
+            .expect("bindings should be resolvable");
+        assert!(
+            result.is_empty(),
+            "binding with no messaging config should be skipped"
+        );
+    }
+
+    #[test]
+    fn validate_strict_mode_rejects_missing_messaging_config() {
+        let messaging = MessagingConfig {
+            discord: None,
+            slack: None,
+            telegram: None,
+            email: None,
+            webhook: None,
+            twitch: None,
+            signal: None,
+            mattermost: None,
+        };
+        let bindings = vec![Binding {
+            agent_id: "main".into(),
+            channel: "telegram".into(),
+            adapter: None,
+            guild_id: None,
+            workspace_id: None,
+            chat_id: None,
+            team_id: None,
+            channel_ids: vec![],
+            require_mention: false,
+            dm_allowed_users: vec![],
+            settings: None,
+        }];
+        let result = validate_named_messaging_adapters(&messaging, bindings, true);
+        assert!(
+            result.is_err(),
+            "strict mode should reject unresolvable bindings"
+        );
+    }
+
+    #[test]
+    fn validate_disabled_instance_is_filtered_out() {
+        let messaging = MessagingConfig {
+            discord: None,
+            slack: None,
+            telegram: Some(TelegramConfig {
+                enabled: true,
+                token: "tok".into(),
+                instances: vec![TelegramInstanceConfig {
+                    name: "support".into(),
+                    enabled: false,
+                    token: "tok2".into(),
+                    dm_allowed_users: vec![],
+                }],
+                dm_allowed_users: vec![],
+            }),
+            email: None,
+            webhook: None,
+            twitch: None,
+            signal: None,
+            mattermost: None,
+        };
+        let bindings = vec![Binding {
+            agent_id: "main".into(),
+            channel: "telegram".into(),
+            adapter: Some("support".into()),
+            guild_id: None,
+            workspace_id: None,
+            chat_id: None,
+            team_id: None,
+            channel_ids: vec![],
+            require_mention: false,
+            dm_allowed_users: vec![],
+            settings: None,
+        }];
+        let result = validate_named_messaging_adapters(&messaging, bindings, false)
+            .expect("bindings should be resolvable");
+        assert!(
+            result.is_empty(),
+            "binding to disabled instance should be skipped"
+        );
+    }
+
+    #[test]
+    fn validate_disabled_platform_default_is_filtered_out() {
+        let messaging = MessagingConfig {
+            discord: None,
+            slack: None,
+            telegram: Some(TelegramConfig {
+                enabled: false,
+                token: "tok".into(),
+                instances: vec![],
+                dm_allowed_users: vec![],
+            }),
+            email: None,
+            webhook: None,
+            twitch: None,
+            signal: None,
+            mattermost: None,
+        };
+        let bindings = vec![Binding {
+            agent_id: "main".into(),
+            channel: "telegram".into(),
+            adapter: None,
+            guild_id: None,
+            workspace_id: None,
+            chat_id: None,
+            team_id: None,
+            channel_ids: vec![],
+            require_mention: false,
+            dm_allowed_users: vec![],
+            settings: None,
+        }];
+        let result = validate_named_messaging_adapters(&messaging, bindings, false)
+            .expect("bindings should be resolvable");
+        assert!(
+            result.is_empty(),
+            "binding to disabled platform default should be skipped"
+        );
     }
 
     #[test]
@@ -1847,5 +2212,48 @@ command = "/usr/bin/test"
         let parsed: TomlConfig = toml::from_str(toml).expect("should parse without error");
         // The mcp_servers data is silently dropped — verify it's not accessible
         assert!(parsed.defaults.mcp.is_empty());
+    }
+
+    #[test]
+    fn tool_use_enforcement_parses_and_resolves() {
+        let toml = r#"
+[defaults]
+tool_use_enforcement = "always"
+
+[[agents]]
+id = "main"
+tool_use_enforcement = ["gemini", "deepseek"]
+"#;
+
+        let parsed: TomlConfig = toml::from_str(toml).expect("failed to parse test TOML");
+        let config = Config::from_toml(parsed, PathBuf::from(".")).expect("failed to build Config");
+
+        assert_eq!(
+            config.defaults.tool_use_enforcement,
+            ToolUseEnforcement::Always
+        );
+        assert_eq!(
+            config.agents[0].tool_use_enforcement,
+            Some(ToolUseEnforcement::Custom(vec![
+                "gemini".to_string(),
+                "deepseek".to_string(),
+            ]))
+        );
+
+        let resolved = config.resolve_agents();
+        assert_eq!(
+            resolved[0].tool_use_enforcement,
+            ToolUseEnforcement::Custom(vec!["gemini".to_string(), "deepseek".to_string()])
+        );
+        assert!(
+            resolved[0]
+                .tool_use_enforcement
+                .should_inject("google/gemini-2.5-pro")
+        );
+        assert!(
+            !resolved[0]
+                .tool_use_enforcement
+                .should_inject("anthropic/claude-sonnet-4")
+        );
     }
 }
