@@ -47,6 +47,168 @@ const TRANSIENT_RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::fro
 /// without completing the task.
 const MAX_SEGMENTS: usize = 10;
 
+/// Default wall-clock budget for a worker run when no agent override is set.
+pub const DEFAULT_WORKER_WALL_CLOCK_TIMEOUT_SECS: u64 = 1800;
+
+/// Reason a worker run was blocked by an external defense (captcha, login
+/// wall, rate-limit, fraud-detect WAF). Detection only — the agent fails
+/// cleanly and surfaces to the parent app's escalation path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockReason {
+    /// Captcha challenge (recaptcha, hcaptcha, Cloudflare Turnstile, etc.).
+    Captcha { provider: String },
+    /// Page redirected to a login URL or returned 401/403 with auth-prompting
+    /// headers.
+    LoginWall,
+    /// HTTP 429 or equivalent rate-limit signal. `retry_after_secs` is set
+    /// when the response carried a `Retry-After` header.
+    RateLimit { retry_after_secs: Option<u64> },
+    /// WAF-style fraud / bot-protect block (Akamai, Cloudflare challenge,
+    /// AWS WAF, Imperva). `vendor` identifies the WAF where known.
+    FraudDetect { vendor: String },
+    /// Detector fired but couldn't classify into a specific category.
+    Unknown,
+}
+
+impl BlockReason {
+    pub fn kind_tag(&self) -> &'static str {
+        match self {
+            Self::Captcha { .. } => "captcha",
+            Self::LoginWall => "login_wall",
+            Self::RateLimit { .. } => "rate_limit",
+            Self::FraudDetect { .. } => "fraud_detect",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Captcha { provider } => format!("captcha ({provider})"),
+            Self::LoginWall => "login wall".to_string(),
+            Self::RateLimit { retry_after_secs } => match retry_after_secs {
+                Some(secs) => format!("rate limit (retry after {secs}s)"),
+                None => "rate limit".to_string(),
+            },
+            Self::FraudDetect { vendor } => format!("fraud detect ({vendor})"),
+            Self::Unknown => "unknown block".to_string(),
+        }
+    }
+}
+
+/// Captured artifacts at the moment a block was detected. Surfaced via
+/// `WorkerOutcome::Blocked` so the parent app's escalation path has enough
+/// to triage (and the agent can capture the dead-end into memory).
+#[derive(Debug, Clone, Default)]
+pub struct BlockEvidence {
+    /// Final URL the browser landed on at detection time.
+    pub final_url: Option<String>,
+    /// Snippet of page HTML (first ~4KB) for human triage.
+    pub html_snippet: Option<String>,
+    /// HTTP status code where available (server-side detected).
+    pub status: Option<u16>,
+}
+
+/// Shared mutable slot that browser tools write to on positive block
+/// detection. The worker reads it at each loop iteration and short-circuits
+/// to `WorkerOutcome::Blocked` when set. Mirrors the role of
+/// `SpacebotHook::outcome_signaled` for terminal completion intent.
+pub type BlockSignal = std::sync::Arc<std::sync::Mutex<Option<BlockSignalData>>>;
+
+#[derive(Debug, Clone)]
+pub struct BlockSignalData {
+    pub reason: BlockReason,
+    pub url: Option<String>,
+    pub evidence: BlockEvidence,
+}
+
+/// Construct a fresh empty block signal slot.
+pub fn new_block_signal() -> BlockSignal {
+    std::sync::Arc::new(std::sync::Mutex::new(None))
+}
+
+/// Structured outcome of a worker's `run()` call.
+///
+/// Replaces the prior `Result<String>` return so callers can distinguish a
+/// clean success from a partial (max-segments) exit, a wall-clock timeout,
+/// a tool-driven block (captcha / login wall), a cancellation, or a hard
+/// failure. All variants carry enough payload that the caller can emit a
+/// `ProcessEvent::WorkerComplete` without losing context.
+#[derive(Debug, Clone)]
+pub enum WorkerOutcome {
+    /// Worker completed and produced a final assistant response.
+    Success { result: String },
+    /// Worker hit the segment ceiling (`MAX_SEGMENTS`) before producing a
+    /// terminal response. `result` is the last assistant text or a synthetic
+    /// "max segments reached" marker.
+    Partial { result: String, segments_run: usize },
+    /// Worker was cancelled (LLM `PromptCancelled`, manual cancel, etc.).
+    Cancelled { reason: String },
+    /// Worker exceeded the wall-clock timeout. `segments_run` reflects how
+    /// many segments completed before the timeout fired.
+    Timeout {
+        elapsed_secs: u64,
+        segments_run: usize,
+    },
+    /// Browser (or other tool) detected an external defense — captcha,
+    /// login wall, rate limit, WAF block. The worker exits cleanly so the
+    /// agent can capture the dead-end into memory and the parent app can
+    /// escalate to a human.
+    Blocked {
+        reason: BlockReason,
+        url: Option<String>,
+        evidence: Box<BlockEvidence>,
+    },
+    /// Worker failed for any other reason (LLM error, transient retries
+    /// exhausted, context overflow exhausted, empty result without outcome).
+    Failed { reason: String },
+}
+
+impl WorkerOutcome {
+    /// Render the outcome as text suitable for relay to a channel.
+    pub fn into_text(self) -> String {
+        match self {
+            Self::Success { result } => result,
+            Self::Partial {
+                result,
+                segments_run,
+            } => format!(
+                "{result}\n\n(reached max segments after {segments_run} attempts — partial result)"
+            ),
+            Self::Cancelled { reason } => format!("Worker cancelled: {reason}"),
+            Self::Timeout {
+                elapsed_secs,
+                segments_run,
+            } => format!(
+                "Worker exceeded {elapsed_secs}s wall-clock timeout after {segments_run} segments."
+            ),
+            Self::Blocked { reason, url, .. } => match url {
+                Some(url) => format!("Worker blocked: {} at {url}", reason.describe()),
+                None => format!("Worker blocked: {}", reason.describe()),
+            },
+            Self::Failed { reason } => format!("Worker failed: {reason}"),
+        }
+    }
+
+    /// Whether the outcome should be classified as a successful completion
+    /// for downstream notification / task-state purposes. `Partial` counts as
+    /// success — the worker did real work, just hit a ceiling.
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Success { .. } | Self::Partial { .. })
+    }
+
+    /// Short stable kind tag for telemetry / event payloads.
+    pub fn kind_tag(&self) -> &'static str {
+        match self {
+            Self::Success { .. } => "success",
+            Self::Partial { .. } => "partial",
+            Self::Cancelled { .. } => "cancelled",
+            Self::Timeout { .. } => "timeout",
+            Self::Blocked { .. } => "blocked",
+            Self::Failed { .. } => "failed",
+        }
+    }
+}
+
 /// Worker state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerState {
@@ -97,6 +259,21 @@ pub struct Worker {
     pub wiki_write: bool,
     /// Model override from conversation settings (per-process or blanket).
     pub model_override: Option<String>,
+    /// Wall-clock budget for the entire `run()` invocation. Distinct from
+    /// the supervisor's `CortexConfig.worker_timeout_secs` (which is an
+    /// idle-kill bound measured from `last_activity_at`). Resolution chain
+    /// at construction: agent `CortexConfig.worker_wall_clock_timeout_secs`
+    /// → `DEFAULT_WORKER_WALL_CLOCK_TIMEOUT_SECS`.
+    pub worker_wall_clock_timeout_secs: u64,
+    /// Shared segment counter so the outer timeout wrapper can report
+    /// progress in `WorkerOutcome::Timeout` after the inner future is
+    /// cancelled.
+    pub segments_run: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Shared slot that browser tools (and any future block-aware tool)
+    /// write to on positive detection of an external defense. The worker
+    /// loop reads it at each iteration and short-circuits to
+    /// `WorkerOutcome::Blocked` when populated.
+    pub blocked_signal: BlockSignal,
 }
 
 impl Worker {
@@ -128,6 +305,12 @@ impl Worker {
         let (status_tx, status_rx) = watch::channel("starting".to_string());
         let (inject_tx, inject_rx) = mpsc::channel(8);
 
+        let worker_wall_clock_timeout_secs = deps
+            .runtime_config
+            .cortex
+            .load()
+            .worker_wall_clock_timeout_secs;
+
         (
             Self {
                 id,
@@ -153,6 +336,9 @@ impl Worker {
                 worker_memory_mode,
                 wiki_write,
                 model_override,
+                worker_wall_clock_timeout_secs,
+                segments_run: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                blocked_signal: new_block_signal(),
             },
             inject_tx,
         )
@@ -316,13 +502,47 @@ impl Worker {
         Ok(())
     }
 
+    /// Run the worker with the configured wall-clock budget.
+    ///
+    /// Wraps `run_inner` in `tokio::time::timeout`. On expiry the inner
+    /// future is dropped (cancelled mid-step) and we return
+    /// `WorkerOutcome::Timeout`, reading the segment count from the shared
+    /// atomic so the caller knows how far the worker got.
+    pub async fn run(self) -> Result<WorkerOutcome> {
+        let timeout_secs = self.worker_wall_clock_timeout_secs;
+        let segments_tracker = self.segments_run.clone();
+        let worker_id = self.id;
+        let agent_id = self.deps.agent_id.clone();
+
+        let inner_fut = self.run_inner();
+        tokio::pin!(inner_fut);
+
+        tokio::select! {
+            outcome = &mut inner_fut => outcome,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
+                let segments = segments_tracker.load(std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    %worker_id,
+                    %agent_id,
+                    timeout_secs,
+                    segments_run = segments,
+                    "worker exceeded wall-clock timeout"
+                );
+                Ok(WorkerOutcome::Timeout {
+                    elapsed_secs: timeout_secs,
+                    segments_run: segments,
+                })
+            }
+        }
+    }
+
     /// Run the worker's LLM agent loop until completion.
     ///
     /// Runs in segments of 25 turns. After each segment, checks context usage
     /// and compacts if the worker is approaching the context window limit.
     /// This prevents long-running workers from dying mid-task due to context
     /// exhaustion.
-    pub async fn run(mut self) -> Result<String> {
+    async fn run_inner(mut self) -> Result<WorkerOutcome> {
         // Wire the injection receiver into the hook so `on_completion_call`
         // can drain pending injected context before each LLM turn.
         if let Some(inject_rx) = self.inject_rx.take() {
@@ -335,6 +555,11 @@ impl Worker {
         tracing::info!(worker_id = %self.id, task = %self.task, "worker starting");
 
         let mcp_tools = self.deps.mcp_manager.get_tools().await;
+        let tool_call_registry = crate::tools::ToolCallRegistry::default();
+        self.hook = self
+            .hook
+            .clone()
+            .with_tool_call_registry(tool_call_registry.clone());
 
         // Create per-worker ToolServer with task tools
         let worker_tool_server = crate::tools::create_worker_tool_server(
@@ -343,6 +568,8 @@ impl Worker {
             self.channel_id.clone(),
             self.deps.task_store.clone(),
             self.deps.event_tx.clone(),
+            self.deps.tool_output_tx.clone(),
+            tool_call_registry,
             self.browser_config.clone(),
             self.screenshot_dir.clone(),
             self.brave_search_key.clone(),
@@ -354,6 +581,7 @@ impl Worker {
             self.deps.memory_search.clone(),
             self.wiki_write,
             self.deps.wiki_store.clone(),
+            Some(self.blocked_signal.clone()),
         );
 
         let routing = self.deps.runtime_config.routing.load();
@@ -397,9 +625,10 @@ impl Worker {
         // Run the initial task in segments with compaction checkpoints
         // (skipped entirely for resumed workers).
         let mut prompt = self.task.clone();
-        let mut segments_run = 0;
+        let mut segments_run: usize = 0;
         let mut overflow_retries = 0;
         let mut transient_retries = 0;
+        let mut hit_max_segments = false;
 
         let mut result = if resuming {
             // For resumed workers, synthesize a "result" from the task
@@ -407,7 +636,36 @@ impl Worker {
             String::new()
         } else {
             loop {
+                // Short-circuit on a tool-detected block (captcha / login wall
+                // / WAF). Browser tools write to `blocked_signal` after their
+                // page action; the worker exits cleanly so the agent can
+                // capture the dead-end into memory and the parent app can
+                // escalate.
+                if let Some(data) = self.blocked_signal.lock().ok().and_then(|mut s| s.take()) {
+                    self.state = WorkerState::Failed;
+                    self.hook
+                        .send_status(format!("blocked: {}", data.reason.kind_tag()));
+                    self.write_failure_log(
+                        &history,
+                        &format!("blocked: {}", data.reason.describe()),
+                    );
+                    self.persist_transcript(&compacted_history, &history).await;
+                    tracing::warn!(
+                        worker_id = %self.id,
+                        reason = %data.reason.kind_tag(),
+                        url = ?data.url,
+                        "worker short-circuited on blocked signal"
+                    );
+                    return Ok(WorkerOutcome::Blocked {
+                        reason: data.reason,
+                        url: data.url,
+                        evidence: Box::new(data.evidence),
+                    });
+                }
+
                 segments_run += 1;
+                self.segments_run
+                    .store(segments_run, std::sync::atomic::Ordering::Relaxed);
 
                 // Pre-prompt maintenance: dedup stale tool results and check
                 // context usage *before* each LLM call, not just at segment
@@ -439,6 +697,7 @@ impl Worker {
                                 "worker hit max segments, returning partial result"
                             );
                             self.hook.send_status("done (max segments)");
+                            hit_max_segments = true;
                             break crate::agent::extract_last_assistant_text(&history)
                                 .unwrap_or_else(|| {
                                     "Worker reached maximum segments without a final response."
@@ -468,17 +727,20 @@ impl Worker {
                         self.write_failure_log(&history, &format!("cancelled: {reason}"));
                         self.persist_transcript(&compacted_history, &history).await;
                         tracing::info!(worker_id = %self.id, %reason, "worker cancelled");
-                        return Err(crate::error::AgentError::Cancelled { reason }.into());
+                        return Ok(WorkerOutcome::Cancelled { reason });
                     }
                     Err(error) if is_context_overflow_error(&error.to_string()) => {
                         overflow_retries += 1;
                         if overflow_retries > MAX_OVERFLOW_RETRIES {
                             self.state = WorkerState::Failed;
                             self.hook.send_status("failed");
-                            self.write_failure_log(&history, &format!("context overflow after {MAX_OVERFLOW_RETRIES} compaction attempts: {error}"));
+                            let reason = format!(
+                                "context overflow after {MAX_OVERFLOW_RETRIES} compaction attempts: {error}"
+                            );
+                            self.write_failure_log(&history, &reason);
                             self.persist_transcript(&compacted_history, &history).await;
                             tracing::error!(worker_id = %self.id, %error, "worker context overflow unrecoverable");
-                            return Err(crate::error::AgentError::Other(error.into()).into());
+                            return Ok(WorkerOutcome::Failed { reason });
                         }
 
                         tracing::warn!(
@@ -501,9 +763,10 @@ impl Worker {
                         if transient_retries > MAX_TRANSIENT_RETRIES {
                             self.state = WorkerState::Failed;
                             self.hook.send_status("failed");
-                            self.write_failure_log(&history, &format!(
+                            let reason = format!(
                                 "transient provider error after {MAX_TRANSIENT_RETRIES} retries: {error}"
-                            ));
+                            );
+                            self.write_failure_log(&history, &reason);
                             self.persist_transcript(&compacted_history, &history).await;
                             tracing::error!(
                                 worker_id = %self.id,
@@ -511,7 +774,7 @@ impl Worker {
                                 %error,
                                 "worker transient error retries exhausted"
                             );
-                            return Err(crate::error::AgentError::Other(error.into()).into());
+                            return Ok(WorkerOutcome::Failed { reason });
                         }
 
                         let delay =
@@ -536,10 +799,11 @@ impl Worker {
                     Err(error) => {
                         self.state = WorkerState::Failed;
                         self.hook.send_status("failed");
-                        self.write_failure_log(&history, &error.to_string());
+                        let reason = error.to_string();
+                        self.write_failure_log(&history, &reason);
                         self.persist_transcript(&compacted_history, &history).await;
                         tracing::error!(worker_id = %self.id, %error, "worker LLM call failed");
-                        return Err(crate::error::AgentError::Other(error.into()).into());
+                        return Ok(WorkerOutcome::Failed { reason });
                     }
                 }
             }
@@ -563,18 +827,18 @@ impl Worker {
             } else {
                 self.state = WorkerState::Failed;
                 self.hook.send_status("failed (empty result)");
+                let reason = "worker produced empty result without signaling a meaningful outcome"
+                    .to_string();
                 self.write_failure_log(&history, "worker produced empty result — likely a reasoning-only exit that bypassed the outcome gate");
                 self.persist_transcript(&compacted_history, &history).await;
                 tracing::error!(worker_id = %self.id, "worker produced empty result, treating as failure");
-                return Err(crate::error::AgentError::Other(anyhow::anyhow!(
-                    "worker produced empty result without signaling a meaningful outcome"
-                ))
-                .into());
+                return Ok(WorkerOutcome::Failed { reason });
             }
         }
 
         // For interactive workers, enter a follow-up loop
         let mut follow_up_failure: Option<String> = None;
+        let mut follow_up_blocked: Option<BlockSignalData> = None;
         if let Some(mut input_rx) = self.input_rx.take() {
             if !resuming {
                 // Fresh worker: persist transcript and signal idle for the first time.
@@ -588,6 +852,15 @@ impl Worker {
             while let Some(follow_up) = input_rx.recv().await {
                 self.state = WorkerState::Running;
                 self.hook.send_status("processing follow-up");
+
+                // Honor a blocked signal that may have arrived while we were
+                // idle waiting for input. Browser tools called during a prior
+                // follow-up turn may have detected captcha / login / WAF
+                // after the turn returned.
+                if let Some(data) = self.blocked_signal.lock().ok().and_then(|mut s| s.take()) {
+                    follow_up_blocked = Some(data);
+                    break;
+                }
 
                 // Dedup stale tool results and compact before follow-up if needed
                 dedup_tool_results(&mut history);
@@ -686,7 +959,11 @@ impl Worker {
                             let scrubbed = if let Some(store) =
                                 self.deps.runtime_config.secrets.load().as_ref().as_ref()
                             {
-                                crate::secrets::scrub::scrub_with_store(&response, store)
+                                crate::secrets::scrub::scrub_with_store(
+                                    &response,
+                                    store,
+                                    &self.deps.agent_id,
+                                )
                             } else {
                                 response
                             };
@@ -703,6 +980,28 @@ impl Worker {
                         }
                     }
                     Err(failure_reason) => {
+                        // Surface as Blocked when the failure was caused by a
+                        // browser tool detecting captcha / login / WAF — the
+                        // tool returned an error that bubbled up here, but
+                        // also wrote to `blocked_signal`. Without this check,
+                        // phase 4's structured Blocked outcome would
+                        // regress to a generic Failed for interactive
+                        // workers hitting blocks mid-conversation.
+                        if let Some(data) =
+                            self.blocked_signal.lock().ok().and_then(|mut s| s.take())
+                        {
+                            follow_up_blocked = Some(data);
+                            self.state = WorkerState::Failed;
+                            self.hook.send_status(format!(
+                                "blocked: {}",
+                                follow_up_blocked
+                                    .as_ref()
+                                    .expect("just set")
+                                    .reason
+                                    .kind_tag()
+                            ));
+                            break;
+                        }
                         self.state = WorkerState::Failed;
                         self.hook.send_status("failed");
                         follow_up_failure = Some(failure_reason);
@@ -717,10 +1016,27 @@ impl Worker {
             }
         }
 
+        if let Some(data) = follow_up_blocked {
+            self.persist_transcript(&compacted_history, &history).await;
+            tracing::warn!(
+                worker_id = %self.id,
+                reason = %data.reason.kind_tag(),
+                url = ?data.url,
+                "worker follow-up short-circuited on blocked signal"
+            );
+            return Ok(WorkerOutcome::Blocked {
+                reason: data.reason,
+                url: data.url,
+                evidence: Box::new(data.evidence),
+            });
+        }
+
         if let Some(failure_reason) = follow_up_failure {
             self.persist_transcript(&compacted_history, &history).await;
             tracing::error!(worker_id = %self.id, reason = %failure_reason, "worker failed");
-            return Err(crate::error::AgentError::Other(anyhow::anyhow!(failure_reason)).into());
+            return Ok(WorkerOutcome::Failed {
+                reason: failure_reason,
+            });
         }
 
         self.state = WorkerState::Done;
@@ -750,7 +1066,14 @@ impl Worker {
         }
 
         tracing::info!(worker_id = %self.id, "worker completed");
-        Ok(result)
+        if hit_max_segments {
+            Ok(WorkerOutcome::Partial {
+                result,
+                segments_run,
+            })
+        } else {
+            Ok(WorkerOutcome::Success { result })
+        }
     }
 
     /// Check context usage and compact history if approaching the limit.

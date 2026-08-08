@@ -29,6 +29,21 @@ impl SpawnWorkerTool {
     }
 }
 
+fn summarize_duplicate_task(task: &str) -> String {
+    let trimmed = task.trim();
+    if trimmed.is_empty() {
+        return "unspecified task".to_string();
+    }
+
+    const MAX_CHARS: usize = 80;
+    if trimmed.len() <= MAX_CHARS {
+        trimmed.to_string()
+    } else {
+        let boundary = trimmed.floor_char_boundary(MAX_CHARS);
+        format!("{}...", &trimmed[..boundary])
+    }
+}
+
 /// Error type for spawn worker tool.
 #[derive(Debug, thiserror::Error)]
 #[error("Worker spawn failed: {0}")]
@@ -188,6 +203,20 @@ impl Tool for SpawnWorkerTool {
         {
             let status = self.state.status_block.read().await;
             if let Some(existing_id) = status.find_duplicate_worker_task(&args.task) {
+                self.state
+                    .deps
+                    .working_memory
+                    .emit(
+                        crate::memory::WorkingMemoryEventType::BlockedOn,
+                        format!(
+                            "Worker spawn blocked on active worker {existing_id} for duplicate task: {}",
+                            summarize_duplicate_task(&args.task)
+                        ),
+                    )
+                    .channel(self.state.channel_id.to_string())
+                    .importance(0.6)
+                    .record();
+
                 return Ok(SpawnWorkerOutput {
                     worker_id: existing_id,
                     spawned: false,
@@ -415,7 +444,7 @@ impl Tool for DetachedSpawnWorkerTool {
 
         let secrets_guard = rc.secrets.load();
         let tool_secret_names = match (*secrets_guard).as_ref() {
-            Some(store) => store.tool_secret_names(),
+            Some(store) => store.tool_secret_names(&self.deps.agent_id),
             None => Vec::new(),
         };
 
@@ -487,7 +516,7 @@ impl Tool for DetachedSpawnWorkerTool {
             .working_memory
             .emit(
                 crate::memory::WorkingMemoryEventType::WorkerSpawned,
-                format!("Worker spawned (cortex): {}", &args.task),
+                format!("Worker spawned (cortex): {}", args.task),
             )
             .importance(0.5)
             .record();

@@ -1,0 +1,5 @@
+# Pinned so local builds and CI compile with the same rustc/clippy.
+# CI reads this version via .github/workflows/ci.yml — bump both together.
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]
