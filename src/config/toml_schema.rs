@@ -29,6 +29,14 @@ pub(super) struct TomlConfig {
     pub(super) metrics: TomlMetricsConfig,
     #[serde(default)]
     pub(super) telemetry: TomlTelemetryConfig,
+    #[serde(default)]
+    pub(super) memory_janitor: TomlMemoryJanitorConfig,
+}
+
+#[derive(Deserialize, Default)]
+pub(super) struct TomlMemoryJanitorConfig {
+    pub(super) enabled: Option<bool>,
+    pub(super) interval_secs: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -362,8 +370,11 @@ pub(super) struct TomlCompactionConfig {
 
 #[derive(Deserialize)]
 pub(super) struct TomlCortexConfig {
+    pub(super) mode: Option<crate::config::CortexMode>,
     pub(super) tick_interval_secs: Option<u64>,
     pub(super) worker_timeout_secs: Option<u64>,
+    pub(super) worker_wall_clock_timeout_secs: Option<u64>,
+    pub(super) cron_default_timeout_secs: Option<u64>,
     pub(super) branch_timeout_secs: Option<u64>,
     pub(super) detached_worker_timeout_retry_limit: Option<u8>,
     pub(super) supervisor_kill_budget_per_tick: Option<usize>,

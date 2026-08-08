@@ -2773,6 +2773,16 @@ async fn initialize_agents(
             .collect(),
     );
 
+    // Wake-dispatch infrastructure for dormant-mode agents. Always spawned
+    // so active-mode agents can also participate (cron / message wake hooks
+    // are mode-agnostic — `cortex::wake_one` is a no-op contention with the
+    // active loop's pickup, harmless either way). The registry lives on
+    // `api_state` so runtime agent-create / agent-delete paths can keep it
+    // in sync without going through main.
+    let wake_registry = api_state.wake_registry.clone();
+    let wake_tx = spacebot::agent::wake::spawn_wake_manager(wake_registry.clone());
+    api_state.wake_tx.store(Arc::new(Some(wake_tx.clone())));
+
     for agent_config in &resolved_agents {
         tracing::info!(agent_id = %agent_config.id, "initializing agent");
 
@@ -2907,7 +2917,10 @@ async fn initialize_agents(
             spacebot::memory::WorkingMemoryStore::new(db.sqlite.clone(), working_memory_timezone);
 
         // Per-agent control and memory event buses (broadcast fan-out).
-        let (event_tx, memory_event_tx) = spacebot::create_process_event_buses();
+        let process_event_buses = spacebot::create_process_event_buses();
+        let event_tx = process_event_buses.control;
+        let memory_event_tx = process_event_buses.memory;
+        let tool_output_tx = process_event_buses.tool_output;
 
         let agent_id: spacebot::AgentId = Arc::from(agent_config.id.as_str());
         let mcp_manager = Arc::new(spacebot::mcp::McpManager::new(agent_config.mcp.clone()));
@@ -2969,6 +2982,7 @@ async fn initialize_agents(
                 agent_config.workspace.clone(),
                 &config.instance_dir,
                 agent_config.data_dir.clone(),
+                agent_id.clone(),
             )
             .await,
         );
@@ -2993,6 +3007,7 @@ async fn initialize_agents(
             runtime_config,
             event_tx,
             memory_event_tx,
+            tool_output_tx,
             sqlite_pool: db.sqlite.clone(),
             messaging_manager: None,
             sandbox,
@@ -3006,6 +3021,7 @@ async fn initialize_agents(
             working_memory,
             api_state: Some(api_state.clone()),
             wiki_store: Some(global_wiki_store.clone()),
+            wake_tx: Some(wake_tx.clone()),
         };
 
         let agent = spacebot::Agent {
@@ -3014,6 +3030,12 @@ async fn initialize_agents(
             db,
             deps,
         };
+
+        // Register with the wake manager so external triggers can reach this agent.
+        wake_registry
+            .write()
+            .await
+            .insert(agent_id.clone(), agent.deps.clone());
 
         tracing::info!(agent_id = %agent_config.id, "agent initialized");
         agents.insert(agent_id, agent);
@@ -3073,6 +3095,8 @@ async fn initialize_agents(
         for (agent_id, agent) in agents.iter() {
             let event_rx = agent.deps.event_tx.subscribe();
             api_state.register_agent_events(agent_id.to_string(), event_rx);
+            let tool_output_rx = agent.deps.tool_output_tx.subscribe();
+            api_state.register_tool_output_stream(agent_id.to_string(), tool_output_rx);
             agent_pools.insert(agent_id.to_string(), agent.db.sqlite.clone());
             memory_searches.insert(agent_id.to_string(), agent.deps.memory_search.clone());
             mcp_managers.insert(agent_id.to_string(), agent.deps.mcp_manager.clone());
@@ -3118,6 +3142,13 @@ async fn initialize_agents(
         let mut startup_warmup = tokio::task::JoinSet::new();
 
         for (agent_id, agent) in agents.iter() {
+            // Dormant agents stay cold at startup — running warmup here would
+            // touch model/embedding load paths the dormant-mode contract
+            // promises to skip until an explicit wake.
+            if agent.deps.runtime_config.cortex.load().mode.is_dormant() {
+                tracing::info!(agent_id = %agent_id, "startup warmup skipped: dormant");
+                continue;
+            }
             let deps = agent.deps.clone();
             let sqlite_pool = agent.db.sqlite.clone();
             let agent_id = agent_id.clone();
@@ -3726,8 +3757,19 @@ async fn initialize_agents(
         }
     }
 
-    // Start cortex warmup, runtime, and association loops for each agent
+    // Start cortex warmup, runtime, and association loops for each agent.
+    // Skip every loop when the agent is in Dormant mode — those agents wake
+    // only on external triggers (cross-agent message, cron fire, admin API).
     for (agent_id, agent) in agents.iter() {
+        let cortex_mode = agent.deps.runtime_config.cortex.load().mode;
+        if cortex_mode.is_dormant() {
+            tracing::info!(
+                agent_id = %agent_id,
+                "cortex loops skipped: agent is in dormant mode"
+            );
+            continue;
+        }
+
         let cortex_logger = spacebot::agent::cortex::CortexLogger::new(agent.db.sqlite.clone())
             .with_notifications(global_notification_store.clone(), agent_id.to_string());
         let warmup_handle =
@@ -3752,6 +3794,21 @@ async fn initialize_agents(
         );
         cortex_handles.push(ready_task_handle);
         tracing::info!(agent_id = %agent_id, "cortex ready-task loop started");
+    }
+
+    // Spawn the instance-wide memory janitor when configured. Required for
+    // dormant-mode agents (their cortex loop never runs maintenance);
+    // additive on active-mode agents (idempotent).
+    if config.memory_janitor.enabled {
+        let janitor_handle = spacebot::agent::maintenance::spawn_memory_janitor(
+            wake_registry.clone(),
+            config.memory_janitor.interval_secs,
+        );
+        cortex_handles.push(janitor_handle);
+        tracing::info!(
+            interval_secs = config.memory_janitor.interval_secs,
+            "memory janitor started"
+        );
     }
 
     // Create cortex chat sessions for each agent

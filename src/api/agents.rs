@@ -4,7 +4,7 @@ use crate::agent::cortex::CortexLogger;
 use crate::conversation::channels::ChannelStore;
 
 use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use sqlx::Row as _;
@@ -396,6 +396,53 @@ pub(super) async fn get_warmup_status(
     Ok(Json(WarmupStatusResponse { statuses }))
 }
 
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub(super) struct WakeAgentResponse {
+    pub agent_id: String,
+    pub fired: bool,
+    pub message: String,
+}
+
+/// Manually wake a (typically dormant) agent.
+///
+/// Fires the same wake path that `send_agent_message`, cron, and other
+/// trigger sources use. Useful for debugging dormant deployments and
+/// recovering an agent stuck on a missed trigger.
+#[utoipa::path(
+    post,
+    path = "/agents/{agent_id}/wake",
+    params(("agent_id" = String, Path, description = "Agent ID")),
+    responses(
+        (status = 202, body = WakeAgentResponse),
+        (status = 503, description = "Wake manager not running"),
+    ),
+    tag = "agents",
+)]
+pub(super) async fn wake_agent(
+    State(state): State<Arc<ApiState>>,
+    Path(agent_id): Path<String>,
+) -> Result<Json<WakeAgentResponse>, StatusCode> {
+    let wake_tx_guard = state.wake_tx.load();
+    let Some(tx) = wake_tx_guard.as_ref().as_ref() else {
+        tracing::warn!(%agent_id, "wake requested but wake manager is not running");
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let target: crate::AgentId = std::sync::Arc::from(agent_id.as_str());
+    if !state.wake_registry.read().await.contains_key(&target) {
+        tracing::warn!(%agent_id, "wake requested for unregistered agent");
+        return Err(StatusCode::NOT_FOUND);
+    }
+    if let Err(error) = tx.send(target) {
+        tracing::warn!(%agent_id, %error, "wake send failed — manager not receiving");
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    Ok(Json(WakeAgentResponse {
+        agent_id,
+        fired: true,
+        message: "wake queued".to_string(),
+    }))
+}
+
 /// Trigger warmup for one agent or all agents.
 #[utoipa::path(
     post,
@@ -476,7 +523,10 @@ pub(super) async fn trigger_warmup(
         let humans = (**state.agent_humans.load()).clone();
         let notif_store_warmup = state.notification_store.load().as_ref().clone();
         tokio::spawn(async move {
-            let (event_tx, memory_event_tx) = crate::create_process_event_buses();
+            let process_event_buses = crate::create_process_event_buses();
+            let event_tx = process_event_buses.control;
+            let memory_event_tx = process_event_buses.memory;
+            let tool_output_tx = process_event_buses.tool_output;
             let working_memory_tz = runtime_config
                 .user_timezone
                 .load()
@@ -495,6 +545,7 @@ pub(super) async fn trigger_warmup(
                 runtime_config,
                 event_tx,
                 memory_event_tx,
+                tool_output_tx,
                 sqlite_pool: sqlite_pool.clone(),
                 messaging_manager: None,
                 sandbox,
@@ -510,6 +561,7 @@ pub(super) async fn trigger_warmup(
                 working_memory,
                 api_state: None,
                 wiki_store: None,
+                wake_tx: None,
             };
             let mut logger = CortexLogger::new(sqlite_pool);
             if let Some(store) = notif_store_warmup {
@@ -802,7 +854,10 @@ pub async fn create_agent_internal(
         .clone()
         .ok_or_else(|| "global task store not initialized".to_string())?;
 
-    let (event_tx, memory_event_tx) = crate::create_process_event_buses();
+    let process_event_buses = crate::create_process_event_buses();
+    let event_tx = process_event_buses.control;
+    let memory_event_tx = process_event_buses.memory;
+    let tool_output_tx = process_event_buses.tool_output;
     let arc_agent_id: crate::AgentId = std::sync::Arc::from(agent_id.as_str());
 
     crate::identity::scaffold_identity_files(&agent_config.identity_dir)
@@ -871,6 +926,7 @@ pub async fn create_agent_internal(
             agent_config.workspace.clone(),
             &instance_dir,
             agent_config.data_dir.clone(),
+            std::sync::Arc::from(agent_config.id.as_str()),
         )
         .await,
     );
@@ -896,6 +952,7 @@ pub async fn create_agent_internal(
         runtime_config: runtime_config.clone(),
         event_tx: event_tx.clone(),
         memory_event_tx: memory_event_tx.clone(),
+        tool_output_tx: tool_output_tx.clone(),
         sqlite_pool: db.sqlite.clone(),
         messaging_manager: Some(messaging_manager.clone()),
         sandbox: sandbox.clone(),
@@ -940,10 +997,22 @@ pub async fn create_agent_internal(
         },
         api_state: Some(state.clone()),
         wiki_store: state.wiki_store.load().as_ref().clone(),
+        wake_tx: state.wake_tx.load().as_ref().as_ref().cloned(),
     };
 
     let event_rx = event_tx.subscribe();
     state.register_agent_events(agent_id.clone(), event_rx);
+    let tool_output_rx = tool_output_tx.subscribe();
+    state.register_tool_output_stream(agent_id.clone(), tool_output_rx);
+
+    // Register with the wake manager so dormant-mode triggers can reach
+    // this agent. Without this, agents created at runtime would never
+    // receive cross-agent message wakes or admin /wake calls.
+    state
+        .wake_registry
+        .write()
+        .await
+        .insert(arc_agent_id.clone(), deps.clone());
 
     let cron_store = std::sync::Arc::new(crate::cron::CronStore::new(db.sqlite.clone()));
     let cron_context = crate::cron::CronContext {
@@ -1334,6 +1403,14 @@ pub(super) async fn delete_agent(
                 tracing::warn!(%error, "failed to write config.toml");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
+    }
+
+    // Drop the wake-manager registration only after the fallible config write
+    // succeeds. Removing it earlier would leave the agent alive but unwakeable
+    // if the write failed mid-flight.
+    {
+        let key: crate::AgentId = std::sync::Arc::from(agent_id.as_str());
+        state.wake_registry.write().await.remove(&key);
     }
 
     // Close the SQLite pool before removing state

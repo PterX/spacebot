@@ -15,7 +15,7 @@ use super::{
     CoalesceConfig, CompactionConfig, Config, CortexConfig, CronDef, DefaultsConfig, DiscordConfig,
     DiscordInstanceConfig, EmailConfig, EmailInstanceConfig, GroupDef, HumanDef, IngestionConfig,
     LinkDef, LlmConfig, MattermostConfig, MattermostInstanceConfig, McpServerConfig, McpTransport,
-    MemoryPersistenceConfig, MessagingConfig, MetricsConfig, OpenCodeConfig,
+    MemoryJanitorConfig, MemoryPersistenceConfig, MessagingConfig, MetricsConfig, OpenCodeConfig,
     ParticipantContextConfig, ProjectsConfig, ProviderConfig, SignalConfig, SignalInstanceConfig,
     SlackCommandConfig, SlackConfig, SlackInstanceConfig, TelegramConfig, TelegramInstanceConfig,
     TelemetryConfig, TwitchConfig, TwitchInstanceConfig, WarmupConfig, WebhookConfig,
@@ -38,7 +38,7 @@ pub(crate) fn resolve_env_value(value: &str) -> Option<String> {
     if let Some(alias) = value.strip_prefix("secret:") {
         let guard = RESOLVE_SECRETS_STORE.load();
         match (*guard).as_ref() {
-            Some(store) => match store.get(alias) {
+            Some(store) => match store.get(&crate::secrets::store::SecretScope::shared(), alias) {
                 Ok(secret) => Some(secret.expose().to_string()),
                 Err(error) => {
                     tracing::warn!(%error, alias, "failed to resolve secret: reference");
@@ -80,6 +80,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "api",
     "metrics",
     "telemetry",
+    "memory_janitor",
 ];
 
 /// Pre-parse check that warns about unrecognised top-level keys in a config
@@ -188,13 +189,28 @@ impl CortexConfig {
             );
         }
 
+        let worker_wall_clock_timeout_secs = overrides
+            .worker_wall_clock_timeout_secs
+            .unwrap_or(defaults.worker_wall_clock_timeout_secs);
+        if worker_wall_clock_timeout_secs < 1 {
+            return Err(ConfigError::Invalid(
+                "worker_wall_clock_timeout_secs must be >= 1".to_string(),
+            )
+            .into());
+        }
+
         let config = CortexConfig {
+            mode: overrides.mode.unwrap_or(defaults.mode),
             tick_interval_secs: overrides
                 .tick_interval_secs
                 .unwrap_or(defaults.tick_interval_secs),
             worker_timeout_secs: overrides
                 .worker_timeout_secs
                 .unwrap_or(defaults.worker_timeout_secs),
+            worker_wall_clock_timeout_secs,
+            cron_default_timeout_secs: overrides
+                .cron_default_timeout_secs
+                .or(defaults.cron_default_timeout_secs),
             branch_timeout_secs: overrides
                 .branch_timeout_secs
                 .unwrap_or(defaults.branch_timeout_secs),
@@ -977,6 +993,7 @@ impl Config {
                     .unwrap_or_else(|_| "spacebot".into()),
                 sample_rate: 1.0,
             },
+            memory_janitor: MemoryJanitorConfig::default(),
         })
     }
 
@@ -2628,6 +2645,17 @@ impl Config {
             }
         }
 
+        let memory_janitor = MemoryJanitorConfig {
+            enabled: toml
+                .memory_janitor
+                .enabled
+                .unwrap_or_else(|| MemoryJanitorConfig::default().enabled),
+            interval_secs: toml
+                .memory_janitor
+                .interval_secs
+                .unwrap_or_else(|| MemoryJanitorConfig::default().interval_secs),
+        };
+
         Ok(Config {
             instance_dir,
             llm,
@@ -2641,6 +2669,7 @@ impl Config {
             api,
             metrics,
             telemetry,
+            memory_janitor,
         })
     }
 }

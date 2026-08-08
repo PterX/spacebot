@@ -87,7 +87,10 @@ async fn bootstrap_deps() -> anyhow::Result<(spacebot::AgentDeps, spacebot::conf
         skills,
     ));
 
-    let (event_tx, memory_event_tx) = spacebot::create_process_event_buses_with_capacity(16, 32);
+    let process_event_buses = spacebot::create_process_event_buses_with_capacity(16, 32, 1024);
+    let event_tx = process_event_buses.control;
+    let memory_event_tx = process_event_buses.memory;
+    let tool_output_tx = process_event_buses.tool_output;
 
     let agent_id: spacebot::AgentId = Arc::from(agent_config.id.as_str());
     let mcp_manager = Arc::new(spacebot::mcp::McpManager::new(agent_config.mcp.clone()));
@@ -101,6 +104,7 @@ async fn bootstrap_deps() -> anyhow::Result<(spacebot::AgentDeps, spacebot::conf
             agent_config.workspace.clone(),
             &config.instance_dir,
             agent_config.data_dir.clone(),
+            agent_id.clone(),
         )
         .await,
     );
@@ -116,6 +120,7 @@ async fn bootstrap_deps() -> anyhow::Result<(spacebot::AgentDeps, spacebot::conf
         runtime_config,
         event_tx,
         memory_event_tx,
+        tool_output_tx,
         sqlite_pool: db.sqlite.clone(),
         messaging_manager: None,
         sandbox,
@@ -132,6 +137,7 @@ async fn bootstrap_deps() -> anyhow::Result<(spacebot::AgentDeps, spacebot::conf
         ),
         api_state: None,
         wiki_store: None,
+        wake_tx: None,
     };
 
     Ok((deps, config))
@@ -408,6 +414,8 @@ async fn dump_worker_context() {
         None,
         deps.task_store.clone(),
         deps.event_tx.clone(),
+        deps.tool_output_tx.clone(),
+        spacebot::tools::ToolCallRegistry::default(),
         browser_config,
         std::path::PathBuf::from("/tmp/screenshots"),
         brave_search_key,
@@ -418,6 +426,7 @@ async fn dump_worker_context() {
         Default::default(),
         deps.memory_search.clone(),
         false,
+        None,
         None,
     );
 
@@ -604,6 +613,8 @@ async fn dump_all_contexts() {
         None,
         deps.task_store.clone(),
         deps.event_tx.clone(),
+        deps.tool_output_tx.clone(),
+        spacebot::tools::ToolCallRegistry::default(),
         browser_config,
         std::path::PathBuf::from("/tmp/screenshots"),
         brave_search_key,
@@ -614,6 +625,7 @@ async fn dump_all_contexts() {
         Default::default(),
         deps.memory_search.clone(),
         false,
+        None,
         None,
     );
     let worker_tool_defs = worker_tool_server.get_tool_defs(None).await.unwrap();
