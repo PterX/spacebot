@@ -890,11 +890,6 @@ pub fn create_branch_tool_server(
         task_create = task_create.with_api_state(api.clone());
     }
 
-    // Branches act inside a user conversation, so skill writes carry User
-    // origin. The reflection branch (autonomous) constructs its own server
-    // with WriteOrigin::Agent and the read-before-write rail active.
-    let skill_read_tracker = new_skill_read_tracker();
-
     let mut server = ToolServer::new()
         .tool(memory_save)
         .tool(MemoryRecallTool::new(memory_search.clone()))
@@ -906,19 +901,29 @@ pub fn create_branch_tool_server(
         .tool(task_create)
         .tool(TaskListTool::new(task_store.clone(), agent_id.to_string()))
         .tool(TaskUpdateTool::for_branch(task_store, agent_id.clone()))
-        .tool(
-            ReadSkillTool::new(runtime_config.clone())
-                .with_read_tracker(skill_read_tracker.clone()),
-        )
-        .tool(
-            SkillManageTool::new(runtime_config.clone(), crate::skills::WriteOrigin::User)
-                .with_read_tracker(skill_read_tracker),
-        )
-        .tool(SkillsListTool::new(runtime_config.clone()))
         .tool(FileReadTool::new(
             runtime_config.workspace_dir.clone(),
             sandbox,
         ));
+
+    // Skill tools go to conversation branches only. They carry User origin
+    // because the user is present and directing; memory-persistence and
+    // ingestion branches are focused pipelines and get no mutation surface.
+    // The reflection branch (autonomous) constructs its own server with
+    // WriteOrigin::Agent and the read-before-write rail active.
+    if matches!(profile, BranchToolProfile::Default) {
+        let skill_read_tracker = new_skill_read_tracker();
+        server = server
+            .tool(
+                ReadSkillTool::new(runtime_config.clone())
+                    .with_read_tracker(skill_read_tracker.clone()),
+            )
+            .tool(
+                SkillManageTool::new(runtime_config.clone(), crate::skills::WriteOrigin::User)
+                    .with_read_tracker(skill_read_tracker),
+            )
+            .tool(SkillsListTool::new(runtime_config.clone()));
+    }
 
     if let Some(wiki) = wiki_store {
         let author_id = agent_id.to_string();

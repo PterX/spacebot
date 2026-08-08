@@ -253,12 +253,20 @@ impl SkillUsageStore {
         Ok(())
     }
 
-    /// Mark an archived skill active again.
+    /// Mark an archived skill active again, creating the row if a skill was
+    /// archived outside the store's knowledge.
     pub async fn set_restored(&self, name: &str) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+
         sqlx::query(
-            "UPDATE skill_usage SET state = 'active', archived_at = NULL WHERE skill_name = ?",
+            "INSERT INTO skill_usage (skill_name, created_by, created_at) \
+             VALUES (?, 'user', ?) \
+             ON CONFLICT(skill_name) DO UPDATE SET \
+                 state = 'active', \
+                 archived_at = NULL",
         )
         .bind(name.to_lowercase())
+        .bind(&now)
         .execute(&self.pool)
         .await?;
 

@@ -68,11 +68,7 @@ impl Tool for SkillsListTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "List every loaded skill with its source, provenance \
-                (who created it), lifecycle state, pin flag, and usage counters. \
-                Use this before creating or modifying skills to see what already \
-                exists and what you're allowed to touch."
-                .to_string(),
+            description: crate::prompts::text::get("tools/skills_list").to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {}

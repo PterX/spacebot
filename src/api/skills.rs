@@ -490,6 +490,16 @@ pub(super) async fn archive_skill(
         return Err(StatusCode::FORBIDDEN);
     }
 
+    // Pin blocks archiving the same way it blocks deletion.
+    match store.get(&req.name).await {
+        Ok(Some(record)) if record.pinned => return Err(StatusCode::FORBIDDEN),
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%error, skill = %req.name, "failed to check pin before archive");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+
     let workspace_skills = runtime_config.workspace_dir.join("skills");
     let archived = crate::skills::archive_skill_dir(
         &workspace_skills,

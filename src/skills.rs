@@ -397,24 +397,31 @@ pub const ARCHIVE_DIR: &str = ".archive";
 
 /// Move a skill directory into the workspace archive instead of deleting it.
 ///
-/// Returns the archive path. An existing archived copy of the same name is
-/// suffixed away (`{name}-1`, `{name}-2`, ...) rather than overwritten, so
-/// repeated archive cycles never destroy a prior snapshot.
+/// The skill's path relative to the skills root is preserved under
+/// `.archive/`, so a categorized skill (`{category}/{name}`) restores to the
+/// same location. An existing archived copy is suffixed away (`{name}-1`,
+/// `{name}-2`, ...) rather than overwritten, so repeated archive cycles
+/// never destroy a prior snapshot.
 pub async fn archive_skill_dir(
     workspace_skills_dir: &Path,
     skill_base_dir: &Path,
     name: &str,
 ) -> anyhow::Result<PathBuf> {
-    let archive_root = workspace_skills_dir.join(ARCHIVE_DIR);
-    tokio::fs::create_dir_all(&archive_root)
-        .await
-        .with_context(|| format!("failed to create {}", archive_root.display()))?;
+    let relative_parent = skill_base_dir
+        .parent()
+        .and_then(|parent| parent.strip_prefix(workspace_skills_dir).ok())
+        .unwrap_or_else(|| Path::new(""));
 
-    let mut destination = archive_root.join(name);
+    let archive_parent = workspace_skills_dir.join(ARCHIVE_DIR).join(relative_parent);
+    tokio::fs::create_dir_all(&archive_parent)
+        .await
+        .with_context(|| format!("failed to create {}", archive_parent.display()))?;
+
+    let mut destination = archive_parent.join(name);
     let mut suffix = 0usize;
     while destination.exists() {
         suffix += 1;
-        destination = archive_root.join(format!("{name}-{suffix}"));
+        destination = archive_parent.join(format!("{name}-{suffix}"));
     }
 
     tokio::fs::rename(skill_base_dir, &destination)
@@ -430,14 +437,61 @@ pub async fn archive_skill_dir(
     Ok(destination)
 }
 
-/// Restore the most recently archived copy of a skill back into the
-/// workspace skills root.
+/// Find the most recently archived copy of a skill in `dir`: the highest
+/// suffix of `{name}`, or `None`.
+fn latest_archived_copy(dir: &Path, name: &str) -> Option<PathBuf> {
+    let mut source = None;
+    let plain = dir.join(name);
+    if plain.is_dir() {
+        source = Some(plain);
+    }
+    let mut suffix = 1usize;
+    loop {
+        let candidate = dir.join(format!("{name}-{suffix}"));
+        if !candidate.is_dir() {
+            break;
+        }
+        source = Some(candidate);
+        suffix += 1;
+    }
+    source
+}
+
+/// Restore the most recently archived copy of a skill to the location it
+/// was archived from (category directories are preserved).
 ///
 /// Fails when no archived copy exists or when an active skill directory
 /// already occupies the name.
 pub async fn restore_skill_dir(workspace_skills_dir: &Path, name: &str) -> anyhow::Result<PathBuf> {
     let archive_root = workspace_skills_dir.join(ARCHIVE_DIR);
-    let destination = workspace_skills_dir.join(name);
+
+    // Look in the archive root, then one category level deep — mirroring
+    // discovery's two levels.
+    let mut found: Option<(PathBuf, PathBuf)> = latest_archived_copy(&archive_root, name)
+        .map(|source| (source, workspace_skills_dir.join(name)));
+
+    if found.is_none()
+        && let Ok(mut entries) = tokio::fs::read_dir(&archive_root).await
+    {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let category_dir = entry.path();
+            if !category_dir.is_dir() {
+                continue;
+            }
+            if let Some(source) = latest_archived_copy(&category_dir, name) {
+                let category = entry.file_name();
+                found = Some((source, workspace_skills_dir.join(category).join(name)));
+                break;
+            }
+        }
+    }
+
+    let Some((source, destination)) = found else {
+        anyhow::bail!(
+            "no archived copy of '{name}' found under {}",
+            archive_root.display()
+        );
+    };
 
     if destination.exists() {
         anyhow::bail!(
@@ -446,28 +500,11 @@ pub async fn restore_skill_dir(workspace_skills_dir: &Path, name: &str) -> anyho
         );
     }
 
-    // Prefer the highest suffix — it's the most recent archive cycle.
-    let mut source = None;
-    let plain = archive_root.join(name);
-    if plain.is_dir() {
-        source = Some(plain);
+    if let Some(parent) = destination.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let mut suffix = 1usize;
-    loop {
-        let candidate = archive_root.join(format!("{name}-{suffix}"));
-        if !candidate.is_dir() {
-            break;
-        }
-        source = Some(candidate);
-        suffix += 1;
-    }
-
-    let Some(source) = source else {
-        anyhow::bail!(
-            "no archived copy of '{name}' found under {}",
-            archive_root.display()
-        );
-    };
 
     tokio::fs::rename(&source, &destination)
         .await
@@ -825,6 +862,57 @@ mod tests {
         let rendered = index_description(&over);
         assert_eq!(rendered.chars().count(), DESCRIPTION_BUDGET);
         assert!(rendered.ends_with("..."));
+    }
+
+    #[tokio::test]
+    async fn archive_and_restore_preserve_category() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("skills");
+        let skill_dir = root.join("ops").join("deploy");
+        tokio::fs::create_dir_all(&skill_dir).await.unwrap();
+        tokio::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: d\n---\nBody.",
+        )
+        .await
+        .unwrap();
+
+        let archived = archive_skill_dir(&root, &skill_dir, "deploy")
+            .await
+            .unwrap();
+        assert!(archived.starts_with(root.join(ARCHIVE_DIR).join("ops")));
+        assert!(!skill_dir.exists());
+
+        let restored = restore_skill_dir(&root, "deploy").await.unwrap();
+        assert_eq!(restored, skill_dir);
+        assert!(skill_dir.join("SKILL.md").exists());
+    }
+
+    #[tokio::test]
+    async fn repeated_archive_keeps_prior_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("skills");
+
+        for round in 0..2 {
+            let skill_dir = root.join("deploy");
+            tokio::fs::create_dir_all(&skill_dir).await.unwrap();
+            tokio::fs::write(skill_dir.join("SKILL.md"), format!("round {round}"))
+                .await
+                .unwrap();
+            archive_skill_dir(&root, &skill_dir, "deploy")
+                .await
+                .unwrap();
+        }
+
+        assert!(root.join(ARCHIVE_DIR).join("deploy").is_dir());
+        assert!(root.join(ARCHIVE_DIR).join("deploy-1").is_dir());
+
+        // Restore takes the most recent copy.
+        let restored = restore_skill_dir(&root, "deploy").await.unwrap();
+        let content = tokio::fs::read_to_string(restored.join("SKILL.md"))
+            .await
+            .unwrap();
+        assert_eq!(content, "round 1");
     }
 
     #[test]

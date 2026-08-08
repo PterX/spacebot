@@ -1293,22 +1293,27 @@ fn cmd_skill(
                 println!("Path: {}", skill.file_path.display());
                 println!("Base directory: {}", skill.base_dir.display());
 
-                if let Ok(store) = open_skill_usage_store(&config, agent.as_deref()).await
-                    && let Ok(Some(record)) = store.get(&name).await
-                {
-                    println!("Created by: {}", record.created_by);
-                    println!("State: {}", record.state);
-                    println!("Pinned: {}", record.pinned);
-                    println!(
-                        "Reads: {} (last: {})",
-                        record.read_count,
-                        record.last_read_at.as_deref().unwrap_or("never")
-                    );
-                    println!(
-                        "Patches: {} (last: {})",
-                        record.patch_count,
-                        record.last_patched_at.as_deref().unwrap_or("never")
-                    );
+                match open_skill_usage_store(&config, agent.as_deref()).await {
+                    Ok(store) => match store.get(&name).await {
+                        Ok(Some(record)) => {
+                            println!("Created by: {}", record.created_by);
+                            println!("State: {}", record.state);
+                            println!("Pinned: {}", record.pinned);
+                            println!(
+                                "Reads: {} (last: {})",
+                                record.read_count,
+                                record.last_read_at.as_deref().unwrap_or("never")
+                            );
+                            println!(
+                                "Patches: {} (last: {})",
+                                record.patch_count,
+                                record.last_patched_at.as_deref().unwrap_or("never")
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(error) => eprintln!("(usage data unavailable: {error})"),
+                    },
+                    Err(error) => eprintln!("(usage data unavailable: {error})"),
                 }
 
                 // Show a preview of the content
@@ -1358,6 +1363,17 @@ fn cmd_skill(
                     std::process::exit(1);
                 }
 
+                // Open the store before moving the directory, so a store
+                // failure can't leave the skill archived on disk with a row
+                // still reporting it active.
+                let store = open_skill_usage_store(&config, agent.as_deref()).await?;
+                if let Some(record) = store.get(&name).await?
+                    && record.pinned
+                {
+                    eprintln!("Skill is pinned; unpin it before archiving: {name}");
+                    std::process::exit(1);
+                }
+
                 let archived = spacebot::skills::archive_skill_dir(
                     &workspace_dir,
                     &skill.base_dir,
@@ -1365,7 +1381,6 @@ fn cmd_skill(
                 )
                 .await?;
 
-                let store = open_skill_usage_store(&config, agent.as_deref()).await?;
                 store.set_archived(&name).await?;
 
                 println!("Archived skill: {name}");
@@ -1375,11 +1390,12 @@ fn cmd_skill(
             SkillCommand::Restore { name, agent } => {
                 let (_, workspace_dir) = resolve_skill_dirs(&config, agent.as_deref())?;
 
+                let store = open_skill_usage_store(&config, agent.as_deref()).await?;
+
                 let restored =
                     spacebot::skills::restore_skill_dir(&workspace_dir, &name.to_lowercase())
                         .await?;
 
-                let store = open_skill_usage_store(&config, agent.as_deref()).await?;
                 store.set_restored(&name).await?;
 
                 println!("Restored skill: {name}");

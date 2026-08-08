@@ -106,7 +106,7 @@ impl Tool for ReadSkillTool {
         if let Some(tracker) = &self.read_tracker {
             tracker
                 .lock()
-                .expect("skill read tracker lock")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(skill.name.to_lowercase());
         }
 

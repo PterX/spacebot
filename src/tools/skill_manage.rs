@@ -97,9 +97,11 @@ impl SkillManageTool {
         self.read_tracker
             .as_ref()
             .map(|tracker| {
+                // A poisoned lock still holds a usable HashSet — recover it
+                // rather than panicking inside a tool call.
                 tracker
                     .lock()
-                    .expect("skill read tracker lock")
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .contains(&name.to_lowercase())
             })
             .unwrap_or(false)
@@ -140,9 +142,11 @@ impl SkillManageTool {
                         skill.name
                     ));
                 }
-                if matches!(action, "patch" | "edit") && !self.has_read(&skill.name) {
+                if matches!(action, "patch" | "edit" | "write_file" | "remove_file")
+                    && !self.has_read(&skill.name)
+                {
                     return Some(format!(
-                        "read '{}' with read_skill before modifying it — patches must be written against the current content",
+                        "read '{}' with read_skill before modifying it — changes must be written against the current content",
                         skill.name
                     ));
                 }
@@ -1045,6 +1049,37 @@ mod tests {
 
         let record = harness.store.get("deploy").await.unwrap().unwrap();
         assert_eq!(record.patch_count, 1);
+    }
+
+    #[tokio::test]
+    async fn agent_write_file_requires_prior_read() {
+        let harness = harness().await;
+        create_skill(&harness, "deploy").await;
+
+        let tracker = new_skill_read_tracker();
+        let agent_tool = tool(&harness, WriteOrigin::Agent).with_read_tracker(tracker.clone());
+
+        let denied = agent_tool
+            .call(SkillManageArgs {
+                file_path: Some("references/notes.md".to_string()),
+                file_content: Some("notes".to_string()),
+                ..args("write_file", "deploy")
+            })
+            .await
+            .unwrap();
+        assert!(!denied.success);
+        assert!(denied.message.contains("read_skill"));
+
+        tracker.lock().unwrap().insert("deploy".to_string());
+        let allowed = agent_tool
+            .call(SkillManageArgs {
+                file_path: Some("references/notes.md".to_string()),
+                file_content: Some("notes".to_string()),
+                ..args("write_file", "deploy")
+            })
+            .await
+            .unwrap();
+        assert!(allowed.success, "{}", allowed.message);
     }
 
     #[tokio::test]
