@@ -76,6 +76,8 @@ pub struct RuntimeConfig {
     pub cron_scheduler: ArcSwap<Option<Arc<crate::cron::Scheduler>>>,
     /// Settings store for agent-specific configuration.
     pub settings: ArcSwap<Option<Arc<crate::settings::SettingsStore>>>,
+    /// Skill provenance and usage tracking, set after agent initialization.
+    pub skill_usage: ArcSwap<Option<Arc<crate::skills::SkillUsageStore>>>,
     /// Prompt snapshot store for debugging prompt construction.
     pub prompt_snapshots: ArcSwap<Option<Arc<crate::agent::prompt_snapshot::PromptSnapshotStore>>>,
     /// Secrets store for encrypted credential storage.
@@ -155,6 +157,7 @@ impl RuntimeConfig {
             cron_store: ArcSwap::from_pointee(None),
             cron_scheduler: ArcSwap::from_pointee(None),
             settings: ArcSwap::from_pointee(None),
+            skill_usage: ArcSwap::from_pointee(None),
             prompt_snapshots: ArcSwap::from_pointee(None),
             secrets: ArcSwap::from_pointee(None),
             sandbox: Arc::new(ArcSwap::from_pointee(agent_config.sandbox.clone())),
@@ -184,6 +187,11 @@ impl RuntimeConfig {
     /// Set the settings store after initialization.
     pub fn set_settings(&self, settings: Arc<crate::settings::SettingsStore>) {
         self.settings.store(Arc::new(Some(settings)));
+    }
+
+    /// Set the skill usage store after initialization.
+    pub fn set_skill_usage(&self, store: Arc<crate::skills::SkillUsageStore>) {
+        self.skill_usage.store(Arc::new(Some(store)));
     }
 
     /// Set the secrets store after initialization.
@@ -322,9 +330,24 @@ impl RuntimeConfig {
     }
 
     /// Reload skills from disk.
+    ///
+    /// Seeds usage rows for skills seen for the first time, so their
+    /// staleness clock starts at discovery.
     pub fn reload_skills(&self, skills: crate::skills::SkillSet) {
+        let names: Vec<String> = skills.iter().map(|s| s.name.to_lowercase()).collect();
         self.skills.store(Arc::new(skills));
         tracing::info!("skills reloaded");
+
+        if let Some(store) = self.skill_usage.load().as_ref()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let store = store.clone();
+            handle.spawn(async move {
+                if let Err(error) = store.seed(&names).await {
+                    tracing::warn!(%error, "failed to seed skill usage rows");
+                }
+            });
+        }
     }
 }
 

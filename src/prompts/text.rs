@@ -93,6 +93,9 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         ("en", "fragments/skills_worker") => {
             include_str!("../../prompts/en/fragments/skills_worker.md.j2")
         }
+        ("en", "fragments/skills_branch") => {
+            include_str!("../../prompts/en/fragments/skills_branch.md.j2")
+        }
         ("en", "fragments/available_channels") => {
             include_str!("../../prompts/en/fragments/available_channels.md.j2")
         }

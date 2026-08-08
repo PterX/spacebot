@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use super::{Skill, SkillSource, parse_frontmatter};
+use super::{Skill, SkillSource, parse_skill_markdown};
 
 /// Each entry is `(directory_name, raw SKILL.md content)`.
 const BUILTIN_SKILLS: &[(&str, &str)] = &[(
@@ -33,23 +33,21 @@ pub fn load() -> Vec<Skill> {
 }
 
 fn parse_builtin(dir_name: &str, raw: &str) -> anyhow::Result<Skill> {
-    let (frontmatter, body) = parse_frontmatter(raw)?;
+    let (frontmatter, body) = parse_skill_markdown(raw)?;
 
-    let name = frontmatter
-        .get("name")
-        .cloned()
-        .unwrap_or_else(|| dir_name.to_string());
-
-    let description = frontmatter.get("description").cloned().unwrap_or_default();
+    let name = frontmatter.name.unwrap_or_else(|| dir_name.to_string());
 
     Ok(Skill {
         name,
-        description,
+        description: frontmatter.description.unwrap_or_default(),
         file_path: PathBuf::from(format!("builtin://{dir_name}/SKILL.md")),
         base_dir: PathBuf::from(format!("builtin://{dir_name}")),
         content: body,
         source: SkillSource::Builtin,
         source_repo: None,
+        tags: frontmatter.tags.unwrap_or_default(),
+        related_skills: frontmatter.related_skills.unwrap_or_default(),
+        linked_files: Vec::new(),
     })
 }
 

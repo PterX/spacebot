@@ -428,15 +428,12 @@ mod tests {
 
     #[test]
     fn test_inject_source_repo_roundtrip_with_parse() {
-        use crate::skills::parse_frontmatter;
+        use crate::skills::parse_skill_markdown;
         let content = "---\nname: weather\ndescription: Get weather\n---\n\n# Weather\n";
         let patched = inject_source_repo(content, "anthropics/skills");
-        let (fm, body) = parse_frontmatter(&patched).unwrap();
-        assert_eq!(
-            fm.get("source_repo").unwrap(),
-            &"anthropics/skills".to_string()
-        );
-        assert_eq!(fm.get("name").unwrap(), &"weather".to_string());
+        let (fm, body) = parse_skill_markdown(&patched).unwrap();
+        assert_eq!(fm.source_repo.as_deref(), Some("anthropics/skills"));
+        assert_eq!(fm.name.as_deref(), Some("weather"));
         assert!(body.contains("# Weather"));
     }
 }

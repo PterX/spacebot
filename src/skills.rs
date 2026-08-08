@@ -15,12 +15,78 @@
 
 pub mod builtin;
 mod installer;
+mod usage;
 
 pub use installer::{install_from_file, install_from_github};
+pub use usage::{SkillUsageRecord, SkillUsageStore, WriteOrigin};
 
 use anyhow::Context as _;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+/// Support subdirectories inside a skill directory. Files under these are
+/// excluded from skill discovery and surfaced as `linked_files` by read_skill,
+/// so a skill body can point at deeper material without inflating the index.
+pub const SUPPORT_SUBDIRS: &[&str] = &["references", "templates", "scripts", "assets"];
+
+/// Character budget for skill descriptions in prompt indexes. Enforced on
+/// create/edit paths; pre-existing skills render truncated instead of
+/// failing to load.
+pub const DESCRIPTION_BUDGET: usize = 80;
+
+/// Typed SKILL.md frontmatter. Unknown fields are ignored so skills from
+/// other ecosystems (carrying `version`, `author`, `license`, ...) load fine.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SkillFrontmatter {
+    /// Skill name; falls back to the directory name when absent.
+    pub name: Option<String>,
+    /// Short description shown in prompt indexes.
+    pub description: Option<String>,
+    /// Host platforms this skill applies to. Absent means all platforms.
+    pub platforms: Option<Vec<Platform>>,
+    /// Free-form tags.
+    pub tags: Option<Vec<String>>,
+    /// Names of related skills, surfaced by read_skill as navigation hints.
+    pub related_skills: Option<Vec<String>>,
+    /// GitHub `owner/repo` this skill was installed from, if any.
+    pub source_repo: Option<String>,
+}
+
+/// A host platform a skill can be gated to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    Linux,
+    Macos,
+    Windows,
+    /// Any value we don't recognize. Never matches the host, so a skill
+    /// gated to an unknown platform is skipped rather than failing to parse.
+    Other,
+}
+
+impl<'de> Deserialize<'de> for Platform {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.trim().to_ascii_lowercase().as_str() {
+            "linux" => Platform::Linux,
+            "macos" | "darwin" | "mac" => Platform::Macos,
+            "windows" | "win" => Platform::Windows,
+            _ => Platform::Other,
+        })
+    }
+}
+
+impl Platform {
+    /// The platform of the host this process is running on.
+    pub fn host() -> Platform {
+        match std::env::consts::OS {
+            "linux" => Platform::Linux,
+            "macos" => Platform::Macos,
+            "windows" => Platform::Windows,
+            _ => Platform::Other,
+        }
+    }
+}
 
 /// A loaded skill definition.
 #[derive(Debug, Clone)]
@@ -39,6 +105,12 @@ pub struct Skill {
     pub source: SkillSource,
     /// GitHub `owner/repo` that this skill was installed from, if any.
     pub source_repo: Option<String>,
+    /// Free-form tags from frontmatter.
+    pub tags: Vec<String>,
+    /// Names of related skills from frontmatter, advisory.
+    pub related_skills: Vec<String>,
+    /// Files under the skill's support subdirectories, relative to `base_dir`.
+    pub linked_files: Vec<String>,
 }
 
 /// Where a skill was loaded from, used for precedence tracking.
@@ -141,13 +213,41 @@ impl SkillSet {
             .into_iter()
             .map(|s| crate::prompts::SkillInfo {
                 name: s.name.clone(),
-                description: s.description.clone(),
+                description: index_description(&s.description),
                 location: s.file_path.display().to_string(),
                 suggested: false,
             })
             .collect();
 
         prompt_engine.render_skills_channel(skill_infos)
+    }
+
+    /// Render the skills listing for injection into a branch system prompt.
+    ///
+    /// Branches see the same index as channels but read skills directly via
+    /// `read_skill`, or pass names to workers they spawn as `suggested_skills`.
+    pub fn render_branch_skills(
+        &self,
+        prompt_engine: &crate::prompts::PromptEngine,
+    ) -> crate::error::Result<String> {
+        if self.skills.is_empty() {
+            return Ok(String::new());
+        }
+
+        let mut sorted_skills: Vec<&Skill> = self.skills.values().collect();
+        sorted_skills.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let skill_infos: Vec<crate::prompts::SkillInfo> = sorted_skills
+            .into_iter()
+            .map(|s| crate::prompts::SkillInfo {
+                name: s.name.clone(),
+                description: index_description(&s.description),
+                location: s.file_path.display().to_string(),
+                suggested: false,
+            })
+            .collect();
+
+        prompt_engine.render_skills_branch(skill_infos)
     }
 
     /// Render the skills listing for injection into a worker system prompt.
@@ -173,7 +273,7 @@ impl SkillSet {
             .map(|s| crate::prompts::SkillInfo {
                 suggested: suggested_lower.contains(&s.name.to_lowercase()),
                 name: s.name.clone(),
-                description: s.description.clone(),
+                description: index_description(&s.description),
                 location: s.file_path.display().to_string(),
             })
             .collect();
@@ -253,6 +353,14 @@ impl SkillSet {
     }
 }
 
+/// Truncate a description to the index budget with an ellipsis.
+///
+/// The budget is enforced on create/edit paths; skills that predate it (or
+/// were installed from a registry) render truncated rather than failing.
+fn index_description(description: &str) -> String {
+    crate::tools::truncate_utf8_ellipsis(description, DESCRIPTION_BUDGET)
+}
+
 /// Public skill information for API responses.
 #[derive(Debug, Clone)]
 pub struct SkillInfo {
@@ -267,6 +375,8 @@ pub struct SkillInfo {
 /// Load all skills from a directory.
 ///
 /// Each subdirectory containing a `SKILL.md` file is treated as a skill.
+/// Hidden directories (`.archive`, `.snapshots`, `.git`, ...) are excluded
+/// from discovery.
 async fn load_skills_from_dir(dir: &Path, source: SkillSource) -> anyhow::Result<Vec<Skill>> {
     let mut skills = Vec::new();
 
@@ -280,19 +390,29 @@ async fn load_skills_from_dir(dir: &Path, source: SkillSource) -> anyhow::Result
             continue;
         }
 
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+
         let skill_file = path.join("SKILL.md");
         if !skill_file.exists() {
             continue;
         }
 
         match load_skill(&skill_file, &path, source.clone()).await {
-            Ok(skill) => {
+            Ok(Some(skill)) => {
                 tracing::debug!(
                     name = %skill.name,
                     path = %skill_file.display(),
                     "loaded skill"
                 );
                 skills.push(skill);
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    path = %skill_file.display(),
+                    "skill gated to another platform, skipping"
+                );
             }
             Err(error) => {
                 tracing::warn!(
@@ -308,18 +428,27 @@ async fn load_skills_from_dir(dir: &Path, source: SkillSource) -> anyhow::Result
 }
 
 /// Load a single skill from its SKILL.md file.
+///
+/// Returns `Ok(None)` when the skill declares `platforms` that don't include
+/// the host platform.
 async fn load_skill(
     file_path: &Path,
     base_dir: &Path,
     source: SkillSource,
-) -> anyhow::Result<Skill> {
+) -> anyhow::Result<Option<Skill>> {
     let raw = tokio::fs::read_to_string(file_path)
         .await
         .with_context(|| format!("failed to read {}", file_path.display()))?;
 
-    let (frontmatter, body) = parse_frontmatter(&raw)?;
+    let (frontmatter, body) = parse_skill_markdown(&raw)?;
 
-    let name = frontmatter.get("name").cloned().unwrap_or_else(|| {
+    if let Some(platforms) = &frontmatter.platforms
+        && !platforms.contains(&Platform::host())
+    {
+        return Ok(None);
+    }
+
+    let name = frontmatter.name.clone().unwrap_or_else(|| {
         // Fall back to directory name if no name in frontmatter
         base_dir
             .file_name()
@@ -328,36 +457,62 @@ async fn load_skill(
             .to_string()
     });
 
-    let description = frontmatter.get("description").cloned().unwrap_or_default();
-    let source_repo = frontmatter.get("source_repo").cloned();
-
     // Resolve {baseDir} template variable in the body
     let base_dir_str = base_dir.to_string_lossy();
     let content = body.replace("{baseDir}", &base_dir_str);
 
-    Ok(Skill {
+    let linked_files = collect_linked_files(base_dir).await;
+
+    Ok(Some(Skill {
         name,
-        description,
+        description: frontmatter.description.unwrap_or_default(),
         file_path: file_path.to_path_buf(),
         base_dir: base_dir.to_path_buf(),
         content,
         source,
-        source_repo,
-    })
+        source_repo: frontmatter.source_repo,
+        tags: frontmatter.tags.unwrap_or_default(),
+        related_skills: frontmatter.related_skills.unwrap_or_default(),
+        linked_files,
+    }))
 }
 
-/// Parse YAML frontmatter from a markdown file.
+/// List files under the skill's support subdirectories, relative to `base_dir`.
+async fn collect_linked_files(base_dir: &Path) -> Vec<String> {
+    let mut files = Vec::new();
+
+    for subdir in SUPPORT_SUBDIRS {
+        let mut pending = vec![base_dir.join(subdir)];
+
+        while let Some(dir) = pending.pop() {
+            let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+                continue;
+            };
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if let Ok(relative) = path.strip_prefix(base_dir) {
+                    files.push(relative.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+
+    files.sort();
+    files
+}
+
+/// Split YAML frontmatter from a markdown file and parse it into
+/// [`SkillFrontmatter`].
 ///
-/// Expects `---` delimiters. Returns the frontmatter key-value pairs and
-/// the remaining body. Compatible with OpenClaw's frontmatter format.
-pub(crate) fn parse_frontmatter(
-    content: &str,
-) -> anyhow::Result<(HashMap<String, String>, String)> {
+/// Expects `---` delimiters. Content without frontmatter yields default
+/// (empty) frontmatter and the full content as body.
+pub(crate) fn parse_skill_markdown(content: &str) -> anyhow::Result<(SkillFrontmatter, String)> {
     let trimmed = content.trim_start();
 
     if !trimmed.starts_with("---") {
-        // No frontmatter, entire content is body
-        return Ok((HashMap::new(), content.to_string()));
+        return Ok((SkillFrontmatter::default(), content.to_string()));
     }
 
     // Find the closing ---
@@ -366,47 +521,17 @@ pub(crate) fn parse_frontmatter(
         anyhow::bail!("unclosed frontmatter: missing closing ---");
     };
 
-    let frontmatter_str = &after_opening[..end_pos].trim();
+    let frontmatter_str = after_opening[..end_pos].trim();
     let body_start = 3 + end_pos + 4; // skip opening --- + content + \n---
     let body = trimmed[body_start..].trim_start_matches('\n').to_string();
 
-    // Parse the YAML frontmatter into simple key-value pairs.
-    // We support the subset that OpenClaw uses: simple scalars and inline JSON for metadata.
-    let mut map = HashMap::new();
+    let frontmatter = if frontmatter_str.is_empty() {
+        SkillFrontmatter::default()
+    } else {
+        serde_yaml::from_str(frontmatter_str).context("failed to parse skill frontmatter")?
+    };
 
-    // Use serde_yaml-compatible line-based parsing for the simple cases
-    // (name, description, homepage, user-invocable, etc.)
-    // The metadata field can be complex JSON but we don't need to parse it — we just
-    // need name and description for Spacebot's purposes.
-    for line in frontmatter_str.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        // Handle simple `key: value` pairs
-        if let Some((key, value)) = line.split_once(':') {
-            let key = key.trim().to_string();
-            let value = value.trim();
-
-            // Skip complex multi-line values (metadata JSON blocks, etc.)
-            if value.is_empty() || value.starts_with('{') || value.starts_with('[') {
-                continue;
-            }
-
-            // Strip surrounding quotes
-            let value = value
-                .trim_start_matches('"')
-                .trim_end_matches('"')
-                .trim_start_matches('\'')
-                .trim_end_matches('\'')
-                .to_string();
-
-            map.insert(key, value);
-        }
-    }
-
-    Ok((map, body))
+    Ok((frontmatter, body))
 }
 
 #[cfg(test)]
@@ -427,13 +552,12 @@ mod tests {
             Two free services, no API keys needed.
         "#};
 
-        let (fm, body) = parse_frontmatter(content).unwrap();
-        assert_eq!(fm.get("name").unwrap(), "weather");
+        let (fm, body) = parse_skill_markdown(content).unwrap();
+        assert_eq!(fm.name.as_deref(), Some("weather"));
         assert_eq!(
-            fm.get("description").unwrap(),
-            "Get current weather and forecasts (no API key required)."
+            fm.description.as_deref(),
+            Some("Get current weather and forecasts (no API key required).")
         );
-        assert_eq!(fm.get("homepage").unwrap(), "https://wttr.in/:help");
         assert!(body.starts_with("# Weather"));
     }
 
@@ -449,22 +573,21 @@ mod tests {
             # GitHub Skill
         "#};
 
-        let (fm, body) = parse_frontmatter(content).unwrap();
-        assert_eq!(fm.get("name").unwrap(), "github");
+        let (fm, body) = parse_skill_markdown(content).unwrap();
+        assert_eq!(fm.name.as_deref(), Some("github"));
         assert_eq!(
-            fm.get("description").unwrap(),
-            "Interact with GitHub using the gh CLI."
+            fm.description.as_deref(),
+            Some("Interact with GitHub using the gh CLI.")
         );
-        // metadata line is skipped (starts with {)
-        assert!(!fm.contains_key("metadata"));
         assert!(body.starts_with("# GitHub Skill"));
     }
 
     #[test]
     fn test_parse_frontmatter_no_frontmatter() {
         let content = "# Just a markdown file\n\nNo frontmatter here.";
-        let (fm, body) = parse_frontmatter(content).unwrap();
-        assert!(fm.is_empty());
+        let (fm, body) = parse_skill_markdown(content).unwrap();
+        assert!(fm.name.is_none());
+        assert!(fm.description.is_none());
         assert_eq!(body, content);
     }
 
@@ -479,11 +602,68 @@ mod tests {
             Body here.
         "#};
 
-        let (fm, _body) = parse_frontmatter(content).unwrap();
+        let (fm, _body) = parse_skill_markdown(content).unwrap();
         assert_eq!(
-            fm.get("description").unwrap(),
-            "A skill with 'quotes' inside"
+            fm.description.as_deref(),
+            Some("A skill with 'quotes' inside")
         );
+    }
+
+    #[test]
+    fn test_parse_frontmatter_lists_and_multiline() {
+        let content = indoc::indoc! {r#"
+            ---
+            name: deploy
+            description: >-
+              Deploy the app to production
+              with the standard checklist.
+            tags:
+              - ops
+              - release
+            related_skills: [rollback, incident-response]
+            platforms:
+              - linux
+              - darwin
+            ---
+
+            Body.
+        "#};
+
+        let (fm, _body) = parse_skill_markdown(content).unwrap();
+        assert_eq!(
+            fm.description.as_deref(),
+            Some("Deploy the app to production with the standard checklist.")
+        );
+        assert_eq!(
+            fm.tags.as_deref(),
+            Some(&["ops".to_string(), "release".to_string()][..])
+        );
+        assert_eq!(
+            fm.related_skills.as_deref(),
+            Some(&["rollback".to_string(), "incident-response".to_string()][..])
+        );
+        assert_eq!(
+            fm.platforms.as_deref(),
+            Some(&[Platform::Linux, Platform::Macos][..])
+        );
+    }
+
+    #[test]
+    fn test_parse_frontmatter_unknown_platform_tolerated() {
+        let content = "---\nname: mobile\nplatforms: [android]\n---\n\nBody.";
+        let (fm, _body) = parse_skill_markdown(content).unwrap();
+        assert_eq!(fm.platforms.as_deref(), Some(&[Platform::Other][..]));
+    }
+
+    #[test]
+    fn test_index_description_truncated() {
+        let long = "x".repeat(DESCRIPTION_BUDGET + 40);
+        let rendered = index_description(&long);
+        assert!(rendered.len() <= DESCRIPTION_BUDGET);
+        assert!(rendered.ends_with("..."));
+
+        let short = "fits fine";
+        assert_eq!(index_description(short), short);
     }
 
     #[test]
@@ -506,6 +686,9 @@ mod tests {
                 content: "# Weather\n\nUse curl.".into(),
                 source: SkillSource::Instance,
                 source_repo: None,
+                tags: Vec::new(),
+                related_skills: Vec::new(),
+                linked_files: Vec::new(),
             },
         );
 
@@ -529,6 +712,9 @@ mod tests {
                 content: "# Weather\n\nUse curl.".into(),
                 source: SkillSource::Instance,
                 source_repo: None,
+                tags: Vec::new(),
+                related_skills: Vec::new(),
+                linked_files: Vec::new(),
             },
         );
 
@@ -560,6 +746,9 @@ mod tests {
             content: format!("# {name}"),
             source,
             source_repo: None,
+            tags: Vec::new(),
+            related_skills: Vec::new(),
+            linked_files: Vec::new(),
         }
     }
 
