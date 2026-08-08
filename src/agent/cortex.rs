@@ -9,17 +9,19 @@
 //! The cortex also observes system-wide activity via signals for future use in
 //! health monitoring and memory consolidation.
 
-use crate::agent::channel_dispatch::{WorkerCompletionError, map_worker_completion_result};
+use crate::agent::channel_dispatch::{WorkerCompletionError, map_worker_completion};
 use crate::agent::process_control::{
     ControlActionResult, DetachedWorkerControl, ProcessControlRegistry,
 };
 use crate::agent::worker::Worker;
+use crate::agent::worker::WorkerOutcome;
 use crate::error::Result;
 use crate::hooks::CortexHook;
 use crate::llm::SpacebotModel;
+use crate::memory::maintenance as memory_maintenance;
 use crate::memory::search::{SearchConfig, SearchMode, SearchSort};
 use crate::memory::types::{Association, MemoryType, RelationType};
-use crate::tasks::{TaskStatus, UpdateTaskInput};
+use crate::tasks::{TaskStatus, TaskStore, UpdateTaskInput};
 use crate::{
     AgentDeps, AgentId, BranchId, ChannelId, ProcessEvent, ProcessId, ProcessType, WorkerId,
 };
@@ -86,6 +88,12 @@ const BULLETIN_REFRESH_FAILURE_BACKOFF_BASE_SECS: u64 = 30;
 const BULLETIN_REFRESH_FAILURE_BACKOFF_MAX_SECS: u64 = 600;
 const BULLETIN_REFRESH_CIRCUIT_OPEN_THRESHOLD: u32 = 3;
 const BULLETIN_REFRESH_CIRCUIT_OPEN_SECS: u64 = 1800;
+const MAINTENANCE_CIRCUIT_OPEN_THRESHOLD: usize = 3;
+const MAINTENANCE_CIRCUIT_OPEN_SECS: u64 = 1800;
+const MAINTENANCE_TASK_TIMEOUT_MIN_SECS: u64 = 300;
+const MAINTENANCE_TASK_TIMEOUT_MAX_SECS: u64 = 3_600;
+const MAINTENANCE_TASK_TIMEOUT_MULTIPLIER: u64 = 6;
+const MAINTENANCE_TASK_CANCEL_GRACE_SECS: u64 = 30;
 
 fn bulletin_refresh_failure_backoff(consecutive_failures: u32) -> Duration {
     let exponent = consecutive_failures.saturating_sub(1).min(5);
@@ -136,6 +144,83 @@ fn maybe_close_bulletin_refresh_circuit(
     *bulletin_refresh_circuit_open = false;
     *next_bulletin_refresh_allowed_at = now;
     true
+}
+
+fn record_maintenance_failure(
+    maintenance_consecutive_failures: &mut usize,
+    maintenance_disabled_at: &mut Option<Instant>,
+    now: Instant,
+) -> bool {
+    *maintenance_consecutive_failures = maintenance_consecutive_failures.saturating_add(1);
+    if *maintenance_consecutive_failures >= MAINTENANCE_CIRCUIT_OPEN_THRESHOLD
+        && maintenance_disabled_at.is_none()
+    {
+        *maintenance_disabled_at = Some(now);
+        return true;
+    }
+    false
+}
+
+fn maybe_close_maintenance_circuit(
+    maintenance_consecutive_failures: &mut usize,
+    maintenance_disabled_at: &mut Option<Instant>,
+    now: Instant,
+) -> bool {
+    let Some(disabled_at) = *maintenance_disabled_at else {
+        return false;
+    };
+    if now.duration_since(disabled_at) < Duration::from_secs(MAINTENANCE_CIRCUIT_OPEN_SECS) {
+        return false;
+    }
+
+    *maintenance_consecutive_failures = 0;
+    *maintenance_disabled_at = None;
+    true
+}
+
+fn maintenance_task_timeout(maintenance_interval_secs: u64) -> Duration {
+    let interval_secs = maintenance_interval_secs.max(1);
+    let derived_secs = interval_secs.saturating_mul(MAINTENANCE_TASK_TIMEOUT_MULTIPLIER);
+    let bounded_secs = derived_secs.clamp(
+        MAINTENANCE_TASK_TIMEOUT_MIN_SECS,
+        MAINTENANCE_TASK_TIMEOUT_MAX_SECS,
+    );
+    Duration::from_secs(bounded_secs)
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum MaintenanceTimeoutAction {
+    None,
+    RequestCancel,
+    ForceAbort,
+}
+
+fn maintenance_timeout_action(
+    now: Instant,
+    started_at: Instant,
+    timeout: Duration,
+    cancel_requested_at: Option<Instant>,
+    forced_abort_issued: bool,
+) -> MaintenanceTimeoutAction {
+    if now.duration_since(started_at) < timeout {
+        return MaintenanceTimeoutAction::None;
+    }
+
+    if cancel_requested_at.is_none() {
+        return MaintenanceTimeoutAction::RequestCancel;
+    }
+
+    if forced_abort_issued {
+        return MaintenanceTimeoutAction::None;
+    }
+
+    if now.duration_since(cancel_requested_at.unwrap())
+        >= Duration::from_secs(MAINTENANCE_TASK_CANCEL_GRACE_SECS)
+    {
+        return MaintenanceTimeoutAction::ForceAbort;
+    }
+
+    MaintenanceTimeoutAction::None
 }
 
 fn has_completed_initial_warmup(status: &crate::config::WarmupStatus) -> bool {
@@ -233,6 +318,42 @@ where
     }
 }
 
+async fn generate_if_dirty_under_lock<ShouldGenerate, Generate, Fut>(
+    warmup_lock: &tokio::sync::Mutex<()>,
+    should_generate: ShouldGenerate,
+    generate: Generate,
+) -> BulletinRefreshOutcome
+where
+    ShouldGenerate: FnOnce() -> bool,
+    Generate: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let _warmup_guard = warmup_lock.lock().await;
+
+    if !should_generate() {
+        tracing::debug!("skipping knowledge synthesis because dirty version was already handled");
+        return BulletinRefreshOutcome::SkippedFresh;
+    }
+
+    if generate().await {
+        BulletinRefreshOutcome::Generated
+    } else {
+        BulletinRefreshOutcome::Failed
+    }
+}
+
+async fn generate_knowledge_synthesis_if_dirty_under_lock(
+    deps: &AgentDeps,
+    logger: &CortexLogger,
+) -> BulletinRefreshOutcome {
+    generate_if_dirty_under_lock(
+        deps.runtime_config.warmup_lock.as_ref(),
+        || should_regenerate_knowledge_synthesis(deps),
+        || generate_knowledge_synthesis(deps, logger),
+    )
+    .await
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BulletinRefreshOutcome {
     Generated,
@@ -245,8 +366,162 @@ impl BulletinRefreshOutcome {
         !matches!(self, Self::Failed)
     }
 
+    #[allow(dead_code)]
     fn generated(self) -> bool {
         matches!(self, Self::Generated)
+    }
+}
+
+fn maybe_spawn_synthesis_task(
+    task: &mut Option<tokio::task::JoinHandle<anyhow::Result<bool>>>,
+    backoff: &SynthesisTaskBackoff,
+    task_name: &'static str,
+    now: Instant,
+    spawn: impl FnOnce() -> tokio::task::JoinHandle<anyhow::Result<bool>>,
+) -> bool {
+    if task.is_some() {
+        return false;
+    }
+
+    if !backoff.can_spawn(now) {
+        tracing::debug!(
+            task = task_name,
+            failure_count = backoff.failure_count,
+            "cortex synthesis task scheduling skipped during backoff"
+        );
+        return false;
+    }
+
+    *task = Some(spawn());
+    true
+}
+
+fn spawn_intraday_synthesis_task(
+    deps: AgentDeps,
+    logger: CortexLogger,
+) -> tokio::task::JoinHandle<anyhow::Result<bool>> {
+    tokio::spawn(async move { maybe_synthesize_intraday_batch(&deps, &logger).await })
+}
+
+fn spawn_daily_synthesis_task(
+    deps: AgentDeps,
+    logger: CortexLogger,
+) -> tokio::task::JoinHandle<anyhow::Result<bool>> {
+    tokio::spawn(async move { maybe_synthesize_daily_summary(&deps, &logger).await })
+}
+
+fn mark_knowledge_synthesis_version_complete(
+    last_version: &std::sync::atomic::AtomicU64,
+    target_version: u64,
+) {
+    last_version.store(target_version, std::sync::atomic::Ordering::Release);
+}
+
+const SYNTHESIS_TASK_BACKOFF_INITIAL_SECS: u64 = 30;
+const SYNTHESIS_TASK_BACKOFF_MAX_SECS: u64 = 5 * 60;
+
+#[derive(Debug, Clone)]
+struct SynthesisTaskBackoff {
+    failure_count: u32,
+    next_allowed_instant: Instant,
+}
+
+impl SynthesisTaskBackoff {
+    fn new(now: Instant) -> Self {
+        Self {
+            failure_count: 0,
+            next_allowed_instant: now,
+        }
+    }
+
+    fn can_spawn(&self, now: Instant) -> bool {
+        now >= self.next_allowed_instant
+    }
+
+    fn record_success(&mut self, now: Instant) {
+        self.failure_count = 0;
+        self.next_allowed_instant = now;
+    }
+
+    fn record_failure(&mut self, now: Instant) {
+        self.failure_count = self.failure_count.saturating_add(1);
+        self.next_allowed_instant = now + synthesis_task_backoff_delay(self.failure_count);
+    }
+}
+
+fn synthesis_task_backoff_delay(failure_count: u32) -> Duration {
+    let exponent = failure_count.saturating_sub(1).min(10);
+    let multiplier = 1_u64 << exponent;
+    let seconds = SYNTHESIS_TASK_BACKOFF_INITIAL_SECS
+        .saturating_mul(multiplier)
+        .min(SYNTHESIS_TASK_BACKOFF_MAX_SECS);
+
+    Duration::from_secs(seconds)
+}
+
+async fn collect_synthesis_task(
+    task: &mut Option<tokio::task::JoinHandle<anyhow::Result<bool>>>,
+    task_name: &'static str,
+    backoff: &mut SynthesisTaskBackoff,
+    now: Instant,
+) {
+    let Some(handle) = task.as_ref() else {
+        return;
+    };
+
+    if !handle.is_finished() {
+        return;
+    }
+
+    let Some(handle) = task.take() else {
+        return;
+    };
+
+    match handle.await {
+        Ok(Ok(true)) => {
+            backoff.record_success(now);
+            tracing::debug!(task = task_name, "cortex synthesis task completed");
+        }
+        Ok(Ok(false)) => {
+            backoff.record_success(now);
+            tracing::trace!(task = task_name, "cortex synthesis task skipped");
+        }
+        Ok(Err(error)) => {
+            backoff.record_failure(now);
+            tracing::warn!(
+                %error,
+                task = task_name,
+                failure_count = backoff.failure_count,
+                "cortex synthesis task failed"
+            );
+        }
+        Err(error) if error.is_cancelled() => {
+            backoff.record_failure(now);
+            tracing::debug!(
+                %error,
+                task = task_name,
+                failure_count = backoff.failure_count,
+                "cortex synthesis task cancelled"
+            );
+        }
+        Err(error) if error.is_panic() => {
+            backoff.record_failure(now);
+            tracing::warn!(
+                %error,
+                task = task_name,
+                failure_count = backoff.failure_count,
+                "cortex synthesis task panicked"
+            );
+        }
+        Err(error) => {
+            backoff.record_failure(now);
+            tracing::warn!(
+                %error,
+                task = task_name,
+                failure_count = backoff.failure_count,
+                "cortex synthesis task failed"
+            );
+        }
     }
 }
 
@@ -537,7 +812,6 @@ pub async fn register_detached_worker_for_pickup(
 
     if let Err(error) = task_store
         .update(
-            agent_id,
             task_number,
             UpdateTaskInput {
                 worker_id: Some(worker_id.to_string()),
@@ -674,7 +948,7 @@ pub enum Signal {
 }
 
 /// A persisted cortex action record.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct CortexEvent {
     pub id: String,
     pub event_type: String,
@@ -690,17 +964,53 @@ pub struct CortexEvent {
 #[derive(Debug, Clone)]
 pub struct CortexLogger {
     pool: SqlitePool,
+    /// Optional notification store for emitting dashboard inbox entries.
+    notification_store: Option<std::sync::Arc<crate::notifications::NotificationStore>>,
+    /// Agent id, recorded in notifications for filtering.
+    agent_id: Option<String>,
 }
+
+// TODO: re-enable once notifications have proper action_url
+// const NOTIFY_EVENT_TYPES: &[&str] = &["circuit_breaker_tripped", "worker_killed"];
 
 impl CortexLogger {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            notification_store: None,
+            agent_id: None,
+        }
+    }
+
+    /// Attach a notification store so high-signal events surface in the inbox.
+    pub fn with_notifications(
+        mut self,
+        store: std::sync::Arc<crate::notifications::NotificationStore>,
+        agent_id: String,
+    ) -> Self {
+        self.notification_store = Some(store);
+        self.agent_id = Some(agent_id);
+        self
     }
 
     /// Log a cortex action. Fire-and-forget.
     pub fn log(&self, event_type: &str, summary: &str, details: Option<serde_json::Value>) {
         let pool = self.pool.clone();
         let id = uuid::Uuid::new_v4().to_string();
+
+        // TODO: re-enable once action_url points somewhere useful
+        // let should_notify =
+        //     self.notification_store.is_some() && NOTIFY_EVENT_TYPES.contains(&event_type);
+        // let notif_data = should_notify.then(|| {
+        //     (
+        //         self.notification_store.clone().unwrap(),
+        //         self.agent_id.clone(),
+        //         summary.to_string(),
+        //         details.clone(),
+        //         id.clone(),
+        //     )
+        // });
+
         let event_type = event_type.to_string();
         let summary = summary.to_string();
         let details_json = details.map(|d| d.to_string());
@@ -719,6 +1029,26 @@ impl CortexLogger {
                 tracing::warn!(%error, "failed to persist cortex event");
             }
         });
+
+        // TODO: re-enable once action_url points somewhere useful
+        // if let Some((store, agent_id, title, details, entity_id)) = notif_data {
+        //     tokio::spawn(async move {
+        //         let n = crate::notifications::NewNotification {
+        //             kind: crate::notifications::NotificationKind::CortexObservation,
+        //             severity: crate::notifications::NotificationSeverity::Warn,
+        //             title,
+        //             body: details.as_ref().map(|d| d.to_string()),
+        //             agent_id,
+        //             related_entity_type: Some("cortex_event".to_string()),
+        //             related_entity_id: Some(entity_id),
+        //             action_url: None,
+        //             metadata: None,
+        //         };
+        //         if let Err(error) = store.insert(n).await {
+        //             tracing::warn!(%error, "failed to insert cortex observation notification");
+        //         }
+        //     });
+        // }
     }
 
     /// Load cortex events with optional type filter, newest first.
@@ -811,6 +1141,12 @@ impl Cortex {
     /// Process a process event and extract signals.
     pub async fn observe(&self, event: ProcessEvent) {
         self.observe_health_event(&event).await;
+
+        // Bump knowledge synthesis version on memory content changes.
+        if matches!(&event, ProcessEvent::MemorySaved { .. }) {
+            self.deps.runtime_config.bump_knowledge_synthesis_version();
+        }
+
         let Some(signal) = signal_from_event(event) else {
             return;
         };
@@ -847,6 +1183,12 @@ impl Cortex {
                 state.track_worker_activity(*worker_id);
             }
             ProcessEvent::ToolStarted {
+                process_id: ProcessId::Worker(worker_id),
+                ..
+            } => {
+                state.track_worker_activity(*worker_id);
+            }
+            ProcessEvent::ToolOutput {
                 process_id: ProcessId::Worker(worker_id),
                 ..
             } => {
@@ -1053,19 +1395,24 @@ impl Cortex {
             }
         }
 
-        logger.log(
-            "health_check",
-            "Cortex supervision health tick completed",
-            Some(serde_json::json!({
-                "kill_skipped_due_to_lag": false,
-                "kill_budget": kill_budget,
-                "kill_attempts": kill_attempts,
-                "kill_actions": kill_actions,
-                "worker_timeout_secs": worker_timeout.as_secs(),
-                "branch_timeout_secs": branch_timeout.as_secs(),
-                "pruned_dead_channels": pruned_dead_channels,
-            })),
-        );
+        // Only log health ticks when something actually happened.
+        if kill_actions > 0 || pruned_dead_channels > 0 {
+            logger.log(
+                "health_check",
+                &format!(
+                    "Cortex supervision: killed {} processes, pruned {} dead channels",
+                    kill_actions, pruned_dead_channels
+                ),
+                Some(serde_json::json!({
+                    "kill_budget": kill_budget,
+                    "kill_attempts": kill_attempts,
+                    "kill_actions": kill_actions,
+                    "worker_timeout_secs": worker_timeout.as_secs(),
+                    "branch_timeout_secs": branch_timeout.as_secs(),
+                    "pruned_dead_channels": pruned_dead_channels,
+                })),
+            );
+        }
 
         Ok(())
     }
@@ -1259,7 +1606,9 @@ fn signal_from_event(event: ProcessEvent) -> Option<Signal> {
         | ProcessEvent::OpenCodePartUpdated { .. }
         | ProcessEvent::WorkerInitialResult { .. }
         | ProcessEvent::WorkerText { .. }
-        | ProcessEvent::CortexChatUpdate { .. } => return None,
+        | ProcessEvent::CortexChatUpdate { .. }
+        | ProcessEvent::SettingsUpdated { .. }
+        | ProcessEvent::ToolOutput { .. } => return None,
     })
 }
 
@@ -1406,8 +1755,21 @@ fn handle_cortex_receiver_result(
 pub fn spawn_cortex_loop(deps: AgentDeps, logger: CortexLogger) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let prompt_engine = deps.runtime_config.prompts.load();
+        let routing = deps.runtime_config.routing.load();
+        let model_name = routing.resolve(ProcessType::Cortex, None).to_string();
+        let tool_use_enforcement = deps.runtime_config.tool_use_enforcement.load();
         let system_prompt = match prompt_engine.render_static("cortex") {
-            Ok(prompt) => prompt,
+            Ok(prompt) => match prompt_engine.maybe_append_tool_use_enforcement(
+                prompt.clone(),
+                tool_use_enforcement.as_ref(),
+                &model_name,
+            ) {
+                Ok(prompt) => prompt,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to append tool-use enforcement, using base cortex prompt");
+                    prompt
+                }
+            },
             Err(error) => {
                 tracing::warn!(%error, "failed to render cortex prompt, using empty preamble");
                 String::new()
@@ -1418,8 +1780,15 @@ pub fn spawn_cortex_loop(deps: AgentDeps, logger: CortexLogger) -> tokio::task::
         let cortex = Cortex::new(deps.clone(), system_prompt);
         let mut event_rx = deps.event_tx.subscribe();
         let mut memory_event_rx = deps.memory_event_tx.subscribe();
-        if let Err(error) =
-            run_cortex_loop(&cortex, &logger, &mut event_rx, &mut memory_event_rx).await
+        let mut tool_output_rx = deps.tool_output_tx.subscribe();
+        if let Err(error) = run_cortex_loop(
+            &cortex,
+            &logger,
+            &mut event_rx,
+            &mut memory_event_rx,
+            &mut tool_output_rx,
+        )
+        .await
         {
             tracing::error!(%error, "cortex loop exited with error");
         }
@@ -1523,9 +1892,15 @@ pub async fn run_warmup_once(deps: &AgentDeps, logger: &CortexLogger, reason: &s
         }
     }
 
-    let bulletin_ok = generate_bulletin(deps, logger).await;
-    if !bulletin_ok {
-        errors.push("bulletin generation failed".to_string());
+    // Generate knowledge synthesis (narrower scope, replaces bulletin).
+    // This also syncs memory_bulletin for backward compatibility.
+    let synthesis_ok = generate_knowledge_synthesis(deps, logger).await;
+    if !synthesis_ok {
+        // Fall back to the broader bulletin if knowledge synthesis fails.
+        let bulletin_ok = generate_bulletin(deps, logger).await;
+        if !bulletin_ok {
+            errors.push("knowledge synthesis and bulletin fallback both failed".to_string());
+        }
     }
 
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -1590,6 +1965,9 @@ pub fn trigger_forced_warmup(deps: AgentDeps, dispatch_type: &'static str) {
     });
 }
 
+/// Preserved for fallback — the bulletin loop has been replaced by change-driven
+/// knowledge synthesis, but this function is still used at startup.
+#[allow(dead_code)]
 fn spawn_bulletin_refresh_task(
     deps: AgentDeps,
     logger: CortexLogger,
@@ -1614,6 +1992,7 @@ async fn run_cortex_loop(
     logger: &CortexLogger,
     event_rx: &mut broadcast::Receiver<ProcessEvent>,
     memory_event_rx: &mut broadcast::Receiver<ProcessEvent>,
+    tool_output_rx: &mut broadcast::Receiver<ProcessEvent>,
 ) -> anyhow::Result<()> {
     tracing::info!("cortex loop started");
 
@@ -1621,13 +2000,14 @@ async fn run_cortex_loop(
     const RETRY_DELAY_SECS: u64 = 15;
     const LAG_WARNING_INTERVAL_SECS: u64 = 30;
 
-    // Run bulletin generation immediately on startup, with retries.
+    // Run knowledge synthesis immediately on startup, with retries.
+    // Falls back to the broader bulletin if synthesis fails.
     for attempt in 0..=MAX_RETRIES {
         let bulletin_outcome = maybe_generate_bulletin_under_lock(
             cortex.deps.runtime_config.warmup_lock.as_ref(),
             &cortex.deps.runtime_config.warmup,
             &cortex.deps.runtime_config.warmup_status,
-            || generate_bulletin(&cortex.deps, logger),
+            || generate_knowledge_synthesis(&cortex.deps, logger),
         )
         .await;
 
@@ -1638,12 +2018,12 @@ async fn run_cortex_loop(
             tracing::info!(
                 attempt = attempt + 1,
                 max = MAX_RETRIES,
-                "retrying bulletin generation in {RETRY_DELAY_SECS}s"
+                "retrying knowledge synthesis in {RETRY_DELAY_SECS}s"
             );
             logger.log(
-                "bulletin_failed",
+                "knowledge_synthesis_startup_retry",
                 &format!(
-                    "Bulletin generation failed, retrying (attempt {}/{})",
+                    "Knowledge synthesis failed, retrying (attempt {}/{})",
                     attempt + 1,
                     MAX_RETRIES
                 ),
@@ -1655,7 +2035,7 @@ async fn run_cortex_loop(
 
     // Generate an initial profile after startup bulletin synthesis.
     generate_profile(&cortex.deps, logger).await;
-    let mut last_bulletin_refresh = Instant::now();
+    let mut _last_bulletin_refresh = Instant::now();
     let mut tick_interval_secs = cortex
         .deps
         .runtime_config
@@ -1671,11 +2051,28 @@ async fn run_cortex_loop(
     let mut last_lag_warning_control: Option<Instant> = None;
     let mut lagged_since_last_warning_memory: u64 = 0;
     let mut last_lag_warning_memory: Option<Instant> = None;
+    let mut lagged_since_last_warning_tool_output: u64 = 0;
+    let mut last_lag_warning_tool_output: Option<Instant> = None;
     let mut memory_event_stream_open = true;
+    let mut tool_output_stream_open = true;
     let mut refresh_task: Option<tokio::task::JoinHandle<BulletinRefreshOutcome>> = None;
+    let mut maintenance_task: Option<
+        tokio::task::JoinHandle<crate::error::Result<memory_maintenance::MaintenanceReport>>,
+    > = None;
+    let mut maintenance_task_started_at: Option<Instant> = None;
+    let mut maintenance_task_cancel_tx: Option<tokio::sync::watch::Sender<bool>> = None;
+    let mut maintenance_task_cancel_requested_at: Option<Instant> = None;
+    let mut maintenance_task_forced_abort_issued = false;
+    let mut maintenance_consecutive_failures: usize = 0;
+    let mut maintenance_disabled_at: Option<Instant> = None;
     let mut bulletin_refresh_failures: u32 = 0;
     let mut bulletin_refresh_circuit_open = false;
     let mut next_bulletin_refresh_allowed_at = Instant::now();
+    let mut last_maintenance = Instant::now();
+    let mut intraday_synthesis_task: Option<tokio::task::JoinHandle<anyhow::Result<bool>>> = None;
+    let mut daily_synthesis_task: Option<tokio::task::JoinHandle<anyhow::Result<bool>>> = None;
+    let mut intraday_synthesis_backoff = SynthesisTaskBackoff::new(Instant::now());
+    let mut daily_synthesis_backoff = SynthesisTaskBackoff::new(Instant::now());
 
     loop {
         tokio::select! {
@@ -1702,6 +2099,15 @@ async fn run_cortex_loop(
                     }
                     CortexReceiverOutcome::StopLoop => {
                         if let Some(task) = refresh_task.take() {
+                            task.abort();
+                        }
+                        if let Some(task) = intraday_synthesis_task.take() {
+                            task.abort();
+                        }
+                        if let Some(task) = daily_synthesis_task.take() {
+                            task.abort();
+                        }
+                        if let Some(task) = maintenance_task.take() {
                             task.abort();
                         }
                         return Ok(());
@@ -1732,6 +2138,15 @@ async fn run_cortex_loop(
                         if let Some(task) = refresh_task.take() {
                             task.abort();
                         }
+                        if let Some(task) = intraday_synthesis_task.take() {
+                            task.abort();
+                        }
+                        if let Some(task) = daily_synthesis_task.take() {
+                            task.abort();
+                        }
+                        if let Some(task) = maintenance_task.take() {
+                            task.abort();
+                        }
                         return Ok(());
                     }
                     CortexReceiverOutcome::DisableStream => {
@@ -1739,10 +2154,53 @@ async fn run_cortex_loop(
                     }
                 }
             },
+            event = tool_output_rx.recv(), if tool_output_stream_open => {
+                match handle_cortex_receiver_result(
+                    event,
+                    "tool_output",
+                    ReceiverClosedBehavior::DisableStream,
+                    &mut lagged_since_last_warning_tool_output,
+                    &mut last_lag_warning_tool_output,
+                    LAG_WARNING_INTERVAL_SECS,
+                ) {
+                    CortexReceiverOutcome::Observe(event) => cortex.observe(event).await,
+                    CortexReceiverOutcome::Lagged { dropped } => {
+                        #[cfg(feature = "metrics")]
+                        crate::telemetry::Metrics::global()
+                            .event_receiver_lagged_events_total
+                            .with_label_values(&[&*cortex.deps.agent_id, "cortex_tool_output"])
+                            .inc_by(dropped);
+                        #[cfg(not(feature = "metrics"))]
+                        let _ = dropped;
+                    }
+                    CortexReceiverOutcome::StopLoop => unreachable!("tool output stream cannot stop cortex loop"),
+                    CortexReceiverOutcome::DisableStream => {
+                        tool_output_stream_open = false;
+                    }
+                }
+            },
             _ = tick_timer.tick() => {
                 if let Err(error) = cortex.run_health_tick(logger).await {
                     tracing::warn!(%error, "cortex health tick failed");
                 }
+
+                let cortex_config = **cortex.deps.runtime_config.cortex.load();
+                let now = Instant::now();
+
+                collect_synthesis_task(
+                    &mut intraday_synthesis_task,
+                    "intraday",
+                    &mut intraday_synthesis_backoff,
+                    now,
+                )
+                .await;
+                collect_synthesis_task(
+                    &mut daily_synthesis_task,
+                    "daily",
+                    &mut daily_synthesis_backoff,
+                    now,
+                )
+                .await;
 
                 if refresh_task
                     .as_ref()
@@ -1753,7 +2211,7 @@ async fn run_cortex_loop(
                         Ok(outcome) => {
                             let now = Instant::now();
                             if outcome.is_success() {
-                                last_bulletin_refresh = now;
+                                _last_bulletin_refresh = now;
                                 bulletin_refresh_failures = 0;
                                 bulletin_refresh_circuit_open = false;
                                 next_bulletin_refresh_allowed_at = now;
@@ -1812,8 +2270,144 @@ async fn run_cortex_loop(
                     }
                 }
 
-                let cortex_config = **cortex.deps.runtime_config.cortex.load();
-                let bulletin_interval = Duration::from_secs(cortex_config.bulletin_interval_secs.max(1));
+                if maintenance_task
+                    .as_ref()
+                    .is_some_and(tokio::task::JoinHandle::is_finished)
+                    && let Some(task) = maintenance_task.take()
+                {
+                    maintenance_task_started_at = None;
+                    maintenance_task_cancel_tx = None;
+                    maintenance_task_cancel_requested_at = None;
+                    maintenance_task_forced_abort_issued = false;
+                    match task.await {
+                        Ok(Ok(report)) => {
+                            if maintenance_consecutive_failures > 0 || maintenance_disabled_at.is_some()
+                            {
+                                tracing::info!(
+                                    previous_failures = maintenance_consecutive_failures,
+                                    "cortex maintenance circuit reset after successful run"
+                                );
+                            }
+                            maintenance_consecutive_failures = 0;
+                            maintenance_disabled_at = None;
+                            // Prunes and merges change memory content; decay is
+                            // importance-only and does not dirty knowledge.
+                            if report.pruned > 0 || report.merged > 0 {
+                                cortex.deps.runtime_config.bump_knowledge_synthesis_version();
+                            }
+                            logger.log(
+                                "maintenance_completed",
+                                "Memory maintenance completed",
+                                Some(serde_json::json!({
+                                    "decayed": report.decayed,
+                                    "pruned": report.pruned,
+                                    "merged": report.merged,
+                                })),
+                            );
+                        }
+                        Ok(Err(error)) => {
+                            let now = Instant::now();
+                            let circuit_opened = record_maintenance_failure(
+                                &mut maintenance_consecutive_failures,
+                                &mut maintenance_disabled_at,
+                                now,
+                            );
+                            tracing::warn!(%error, "cortex maintenance failed");
+                            if circuit_opened {
+                                tracing::warn!(
+                                    failures = maintenance_consecutive_failures,
+                                    cooldown_secs = MAINTENANCE_CIRCUIT_OPEN_SECS,
+                                    "cortex maintenance circuit opened after consecutive failures"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            let now = Instant::now();
+                            let circuit_opened = record_maintenance_failure(
+                                &mut maintenance_consecutive_failures,
+                                &mut maintenance_disabled_at,
+                                now,
+                            );
+                            if error.is_cancelled() {
+                                tracing::warn!(
+                                    %error,
+                                    "cortex maintenance task was cancelled before completion"
+                                );
+                            } else if error.is_panic() {
+                                tracing::warn!(%error, "cortex maintenance task panicked");
+                            } else {
+                                tracing::warn!(%error, "cortex maintenance task failed");
+                            }
+                            if circuit_opened {
+                                tracing::warn!(
+                                    failures = maintenance_consecutive_failures,
+                                    cooldown_secs = MAINTENANCE_CIRCUIT_OPEN_SECS,
+                                    "cortex maintenance circuit opened after task failures"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if let Some(started_at) = maintenance_task_started_at {
+                    let timeout = maintenance_task_timeout(cortex_config.maintenance_interval_secs);
+                    let action = maintenance_timeout_action(
+                        now,
+                        started_at,
+                        timeout,
+                        maintenance_task_cancel_requested_at,
+                        maintenance_task_forced_abort_issued,
+                    );
+                    match action {
+                        MaintenanceTimeoutAction::None => {}
+                        MaintenanceTimeoutAction::RequestCancel => {
+                            if let Some(cancel_tx) = maintenance_task_cancel_tx.as_ref() {
+                                cancel_tx.send(true).ok();
+                            }
+                            maintenance_task_cancel_requested_at = Some(now);
+                            tracing::warn!(
+                                elapsed_secs = started_at.elapsed().as_secs(),
+                                timeout_secs = timeout.as_secs(),
+                                "cortex maintenance task timed out; requesting graceful cancel"
+                            );
+                            logger.log(
+                                "maintenance_timeout",
+                                "Memory maintenance timeout requested",
+                                Some(serde_json::json!({
+                                    "elapsed_secs": started_at.elapsed().as_secs(),
+                                    "timeout_secs": timeout.as_secs(),
+                                    "maintenance_interval_secs": cortex_config.maintenance_interval_secs,
+                                    "graceful_cancel": true,
+                                })),
+                            );
+                        }
+                        MaintenanceTimeoutAction::ForceAbort => {
+                            if let Some(task) = maintenance_task.as_ref() {
+                                task.abort();
+                            }
+                            maintenance_task_cancel_requested_at = Some(now);
+                            maintenance_task_forced_abort_issued = true;
+                            tracing::warn!(
+                                elapsed_secs = started_at.elapsed().as_secs(),
+                                timeout_secs = timeout.as_secs(),
+                                grace_secs = MAINTENANCE_TASK_CANCEL_GRACE_SECS,
+                                "cortex maintenance task did not stop gracefully; forcing abort"
+                            );
+                            logger.log(
+                                "maintenance_timeout",
+                                "Memory maintenance forced abort",
+                                Some(serde_json::json!({
+                                    "elapsed_secs": started_at.elapsed().as_secs(),
+                                    "timeout_secs": timeout.as_secs(),
+                                    "maintenance_interval_secs": cortex_config.maintenance_interval_secs,
+                                    "forced_abort": true,
+                                })),
+                            );
+                        }
+                    }
+                }
+
+                let _bulletin_interval = Duration::from_secs(cortex_config.bulletin_interval_secs.max(1));
                 let now = Instant::now();
                 if maybe_close_bulletin_refresh_circuit(
                     &mut bulletin_refresh_failures,
@@ -1823,15 +2417,99 @@ async fn run_cortex_loop(
                 ) {
                     tracing::info!("cortex bulletin refresh circuit closed; retries re-enabled");
                 }
+                if maybe_close_maintenance_circuit(
+                    &mut maintenance_consecutive_failures,
+                    &mut maintenance_disabled_at,
+                    now,
+                ) {
+                    tracing::info!("cortex maintenance circuit closed; retries re-enabled");
+                }
+                // Bulletin timer-based refresh removed — knowledge synthesis
+                // is now change-driven via dirty flag + debounce. The bulletin
+                // loop was generating ~96 redundant calls/day at 15-min intervals.
+                // The old bulletin code is preserved for startup fallback only.
+
+                // Knowledge synthesis: change-driven regeneration with debounce.
                 if refresh_task.is_none()
-                    && !bulletin_refresh_circuit_open
-                    && last_bulletin_refresh.elapsed() >= bulletin_interval
-                    && now >= next_bulletin_refresh_allowed_at
+                    && should_regenerate_knowledge_synthesis(&cortex.deps)
                 {
-                    refresh_task = Some(spawn_bulletin_refresh_task(
-                        cortex.deps.clone(),
-                        logger.clone(),
-                    ));
+                    let deps = cortex.deps.clone();
+                    let synthesis_logger = logger.clone();
+                    refresh_task = Some(tokio::spawn(async move {
+                        generate_knowledge_synthesis_if_dirty_under_lock(&deps, &synthesis_logger)
+                            .await
+                    }));
+                }
+
+                if last_maintenance.elapsed() >= Duration::from_secs(
+                    cortex_config.maintenance_interval_secs.max(1),
+                ) {
+                    if maintenance_task.is_none() && maintenance_disabled_at.is_none() {
+                        maintenance_task_started_at = Some(Instant::now());
+                        let maintenance_config = memory_maintenance::MaintenanceConfig {
+                            prune_threshold: cortex_config.maintenance_prune_threshold,
+                            decay_rate: cortex_config.maintenance_decay_rate,
+                            min_age_days: cortex_config.maintenance_min_age_days,
+                            merge_similarity_threshold: cortex_config
+                                .maintenance_merge_similarity_threshold,
+                        };
+                        let memory_search = cortex.deps.memory_search.clone();
+                        logger.log(
+                            "maintenance_started",
+                            "Memory maintenance started",
+                            Some(serde_json::json!({
+                                "decay_rate": maintenance_config.decay_rate,
+                                "prune_threshold": maintenance_config.prune_threshold,
+                                "min_age_days": maintenance_config.min_age_days,
+                                "merge_similarity_threshold": maintenance_config.merge_similarity_threshold,
+                            })),
+                        );
+                        let (maintenance_cancel_tx, maintenance_cancel_rx) =
+                            tokio::sync::watch::channel(false);
+                        maintenance_task = Some(tokio::spawn(async move {
+                            memory_maintenance::run_maintenance_with_cancel(
+                                memory_search.store(),
+                                memory_search.embedding_table(),
+                                memory_search.embedding_model_arc(),
+                                &maintenance_config,
+                                maintenance_cancel_rx,
+                            )
+                            .await
+                        }));
+                        maintenance_task_cancel_tx = Some(maintenance_cancel_tx);
+                        maintenance_task_cancel_requested_at = None;
+                        maintenance_task_forced_abort_issued = false;
+                    } else if maintenance_disabled_at.is_some() {
+                        tracing::debug!(
+                            failures = maintenance_consecutive_failures,
+                            cooldown_secs = MAINTENANCE_CIRCUIT_OPEN_SECS,
+                            "maintenance scheduling skipped while maintenance circuit is open"
+                        );
+                    }
+
+                    last_maintenance = Instant::now();
+                }
+
+                maybe_spawn_synthesis_task(
+                    &mut intraday_synthesis_task,
+                    &intraday_synthesis_backoff,
+                    "intraday",
+                    now,
+                    || spawn_intraday_synthesis_task(cortex.deps.clone(), logger.clone()),
+                );
+
+                maybe_spawn_synthesis_task(
+                    &mut daily_synthesis_task,
+                    &daily_synthesis_backoff,
+                    "daily",
+                    now,
+                    || spawn_daily_synthesis_task(cortex.deps.clone(), logger.clone()),
+                );
+
+                // Working memory: prune old events (cheap SQL, runs every tick but deletes nothing most of the time).
+                let wm_config = **cortex.deps.runtime_config.working_memory.load();
+                if let Err(error) = cortex.deps.working_memory.prune_old_events(wm_config.event_retention_days).await {
+                    tracing::warn!(%error, "working memory event pruning failed");
                 }
 
                 let updated_tick_interval_secs = cortex_config.tick_interval_secs.max(1);
@@ -1990,7 +2668,12 @@ async fn gather_active_tasks(deps: &AgentDeps) -> anyhow::Result<String> {
     ] {
         let tasks = deps
             .task_store
-            .list(&deps.agent_id, Some(*status), None, 20)
+            .list(crate::tasks::TaskListFilter {
+                assigned_agent_id: Some(deps.agent_id.to_string()),
+                status: Some(*status),
+                limit: Some(20),
+                ..Default::default()
+            })
             .await?;
         all_tasks.extend(tasks);
     }
@@ -2066,9 +2749,13 @@ pub async fn generate_bulletin(deps: &AgentDeps, logger: &CortexLogger) -> bool 
 
     let routing = deps.runtime_config.routing.load();
     let model_name = routing.resolve(ProcessType::Cortex, None).to_string();
+    let usage_accumulator = std::sync::Arc::new(tokio::sync::Mutex::new(
+        crate::llm::usage::UsageAccumulator::new(),
+    ));
     let model = SpacebotModel::make(&deps.llm_manager, &model_name)
         .with_context(&*deps.agent_id, "cortex")
-        .with_routing((**routing).clone());
+        .with_routing((**routing).clone())
+        .with_accumulator(usage_accumulator.clone());
 
     // No tools needed — the LLM just synthesizes the pre-gathered data.
     // Attach CortexHook so observation/termination semantics stay consistent
@@ -2088,7 +2775,18 @@ pub async fn generate_bulletin(deps: &AgentDeps, logger: &CortexLogger) -> bool 
         }
     };
 
-    match agent.prompt(&synthesis_prompt).await {
+    let result = agent.prompt(&synthesis_prompt).await;
+    // Flush cortex token usage.
+    let acc = usage_accumulator.lock().await;
+    if let Err(error) = acc
+        .flush(&deps.sqlite_pool, &deps.agent_id, "cortex", None)
+        .await
+    {
+        tracing::warn!(%error, "failed to flush cortex token usage");
+    }
+    drop(acc);
+
+    match result {
         Ok(bulletin) => {
             let word_count = bulletin.split_whitespace().count();
             let duration_ms = started.elapsed().as_millis() as u64;
@@ -2143,10 +2841,642 @@ pub async fn generate_bulletin(deps: &AgentDeps, logger: &CortexLogger) -> bool 
     }
 }
 
+// -- Knowledge Synthesis --
+
+/// Sections for knowledge synthesis — narrower than the bulletin.
+/// No identity (Layer 1), no recent events (Layer 2), no per-user context (Layer 4).
+const KNOWLEDGE_SYNTHESIS_SECTIONS: &[BulletinSection] = &[
+    BulletinSection {
+        label: "Decisions",
+        mode: SearchMode::Typed,
+        memory_type: Some(MemoryType::Decision),
+        sort_by: SearchSort::Recent,
+        max_results: 10,
+    },
+    BulletinSection {
+        label: "High-Importance Context",
+        mode: SearchMode::Important,
+        memory_type: None,
+        sort_by: SearchSort::Importance,
+        max_results: 10,
+    },
+    BulletinSection {
+        label: "Preferences & Patterns",
+        mode: SearchMode::Typed,
+        memory_type: Some(MemoryType::Preference),
+        sort_by: SearchSort::Importance,
+        max_results: 10,
+    },
+    BulletinSection {
+        label: "Active Goals",
+        mode: SearchMode::Typed,
+        memory_type: Some(MemoryType::Goal),
+        sort_by: SearchSort::Recent,
+        max_results: 10,
+    },
+    BulletinSection {
+        label: "Observations",
+        mode: SearchMode::Typed,
+        memory_type: Some(MemoryType::Observation),
+        sort_by: SearchSort::Recent,
+        max_results: 5,
+    },
+];
+
+#[derive(Debug, Default)]
+struct GatheredSections {
+    text: String,
+    failed_sections: usize,
+}
+
+impl GatheredSections {
+    fn has_failures(&self) -> bool {
+        self.failed_sections > 0
+    }
+}
+
+/// Generate a change-driven knowledge synthesis (Layer 5) and store it in RuntimeConfig.
+///
+/// Uses the same programmatic gather + LLM synthesis pattern as the bulletin,
+/// but with narrower scope and the `cortex_knowledge_synthesis` prompt template.
+/// Also keeps `memory_bulletin` in sync for backward compatibility.
+#[tracing::instrument(skip(deps, logger), fields(agent_id = %deps.agent_id))]
+pub async fn generate_knowledge_synthesis(deps: &AgentDeps, logger: &CortexLogger) -> bool {
+    tracing::info!("cortex generating knowledge synthesis");
+    let started = Instant::now();
+    let target_version = deps
+        .runtime_config
+        .knowledge_synthesis_version
+        .load(std::sync::atomic::Ordering::Acquire);
+
+    let mut gathered_sections = gather_sections_from_list(deps, KNOWLEDGE_SYNTHESIS_SECTIONS).await;
+    let active_tasks_failed = match gather_active_tasks(deps).await {
+        Ok(tasks) => {
+            gathered_sections.text.push_str(&tasks);
+            false
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to gather active tasks for knowledge synthesis");
+            true
+        }
+    };
+    let gather_failed = gathered_sections.has_failures() || active_tasks_failed;
+    let failed_memory_sections = gathered_sections.failed_sections;
+    let raw_sections = gathered_sections.text;
+    let section_count = raw_sections.matches("### ").count();
+
+    if gather_failed {
+        let duration_ms = started.elapsed().as_millis() as u64;
+        tracing::warn!(
+            failed_memory_sections,
+            active_tasks_failed,
+            duration_ms,
+            "knowledge synthesis input gather failed"
+        );
+        update_warmup_status(deps, |status| {
+            status.last_error = Some("knowledge synthesis input gather failed".to_string());
+        });
+        logger.log(
+            "knowledge_synthesis_failed",
+            "Knowledge synthesis failed while gathering input",
+            Some(serde_json::json!({
+                "duration_ms": duration_ms,
+                "failed_memory_sections": failed_memory_sections,
+                "active_tasks_failed": active_tasks_failed,
+                "target_version": target_version,
+            })),
+        );
+        return false;
+    }
+
+    if raw_sections.is_empty() {
+        tracing::info!("no memories found for knowledge synthesis");
+        deps.runtime_config
+            .knowledge_synthesis
+            .store(Arc::new(String::new()));
+        // Keep bulletin in sync during transition.
+        deps.runtime_config
+            .memory_bulletin
+            .store(Arc::new(String::new()));
+        mark_knowledge_synthesis_version_complete(
+            &deps.runtime_config.knowledge_synthesis_last_version,
+            target_version,
+        );
+        update_warmup_status(deps, |status| {
+            status.last_refresh_unix_ms = Some(chrono::Utc::now().timestamp_millis());
+            status.bulletin_age_secs = Some(0);
+            if status.state != crate::config::WarmupState::Warming {
+                status.state = crate::config::WarmupState::Warm;
+                status.last_error = None;
+            }
+        });
+        logger.log(
+            "knowledge_synthesis_generated",
+            "Knowledge synthesis skipped: no memories or active tasks",
+            Some(serde_json::json!({
+                "word_count": 0,
+                "sections": 0,
+                "duration_ms": started.elapsed().as_millis() as u64,
+                "target_version": target_version,
+                "skipped": true,
+            })),
+        );
+        return true;
+    }
+
+    let cortex_config = **deps.runtime_config.cortex.load();
+    let prompt_engine = deps.runtime_config.prompts.load();
+    let synthesis_preamble = match prompt_engine.render_static("cortex_knowledge_synthesis") {
+        Ok(p) => p,
+        Err(error) => {
+            tracing::error!(%error, "failed to render cortex_knowledge_synthesis prompt");
+            return false;
+        }
+    };
+
+    let routing = deps.runtime_config.routing.load();
+    let model_name = routing.resolve(ProcessType::Cortex, None).to_string();
+    let usage_accumulator = std::sync::Arc::new(tokio::sync::Mutex::new(
+        crate::llm::usage::UsageAccumulator::new(),
+    ));
+    let model = SpacebotModel::make(&deps.llm_manager, &model_name)
+        .with_context(&*deps.agent_id, "cortex")
+        .with_routing((**routing).clone())
+        .with_accumulator(usage_accumulator.clone());
+
+    let agent = AgentBuilder::new(model)
+        .preamble(&synthesis_preamble)
+        .hook(CortexHook::new())
+        .build();
+
+    let max_words = cortex_config.knowledge_synthesis_max_words;
+    let user_prompt = match prompt_engine.render_system_cortex_synthesis(max_words, &raw_sections) {
+        Ok(p) => p,
+        Err(error) => {
+            tracing::error!(%error, "failed to render cortex synthesis user prompt");
+            return false;
+        }
+    };
+
+    let result = agent.prompt(&user_prompt).await;
+    let acc = usage_accumulator.lock().await;
+    if let Err(error) = acc
+        .flush(&deps.sqlite_pool, &deps.agent_id, "cortex", None)
+        .await
+    {
+        tracing::warn!(%error, "failed to flush cortex token usage");
+    }
+    drop(acc);
+
+    match result {
+        Ok(synthesis) => {
+            let word_count = synthesis.split_whitespace().count();
+            let duration_ms = started.elapsed().as_millis() as u64;
+            tracing::info!(
+                words = word_count,
+                sections = section_count,
+                duration_ms,
+                "knowledge synthesis generated"
+            );
+            deps.runtime_config
+                .knowledge_synthesis
+                .store(Arc::new(synthesis.clone()));
+            // Keep bulletin in sync during transition so unconverted consumers work.
+            deps.runtime_config
+                .memory_bulletin
+                .store(Arc::new(synthesis));
+            mark_knowledge_synthesis_version_complete(
+                &deps.runtime_config.knowledge_synthesis_last_version,
+                target_version,
+            );
+            // Update warmup status.
+            let refresh_ms = chrono::Utc::now().timestamp_millis();
+            update_warmup_status(deps, |status| {
+                status.last_refresh_unix_ms = Some(refresh_ms);
+                status.bulletin_age_secs = Some(0);
+                if status.state != crate::config::WarmupState::Warming {
+                    status.state = crate::config::WarmupState::Warm;
+                    status.last_error = None;
+                }
+            });
+            logger.log(
+                "knowledge_synthesis_generated",
+                &format!("Knowledge synthesis: {word_count} words, {section_count} sections, {duration_ms}ms"),
+                Some(serde_json::json!({
+                    "word_count": word_count,
+                    "sections": section_count,
+                    "duration_ms": duration_ms,
+                    "model": model_name,
+                })),
+            );
+            true
+        }
+        Err(error) => {
+            let duration_ms = started.elapsed().as_millis() as u64;
+            tracing::error!(%error, duration_ms, "knowledge synthesis failed");
+            update_warmup_status(deps, |status| {
+                status.last_error = Some(format!("knowledge synthesis failed: {error}"));
+            });
+            logger.log(
+                "knowledge_synthesis_failed",
+                &format!("Knowledge synthesis failed after {duration_ms}ms: {error}"),
+                Some(serde_json::json!({
+                    "duration_ms": duration_ms,
+                    "error": error.to_string(),
+                    "model": model_name,
+                })),
+            );
+            false
+        }
+    }
+}
+
+/// Gather raw memory sections from a specific section list.
+///
+/// Uses the same pattern as `gather_bulletin_sections` (empty-query metadata
+/// search) but accepts an arbitrary section list for narrower scoping.
+async fn gather_sections_from_list(
+    deps: &AgentDeps,
+    sections: &[BulletinSection],
+) -> GatheredSections {
+    let mut gathered = GatheredSections::default();
+
+    for section in sections {
+        let config = SearchConfig {
+            mode: section.mode,
+            memory_type: section.memory_type,
+            max_results: section.max_results,
+            sort_by: section.sort_by,
+            ..Default::default()
+        };
+
+        let results = match deps.memory_search.search("", &config).await {
+            Ok(results) => results,
+            Err(error) => {
+                tracing::warn!(
+                    section = section.label,
+                    %error,
+                    "knowledge synthesis section query failed"
+                );
+                gathered.failed_sections += 1;
+                continue;
+            }
+        };
+
+        if results.is_empty() {
+            continue;
+        }
+
+        gathered
+            .text
+            .push_str(&format!("### {}\n\n", section.label));
+        for result in &results {
+            gathered.text.push_str(&format!(
+                "- [{}] (importance: {:.1}) {}\n",
+                result.memory.memory_type,
+                result.memory.importance,
+                result
+                    .memory
+                    .content
+                    .lines()
+                    .next()
+                    .unwrap_or(&result.memory.content),
+            ));
+        }
+        gathered.text.push('\n');
+    }
+
+    gathered
+}
+
+/// Check if knowledge synthesis needs regeneration based on dirty flag and debounce.
+pub fn should_regenerate_knowledge_synthesis(deps: &AgentDeps) -> bool {
+    let current_version = deps
+        .runtime_config
+        .knowledge_synthesis_version
+        .load(std::sync::atomic::Ordering::Acquire);
+    let last_version = deps
+        .runtime_config
+        .knowledge_synthesis_last_version
+        .load(std::sync::atomic::Ordering::Acquire);
+
+    if current_version == last_version {
+        return false;
+    }
+
+    // Debounce: wait for activity to settle.
+    let cortex_config = **deps.runtime_config.cortex.load();
+    let last_change = deps
+        .runtime_config
+        .knowledge_synthesis_last_change
+        .load(std::sync::atomic::Ordering::Acquire);
+    let now = chrono::Utc::now().timestamp();
+    let elapsed = now.saturating_sub(last_change) as u64;
+
+    elapsed >= cortex_config.knowledge_synthesis_debounce_secs
+}
+
+// -- Intra-Day Synthesis + Daily Summaries --
+
+/// Check and potentially synthesize a batch of recent working memory events.
+///
+/// Called on every cortex tick. The check is one cheap SQL query. LLM synthesis
+/// only happens when the event count threshold or time fallback is reached.
+pub async fn maybe_synthesize_intraday_batch(
+    deps: &AgentDeps,
+    logger: &CortexLogger,
+) -> anyhow::Result<bool> {
+    let wm = &deps.working_memory;
+    let wm_config = **deps.runtime_config.working_memory.load();
+    let today = wm.today();
+
+    let last_end = wm.get_last_intraday_synthesis_end(&today).await?;
+    let unsynthesized = wm.get_events_after(&today, last_end).await?;
+
+    if unsynthesized.is_empty() {
+        return Ok(false);
+    }
+
+    // Dual trigger: count-based OR time-based fallback.
+    let count_trigger = unsynthesized.len() >= wm_config.intraday_batch_threshold;
+    let time_trigger = if let Some(last) = last_end {
+        let elapsed = (chrono::Utc::now() - last).num_seconds() as u64;
+        elapsed >= wm_config.intraday_time_fallback_secs
+    } else {
+        // No previous synthesis — use time since first event.
+        let first_event = &unsynthesized[0];
+        let elapsed = (chrono::Utc::now() - first_event.timestamp).num_seconds() as u64;
+        elapsed >= wm_config.intraday_time_fallback_secs
+    };
+
+    if !count_trigger && !time_trigger {
+        return Ok(false);
+    }
+
+    // Build the event text for the LLM.
+    let time_start = unsynthesized
+        .first()
+        .map(|e| e.timestamp)
+        .unwrap_or_else(chrono::Utc::now);
+    let time_end = unsynthesized
+        .last()
+        .map(|e| e.timestamp)
+        .unwrap_or_else(chrono::Utc::now);
+    let timezone = wm.timezone();
+    let time_start_str = time_start
+        .with_timezone(&timezone)
+        .format("%H:%M")
+        .to_string();
+    let time_end_str = time_end
+        .with_timezone(&timezone)
+        .format("%H:%M")
+        .to_string();
+
+    let mut events_text = String::new();
+    for event in &unsynthesized {
+        let ts = event
+            .timestamp
+            .with_timezone(&timezone)
+            .format("%H:%M")
+            .to_string();
+        let channel_label = event
+            .channel_id
+            .as_deref()
+            .map(|c| format!(" [{c}]"))
+            .unwrap_or_default();
+        events_text.push_str(&format!(
+            "[{ts}]{channel_label} {}: {}\n",
+            event.event_type, event.summary
+        ));
+    }
+
+    // Render the synthesis prompt.
+    let prompt_engine = deps.runtime_config.prompts.load();
+    let prompt = prompt_engine.render_intraday_synthesis(
+        unsynthesized.len(),
+        &time_start_str,
+        &time_end_str,
+        &events_text,
+    )?;
+
+    // Use a short one-shot LLM call — no tools, no hooks.
+    let routing = deps.runtime_config.routing.load();
+    let model_name = routing.resolve(ProcessType::Cortex, None).to_string();
+    let usage_accumulator = std::sync::Arc::new(tokio::sync::Mutex::new(
+        crate::llm::usage::UsageAccumulator::new(),
+    ));
+    let model = SpacebotModel::make(&deps.llm_manager, &model_name)
+        .with_context(&*deps.agent_id, "cortex")
+        .with_routing((**routing).clone())
+        .with_accumulator(usage_accumulator.clone());
+
+    let agent = AgentBuilder::new(model)
+        .preamble("You are a concise narrative summarizer. Output only the summary paragraph, nothing else.")
+        .hook(CortexHook::new())
+        .build();
+
+    let synthesis = agent.prompt(&prompt).await;
+    let acc = usage_accumulator.lock().await;
+    if let Err(e) = acc
+        .flush(&deps.sqlite_pool, &deps.agent_id, "cortex", None)
+        .await
+    {
+        tracing::warn!(error = %e, "failed to flush cortex token usage");
+    }
+    drop(acc);
+    let synthesis = synthesis?;
+
+    // Store the synthesis.
+    wm.save_intraday_synthesis(
+        &today,
+        time_start,
+        time_end,
+        &synthesis,
+        unsynthesized.len(),
+    )
+    .await?;
+
+    tracing::info!(
+        event_count = unsynthesized.len(),
+        time_range = format!("{time_start_str}-{time_end_str}"),
+        words = synthesis.split_whitespace().count(),
+        trigger = if count_trigger {
+            "count"
+        } else {
+            "time_fallback"
+        },
+        "intra-day synthesis completed"
+    );
+
+    logger.log(
+        "intraday_synthesis",
+        &format!(
+            "Synthesized {} events ({time_start_str}-{time_end_str})",
+            unsynthesized.len()
+        ),
+        Some(serde_json::json!({
+            "event_count": unsynthesized.len(),
+            "trigger": if count_trigger { "count" } else { "time_fallback" },
+            "words": synthesis.split_whitespace().count(),
+        })),
+    );
+
+    Ok(true)
+}
+
+/// Check and potentially synthesize yesterday's daily summary.
+///
+/// Called on every cortex tick. Idempotent — once a daily summary exists for
+/// a given day, it is never regenerated. Uses intra-day synthesis paragraphs
+/// (not raw events) as input, so the LLM call is small and cheap.
+pub async fn maybe_synthesize_daily_summary(
+    deps: &AgentDeps,
+    logger: &CortexLogger,
+) -> anyhow::Result<bool> {
+    let wm = &deps.working_memory;
+    let yesterday = wm.yesterday();
+
+    // Idempotent check.
+    if wm.has_daily_summary(&yesterday).await? {
+        return Ok(false);
+    }
+
+    let intraday = wm.get_intraday_syntheses(&yesterday).await?;
+    let raw_events = wm.get_events_for_day(&yesterday).await?;
+
+    // No activity at all — save a minimal summary.
+    if intraday.is_empty() && raw_events.is_empty() {
+        wm.save_daily_summary(&yesterday, "No activity.", 0).await?;
+        return Ok(true);
+    }
+
+    // Build input from intra-day synthesis paragraphs + any unsynthesized tail.
+    let timezone = wm.timezone();
+    let mut blocks_text = String::new();
+    let mut total_events = 0i64;
+
+    // Last timestamp covered by intra-day syntheses (if any).
+    let mut last_synthesis_end = None;
+
+    for synthesis in &intraday {
+        let time_label = synthesis
+            .time_range_start
+            .with_timezone(&timezone)
+            .format("%H:%M")
+            .to_string();
+        blocks_text.push_str(&format!("[{time_label}] {}\n\n", synthesis.summary));
+        total_events += synthesis.event_count;
+        let end = synthesis.time_range_end;
+        last_synthesis_end = Some(
+            last_synthesis_end.map_or(end, |prev: chrono::DateTime<chrono::Utc>| prev.max(end)),
+        );
+    }
+
+    // Collect raw events not covered by any intra-day synthesis (the "tail").
+    // This happens when events didn't hit the count/time trigger before midnight.
+    let tail_events: Vec<_> = raw_events
+        .iter()
+        .filter(|event| match last_synthesis_end {
+            Some(end) => event.timestamp > end,
+            None => true, // No syntheses at all — all events are unsynthesized.
+        })
+        .collect();
+
+    if !tail_events.is_empty() {
+        if !blocks_text.is_empty() {
+            blocks_text.push_str("Unsynthesized events from the rest of the day:\n");
+        }
+        for event in &tail_events {
+            let ts = event
+                .timestamp
+                .with_timezone(&timezone)
+                .format("%H:%M")
+                .to_string();
+            let channel_label = event
+                .channel_id
+                .as_deref()
+                .map(|c| format!(" [{c}]"))
+                .unwrap_or_default();
+            blocks_text.push_str(&format!(
+                "[{ts}]{channel_label} {}: {}\n",
+                event.event_type, event.summary
+            ));
+        }
+        blocks_text.push('\n');
+        total_events += tail_events.len() as i64;
+    }
+
+    let wm_config = **deps.runtime_config.working_memory.load();
+    let prompt_engine = deps.runtime_config.prompts.load();
+    let prompt = prompt_engine.render_daily_summary(
+        &yesterday,
+        wm_config.daily_summary_max_words,
+        &blocks_text,
+    )?;
+
+    // One-shot LLM call.
+    let routing = deps.runtime_config.routing.load();
+    let model_name = routing.resolve(ProcessType::Cortex, None).to_string();
+    let usage_accumulator = std::sync::Arc::new(tokio::sync::Mutex::new(
+        crate::llm::usage::UsageAccumulator::new(),
+    ));
+    let model = SpacebotModel::make(&deps.llm_manager, &model_name)
+        .with_context(&*deps.agent_id, "cortex")
+        .with_routing((**routing).clone())
+        .with_accumulator(usage_accumulator.clone());
+
+    let agent = AgentBuilder::new(model)
+        .preamble("You are a daily activity summarizer. Output only the summary, nothing else.")
+        .hook(CortexHook::new())
+        .build();
+
+    let summary = agent.prompt(&prompt).await;
+    let acc = usage_accumulator.lock().await;
+    if let Err(e) = acc
+        .flush(&deps.sqlite_pool, &deps.agent_id, "cortex", None)
+        .await
+    {
+        tracing::warn!(error = %e, "failed to flush cortex token usage");
+    }
+    drop(acc);
+    let summary = summary?;
+
+    wm.save_daily_summary(&yesterday, &summary, total_events)
+        .await?;
+
+    let tail_count = tail_events.len();
+
+    tracing::info!(
+        day = yesterday,
+        intraday_blocks = intraday.len(),
+        tail_events = tail_count,
+        total_events,
+        words = summary.split_whitespace().count(),
+        "daily summary generated"
+    );
+
+    logger.log(
+        "daily_summary",
+        &format!(
+            "Daily summary for {yesterday}: {total_events} events, {} blocks, {tail_count} tail",
+            intraday.len()
+        ),
+        Some(serde_json::json!({
+            "day": yesterday,
+            "intraday_blocks": intraday.len(),
+            "tail_events": tail_count,
+            "total_events": total_events,
+            "words": summary.split_whitespace().count(),
+        })),
+    );
+
+    Ok(true)
+}
+
 // -- Agent Profile --
 
 /// Persisted agent profile generated by the cortex.
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct AgentProfile {
     pub agent_id: String,
     pub display_name: Option<String>,
@@ -2251,19 +3581,32 @@ async fn generate_profile(deps: &AgentDeps, logger: &CortexLogger) {
 
     let routing = deps.runtime_config.routing.load();
     let model_name = routing.resolve(ProcessType::Cortex, None).to_string();
+    let usage_accumulator = std::sync::Arc::new(tokio::sync::Mutex::new(
+        crate::llm::usage::UsageAccumulator::new(),
+    ));
     let model = SpacebotModel::make(&deps.llm_manager, &model_name)
         .with_context(&*deps.agent_id, "cortex")
-        .with_routing((**routing).clone());
+        .with_routing((**routing).clone())
+        .with_accumulator(usage_accumulator.clone());
 
     let agent = AgentBuilder::new(model)
         .preamble(&profile_prompt)
         .hook(CortexHook::new())
         .build();
 
-    match agent
+    let result = agent
         .prompt_typed::<ProfileLlmResponse>(&synthesis_prompt)
+        .await;
+    let acc = usage_accumulator.lock().await;
+    if let Err(e) = acc
+        .flush(&deps.sqlite_pool, &deps.agent_id, "cortex", None)
         .await
     {
+        tracing::warn!(error = %e, "failed to flush cortex token usage");
+    }
+    drop(acc);
+
+    match result {
         Ok(profile_data) => {
             let duration_ms = started.elapsed().as_millis() as u64;
             let agent_id = &deps.agent_id;
@@ -2348,6 +3691,191 @@ pub fn spawn_association_loop(
     })
 }
 
+/// How to route a completed detached worker against the task store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetachedRouting {
+    /// Worker produced a usable result — mark `Done` and notify success.
+    Success,
+    /// Terminal failure that won't fix itself (cancelled, wall-clock
+    /// timeout, captcha / login wall). Mark `Done` so the loop doesn't
+    /// pick the task up again; emit a failure event so callers can react
+    /// (escalate to a human, raise a follow-up task, etc.).
+    Terminal,
+    /// Transient failure (LLM error, panic, generic Failed). Requeue to
+    /// `Ready` so the next pickup pass can retry.
+    Requeue,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_detached_completion(
+    routing: DetachedRouting,
+    task: &crate::tasks::Task,
+    worker_id: WorkerId,
+    result_text: &str,
+    task_store: &Arc<TaskStore>,
+    run_logger: &crate::conversation::history::ProcessRunLogger,
+    logger: &CortexLogger,
+    event_tx: &tokio::sync::broadcast::Sender<ProcessEvent>,
+    agent_id: &str,
+    links: &Arc<arc_swap::ArcSwap<Vec<crate::links::AgentLink>>>,
+    agent_names: &Arc<std::collections::HashMap<String, String>>,
+    sqlite_pool: &sqlx::SqlitePool,
+    injection_tx: &tokio::sync::mpsc::Sender<crate::ChannelInjection>,
+) {
+    let success = matches!(routing, DetachedRouting::Success);
+    let new_status = match routing {
+        DetachedRouting::Success | DetachedRouting::Terminal => TaskStatus::Done,
+        DetachedRouting::Requeue => TaskStatus::Ready,
+    };
+    let update_input = match routing {
+        DetachedRouting::Success | DetachedRouting::Terminal => UpdateTaskInput {
+            status: Some(new_status),
+            ..Default::default()
+        },
+        DetachedRouting::Requeue => UpdateTaskInput {
+            status: Some(new_status),
+            clear_worker_id: true,
+            ..Default::default()
+        },
+    };
+
+    let update_result = task_store.update(task.task_number, update_input).await;
+    let persisted = match update_result {
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            tracing::warn!(
+                task_number = task.task_number,
+                routing = ?routing,
+                "task store returned no row when updating completed task — task may have been deleted"
+            );
+            logger.log(
+                "task_pickup_no_row",
+                &format!(
+                    "Picked-up task #{} completed ({routing:?}) but the task row was missing on update",
+                    task.task_number
+                ),
+                Some(serde_json::json!({
+                    "task_number": task.task_number,
+                    "worker_id": worker_id.to_string(),
+                    "routing": format!("{routing:?}"),
+                })),
+            );
+            run_logger.log_worker_completed(worker_id, result_text, false);
+            let _ = event_tx.send(ProcessEvent::WorkerComplete {
+                agent_id: Arc::from(agent_id),
+                worker_id,
+                channel_id: None,
+                result: result_text.to_string(),
+                notify: true,
+                success: false,
+            });
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                task_number = task.task_number,
+                routing = ?routing,
+                "failed to persist task status after worker completion"
+            );
+            run_logger.log_worker_completed(worker_id, result_text, false);
+            logger.log(
+                "task_pickup_persist_failure",
+                &format!(
+                    "Picked-up task #{} ({routing:?}) could not persist status: {error}",
+                    task.task_number
+                ),
+                Some(serde_json::json!({
+                    "task_number": task.task_number,
+                    "worker_id": worker_id.to_string(),
+                    "routing": format!("{routing:?}"),
+                })),
+            );
+            let _ = event_tx.send(ProcessEvent::WorkerComplete {
+                agent_id: Arc::from(agent_id),
+                worker_id,
+                channel_id: None,
+                result: result_text.to_string(),
+                notify: true,
+                success: false,
+            });
+            return;
+        }
+    };
+
+    if !persisted {
+        return;
+    }
+
+    run_logger.log_worker_completed(worker_id, result_text, success);
+    let _ = event_tx.send(ProcessEvent::TaskUpdated {
+        agent_id: Arc::from(agent_id),
+        task_number: task.task_number,
+        status: new_status.as_str().to_string(),
+        action: "updated".to_string(),
+    });
+
+    let log_event = match routing {
+        DetachedRouting::Success => "task_pickup_completed",
+        DetachedRouting::Terminal => "task_pickup_terminal_failure",
+        DetachedRouting::Requeue => "task_pickup_failed",
+    };
+    let log_message = match routing {
+        DetachedRouting::Success => format!("Completed picked-up task #{}", task.task_number),
+        DetachedRouting::Terminal => format!(
+            "Terminal failure on picked-up task #{}: {result_text}",
+            task.task_number
+        ),
+        DetachedRouting::Requeue => {
+            format!("Picked-up task #{} failed: {result_text}", task.task_number)
+        }
+    };
+    logger.log(
+        log_event,
+        &log_message,
+        Some(serde_json::json!({
+            "task_number": task.task_number,
+            "worker_id": worker_id.to_string(),
+            "routing": format!("{routing:?}"),
+        })),
+    );
+
+    notify_delegation_completion(
+        task,
+        result_text,
+        success,
+        agent_id,
+        links,
+        agent_names,
+        sqlite_pool,
+        injection_tx,
+    )
+    .await;
+
+    let _ = event_tx.send(ProcessEvent::WorkerComplete {
+        agent_id: Arc::from(agent_id),
+        worker_id,
+        channel_id: None,
+        result: result_text.to_string(),
+        notify: true,
+        success,
+    });
+}
+
+/// One-shot wake for dormant agents.
+///
+/// Triggered by `agent::wake::WakeManager` when an external event delivers
+/// a wake (cross-agent message, cron fire, admin API). Picks up at most
+/// one ready task synchronously, then returns. Idempotent and safe to
+/// call on active-mode agents — the spawn_ready_task_loop will simply
+/// race with us, which is fine because `task_store.claim_next_ready` is
+/// transactional.
+pub async fn wake_one(deps: &AgentDeps) -> anyhow::Result<()> {
+    tracing::debug!(agent_id = %deps.agent_id, "cortex wake fired");
+    let logger = CortexLogger::new(deps.sqlite_pool.clone());
+    pickup_one_ready_task(deps, &logger).await
+}
+
 /// Spawn a background loop that picks up ready tasks when idle.
 pub fn spawn_ready_task_loop(deps: AgentDeps, logger: CortexLogger) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -2396,11 +3924,25 @@ async fn pickup_one_ready_task(deps: &AgentDeps, logger: &CortexLogger) -> anyho
     // Collect tool secret names so the worker template can list available credentials.
     let secrets_guard = deps.runtime_config.secrets.load();
     let tool_secret_names = match (*secrets_guard).as_ref() {
-        Some(store) => store.tool_secret_names(),
+        Some(store) => store.tool_secret_names(&deps.agent_id),
         None => Vec::new(),
     };
 
     let browser_config = (**deps.runtime_config.browser_config.load()).clone();
+
+    // Build worker status text (time + model) for the system prompt.
+    let system_info =
+        crate::agent::status::SystemInfo::from_runtime_config(&deps.runtime_config, &deps.sandbox);
+    let temporal_context =
+        crate::agent::channel_prompt::TemporalContext::from_runtime(&deps.runtime_config);
+    let current_time_line = temporal_context.current_time_line();
+    let worker_status_text = Some(system_info.render_for_worker(&current_time_line));
+
+    let routing = deps.runtime_config.routing.load();
+    let model_name = routing.resolve(ProcessType::Worker, None).to_string();
+    let tool_use_enforcement = deps.runtime_config.tool_use_enforcement.load();
+    let project_context =
+        crate::agent::channel_dispatch::build_project_context(deps, &prompt_engine).await;
     let worker_system_prompt = prompt_engine
         .render_worker_prompt(
             &deps.runtime_config.instance_dir.display().to_string(),
@@ -2411,8 +3953,35 @@ async fn pickup_one_ready_task(deps: &AgentDeps, logger: &CortexLogger) -> anyho
             sandbox_write_allowlist,
             &tool_secret_names,
             browser_config.persist_session,
+            worker_status_text,
+            deps.wiki_store.is_some(),
+            project_context,
         )
         .map_err(|error| anyhow::anyhow!("failed to render worker prompt: {error}"))?;
+
+    // Append skills listing so task workers can discover and read_skill relevant
+    // skills (e.g. wiki-writing). No suggested skills — the worker decides based
+    // on the task description.
+    let skills = deps.runtime_config.skills.load();
+    let worker_system_prompt = match skills.render_worker_skills(&[], &prompt_engine) {
+        Ok(skills_prompt) if !skills_prompt.is_empty() => {
+            format!("{worker_system_prompt}\n\n{skills_prompt}")
+        }
+        Ok(_) => worker_system_prompt,
+        Err(error) => {
+            tracing::warn!(%error, "failed to render worker skills listing for task pickup");
+            worker_system_prompt
+        }
+    };
+
+    // Tool-use enforcement must be the last instruction appended.
+    let worker_system_prompt = prompt_engine
+        .maybe_append_tool_use_enforcement(
+            worker_system_prompt,
+            tool_use_enforcement.as_ref(),
+            &model_name,
+        )
+        .map_err(|error| anyhow::anyhow!("failed to append tool-use enforcement: {error}"))?;
 
     let mut task_prompt = format!("Execute task #{}: {}", task.task_number, task.title);
     if let Some(description) = &task.description {
@@ -2454,6 +4023,10 @@ async fn pickup_one_ready_task(deps: &AgentDeps, logger: &CortexLogger) -> anyho
         screenshot_dir,
         brave_search_key,
         logs_dir,
+        Vec::new(), // no initial history for cortex task workers
+        crate::conversation::settings::WorkerMemoryMode::None,
+        deps.wiki_store.is_some(),
+        None, // No model override for cortex workers
     );
 
     // Detached workers are not channel-owned, so injection senders are not
@@ -2504,6 +4077,7 @@ async fn pickup_one_ready_task(deps: &AgentDeps, logger: &CortexLogger) -> anyho
     );
 
     let task_store = deps.task_store.clone();
+    let agent_id_typed = deps.agent_id.clone();
     let agent_id = deps.agent_id.to_string();
     let event_tx = deps.event_tx.clone();
     let logger = logger.clone();
@@ -2519,7 +4093,7 @@ async fn pickup_one_ready_task(deps: &AgentDeps, logger: &CortexLogger) -> anyho
         // before persisting, logging, or emitting events.
         let scrub = |text: String| -> String {
             let scrubbed = if let Some(store) = secrets_snapshot.as_ref() {
-                crate::secrets::scrub::scrub_with_store(&text, store)
+                crate::secrets::scrub::scrub_with_store(&text, store, &agent_id_typed)
             } else {
                 text
             };
@@ -2541,234 +4115,66 @@ async fn pickup_one_ready_task(deps: &AgentDeps, logger: &CortexLogger) -> anyho
             if let Some(worker_result) = worker_result {
                 let completion_won = claim_detached_completion(&detached_worker_lifecycle);
                 if completion_won {
-                    match worker_result {
-                        Ok(Ok(raw_result_text)) => {
-                            let result_text = scrub(raw_result_text);
-                            let db_updated = task_store
-                                .update(
-                                    &agent_id,
-                                    task.task_number,
-                                    UpdateTaskInput {
-                                        status: Some(TaskStatus::Done),
-                                        ..Default::default()
-                                    },
-                                )
-                                .await;
-
-                            if let Err(ref error) = db_updated {
-                                tracing::warn!(
-                                    %error,
-                                    task_number = task.task_number,
-                                    "failed to mark picked-up task done"
-                                );
-                                run_logger.log_worker_completed(worker_id, &result_text, false);
-                                logger.log(
-                                    "task_pickup_completed_persist_failure",
-                                    &format!(
-                                        "Picked-up task #{} completed but could not persist done state: {error}",
-                                        task.task_number
-                                    ),
-                                    Some(serde_json::json!({
-                                        "task_number": task.task_number,
-                                        "worker_id": worker_id.to_string(),
-                                    })),
-                                );
-                                let _ = event_tx.send(ProcessEvent::WorkerComplete {
-                                    agent_id: Arc::from(agent_id.as_str()),
-                                    worker_id,
-                                    channel_id: None,
-                                    result: result_text,
-                                    notify: true,
-                                    success: false,
-                                });
-                            } else {
-                                run_logger.log_worker_completed(worker_id, &result_text, true);
-                                let _ = event_tx.send(ProcessEvent::TaskUpdated {
-                                    agent_id: Arc::from(agent_id.as_str()),
-                                    task_number: task.task_number,
-                                    status: "done".to_string(),
-                                    action: "updated".to_string(),
-                                });
-
-                                logger.log(
-                                    "task_pickup_completed",
-                                    &format!("Completed picked-up task #{}", task.task_number),
-                                    Some(serde_json::json!({
-                                        "task_number": task.task_number,
-                                        "worker_id": worker_id.to_string(),
-                                    })),
-                                );
-
-                                notify_delegation_completion(
-                                    &task,
-                                    &result_text,
-                                    true,
-                                    &agent_id,
-                                    &links,
-                                    &agent_names,
-                                    &sqlite_pool,
-                                    &injection_tx,
-                                )
-                                .await;
-
-                                let _ = event_tx.send(ProcessEvent::WorkerComplete {
-                                    agent_id: Arc::from(agent_id.as_str()),
-                                    worker_id,
-                                    channel_id: None,
-                                    result: result_text,
-                                    notify: true,
-                                    success: true,
-                                });
-                            }
-                        }
+                    // Convert the raw worker_result into a Result<WorkerOutcome, _>
+                    // so the routing decision below can inspect the variant kind
+                    // — Timeout / Blocked / Cancelled need terminal handling so
+                    // they don't hot-loop on requeue to Ready.
+                    let outcome_or_error: std::result::Result<
+                        WorkerOutcome,
+                        WorkerCompletionError,
+                    > = match worker_result {
+                        Ok(Ok(outcome)) => Ok(outcome),
                         Ok(Err(error)) => {
-                            let scrubbed_error = scrub(error.to_string());
-                            let (error_message, _notify, _success) = map_worker_completion_result(
-                                Err(WorkerCompletionError::failed(scrubbed_error.clone())),
-                            );
-                            let worker_complete_message = format!("Worker failed: {error}");
-                            run_logger.log_worker_completed(worker_id, &error_message, false);
-                            let requeue_result = task_store
-                                .update(
-                                    &agent_id,
-                                    task.task_number,
-                                    UpdateTaskInput {
-                                        status: Some(TaskStatus::Ready),
-                                        clear_worker_id: true,
-                                        ..Default::default()
-                                    },
-                                )
-                                .await;
-
-                            if let Err(ref update_error) = requeue_result {
-                                tracing::warn!(
-                                    %update_error,
-                                    task_number = task.task_number,
-                                    "failed to return task to ready after failure"
-                                );
-                                logger.log(
-                                    "task_pickup_failed_to_persist",
-                                    &format!(
-                                        "Picked-up task #{} failed but could not persist failure state: {error}",
-                                        task.task_number
-                                    ),
-                                    Some(serde_json::json!({
-                                        "task_number": task.task_number,
-                                        "worker_id": worker_id.to_string(),
-                                        "error": error.to_string(),
-                                    })),
-                                );
-                            } else {
-                                let _ = event_tx.send(ProcessEvent::TaskUpdated {
-                                    agent_id: Arc::from(agent_id.as_str()),
-                                    task_number: task.task_number,
-                                    status: "ready".to_string(),
-                                    action: "updated".to_string(),
-                                });
-
-                                logger.log(
-                                    "task_pickup_failed",
-                                    &format!(
-                                        "Picked-up task #{} failed: {error}",
-                                        task.task_number
-                                    ),
-                                    Some(serde_json::json!({
-                                        "task_number": task.task_number,
-                                        "worker_id": worker_id.to_string(),
-                                        "error": error.to_string(),
-                                    })),
-                                );
-
-                                notify_delegation_completion(
-                                    &task,
-                                    &error_message,
-                                    false,
-                                    &agent_id,
-                                    &links,
-                                    &agent_names,
-                                    &sqlite_pool,
-                                    &injection_tx,
-                                )
-                                .await;
-                            }
-
-                            let _ = event_tx.send(ProcessEvent::WorkerComplete {
-                                agent_id: Arc::from(agent_id.as_str()),
-                                worker_id,
-                                channel_id: None,
-                                result: worker_complete_message,
-                                notify: true,
-                                success: false,
-                            });
+                            Err(WorkerCompletionError::failed(scrub(error.to_string())))
                         }
                         Err(panic_payload) => {
-                            let scrubbed_panic =
-                                scrub(crate::agent::panic_payload_to_string(&*panic_payload));
-                            let (error_message, _notify, _success) =
-                                map_worker_completion_result(Err(WorkerCompletionError::failed(
-                                    format!("worker task panicked: {scrubbed_panic}"),
-                                )));
-                            run_logger.log_worker_completed(worker_id, &error_message, false);
-                            let requeue_result = task_store
-                                .update(
-                                    &agent_id,
-                                    task.task_number,
-                                    UpdateTaskInput {
-                                        status: Some(TaskStatus::Ready),
-                                        clear_worker_id: true,
-                                        ..Default::default()
-                                    },
-                                )
-                                .await;
-
-                            if let Err(ref update_error) = requeue_result {
-                                tracing::warn!(
-                                    %update_error,
-                                    task_number = task.task_number,
-                                    "failed to return task to ready after panic"
-                                );
-                                logger.log(
-                                    "task_pickup_panic_persist_failure",
-                                    &format!(
-                                        "Picked-up task #{} panicked and could not persist failure state: {error_message}",
-                                        task.task_number
-                                    ),
-                                    Some(serde_json::json!({
-                                        "task_number": task.task_number,
-                                        "worker_id": worker_id.to_string(),
-                                    })),
-                                );
-                            } else {
-                                let _ = event_tx.send(ProcessEvent::TaskUpdated {
-                                    agent_id: Arc::from(agent_id.as_str()),
-                                    task_number: task.task_number,
-                                    status: "ready".to_string(),
-                                    action: "updated".to_string(),
-                                });
-
-                                notify_delegation_completion(
-                                    &task,
-                                    &error_message,
-                                    false,
-                                    &agent_id,
-                                    &links,
-                                    &agent_names,
-                                    &sqlite_pool,
-                                    &injection_tx,
-                                )
-                                .await;
-                            }
-
-                            let _ = event_tx.send(ProcessEvent::WorkerComplete {
-                                agent_id: Arc::from(agent_id.as_str()),
-                                worker_id,
-                                channel_id: None,
-                                result: error_message,
-                                notify: true,
-                                success: false,
-                            });
+                            let panic_message =
+                                crate::agent::panic_payload_to_string(&*panic_payload);
+                            tracing::error!(
+                                %worker_id,
+                                %panic_message,
+                                "cortex worker task panicked"
+                            );
+                            Err(WorkerCompletionError::failed(format!(
+                                "worker task panicked: {}",
+                                scrub(panic_message)
+                            )))
                         }
-                    }
+                    };
+
+                    // Routing: Success/Partial → mark Done.
+                    // Cancelled/Timeout/Blocked → terminal (mark Done, do not
+                    // retry — these need human / explicit re-creation, not a
+                    // pickup loop racing the same dead end again).
+                    // Failed/error/panic → requeue Ready (true transient errors
+                    // that might succeed on a future tick).
+                    let routing = match &outcome_or_error {
+                        Ok(WorkerOutcome::Success { .. }) | Ok(WorkerOutcome::Partial { .. }) => {
+                            DetachedRouting::Success
+                        }
+                        Ok(WorkerOutcome::Cancelled { .. })
+                        | Ok(WorkerOutcome::Timeout { .. })
+                        | Ok(WorkerOutcome::Blocked { .. }) => DetachedRouting::Terminal,
+                        Ok(WorkerOutcome::Failed { .. }) | Err(_) => DetachedRouting::Requeue,
+                    };
+                    let (result_text, _notify, _success) = map_worker_completion(outcome_or_error);
+                    let result_text = scrub(result_text);
+                    handle_detached_completion(
+                        routing,
+                        &task,
+                        worker_id,
+                        &result_text,
+                        &task_store,
+                        &run_logger,
+                        &logger,
+                        &event_tx,
+                        &agent_id,
+                        &links,
+                        &agent_names,
+                        &sqlite_pool,
+                        &injection_tx,
+                    )
+                    .await;
 
                     let _ = detached_worker_lifecycle.compare_exchange(
                         crate::agent::process_control::DETACHED_WORKER_LIFECYCLE_COMPLETING,
@@ -2802,7 +4208,6 @@ async fn pickup_one_ready_task(deps: &AgentDeps, logger: &CortexLogger) -> anyho
                 ));
                 let update_result = task_store
                     .update(
-                        &agent_id,
                         task.task_number,
                         UpdateTaskInput {
                             status: Some(next_status),
@@ -3242,11 +4647,15 @@ async fn fetch_memories_for_association(
 mod tests {
     use super::{
         BULLETIN_REFRESH_CIRCUIT_OPEN_SECS, BULLETIN_REFRESH_CIRCUIT_OPEN_THRESHOLD, BranchTracker,
-        BulletinRefreshOutcome, CortexReceiverOutcome, HealthRuntimeState, ReceiverClosedBehavior,
-        Signal, WorkerTracker, apply_cancelled_warmup_status, build_kill_targets,
-        claim_detached_completion, detached_timeout_transition, handle_cortex_receiver_result,
+        BulletinRefreshOutcome, CortexReceiverOutcome, GatheredSections, HealthRuntimeState,
+        MAINTENANCE_TASK_CANCEL_GRACE_SECS, MaintenanceTimeoutAction, ReceiverClosedBehavior,
+        Signal, SynthesisTaskBackoff, WorkerTracker, apply_cancelled_warmup_status,
+        build_kill_targets, claim_detached_completion, collect_synthesis_task,
+        detached_timeout_transition, generate_if_dirty_under_lock, handle_cortex_receiver_result,
         has_completed_initial_warmup, is_cancelled_control_result, is_terminal_control_result,
-        maybe_close_bulletin_refresh_circuit, maybe_generate_bulletin_under_lock,
+        maintenance_task_timeout, maintenance_timeout_action,
+        mark_knowledge_synthesis_version_complete, maybe_close_bulletin_refresh_circuit,
+        maybe_generate_bulletin_under_lock, maybe_spawn_synthesis_task,
         parse_structured_success_flag, push_signal_into_buffer, record_bulletin_refresh_failure,
         should_execute_warmup, should_generate_bulletin_from_bulletin_loop, signal_from_event,
         summarize_signal_text, take_lagged_control_flag,
@@ -3261,7 +4670,7 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
     use std::collections::VecDeque;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -3457,6 +4866,211 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test]
+    async fn dirty_knowledge_synthesis_rechecks_after_waiting_for_warmup_lock() {
+        let warmup_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let dirty = Arc::new(AtomicBool::new(true));
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let guard = warmup_lock.as_ref().lock().await;
+
+        let warmup_lock_for_task = Arc::clone(&warmup_lock);
+        let dirty_for_task = Arc::clone(&dirty);
+        let calls_for_task = Arc::clone(&calls);
+        let task = tokio::spawn(async move {
+            generate_if_dirty_under_lock(
+                warmup_lock_for_task.as_ref(),
+                || dirty_for_task.load(Ordering::SeqCst),
+                || async move {
+                    calls_for_task.fetch_add(1, Ordering::SeqCst);
+                    true
+                },
+            )
+            .await
+        });
+
+        // A warmup pass completes while the dirty task is waiting for the same
+        // lock. Once unblocked, the dirty task must observe the clean version
+        // and skip instead of running a duplicate synthesis.
+        dirty.store(false, Ordering::SeqCst);
+        drop(guard);
+
+        let result = task.await.expect("task should join");
+        assert_eq!(result, BulletinRefreshOutcome::SkippedFresh);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn working_memory_synthesis_task_is_single_flight() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let mut task: Option<tokio::task::JoinHandle<anyhow::Result<bool>>> = None;
+        let now = Instant::now();
+        let backoff = SynthesisTaskBackoff::new(now);
+
+        let calls_for_first = Arc::clone(&calls);
+        let release_rx_for_first = Arc::clone(&release_rx);
+        assert!(maybe_spawn_synthesis_task(
+            &mut task,
+            &backoff,
+            "intraday",
+            now,
+            move || {
+                tokio::spawn(async move {
+                    calls_for_first.fetch_add(1, Ordering::SeqCst);
+                    let receiver = release_rx_for_first
+                        .lock()
+                        .await
+                        .take()
+                        .expect("release receiver should exist");
+                    receiver.await.expect("release oneshot dropped");
+                    Ok(true)
+                })
+            }
+        ));
+
+        let calls_for_second = Arc::clone(&calls);
+        assert!(!maybe_spawn_synthesis_task(
+            &mut task,
+            &backoff,
+            "intraday",
+            now,
+            move || {
+                tokio::spawn(async move {
+                    calls_for_second.fetch_add(1, Ordering::SeqCst);
+                    Ok(true)
+                })
+            }
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first synthesis task should start");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        release_tx.send(()).expect("release should send");
+        task.take()
+            .expect("task should exist")
+            .await
+            .expect("task should join")
+            .expect("task should succeed");
+    }
+
+    #[tokio::test]
+    async fn synthesis_task_failure_backs_off_before_respawn() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let now = Instant::now();
+        let mut backoff = SynthesisTaskBackoff::new(now);
+        let mut task: Option<tokio::task::JoinHandle<anyhow::Result<bool>>> = None;
+
+        let calls_for_first = Arc::clone(&calls);
+        assert!(maybe_spawn_synthesis_task(
+            &mut task,
+            &backoff,
+            "intraday",
+            now,
+            move || {
+                tokio::spawn(async move {
+                    calls_for_first.fetch_add(1, Ordering::SeqCst);
+                    Err(anyhow::anyhow!("backend unavailable"))
+                })
+            }
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while task.as_ref().is_some_and(|handle| !handle.is_finished()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed synthesis task should finish");
+        collect_synthesis_task(&mut task, "intraday", &mut backoff, now).await;
+
+        assert!(task.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backoff.failure_count, 1);
+
+        let retry_at = backoff.next_allowed_instant;
+        let blocked_at = retry_at
+            .checked_sub(Duration::from_millis(1))
+            .expect("retry instant should be after current instant");
+        let calls_for_blocked = Arc::clone(&calls);
+        assert!(!maybe_spawn_synthesis_task(
+            &mut task,
+            &backoff,
+            "intraday",
+            blocked_at,
+            move || {
+                tokio::spawn(async move {
+                    calls_for_blocked.fetch_add(1, Ordering::SeqCst);
+                    Ok(true)
+                })
+            }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let calls_for_retry = Arc::clone(&calls);
+        assert!(maybe_spawn_synthesis_task(
+            &mut task,
+            &backoff,
+            "intraday",
+            retry_at,
+            move || {
+                tokio::spawn(async move {
+                    calls_for_retry.fetch_add(1, Ordering::SeqCst);
+                    Ok(true)
+                })
+            }
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while task.as_ref().is_some_and(|handle| !handle.is_finished()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retry synthesis task should finish");
+        collect_synthesis_task(&mut task, "intraday", &mut backoff, retry_at).await;
+
+        assert!(task.is_none());
+        assert_eq!(backoff.failure_count, 0);
+        assert_eq!(backoff.next_allowed_instant, retry_at);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn knowledge_synthesis_completion_marks_target_version_not_current_version() {
+        let current_version = std::sync::atomic::AtomicU64::new(2);
+        let last_version = std::sync::atomic::AtomicU64::new(0);
+        let target_version = 1;
+
+        mark_knowledge_synthesis_version_complete(&last_version, target_version);
+
+        assert_eq!(
+            current_version.load(Ordering::Acquire),
+            2,
+            "newer dirty version should still be pending"
+        );
+        assert_eq!(last_version.load(Ordering::Acquire), target_version);
+    }
+
+    #[test]
+    fn gathered_sections_fail_when_any_section_query_failed() {
+        let gathered = GatheredSections {
+            text: String::new(),
+            failed_sections: 1,
+        };
+
+        assert!(
+            gathered.has_failures(),
+            "failed section queries must keep synthesis retryable"
+        );
+    }
+
     #[test]
     fn summarize_signal_text_uses_first_non_empty_line() {
         let text = "\n\nfirst line\nsecond line";
@@ -3548,6 +5162,7 @@ mod tests {
                 agent_id: agent_id.clone(),
                 process_id: crate::ProcessId::Worker(worker_id),
                 channel_id: Some(channel_id.clone()),
+                call_id: "shell-call-1".to_string(),
                 tool_name: "shell".to_string(),
                 args: "echo hi".to_string(),
             },
@@ -3555,6 +5170,7 @@ mod tests {
                 agent_id: agent_id.clone(),
                 process_id: crate::ProcessId::Worker(worker_id),
                 channel_id: Some(channel_id.clone()),
+                call_id: "shell-call-1".to_string(),
                 tool_name: "shell".to_string(),
                 result: "done".to_string(),
             },
@@ -3793,6 +5409,58 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_task_timeout_bounds() {
+        assert_eq!(maintenance_task_timeout(1).as_secs(), 300);
+        assert_eq!(maintenance_task_timeout(100).as_secs(), 600);
+        assert_eq!(maintenance_task_timeout(600).as_secs(), 3_600);
+        assert_eq!(maintenance_task_timeout(2_000).as_secs(), 3_600);
+        assert_eq!(maintenance_task_timeout(0).as_secs(), 300);
+    }
+
+    #[test]
+    fn maintenance_timeout_action_progresses_from_none_to_cancel_to_abort() {
+        let now = Instant::now();
+        let started_at = now - Duration::from_secs(1);
+        let timeout = Duration::from_secs(3);
+        let grace = Duration::from_secs(MAINTENANCE_TASK_CANCEL_GRACE_SECS);
+
+        assert_eq!(
+            maintenance_timeout_action(
+                started_at + Duration::from_secs(1),
+                started_at,
+                timeout,
+                None,
+                false
+            ),
+            MaintenanceTimeoutAction::None
+        );
+        assert_eq!(
+            maintenance_timeout_action(started_at + timeout, started_at, timeout, None, false),
+            MaintenanceTimeoutAction::RequestCancel
+        );
+        assert_eq!(
+            maintenance_timeout_action(
+                started_at + timeout + grace,
+                started_at,
+                timeout,
+                Some(started_at + timeout),
+                false
+            ),
+            MaintenanceTimeoutAction::ForceAbort
+        );
+        assert_eq!(
+            maintenance_timeout_action(
+                started_at + timeout + grace + Duration::from_secs(1),
+                started_at,
+                timeout,
+                Some(started_at + timeout),
+                true
+            ),
+            MaintenanceTimeoutAction::None,
+        );
+    }
+
+    #[test]
     fn detached_timeout_transition_requeues_until_limit_then_quarantines() {
         let metadata = serde_json::json!({});
         let (count1, exhausted1, status1) = detached_timeout_transition(&metadata, 2);
@@ -3869,23 +5537,23 @@ mod tests {
         sqlx::query(
             "CREATE TABLE tasks (
                 id TEXT PRIMARY KEY,
-                agent_id TEXT NOT NULL,
-                task_number INTEGER NOT NULL,
+                task_number INTEGER NOT NULL UNIQUE,
                 title TEXT NOT NULL,
                 description TEXT,
                 status TEXT NOT NULL DEFAULT 'backlog',
                 priority TEXT NOT NULL DEFAULT 'medium',
+                owner_agent_id TEXT NOT NULL,
+                assigned_agent_id TEXT NOT NULL,
                 subtasks TEXT,
                 metadata TEXT,
                 source_memory_id TEXT,
                 worker_id TEXT,
                 created_by TEXT NOT NULL,
-                approved_at TIMESTAMP,
+                approved_at TEXT,
                 approved_by TEXT,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                completed_at TIMESTAMP,
-                UNIQUE(agent_id, task_number)
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                completed_at TEXT
             )",
         )
         .execute(&pool)
@@ -3900,17 +5568,19 @@ mod tests {
 
         sqlx::query(
             "INSERT INTO tasks (
-                id, agent_id, task_number, title, description, status, priority,
+                id, task_number, title, description, status, priority,
+                owner_agent_id, assigned_agent_id,
                 subtasks, metadata, source_memory_id, created_by
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(uuid::Uuid::new_v4().to_string())
-        .bind(&*agent_id)
         .bind(task_number)
         .bind("test task")
         .bind(Some("description".to_string()))
         .bind("ready")
         .bind("medium")
+        .bind(&*agent_id)
+        .bind(&*agent_id)
         .bind("[]")
         .bind("{}")
         .bind(Option::<String>::None)
@@ -3951,23 +5621,23 @@ mod tests {
         sqlx::query(
             "CREATE TABLE tasks (
                 id TEXT PRIMARY KEY,
-                agent_id TEXT NOT NULL,
-                task_number INTEGER NOT NULL,
+                task_number INTEGER NOT NULL UNIQUE,
                 title TEXT NOT NULL,
                 description TEXT,
                 status TEXT NOT NULL DEFAULT 'backlog',
                 priority TEXT NOT NULL DEFAULT 'medium',
+                owner_agent_id TEXT NOT NULL,
+                assigned_agent_id TEXT NOT NULL,
                 subtasks TEXT,
                 metadata TEXT,
                 source_memory_id TEXT,
                 worker_id TEXT,
                 created_by TEXT NOT NULL,
-                approved_at TIMESTAMP,
+                approved_at TEXT,
                 approved_by TEXT,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                completed_at TIMESTAMP,
-                UNIQUE(agent_id, task_number)
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                completed_at TEXT
             )",
         )
         .execute(&pool)
@@ -3982,17 +5652,19 @@ mod tests {
 
         sqlx::query(
             "INSERT INTO tasks (
-                id, agent_id, task_number, title, description, status, priority,
+                id, task_number, title, description, status, priority,
+                owner_agent_id, assigned_agent_id,
                 subtasks, metadata, source_memory_id, created_by
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(uuid::Uuid::new_v4().to_string())
-        .bind(&*agent_id)
         .bind(task_number)
         .bind("test task")
         .bind(Some("description".to_string()))
         .bind("ready")
         .bind("medium")
+        .bind(&*agent_id)
+        .bind(&*agent_id)
         .bind("[]")
         .bind("{}")
         .bind(Option::<String>::None)

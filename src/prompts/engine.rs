@@ -57,6 +57,18 @@ impl PromptEngine {
             "cortex_bulletin",
             crate::prompts::text::get("cortex_bulletin"),
         )?;
+        env.add_template(
+            "cortex_knowledge_synthesis",
+            crate::prompts::text::get("cortex_knowledge_synthesis"),
+        )?;
+        env.add_template(
+            "cortex_intraday_synthesis",
+            crate::prompts::text::get("cortex_intraday_synthesis"),
+        )?;
+        env.add_template(
+            "cortex_daily_summary",
+            crate::prompts::text::get("cortex_daily_summary"),
+        )?;
         env.add_template("compactor", crate::prompts::text::get("compactor"))?;
         env.add_template(
             "memory_persistence",
@@ -76,6 +88,10 @@ impl PromptEngine {
             crate::prompts::text::get("adapters/email"),
         )?;
         env.add_template("adapters/cron", crate::prompts::text::get("adapters/cron"))?;
+        env.add_template(
+            "adapters/signal",
+            crate::prompts::text::get("adapters/signal"),
+        )?;
 
         // Fragment templates
         env.add_template(
@@ -149,8 +165,8 @@ impl PromptEngine {
             crate::prompts::text::get("fragments/system/tool_syntax_correction"),
         )?;
         env.add_template(
-            "fragments/system/worker_time_context",
-            crate::prompts::text::get("fragments/system/worker_time_context"),
+            "fragments/tool_use_enforcement",
+            crate::prompts::text::get("fragments/tool_use_enforcement"),
         )?;
         env.add_template(
             "fragments/coalesce_hint",
@@ -203,6 +219,35 @@ impl PromptEngine {
         self.render(template_name, Value::UNDEFINED)
     }
 
+    /// Render the tool-use enforcement fragment.
+    pub fn render_tool_use_enforcement(&self) -> Result<String> {
+        self.render_static("fragments/tool_use_enforcement")
+    }
+
+    /// Append tool-use enforcement guidance when configured for the model.
+    pub fn maybe_append_tool_use_enforcement(
+        &self,
+        mut prompt: String,
+        tool_use_enforcement: &crate::config::ToolUseEnforcement,
+        model_name: &str,
+    ) -> Result<String> {
+        if !tool_use_enforcement.should_inject(model_name) {
+            return Ok(prompt);
+        }
+
+        let guidance = self.render_tool_use_enforcement()?;
+        let guidance = guidance.trim();
+        if guidance.is_empty() {
+            return Ok(prompt);
+        }
+
+        if !prompt.trim_end().is_empty() {
+            prompt.push_str("\n\n");
+        }
+        prompt.push_str(guidance);
+        Ok(prompt)
+    }
+
     /// Convenience method for rendering worker capabilities fragment.
     pub fn render_worker_capabilities(
         &self,
@@ -228,6 +273,7 @@ impl PromptEngine {
         platform: &str,
         server_name: Option<&str>,
         channel_name: Option<&str>,
+        conversation_id: Option<&str>,
     ) -> Result<String> {
         self.render(
             "fragments/conversation_context",
@@ -235,6 +281,7 @@ impl PromptEngine {
                 platform => platform,
                 server_name => server_name,
                 channel_name => channel_name,
+                conversation_id => conversation_id,
             },
         )
     }
@@ -262,6 +309,9 @@ impl PromptEngine {
         sandbox_write_allowlist: Vec<String>,
         tool_secret_names: &[String],
         browser_persist_session: bool,
+        status_text: Option<String>,
+        wiki_enabled: bool,
+        project_context: Option<String>,
     ) -> Result<String> {
         self.render(
             "worker",
@@ -274,17 +324,26 @@ impl PromptEngine {
                 sandbox_write_allowlist => sandbox_write_allowlist,
                 tool_secret_names => tool_secret_names,
                 browser_persist_session => browser_persist_session,
+                status_text => status_text,
+                wiki_enabled => wiki_enabled,
+                project_context => project_context,
             },
         )
     }
 
     /// Render the branch system prompt with filesystem context.
-    pub fn render_branch_prompt(&self, instance_dir: &str, workspace_dir: &str) -> Result<String> {
+    pub fn render_branch_prompt(
+        &self,
+        instance_dir: &str,
+        workspace_dir: &str,
+        wiki_enabled: bool,
+    ) -> Result<String> {
         self.render(
             "branch",
             context! {
                 instance_dir => instance_dir,
                 workspace_dir => workspace_dir,
+                wiki_enabled => wiki_enabled,
             },
         )
     }
@@ -330,21 +389,6 @@ impl PromptEngine {
         self.render_static("fragments/system/tool_syntax_correction")
     }
 
-    /// Render worker task time-context preamble.
-    pub fn render_system_worker_time_context(
-        &self,
-        current_local_datetime: &str,
-        current_utc_datetime: &str,
-    ) -> Result<String> {
-        self.render(
-            "fragments/system/worker_time_context",
-            context! {
-                current_local_datetime => current_local_datetime,
-                current_utc_datetime => current_utc_datetime,
-            },
-        )
-    }
-
     /// Convenience method for rendering truncation marker.
     pub fn render_system_truncation(&self, remove_count: usize) -> Result<String> {
         self.render(
@@ -376,6 +420,11 @@ impl PromptEngine {
         self.render_static("fragments/system/memory_persistence")
     }
 
+    /// Retry nudge sent to a memory-persistence branch that missed its terminal completion call.
+    pub fn render_system_memory_persistence_contract_retry(&self) -> Result<String> {
+        self.render_static("fragments/system/memory_persistence_contract_retry")
+    }
+
     /// Render the profile synthesis prompt with identity and bulletin context.
     pub fn render_system_profile_synthesis(
         &self,
@@ -402,6 +451,42 @@ impl PromptEngine {
             context! {
                 max_words => max_words,
                 raw_sections => raw_sections,
+            },
+        )
+    }
+
+    /// Render the intra-day synthesis prompt.
+    pub fn render_intraday_synthesis(
+        &self,
+        event_count: usize,
+        time_start: &str,
+        time_end: &str,
+        events: &str,
+    ) -> Result<String> {
+        self.render(
+            "cortex_intraday_synthesis",
+            context! {
+                event_count => event_count,
+                time_start => time_start,
+                time_end => time_end,
+                events => events,
+            },
+        )
+    }
+
+    /// Render the daily summary prompt.
+    pub fn render_daily_summary(
+        &self,
+        date: &str,
+        max_words: usize,
+        intraday_blocks: &str,
+    ) -> Result<String> {
+        self.render(
+            "cortex_daily_summary",
+            context! {
+                date => date,
+                max_words => max_words,
+                intraday_blocks => intraday_blocks,
             },
         )
     }
@@ -469,6 +554,7 @@ impl PromptEngine {
         self.render_channel_prompt_with_links(
             identity_context,
             memory_bulletin,
+            None,
             skills_prompt,
             worker_capabilities,
             conversation_context,
@@ -479,6 +565,11 @@ impl PromptEngine {
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
+            false,
         )
     }
 
@@ -487,6 +578,7 @@ impl PromptEngine {
         let template_name = match adapter {
             "email" => "adapters/email",
             "cron" => "adapters/cron",
+            "signal" => "adapters/signal",
             _ => return None,
         };
 
@@ -574,6 +666,7 @@ impl PromptEngine {
         &self,
         identity_context: Option<String>,
         memory_bulletin: Option<String>,
+        knowledge_synthesis: Option<String>,
         skills_prompt: Option<String>,
         worker_capabilities: String,
         conversation_context: Option<String>,
@@ -584,6 +677,11 @@ impl PromptEngine {
         org_context: Option<String>,
         adapter_prompt: Option<String>,
         project_context: Option<String>,
+        backfill_transcript: Option<String>,
+        working_memory: Option<String>,
+        channel_activity_map: Option<String>,
+        participant_context: Option<String>,
+        direct_mode: bool,
     ) -> Result<String> {
         self.render(
             "channel",
@@ -600,6 +698,12 @@ impl PromptEngine {
                 org_context => org_context,
                 adapter_prompt => adapter_prompt,
                 project_context => project_context,
+                backfill_transcript => backfill_transcript,
+                working_memory => working_memory,
+                channel_activity_map => channel_activity_map,
+                participant_context => participant_context,
+                knowledge_synthesis => knowledge_synthesis,
+                direct_mode => direct_mode,
             },
         )
     }
@@ -683,4 +787,82 @@ pub struct ProjectWorktreeContext {
 }
 
 // All templates are now loaded from the centralized text registry (src/prompts/text.rs)
+
+#[cfg(test)]
+mod tests {
+    use super::PromptEngine;
+    use crate::config::ToolUseEnforcement;
+
+    #[test]
+    fn appends_tool_use_enforcement_for_matching_model() {
+        let engine = PromptEngine::new("en").expect("prompt engine should build");
+        let prompt = engine
+            .maybe_append_tool_use_enforcement(
+                "Base prompt".to_string(),
+                &ToolUseEnforcement::Auto,
+                "openai/gpt-4.1",
+            )
+            .expect("tool-use guidance should render");
+
+        assert!(prompt.contains("Base prompt"));
+        assert!(prompt.contains("Tool-Use Enforcement"));
+    }
+
+    #[test]
+    fn skips_tool_use_enforcement_for_non_matching_model() {
+        let engine = PromptEngine::new("en").expect("prompt engine should build");
+        let prompt = engine
+            .maybe_append_tool_use_enforcement(
+                "Base prompt".to_string(),
+                &ToolUseEnforcement::Auto,
+                "anthropic/claude-sonnet-4",
+            )
+            .expect("tool-use guidance should render");
+
+        assert_eq!(prompt, "Base prompt");
+    }
+
+    #[test]
+    fn renders_memory_context_when_knowledge_synthesis_is_absent() {
+        let engine = PromptEngine::new("en").expect("prompt engine should build");
+        let prompt = engine
+            .render_channel_prompt_with_links(
+                None,
+                Some("Bulletin fallback".to_string()),
+                None,
+                None,
+                String::new(),
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .expect("channel prompt should render");
+
+        assert!(prompt.contains("## Memory Context"));
+        assert!(prompt.contains("Bulletin fallback"));
+        assert!(!prompt.contains("## Knowledge Context"));
+    }
+
+    #[test]
+    fn knowledge_synthesis_prompt_preserves_participant_roles() {
+        let engine = PromptEngine::new("en").expect("prompt engine should build");
+        let prompt = engine
+            .render_static("cortex_knowledge_synthesis")
+            .expect("knowledge synthesis prompt should render");
+
+        assert!(prompt.contains("Stable participant or user role facts"));
+        assert!(prompt.contains("the user is the CEO"));
+        assert!(!prompt.contains("\"The user is the CEO\" or similar role statements"));
+    }
+}
 // to support multiple languages at compile time.

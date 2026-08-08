@@ -680,6 +680,7 @@ fn extract_attachments(message: &teloxide::types::Message) -> Vec<Attachment> {
                     url: largest.file.id.to_string(),
                     size_bytes: Some(largest.file.size as u64),
                     auth_header: None,
+                    pre_saved_id: None,
                 });
             }
         }
@@ -699,6 +700,7 @@ fn extract_attachments(message: &teloxide::types::Message) -> Vec<Attachment> {
                 url: doc.document.file.id.to_string(),
                 size_bytes: Some(doc.document.file.size as u64),
                 auth_header: None,
+                pre_saved_id: None,
             });
         }
         MediaKind::Video(video) => {
@@ -717,6 +719,7 @@ fn extract_attachments(message: &teloxide::types::Message) -> Vec<Attachment> {
                 url: video.video.file.id.to_string(),
                 size_bytes: Some(video.video.file.size as u64),
                 auth_header: None,
+                pre_saved_id: None,
             });
         }
         MediaKind::Voice(voice) => {
@@ -731,6 +734,7 @@ fn extract_attachments(message: &teloxide::types::Message) -> Vec<Attachment> {
                 url: voice.voice.file.id.to_string(),
                 size_bytes: Some(voice.voice.file.size as u64),
                 auth_header: None,
+                pre_saved_id: None,
             });
         }
         MediaKind::Audio(audio) => {
@@ -749,6 +753,7 @@ fn extract_attachments(message: &teloxide::types::Message) -> Vec<Attachment> {
                 url: audio.audio.file.id.to_string(),
                 size_bytes: Some(audio.audio.file.size as u64),
                 auth_header: None,
+                pre_saved_id: None,
             });
         }
         _ => {}
@@ -858,7 +863,34 @@ fn build_metadata(
         metadata.insert("telegram_bot_username".into(), bot_username.clone().into());
     }
 
+    // Compute combined mentions-or-replies-to-bot flag for require_mention.
+    // Matches the pattern used by Discord/Slack/Twitch adapters.
+    let mut mentions_or_replies_to_bot = false;
+
+    // Check text-based @mention in message text/caption.
+    // Uses a word-boundary check so "@spacebot" doesn't match "@spacebot_extra".
+    if let Some(bot_username) = bot_username {
+        let bot_lower = bot_username.to_lowercase();
+        if let Some(text) = extract_text(message) {
+            let text_lower = text.to_lowercase();
+            let mention = format!("@{bot_lower}");
+            // Telegram usernames can contain [a-z0-9_], so ensure the character
+            // after the mention (if any) is not a valid username character.
+            if let Some(start) = text_lower.find(&mention) {
+                let after = start + mention.len();
+                let is_boundary = text_lower
+                    .as_bytes()
+                    .get(after)
+                    .is_none_or(|&ch| !ch.is_ascii_alphanumeric() && ch != b'_');
+                if is_boundary {
+                    mentions_or_replies_to_bot = true;
+                }
+            }
+        }
+    }
+
     // Reply-to context for threading
+    let mut reply_to_is_bot_match = false;
     if let Some(reply) = message.reply_to_message() {
         metadata.insert(
             "reply_to_message_id".into(),
@@ -884,9 +916,24 @@ fn build_metadata(
             );
             if let Some(username) = &from.username {
                 metadata.insert("reply_to_username".into(), username.clone().into());
+                // Check if reply is to our bot specifically
+                if from.is_bot
+                    && let Some(bot_username) = bot_username
+                    && username.to_lowercase() == bot_username.to_lowercase()
+                {
+                    reply_to_is_bot_match = true;
+                }
             }
         }
     }
+
+    if !mentions_or_replies_to_bot && reply_to_is_bot_match {
+        mentions_or_replies_to_bot = true;
+    }
+    metadata.insert(
+        "telegram_mentions_or_replies_to_bot".into(),
+        serde_json::Value::Bool(mentions_or_replies_to_bot),
+    );
 
     (metadata, formatted_author)
 }

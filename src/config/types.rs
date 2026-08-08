@@ -60,6 +60,31 @@ pub struct Config {
     pub metrics: MetricsConfig,
     /// OpenTelemetry export configuration.
     pub telemetry: TelemetryConfig,
+    /// Instance-wide memory janitor — required for dormant-mode agents
+    /// (their cortex tick never runs maintenance), additive on active-mode
+    /// agents.
+    pub memory_janitor: MemoryJanitorConfig,
+}
+
+/// Instance-wide memory maintenance scheduler.
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryJanitorConfig {
+    /// When `true`, a single background task walks every registered agent
+    /// on `interval_secs` and runs `memory::maintenance::run_maintenance`
+    /// against its memory store. Disabled by default; enable when running
+    /// dormant-mode agents at scale.
+    pub enabled: bool,
+    /// Seconds between full sweeps. Default `86_400` (daily).
+    pub interval_secs: u64,
+}
+
+impl Default for MemoryJanitorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: 86_400,
+        }
+    }
 }
 
 impl Config {
@@ -188,6 +213,8 @@ pub enum ApiType {
     Anthropic,
     /// Google Gemini API (https://generativelanguage.googleapis.com/v1beta/openai/chat/completions)
     Gemini,
+    /// Azure OpenAI API (https://{resource}.openai.azure.com/openai/deployments/{deployment}/chat/completions?api-version={version})
+    Azure,
 }
 
 impl<'de> serde::Deserialize<'de> for ApiType {
@@ -202,16 +229,89 @@ impl<'de> serde::Deserialize<'de> for ApiType {
             "openai_responses" => Ok(Self::OpenAiResponses),
             "anthropic" => Ok(Self::Anthropic),
             "gemini" => Ok(Self::Gemini),
+            "azure" => Ok(Self::Azure),
             other => Err(serde::de::Error::invalid_value(
                 serde::de::Unexpected::Str(other),
-                &"one of \"openai_completions\", \"openai_chat_completions\", \"kilo_gateway\", \"openai_responses\", \"anthropic\", or \"gemini\"",
+                &"one of \"openai_completions\", \"openai_chat_completions\", \"kilo_gateway\", \"openai_responses\", \"anthropic\", \"gemini\", or \"azure\"",
+            )),
+        }
+    }
+}
+
+/// Tool-use enforcement configuration for preventing models from describing
+/// actions instead of calling tools.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ToolUseEnforcement {
+    /// Auto-detect based on model name (GPT/Codex models get enforcement).
+    #[default]
+    Auto,
+    /// Always inject tool-use enforcement guidance.
+    Always,
+    /// Never inject tool-use enforcement guidance.
+    Never,
+    /// Custom list of model name substrings to match.
+    Custom(Vec<String>),
+}
+
+impl ToolUseEnforcement {
+    /// Check if enforcement should be injected for the given model name.
+    pub fn should_inject(&self, model: &str) -> bool {
+        let model_lower = model.to_lowercase();
+        match self {
+            Self::Auto => {
+                // Match GPT and Codex models by default
+                model_lower.contains("gpt") || model_lower.contains("codex")
+            }
+            Self::Always => true,
+            Self::Never => false,
+            Self::Custom(patterns) => patterns
+                .iter()
+                .any(|p| model_lower.contains(&p.to_lowercase())),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ToolUseEnforcement {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = toml::Value::deserialize(deserializer)?;
+        match value {
+            toml::Value::String(s) => match s.to_lowercase().as_str() {
+                "auto" => Ok(Self::Auto),
+                "true" | "always" | "yes" | "on" => Ok(Self::Always),
+                "false" | "never" | "no" | "off" => Ok(Self::Never),
+                other => Err(D::Error::invalid_value(
+                    serde::de::Unexpected::Str(other),
+                    &"one of 'auto', 'true', 'false', 'always', 'never'",
+                )),
+            },
+            toml::Value::Boolean(enabled) => Ok(if enabled { Self::Always } else { Self::Never }),
+            toml::Value::Array(arr) => {
+                let patterns: Vec<String> = arr
+                    .into_iter()
+                    .map(|v| {
+                        v.as_str().map(String::from).ok_or_else(|| {
+                            D::Error::invalid_value(
+                                serde::de::Unexpected::Other("non-string array element"),
+                                &"array of strings",
+                            )
+                        })
+                    })
+                    .collect::<std::result::Result<_, _>>()?;
+                Ok(Self::Custom(patterns))
+            }
+            _ => Err(D::Error::invalid_value(
+                serde::de::Unexpected::Other("non-string/non-array value"),
+                &"string or array of strings",
             )),
         }
     }
 }
 
 /// Configuration for a single LLM provider.
-#[derive(Clone)]
+#[derive(Clone, serde::Deserialize)]
 pub struct ProviderConfig {
     pub api_type: ApiType,
     pub base_url: String,
@@ -220,10 +320,18 @@ pub struct ProviderConfig {
     /// When true, use `Authorization: Bearer` instead of `x-api-key` for
     /// Anthropic requests. Set automatically when the key originates from
     /// `ANTHROPIC_AUTH_TOKEN` (proxy-compatible auth).
+    #[serde(default)]
     pub use_bearer_auth: bool,
     /// Additional HTTP headers included in requests to this provider.
     /// Currently applied in `call_openai()` (the `OpenAiCompletions` path).
+    #[serde(default)]
     pub extra_headers: Vec<(String, String)>,
+    /// Azure API version (e.g., "2024-12-01-preview"). Required for Azure providers.
+    #[serde(default)]
+    pub api_version: Option<String>,
+    /// Azure deployment name (e.g., "gpt-4o"). Required for Azure providers.
+    #[serde(default)]
+    pub deployment: Option<String>,
 }
 
 impl std::fmt::Debug for ProviderConfig {
@@ -270,6 +378,7 @@ pub struct LlmConfig {
     pub minimax_cn_key: Option<String>,
     pub moonshot_key: Option<String>,
     pub zai_coding_plan_key: Option<String>,
+    pub github_copilot_key: Option<String>,
     pub providers: HashMap<String, ProviderConfig>,
 }
 
@@ -341,6 +450,10 @@ impl std::fmt::Debug for LlmConfig {
                 "zai_coding_plan_key",
                 &self.zai_coding_plan_key.as_ref().map(|_| "[REDACTED]"),
             )
+            .field(
+                "github_copilot_key",
+                &self.github_copilot_key.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("providers", &self.providers)
             .finish()
     }
@@ -370,6 +483,7 @@ impl LlmConfig {
             || self.minimax_cn_key.is_some()
             || self.moonshot_key.is_some()
             || self.zai_coding_plan_key.is_some()
+            || self.github_copilot_key.is_some()
             || !self.providers.is_empty()
     }
 }
@@ -501,6 +615,11 @@ impl SystemSecrets for LlmConfig {
                 secret_name: "SAMBANOVA_API_KEY",
                 instance_pattern: None,
             },
+            SecretField {
+                toml_key: "github_copilot_key",
+                secret_name: "GITHUB_COPILOT_API_KEY",
+                instance_pattern: None,
+            },
         ]
     }
 }
@@ -524,6 +643,7 @@ pub struct DefaultsConfig {
     pub ingestion: IngestionConfig,
     pub cortex: CortexConfig,
     pub warmup: WarmupConfig,
+    pub participant_context: ParticipantContextConfig,
     pub browser: BrowserConfig,
     pub channel: ChannelConfig,
     pub mcp: Vec<McpServerConfig>,
@@ -535,6 +655,9 @@ pub struct DefaultsConfig {
     pub user_timezone: Option<String>,
     pub history_backfill_count: usize,
     pub cron: Vec<CronDef>,
+    /// Tool-use enforcement for preventing models from describing actions instead of calling tools.
+    /// "auto" (default) — matches GPT/Codex models; true — always inject; false — never inject.
+    pub tool_use_enforcement: ToolUseEnforcement,
     pub opencode: OpenCodeConfig,
     /// Worker log mode: "errors_only", "all_separate", or "all_combined".
     pub worker_log_mode: crate::settings::WorkerLogMode,
@@ -557,6 +680,7 @@ impl std::fmt::Debug for DefaultsConfig {
             .field("ingestion", &self.ingestion)
             .field("cortex", &self.cortex)
             .field("warmup", &self.warmup)
+            .field("participant_context", &self.participant_context)
             .field("browser", &self.browser)
             .field("channel", &self.channel)
             .field("mcp", &self.mcp)
@@ -568,6 +692,7 @@ impl std::fmt::Debug for DefaultsConfig {
             .field("user_timezone", &self.user_timezone)
             .field("history_backfill_count", &self.history_backfill_count)
             .field("cron", &self.cron)
+            .field("tool_use_enforcement", &self.tool_use_enforcement)
             .field("opencode", &self.opencode)
             .field("worker_log_mode", &self.worker_log_mode)
             .field("projects", &self.projects)
@@ -633,11 +758,20 @@ pub struct CompactionConfig {
 /// Spawns a silent branch every N messages to recall existing memories and save
 /// new ones from the recent conversation. Runs without blocking the channel and
 /// the result is never injected into channel history.
+///
+/// Legacy note: active working-memory persistence triggers are now configured in
+/// `WorkingMemoryConfig` (`persistence_message_threshold`,
+/// `persistence_time_threshold_secs`, `persistence_event_density_threshold`).
+/// Keep these values in sync only if you intentionally preserve this legacy
+/// branch cadence.
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryPersistenceConfig {
     /// Whether auto memory persistence branches are enabled.
     pub enabled: bool,
-    /// Number of user messages between automatic memory persistence branches.
+    /// Legacy branch cadence in user messages.
+    ///
+    /// Runtime checks now use the working-memory thresholds in
+    /// `WorkingMemoryConfig`.
     pub message_interval: usize,
 }
 
@@ -646,6 +780,95 @@ impl Default for MemoryPersistenceConfig {
         Self {
             enabled: true,
             message_interval: 50,
+        }
+    }
+}
+
+/// Working memory system configuration.
+///
+/// Controls the temporal event log, intra-day synthesis, channel activity map,
+/// and persistence trigger thresholds.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkingMemoryConfig {
+    /// Whether working memory context injection is enabled.
+    pub enabled: bool,
+    /// Events before an intra-day synthesis batch is triggered.
+    pub intraday_batch_threshold: usize,
+    /// Seconds before time-based fallback triggers intra-day synthesis.
+    pub intraday_time_fallback_secs: u64,
+    /// Maximum unsynthesized recent events to show in the raw tail.
+    pub today_max_unsynthesized_events: usize,
+    /// Token budget for the entire working memory section.
+    pub context_token_budget: usize,
+    /// Token budget for the channel activity map.
+    pub channel_map_token_budget: usize,
+    /// Maximum channels to show in the activity map.
+    pub channel_map_max_channels: usize,
+    /// Hide inactive channels after this many hours.
+    pub channel_map_inactive_hours: u64,
+    /// Minimum importance for events to be included under token pressure.
+    pub min_importance_under_pressure: f32,
+    /// Days to retain raw events before pruning.
+    pub event_retention_days: i64,
+    /// Daily summary max words.
+    pub daily_summary_max_words: usize,
+    /// Persistence branch trigger: message count threshold.
+    pub persistence_message_threshold: usize,
+    /// Persistence branch trigger: time threshold in seconds.
+    pub persistence_time_threshold_secs: u64,
+    /// Persistence branch trigger: event density threshold.
+    pub persistence_event_density_threshold: usize,
+}
+
+impl Default for WorkingMemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            intraday_batch_threshold: 15,
+            intraday_time_fallback_secs: 14400,
+            today_max_unsynthesized_events: 10,
+            context_token_budget: 1500,
+            channel_map_token_budget: 300,
+            channel_map_max_channels: 10,
+            channel_map_inactive_hours: 24,
+            min_importance_under_pressure: 0.5,
+            event_retention_days: 30,
+            daily_summary_max_words: 300,
+            persistence_message_threshold: 20,
+            persistence_time_threshold_secs: 900,
+            persistence_event_density_threshold: 5,
+        }
+    }
+}
+
+/// Participant context configuration.
+///
+/// Keeps the prompt-facing participant-awareness surface separate from working
+/// memory so the future humans/user-identity pipeline can evolve behind a
+/// stable boundary.
+#[derive(Debug, Clone, Copy)]
+pub struct ParticipantContextConfig {
+    /// Whether participant context injection is enabled.
+    pub enabled: bool,
+    /// Minimum active participants required before the section appears.
+    ///
+    /// Defaults to 1 for the current config-backed implementation so DMs still
+    /// benefit from participant metadata. The fuller participant-awareness
+    /// pipeline can raise this later if needed.
+    pub min_participants: usize,
+    /// Token budget for the participant context section.
+    pub token_budget: usize,
+    /// Maximum participants to render in the prompt.
+    pub max_participants: usize,
+}
+
+impl Default for ParticipantContextConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_participants: 1,
+            token_budget: 400,
+            max_participants: 5,
         }
     }
 }
@@ -718,7 +941,7 @@ impl Default for IngestionConfig {
 }
 
 /// What happens when a worker explicitly calls "close" on the browser.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ClosePolicy {
     /// Kill the browser process and reset all state (current default behavior).
@@ -786,14 +1009,26 @@ impl Default for BrowserConfig {
 }
 
 /// Channel behavior configuration.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct ChannelConfig {
-    /// When true, unsolicited chat messages are ignored unless command/mention/reply.
+    /// Deprecated: use `response_mode` instead. Kept for backwards compatibility.
     pub listen_only_mode: bool,
+    /// Default response mode for channels. Overrides listen_only_mode when set.
+    pub response_mode: Option<crate::conversation::settings::ResponseMode>,
     /// When true, file attachments received in the channel are saved to
     /// `workspace/saved/` and tracked in the `saved_attachments` table so
     /// they can be recalled on later turns.
     pub save_attachments: bool,
+}
+
+impl Default for ChannelConfig {
+    fn default() -> Self {
+        Self {
+            listen_only_mode: false,
+            response_mode: None,
+            save_attachments: true,
+        }
+    }
 }
 
 /// OpenCode subprocess worker configuration.
@@ -827,11 +1062,49 @@ impl Default for OpenCodeConfig {
     }
 }
 
+/// Whether the cortex runs its periodic loops or stays dormant until woken.
+///
+/// `Active` (default) is the historical behavior — the cortex spawns
+/// warmup, tick, association, and ready-task loops at agent startup.
+///
+/// `Dormant` is the agentic-backend deployment mode — the cortex skips
+/// all four loops and instead relies on external wake triggers
+/// (`send_agent_message` post-insert hook, cron fire, admin wake API).
+/// Required for deployments running thousands of mostly-idle agents on
+/// shared infrastructure where periodic LLM-backed bulletin generation
+/// would dominate cost.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CortexMode {
+    #[default]
+    Active,
+    Dormant,
+}
+
+impl CortexMode {
+    pub fn is_dormant(&self) -> bool {
+        matches!(self, Self::Dormant)
+    }
+}
+
 /// Cortex configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct CortexConfig {
+    /// Whether the cortex's periodic loops run. See `CortexMode` for the
+    /// active vs dormant trade-off.
+    pub mode: CortexMode,
     pub tick_interval_secs: u64,
+    /// Supervisor idle-kill bound: max seconds since `last_activity_at`
+    /// before the cortex supervisor terminates a stuck worker.
     pub worker_timeout_secs: u64,
+    /// Wall-clock budget for an entire `Worker::run` invocation. Distinct
+    /// from `worker_timeout_secs` (which is idle-shaped). Catches the
+    /// slow-drift case where a worker stays "active" but never completes.
+    pub worker_wall_clock_timeout_secs: u64,
+    /// Per-agent default for cron job timeouts. `None` falls back to the
+    /// system default (`crate::cron::scheduler::DEFAULT_CRON_TIMEOUT_SECS`).
+    /// A per-job `timeout_secs` always wins over this default.
+    pub cron_default_timeout_secs: Option<u64>,
     pub branch_timeout_secs: u64,
     pub detached_worker_timeout_retry_limit: u8,
     pub supervisor_kill_budget_per_tick: usize,
@@ -842,6 +1115,16 @@ pub struct CortexConfig {
     pub bulletin_max_words: usize,
     /// Max LLM turns for bulletin generation.
     pub bulletin_max_turns: usize,
+    /// Interval in seconds between memory maintenance passes.
+    pub maintenance_interval_secs: u64,
+    /// Per-day decay applied to memory importance during maintenance.
+    pub maintenance_decay_rate: f32,
+    /// Minimum importance score for non-identity memories to avoid pruning.
+    pub maintenance_prune_threshold: f32,
+    /// Minimum age in days before a memory becomes prune-eligible.
+    pub maintenance_min_age_days: i64,
+    /// Similarity threshold above which memories are merged as near-duplicates.
+    pub maintenance_merge_similarity_threshold: f32,
     /// Interval in seconds between association passes.
     pub association_interval_secs: u64,
     /// Minimum cosine similarity to create a RelatedTo edge.
@@ -850,26 +1133,79 @@ pub struct CortexConfig {
     pub association_updates_threshold: f32,
     /// Max associations to create per pass (rate limit).
     pub association_max_per_pass: usize,
+    /// Knowledge synthesis max words (replaces bulletin_max_words for Layer 5).
+    pub knowledge_synthesis_max_words: usize,
+    /// Debounce seconds after last memory change before regenerating knowledge synthesis.
+    pub knowledge_synthesis_debounce_secs: u64,
 }
 
 impl Default for CortexConfig {
     fn default() -> Self {
         Self {
+            mode: CortexMode::Active,
             tick_interval_secs: 30,
             worker_timeout_secs: 600,
-            branch_timeout_secs: 60,
+            worker_wall_clock_timeout_secs:
+                crate::agent::worker::DEFAULT_WORKER_WALL_CLOCK_TIMEOUT_SECS,
+            cron_default_timeout_secs: None,
+            branch_timeout_secs: 600,
             detached_worker_timeout_retry_limit: 2,
             supervisor_kill_budget_per_tick: 8,
             circuit_breaker_threshold: 3,
             bulletin_interval_secs: 3600,
             bulletin_max_words: 1500,
             bulletin_max_turns: 15,
+            maintenance_interval_secs: 3600,
+            maintenance_decay_rate: 0.05,
+            maintenance_prune_threshold: 0.1,
+            maintenance_min_age_days: 30,
+            maintenance_merge_similarity_threshold: 0.95,
             association_interval_secs: 300,
             association_similarity_threshold: 0.85,
             association_updates_threshold: 0.95,
             association_max_per_pass: 100,
+            knowledge_synthesis_max_words: 500,
+            knowledge_synthesis_debounce_secs: 60,
         }
     }
+}
+
+impl CortexConfig {
+    /// Validate maintenance tuning bounds used by pruning/merge logic.
+    pub fn validate_maintenance_bounds(&self) -> Result<()> {
+        validate_unit_interval_f32("maintenance_decay_rate", self.maintenance_decay_rate)?;
+        validate_unit_interval_f32(
+            "maintenance_prune_threshold",
+            self.maintenance_prune_threshold,
+        )?;
+        validate_unit_interval_f32(
+            "maintenance_merge_similarity_threshold",
+            self.maintenance_merge_similarity_threshold,
+        )?;
+        if self.maintenance_min_age_days < 0 {
+            return Err(ConfigError::Invalid(format!(
+                "maintenance_min_age_days must be >= 0, got {}",
+                self.maintenance_min_age_days
+            ))
+            .into());
+        }
+        if self.maintenance_interval_secs == 0 {
+            return Err(
+                ConfigError::Invalid("maintenance_interval_secs must be >= 1".to_string()).into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+fn validate_unit_interval_f32(name: &str, value: f32) -> Result<()> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(ConfigError::Invalid(format!(
+            "{name} must be finite and between 0.0 and 1.0, got {value}"
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 /// Warmup configuration.
@@ -933,7 +1269,7 @@ impl Default for ProjectsConfig {
 }
 
 /// Current warmup lifecycle state.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WarmupState {
     Cold,
@@ -943,7 +1279,7 @@ pub enum WarmupState {
 }
 
 /// Warmup runtime status snapshot for API and observability.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct WarmupStatus {
     pub state: WarmupState,
     pub embedding_ready: bool,
@@ -1012,14 +1348,14 @@ pub(super) fn evaluate_work_readiness(
         })
         .or(status.bulletin_age_secs);
 
+    // Knowledge synthesis is change-driven, not timer-driven. Staleness
+    // is no longer a readiness concern — only "never generated" matters.
     let reason = if status.state != WarmupState::Warm {
         Some(WorkReadinessReason::StateNotWarm)
     } else if warmup_config.eager_embedding_load && !status.embedding_ready {
         Some(WorkReadinessReason::EmbeddingNotReady)
     } else if bulletin_age_secs.is_none() {
         Some(WorkReadinessReason::BulletinMissing)
-    } else if bulletin_age_secs.is_some_and(|age| age > stale_after_secs) {
-        Some(WorkReadinessReason::BulletinStale)
     } else {
         None
     };
@@ -1056,6 +1392,8 @@ pub struct AgentConfig {
     pub max_turns: Option<usize>,
     pub branch_max_turns: Option<usize>,
     pub context_window: Option<usize>,
+    /// Tool-use enforcement for preventing models from describing actions instead of calling tools.
+    pub tool_use_enforcement: Option<ToolUseEnforcement>,
     pub compaction: Option<CompactionConfig>,
     pub memory_persistence: Option<MemoryPersistenceConfig>,
     pub coalesce: Option<CoalesceConfig>,
@@ -1138,6 +1476,8 @@ pub struct ResolvedAgentConfig {
     /// Number of messages to fetch from the platform when a new channel is created.
     pub history_backfill_count: usize,
     pub cron: Vec<CronDef>,
+    /// Tool-use enforcement for preventing models from describing actions instead of calling tools.
+    pub tool_use_enforcement: ToolUseEnforcement,
 }
 
 impl Default for DefaultsConfig {
@@ -1155,6 +1495,7 @@ impl Default for DefaultsConfig {
             ingestion: IngestionConfig::default(),
             cortex: CortexConfig::default(),
             warmup: WarmupConfig::default(),
+            participant_context: ParticipantContextConfig::default(),
             browser: BrowserConfig::default(),
             channel: ChannelConfig::default(),
             mcp: Vec::new(),
@@ -1163,6 +1504,7 @@ impl Default for DefaultsConfig {
             user_timezone: None,
             history_backfill_count: 50,
             cron: Vec::new(),
+            tool_use_enforcement: ToolUseEnforcement::default(),
             opencode: OpenCodeConfig::default(),
             worker_log_mode: crate::settings::WorkerLogMode::default(),
             projects: ProjectsConfig::default(),
@@ -1239,6 +1581,10 @@ impl AgentConfig {
                 .unwrap_or_else(|| defaults.projects.clone()),
             history_backfill_count: defaults.history_backfill_count,
             cron: self.cron.clone(),
+            tool_use_enforcement: self
+                .tool_use_enforcement
+                .clone()
+                .unwrap_or_else(|| defaults.tool_use_enforcement.clone()),
         }
     }
 }
@@ -1409,13 +1755,21 @@ pub struct Binding {
     pub adapter: Option<String>,
     pub guild_id: Option<String>,
     pub workspace_id: Option<String>, // Slack workspace (team) ID
-    pub chat_id: Option<String>,
+    pub chat_id: Option<String>,      // Telegram group ID
+    pub team_id: Option<String>,      // Mattermost team ID
     /// Channel IDs this binding applies to. If empty, all channels in the guild/workspace are allowed.
     pub channel_ids: Vec<String>,
     /// Require explicit @mention (or reply-to-bot) for inbound messages.
+    /// Messages that don't match are blocked at the routing level and never
+    /// reach the channel — the agent cannot see them at all.
+    /// For context-aware mention filtering (agent sees messages but only
+    /// responds to mentions), use the channel-level `MentionOnly` response
+    /// mode instead.
     pub require_mention: bool,
     /// User IDs allowed to DM the bot through this binding.
     pub dm_allowed_users: Vec<String>,
+    /// Default conversation settings for channels matched by this binding.
+    pub settings: Option<crate::conversation::ConversationSettings>,
 }
 
 impl Binding {
@@ -1429,8 +1783,9 @@ impl Binding {
         self.adapter.is_none()
     }
 
-    /// Check if this binding matches an inbound message.
-    fn matches(&self, message: &crate::InboundMessage) -> bool {
+    /// Check if this binding matches on routing criteria (platform, guild,
+    /// channel IDs, adapter, etc.) — everything *except* `require_mention`.
+    fn matches_route(&self, message: &crate::InboundMessage) -> bool {
         if self.channel != message.source {
             return false;
         }
@@ -1439,8 +1794,8 @@ impl Binding {
             return false;
         }
 
-        // For webchat messages, match based on agent_id in the message
-        if message.source == "webchat"
+        // For portal messages, match based on agent_id in the message
+        if message.source == "portal"
             && let Some(message_agent_id) = &message.agent_id
         {
             return message_agent_id.as_ref() == self.agent_id;
@@ -1497,35 +1852,24 @@ impl Binding {
                 .get("twitch_channel")
                 .and_then(|v| v.as_str());
 
+            // Also check Mattermost channel ID
+            let mattermost_channel = message
+                .metadata
+                .get("mattermost_channel_id")
+                .and_then(|v| v.as_str());
+
             let direct_match = message_channel
                 .as_ref()
                 .is_some_and(|id| self.channel_ids.contains(id))
                 || slack_channel.is_some_and(|id| self.channel_ids.contains(&id.to_string()))
-                || twitch_channel.is_some_and(|id| self.channel_ids.contains(&id.to_string()));
+                || twitch_channel.is_some_and(|id| self.channel_ids.contains(&id.to_string()))
+                || mattermost_channel.is_some_and(|id| self.channel_ids.contains(&id.to_string()));
             let parent_match = parent_channel
                 .as_ref()
                 .is_some_and(|id| self.channel_ids.contains(id));
 
             if !direct_match && !parent_match {
                 return false;
-            }
-        }
-
-        if self.channel == "discord" && self.require_mention {
-            let is_guild_message = message
-                .metadata
-                .get("discord_guild_id")
-                .and_then(|v| v.as_u64())
-                .is_some();
-            if is_guild_message {
-                let mentions_or_replies_to_bot = message
-                    .metadata
-                    .get("discord_mentions_or_replies_to_bot")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if !mentions_or_replies_to_bot {
-                    return false;
-                }
             }
         }
 
@@ -1541,7 +1885,71 @@ impl Binding {
             }
         }
 
+        // Mattermost team filter
+        if let Some(team_id) = &self.team_id
+            && self.channel == "mattermost"
+        {
+            let message_team = message
+                .metadata
+                .get("mattermost_team_id")
+                .and_then(|v| v.as_str());
+            if message_team != Some(team_id.as_str()) {
+                return false;
+            }
+        }
         true
+    }
+
+    /// Check whether a message that already matched on routing criteria also
+    /// passes the `require_mention` filter. Returns `true` when
+    /// `require_mention` is disabled or the message includes a mention/reply.
+    ///
+    /// Works for all platforms by checking the platform-specific
+    /// `*_mentions_or_replies_to_bot` metadata key that every adapter sets.
+    /// DMs are always allowed through (they are inherently directed at the bot).
+    fn passes_require_mention(&self, message: &crate::InboundMessage) -> bool {
+        if !self.require_mention {
+            return true;
+        }
+
+        // DMs are inherently directed at the bot — always pass.
+        let is_dm = match message.source.as_str() {
+            "discord" => message
+                .metadata
+                .get("discord_guild_id")
+                .and_then(|v| v.as_u64())
+                .is_none(),
+            "telegram" => {
+                message
+                    .metadata
+                    .get("telegram_chat_type")
+                    .and_then(|v| v.as_str())
+                    == Some("private")
+            }
+            _ => false,
+        };
+        if is_dm {
+            return true;
+        }
+
+        // Each adapter sets a `<platform>_mentions_or_replies_to_bot` metadata
+        // key. Check the one that corresponds to the message source.
+        let mention_key = match message.source.as_str() {
+            "discord" => "discord_mentions_or_replies_to_bot",
+            "slack" => "slack_mentions_or_replies_to_bot",
+            "twitch" => "twitch_mentions_or_replies_to_bot",
+            "telegram" => "telegram_mentions_or_replies_to_bot",
+            "mattermost" => "mattermost_mentions_or_replies_to_bot",
+            // Unknown platforms: if require_mention is set, default to
+            // requiring a mention (safe default).
+            _ => return false,
+        };
+
+        message
+            .metadata
+            .get(mention_key)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
     }
 }
 
@@ -1586,59 +1994,111 @@ pub(super) struct AdapterValidationState {
 pub(super) fn is_named_adapter_platform(platform: &str) -> bool {
     matches!(
         platform,
-        "discord" | "slack" | "telegram" | "twitch" | "email"
+        "discord" | "slack" | "telegram" | "twitch" | "email" | "signal" | "mattermost"
     )
 }
 
+/// Validate channel bindings against messaging config, returning only the
+/// resolvable bindings. Unresolvable bindings (missing messaging config,
+/// missing adapter, etc.) are logged as warnings and skipped instead of
+/// causing a hard startup failure.
+/// Validate channel bindings against messaging config, returning only the
+/// resolvable bindings. When `strict` is true (config authoring/validation),
+/// unresolvable bindings cause an error. When `strict` is false (startup),
+/// they are logged as warnings and skipped so the agent can still boot.
 pub(super) fn validate_named_messaging_adapters(
     messaging: &MessagingConfig,
-    bindings: &[Binding],
-) -> Result<()> {
+    bindings: Vec<Binding>,
+    strict: bool,
+) -> Result<Vec<Binding>> {
     let adapter_states = build_adapter_validation_states(messaging)?;
+
+    let mut valid_bindings = Vec::with_capacity(bindings.len());
 
     for binding in bindings {
         if !is_named_adapter_platform(binding.channel.as_str()) {
             if binding.adapter.is_some() {
-                return Err(ConfigError::Invalid(format!(
-                    "binding for channel '{}' can't set adapter: this platform does not support named adapters",
-                    binding.channel
-                ))
-                .into());
+                let msg = format!(
+                    "binding for agent '{}' on channel '{}' can't set adapter: this platform does not support named adapters",
+                    binding.agent_id, binding.channel
+                );
+                if strict {
+                    return Err(ConfigError::Invalid(msg).into());
+                }
+                tracing::warn!(
+                    agent_id = %binding.agent_id,
+                    channel = %binding.channel,
+                    adapter = %binding.adapter.as_deref().unwrap_or("<default>"),
+                    "skipping binding: this platform does not support named adapters"
+                );
+                continue;
             }
+            valid_bindings.push(binding);
             continue;
         }
 
-        let state = adapter_states.get(binding.channel.as_str()).ok_or_else(|| {
-            ConfigError::Invalid(format!(
-                "binding for channel '{}' can't be resolved: no messaging config exists for that platform",
-                binding.channel
-            ))
-        })?;
+        let state = match adapter_states.get(binding.channel.as_str()) {
+            Some(s) => s,
+            None => {
+                let msg = format!(
+                    "binding for agent '{}' on channel '{}' can't be resolved: no messaging config exists for that platform",
+                    binding.agent_id, binding.channel
+                );
+                if strict {
+                    return Err(ConfigError::Invalid(msg).into());
+                }
+                tracing::warn!(
+                    agent_id = %binding.agent_id,
+                    channel = %binding.channel,
+                    "skipping binding: no messaging config exists for this platform"
+                );
+                continue;
+            }
+        };
 
         // adapter is already normalized at ingest time via normalize_adapter().
         match binding.adapter.as_deref() {
             Some(adapter_name) => {
                 if !state.named_instances.contains(adapter_name) {
-                    return Err(ConfigError::Invalid(format!(
-                        "binding for channel '{}' references missing adapter '{}'",
-                        binding.channel, adapter_name
-                    ))
-                    .into());
+                    let msg = format!(
+                        "binding for agent '{}' on channel '{}' references missing or disabled adapter '{}'",
+                        binding.agent_id, binding.channel, adapter_name
+                    );
+                    if strict {
+                        return Err(ConfigError::Invalid(msg).into());
+                    }
+                    tracing::warn!(
+                        agent_id = %binding.agent_id,
+                        channel = %binding.channel,
+                        adapter = %adapter_name,
+                        "skipping binding: references missing or disabled adapter"
+                    );
+                    continue;
                 }
             }
             None => {
                 if !state.default_present {
-                    return Err(ConfigError::Invalid(format!(
-                        "binding for channel '{}' requires the default adapter, but no default credentials are configured",
-                        binding.channel
-                    ))
-                    .into());
+                    let msg = format!(
+                        "binding for agent '{}' on channel '{}' requires the default adapter, but it is disabled or has no credentials configured",
+                        binding.agent_id, binding.channel
+                    );
+                    if strict {
+                        return Err(ConfigError::Invalid(msg).into());
+                    }
+                    tracing::warn!(
+                        agent_id = %binding.agent_id,
+                        channel = %binding.channel,
+                        "skipping binding: requires the default adapter, but it is disabled or has no credentials configured"
+                    );
+                    continue;
                 }
             }
         }
+
+        valid_bindings.push(binding);
     }
 
-    Ok(())
+    Ok(valid_bindings)
 }
 
 pub(super) fn build_adapter_validation_states(
@@ -1647,37 +2107,49 @@ pub(super) fn build_adapter_validation_states(
     let mut states = std::collections::HashMap::new();
 
     if let Some(discord) = &messaging.discord {
-        let named_instances = validate_instance_names(
+        // Validate ALL instance names for structural issues (duplicates, empty, etc.)
+        validate_instance_names(
             "discord",
             discord
                 .instances
                 .iter()
                 .map(|instance| instance.name.as_str()),
         )?;
-        validate_runtime_keys(
-            "discord",
-            !discord.token.trim().is_empty(),
-            &named_instances,
-        )?;
+        // Only include enabled instances in the resolvable set
+        let named_instances: std::collections::HashSet<String> = discord
+            .instances
+            .iter()
+            .filter(|i| i.enabled)
+            .map(|i| i.name.clone())
+            .collect();
+        let default_present = discord.enabled && !discord.token.trim().is_empty();
+        validate_runtime_keys("discord", default_present, &named_instances)?;
         states.insert(
             "discord",
             AdapterValidationState {
-                default_present: !discord.token.trim().is_empty(),
+                default_present,
                 named_instances,
             },
         );
     }
 
     if let Some(slack) = &messaging.slack {
-        let named_instances = validate_instance_names(
+        validate_instance_names(
             "slack",
             slack
                 .instances
                 .iter()
                 .map(|instance| instance.name.as_str()),
         )?;
-        let default_present =
-            !slack.bot_token.trim().is_empty() && !slack.app_token.trim().is_empty();
+        let named_instances: std::collections::HashSet<String> = slack
+            .instances
+            .iter()
+            .filter(|i| i.enabled)
+            .map(|i| i.name.clone())
+            .collect();
+        let default_present = slack.enabled
+            && !slack.bot_token.trim().is_empty()
+            && !slack.app_token.trim().is_empty();
         validate_runtime_keys("slack", default_present, &named_instances)?;
         states.insert(
             "slack",
@@ -1689,14 +2161,20 @@ pub(super) fn build_adapter_validation_states(
     }
 
     if let Some(telegram) = &messaging.telegram {
-        let named_instances = validate_instance_names(
+        validate_instance_names(
             "telegram",
             telegram
                 .instances
                 .iter()
                 .map(|instance| instance.name.as_str()),
         )?;
-        let default_present = !telegram.token.trim().is_empty();
+        let named_instances: std::collections::HashSet<String> = telegram
+            .instances
+            .iter()
+            .filter(|i| i.enabled)
+            .map(|i| i.name.clone())
+            .collect();
+        let default_present = telegram.enabled && !telegram.token.trim().is_empty();
         validate_runtime_keys("telegram", default_present, &named_instances)?;
         states.insert(
             "telegram",
@@ -1708,15 +2186,22 @@ pub(super) fn build_adapter_validation_states(
     }
 
     if let Some(twitch) = &messaging.twitch {
-        let named_instances = validate_instance_names(
+        validate_instance_names(
             "twitch",
             twitch
                 .instances
                 .iter()
                 .map(|instance| instance.name.as_str()),
         )?;
-        let default_present =
-            !twitch.username.trim().is_empty() && !twitch.oauth_token.trim().is_empty();
+        let named_instances: std::collections::HashSet<String> = twitch
+            .instances
+            .iter()
+            .filter(|i| i.enabled)
+            .map(|i| i.name.clone())
+            .collect();
+        let default_present = twitch.enabled
+            && !twitch.username.trim().is_empty()
+            && !twitch.oauth_token.trim().is_empty();
         validate_runtime_keys("twitch", default_present, &named_instances)?;
         states.insert(
             "twitch",
@@ -1728,14 +2213,21 @@ pub(super) fn build_adapter_validation_states(
     }
 
     if let Some(email) = &messaging.email {
-        let named_instances = validate_instance_names(
+        validate_instance_names(
             "email",
             email
                 .instances
                 .iter()
                 .map(|instance| instance.name.as_str()),
         )?;
-        let default_present = !email.imap_host.trim().is_empty()
+        let named_instances: std::collections::HashSet<String> = email
+            .instances
+            .iter()
+            .filter(|i| i.enabled)
+            .map(|i| i.name.clone())
+            .collect();
+        let default_present = email.enabled
+            && !email.imap_host.trim().is_empty()
             && !email.imap_username.trim().is_empty()
             && !email.imap_password.trim().is_empty()
             && !email.smtp_host.trim().is_empty();
@@ -1749,7 +2241,122 @@ pub(super) fn build_adapter_validation_states(
         );
     }
 
+    if let Some(signal) = &messaging.signal {
+        validate_instance_names(
+            "signal",
+            signal
+                .instances
+                .iter()
+                .map(|instance| instance.name.as_str()),
+        )?;
+        let named_instances: std::collections::HashSet<String> = signal
+            .instances
+            .iter()
+            .filter(|i| i.enabled)
+            .map(|i| i.name.clone())
+            .collect();
+        let default_present = signal.enabled
+            && !signal.http_url.trim().is_empty()
+            && !signal.account.trim().is_empty();
+        validate_runtime_keys("signal", default_present, &named_instances)?;
+        states.insert(
+            "signal",
+            AdapterValidationState {
+                default_present,
+                named_instances,
+            },
+        );
+    }
+
+    if let Some(mattermost) = &messaging.mattermost {
+        let named_instances = validate_instance_names(
+            "mattermost",
+            mattermost
+                .instances
+                .iter()
+                .map(|instance| instance.name.as_str()),
+        )?;
+        let default_present =
+            !mattermost.base_url.trim().is_empty() && !mattermost.token.trim().is_empty();
+        validate_runtime_keys("mattermost", default_present, &named_instances)?;
+        if default_present {
+            validate_mattermost_url(&mattermost.base_url)?;
+        }
+        for instance in &mattermost.instances {
+            if instance.enabled && !instance.base_url.is_empty() {
+                validate_mattermost_url(&instance.base_url)?;
+            }
+        }
+        states.insert(
+            "mattermost",
+            AdapterValidationState {
+                default_present,
+                named_instances,
+            },
+        );
+    }
+
     Ok(states)
+}
+
+fn validate_mattermost_url(url: &str) -> Result<()> {
+    let parsed = url::Url::parse(url)
+        .map_err(|e| ConfigError::Invalid(format!("invalid mattermost base_url '{url}': {e}")))?;
+
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ConfigError::Invalid(
+            "mattermost base_url must not contain credentials".to_string(),
+        )
+        .into());
+    }
+    let path = parsed.path();
+    if !path.is_empty() && path != "/" {
+        return Err(ConfigError::Invalid(format!(
+            "mattermost base_url must be an origin URL (no path), got path: {path}"
+        ))
+        .into());
+    }
+    if parsed.query().is_some() {
+        return Err(ConfigError::Invalid(
+            "mattermost base_url must not contain a query string".to_string(),
+        )
+        .into());
+    }
+    if parsed.fragment().is_some() {
+        return Err(ConfigError::Invalid(
+            "mattermost base_url must not contain a fragment".to_string(),
+        )
+        .into());
+    }
+
+    match parsed.scheme() {
+        "https" => {}
+        "http" => {
+            let is_local = match parsed.host() {
+                Some(url::Host::Domain(h)) => h.eq_ignore_ascii_case("localhost"),
+                Some(url::Host::Ipv4(addr)) => addr == std::net::Ipv4Addr::LOCALHOST,
+                Some(url::Host::Ipv6(addr)) => addr == std::net::Ipv6Addr::LOCALHOST,
+                None => false,
+            };
+            if !is_local {
+                return Err(ConfigError::Invalid(
+                    "mattermost base_url must use https for non-localhost hosts".to_string(),
+                )
+                .into());
+            }
+            tracing::warn!(
+                host = parsed.host_str().unwrap_or("<unknown>"),
+                "mattermost base_url uses http for localhost"
+            );
+        }
+        scheme => {
+            return Err(ConfigError::Invalid(format!(
+                "mattermost base_url must use http or https, got: {scheme}"
+            ))
+            .into());
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn validate_instance_names<'a>(
@@ -1828,19 +2435,41 @@ fn validate_runtime_keys(
 
 /// Resolve which agent should handle an inbound message.
 ///
-/// Checks bindings in order. First match wins. Falls back to the default
-/// agent if no binding matches.
+/// Checks bindings in order. First routing match wins. Falls back to the
+/// default agent if no binding matches on routing criteria.
+///
+/// Returns `None` when a binding matched on routing but the message was
+/// suppressed by `require_mention` — the caller should drop the message.
+///
+/// When a binding matches, its optional `settings` are returned alongside the
+/// agent ID so the caller can use them as channel defaults.
 pub fn resolve_agent_for_message(
     bindings: &[Binding],
     message: &crate::InboundMessage,
     default_agent_id: &str,
-) -> crate::AgentId {
+) -> Option<(
+    crate::AgentId,
+    Option<crate::conversation::ConversationSettings>,
+)> {
     for binding in bindings {
-        if binding.matches(message) {
-            return std::sync::Arc::from(binding.agent_id.as_str());
+        if binding.matches_route(message) {
+            if binding.passes_require_mention(message) {
+                return Some((
+                    std::sync::Arc::from(binding.agent_id.as_str()),
+                    binding.settings.clone(),
+                ));
+            }
+            // Binding owns this message but require_mention blocked it.
+            // Drop instead of falling through to the default agent.
+            tracing::debug!(
+                agent_id = %binding.agent_id,
+                source = %message.source,
+                "message suppressed by require_mention"
+            );
+            return None;
         }
     }
-    std::sync::Arc::from(default_agent_id)
+    Some((std::sync::Arc::from(default_agent_id), None))
 }
 
 // ---------------------------------------------------------------------------
@@ -1856,6 +2485,8 @@ pub struct MessagingConfig {
     pub email: Option<EmailConfig>,
     pub webhook: Option<WebhookConfig>,
     pub twitch: Option<TwitchConfig>,
+    pub signal: Option<SignalConfig>,
+    pub mattermost: Option<MattermostConfig>,
 }
 
 #[derive(Clone)]
@@ -2348,4 +2979,249 @@ pub struct WebhookConfig {
     pub port: u16,
     pub bind: String,
     pub auth_token: Option<String>,
+}
+
+/// Signal messaging via signal-cli JSON-RPC daemon.
+///
+/// Connects to a running `signal-cli daemon --http` instance for sending and
+/// receiving Signal messages. Supports both direct messages and group chats.
+#[derive(Clone)]
+pub struct SignalConfig {
+    pub enabled: bool,
+    /// Base URL of the signal-cli JSON-RPC HTTP daemon (e.g. `http://127.0.0.1:8686`).
+    /// May contain embedded credentials which are redacted in debug output.
+    pub http_url: String,
+    /// E.164 phone number of the bot's Signal account (e.g. `+1234567890`).
+    pub account: String,
+    /// Additional named Signal adapter instances.
+    pub instances: Vec<SignalInstanceConfig>,
+    /// Phone numbers or UUIDs allowed to DM the bot. If empty, DMs are ignored.
+    pub dm_allowed_users: Vec<String>,
+    /// Group IDs allowed for this adapter. If empty, all groups are blocked
+    /// (same as `None` in the permission filter — groups are opt-in only).
+    pub group_ids: Vec<String>,
+    /// User IDs allowed to message in Signal groups.
+    pub group_allowed_users: Vec<String>,
+    /// Whether to silently drop story messages (default: true).
+    pub ignore_stories: bool,
+}
+
+/// Per-instance config for a named Signal adapter.
+#[derive(Clone)]
+pub struct SignalInstanceConfig {
+    pub name: String,
+    pub enabled: bool,
+    /// Base URL of this instance's signal-cli daemon.
+    pub http_url: String,
+    /// E.164 phone number for this instance's Signal account.
+    pub account: String,
+    /// Phone numbers or UUIDs allowed to DM this instance.
+    pub dm_allowed_users: Vec<String>,
+    /// Group IDs allowed for this instance.
+    pub group_ids: Vec<String>,
+    /// User IDs allowed to message in Signal groups for this instance.
+    pub group_allowed_users: Vec<String>,
+    /// Whether this instance drops story messages.
+    pub ignore_stories: bool,
+}
+
+impl std::fmt::Debug for SignalInstanceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignalInstanceConfig")
+            .field("name", &self.name)
+            .field("enabled", &self.enabled)
+            .field("http_url", &"[REDACTED]")
+            .field("account", &"[REDACTED]")
+            .field("dm_allowed_users", &"[REDACTED]")
+            .field("group_ids", &self.group_ids)
+            .field("group_allowed_users", &"[REDACTED]")
+            .field("ignore_stories", &self.ignore_stories)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for SignalConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignalConfig")
+            .field("enabled", &self.enabled)
+            .field("http_url", &"[REDACTED]")
+            .field("account", &"[REDACTED]")
+            .field("instances", &self.instances)
+            .field("dm_allowed_users", &"[REDACTED]")
+            .field("group_ids", &self.group_ids)
+            .field("group_allowed_users", &"[REDACTED]")
+            .field("ignore_stories", &self.ignore_stories)
+            .finish()
+    }
+}
+
+impl SystemSecrets for SignalConfig {
+    fn section() -> &'static str {
+        "signal"
+    }
+
+    fn is_messaging_adapter() -> bool {
+        true
+    }
+
+    fn secret_fields() -> &'static [SecretField] {
+        &[
+            SecretField {
+                toml_key: "http_url",
+                secret_name: "SIGNAL_HTTP_URL",
+                instance_pattern: None,
+            },
+            SecretField {
+                toml_key: "account",
+                secret_name: "SIGNAL_ACCOUNT",
+                instance_pattern: None,
+            },
+        ]
+    }
+}
+
+#[derive(Clone)]
+pub struct MattermostConfig {
+    pub enabled: bool,
+    pub base_url: String,
+    pub token: String,
+    pub team_id: Option<String>,
+    pub instances: Vec<MattermostInstanceConfig>,
+    pub dm_allowed_users: Vec<String>,
+    pub max_attachment_bytes: usize,
+}
+
+impl std::fmt::Debug for MattermostConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MattermostConfig")
+            .field("enabled", &self.enabled)
+            .field("base_url", &self.base_url)
+            .field("token", &"[REDACTED]")
+            .field("team_id", &self.team_id)
+            .field("instances", &self.instances)
+            .field("dm_allowed_users", &self.dm_allowed_users)
+            .field("max_attachment_bytes", &self.max_attachment_bytes)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub struct MattermostInstanceConfig {
+    pub name: String,
+    pub enabled: bool,
+    pub base_url: String,
+    pub token: String,
+    pub team_id: Option<String>,
+    pub dm_allowed_users: Vec<String>,
+    pub max_attachment_bytes: usize,
+}
+
+impl SystemSecrets for MattermostConfig {
+    fn section() -> &'static str {
+        "mattermost"
+    }
+
+    fn is_messaging_adapter() -> bool {
+        true
+    }
+
+    fn secret_fields() -> &'static [SecretField] {
+        &[
+            SecretField {
+                toml_key: "token",
+                secret_name: "MATTERMOST_TOKEN",
+                instance_pattern: Some(InstancePattern {
+                    platform_prefix: "MATTERMOST",
+                    field_suffix: "TOKEN",
+                }),
+            },
+            SecretField {
+                toml_key: "base_url",
+                secret_name: "MATTERMOST_BASE_URL",
+                instance_pattern: Some(InstancePattern {
+                    platform_prefix: "MATTERMOST",
+                    field_suffix: "BASE_URL",
+                }),
+            },
+        ]
+    }
+}
+
+impl std::fmt::Debug for MattermostInstanceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MattermostInstanceConfig")
+            .field("name", &self.name)
+            .field("enabled", &self.enabled)
+            .field("base_url", &self.base_url)
+            .field("token", &"[REDACTED]")
+            .field("team_id", &self.team_id)
+            .field("dm_allowed_users", &self.dm_allowed_users)
+            .field("max_attachment_bytes", &self.max_attachment_bytes)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod mattermost_url_tests {
+    use super::validate_mattermost_url;
+
+    #[test]
+    fn accepts_https_url() {
+        assert!(validate_mattermost_url("https://mattermost.example.com").is_ok());
+    }
+
+    #[test]
+    fn accepts_http_localhost_with_warning() {
+        // http is allowed only for localhost (with a warning)
+        assert!(validate_mattermost_url("http://localhost:8065").is_ok());
+        assert!(validate_mattermost_url("http://127.0.0.1:8065").is_ok());
+        assert!(validate_mattermost_url("http://[::1]:8065").is_ok());
+    }
+
+    #[test]
+    fn rejects_http_non_localhost() {
+        // http is rejected for non-local hosts
+        assert!(validate_mattermost_url("http://mattermost.example.com").is_err());
+        assert!(validate_mattermost_url("http://10.0.0.1").is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_scheme() {
+        assert!(validate_mattermost_url("ftp://mattermost.example.com").is_err());
+        assert!(validate_mattermost_url("ws://mattermost.example.com").is_err());
+    }
+
+    #[test]
+    fn rejects_unparseable_url() {
+        assert!(validate_mattermost_url("not a url at all").is_err());
+        assert!(validate_mattermost_url("").is_err());
+    }
+
+    #[test]
+    fn rejects_credentials_in_url() {
+        assert!(validate_mattermost_url("https://user:pass@mattermost.example.com").is_err());
+        assert!(validate_mattermost_url("https://user@mattermost.example.com").is_err());
+    }
+
+    #[test]
+    fn rejects_non_root_path() {
+        assert!(validate_mattermost_url("https://mattermost.example.com/some/path").is_err());
+        assert!(validate_mattermost_url("https://mattermost.example.com/mattermost").is_err());
+    }
+
+    #[test]
+    fn accepts_root_path() {
+        assert!(validate_mattermost_url("https://mattermost.example.com/").is_ok());
+        assert!(validate_mattermost_url("https://mattermost.example.com").is_ok());
+    }
+
+    #[test]
+    fn rejects_query_string() {
+        assert!(validate_mattermost_url("https://mattermost.example.com/?token=abc").is_err());
+    }
+
+    #[test]
+    fn rejects_fragment() {
+        assert!(validate_mattermost_url("https://mattermost.example.com/#section").is_err());
+    }
 }

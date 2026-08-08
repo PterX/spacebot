@@ -12,6 +12,7 @@ import ZAI from "@lobehub/icons/es/ZAI";
 import Minimax from "@lobehub/icons/es/Minimax";
 import Kimi from "@lobehub/icons/es/Kimi";
 import Google from "@lobehub/icons/es/Google";
+import GithubCopilot from "@lobehub/icons/es/GithubCopilot";
 
 interface IconProps {
 	size?: number;
@@ -41,7 +42,7 @@ function NvidiaIcon({ size = 24, className }: IconProps) {
 	);
 }
 
-function OpenCodeZenIcon({ size = 24, className }: IconProps) {
+export function OpenCodeZenIcon({ size = 24, className }: IconProps) {
 	const clipId = useId();
 	const clipPathId = `opencode-zen-clip-${clipId}`;
 	const width = (size * 32) / 40;
@@ -138,6 +139,8 @@ export function ProviderIcon({ provider, className = "text-ink-faint", size = 24
 		minimax: Minimax,
 		"minimax-cn": Minimax,
 		moonshot: Kimi, // Kimi is Moonshot AI's product brand
+		"github-copilot": GithubCopilot,
+		azure: OpenAI,
 	};
 
 	const IconComponent = iconMap[provider.toLowerCase()];

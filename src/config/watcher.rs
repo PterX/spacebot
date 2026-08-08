@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::{
-    Binding, Config, DiscordPermissions, RuntimeConfig, SlackPermissions, TelegramPermissions,
-    TwitchPermissions, binding_runtime_adapter_key,
+    Binding, Config, DiscordPermissions, MattermostPermissions, RuntimeConfig, SignalPermissions,
+    SlackPermissions, TelegramPermissions, TwitchPermissions, binding_runtime_adapter_key,
 };
 use sha2::{Digest, Sha256};
 
@@ -43,6 +43,8 @@ pub fn spawn_file_watcher(
     slack_permissions: Option<Arc<arc_swap::ArcSwap<SlackPermissions>>>,
     telegram_permissions: Option<Arc<arc_swap::ArcSwap<TelegramPermissions>>>,
     twitch_permissions: Option<Arc<arc_swap::ArcSwap<TwitchPermissions>>>,
+    mattermost_permissions: Option<Arc<arc_swap::ArcSwap<MattermostPermissions>>>,
+    signal_permissions: Option<Arc<arc_swap::ArcSwap<SignalPermissions>>>,
     bindings: Arc<arc_swap::ArcSwap<Vec<Binding>>>,
     messaging_manager: Option<Arc<crate::messaging::MessagingManager>>,
     llm_manager: Arc<crate::llm::LlmManager>,
@@ -264,6 +266,25 @@ pub fn spawn_file_watcher(
                     tracing::info!("twitch permissions reloaded");
                 }
 
+                if let Some(ref perms) = mattermost_permissions
+                    && let Some(mattermost_config) = &config.messaging.mattermost
+                {
+                    let new_perms =
+                        MattermostPermissions::from_config(mattermost_config, &config.bindings);
+                    perms.store(Arc::new(new_perms));
+                    tracing::info!("mattermost permissions reloaded");
+                }
+
+                if let Some(ref perms) = signal_permissions
+                    && let Some(signal_config) = &config.messaging.signal
+                {
+                    let new_perms = SignalPermissions::from_config(signal_config);
+                    perms.store(Arc::new(new_perms));
+                    tracing::info!("signal permissions reloaded");
+                }
+
+                // Reconcile adapter runtime state with the new config: start
+                // newly enabled adapters, stop removed ones, restart changed ones.
                 if let Some(ref manager) = messaging_manager {
                     let rt = tokio::runtime::Handle::current();
                     let manager = manager.clone();
@@ -272,6 +293,8 @@ pub fn spawn_file_watcher(
                     let slack_permissions = slack_permissions.clone();
                     let telegram_permissions = telegram_permissions.clone();
                     let twitch_permissions = twitch_permissions.clone();
+                    let mattermost_permissions = mattermost_permissions.clone();
+                    let signal_permissions = signal_permissions.clone();
                     let instance_dir = instance_dir.clone();
 
                     rt.spawn(async move {
@@ -282,6 +305,8 @@ pub fn spawn_file_watcher(
                             slack_permissions,
                             telegram_permissions,
                             twitch_permissions,
+                            mattermost_permissions,
+                            signal_permissions,
                         ) {
                             Ok(desired) => {
                                 if let Err(error) = manager.reconcile_configured(desired).await {
@@ -329,6 +354,7 @@ pub fn spawn_file_watcher(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_desired_configured_adapters(
     config: &Config,
     instance_dir: &Path,
@@ -336,6 +362,8 @@ fn build_desired_configured_adapters(
     slack_permissions: Option<Arc<arc_swap::ArcSwap<SlackPermissions>>>,
     telegram_permissions: Option<Arc<arc_swap::ArcSwap<TelegramPermissions>>>,
     twitch_permissions: Option<Arc<arc_swap::ArcSwap<TwitchPermissions>>>,
+    mattermost_permissions: Option<Arc<arc_swap::ArcSwap<MattermostPermissions>>>,
+    signal_permissions: Option<Arc<arc_swap::ArcSwap<SignalPermissions>>>,
 ) -> anyhow::Result<Vec<crate::messaging::ConfiguredAdapter>> {
     let mut desired = Vec::new();
 
@@ -691,6 +719,153 @@ fn build_desired_configured_adapters(
         }
     }
 
+    if let Some(mattermost_config) = &config.messaging.mattermost
+        && mattermost_config.enabled
+    {
+        if !mattermost_config.base_url.is_empty() && !mattermost_config.token.is_empty() {
+            let permissions_snapshot =
+                MattermostPermissions::from_config(mattermost_config, &config.bindings);
+            let permissions = mattermost_permissions.unwrap_or_else(|| {
+                Arc::new(arc_swap::ArcSwap::from_pointee(
+                    permissions_snapshot.clone(),
+                ))
+            });
+            let fingerprint = format!(
+                "base_url={};token={};team_id={:?};max_attachment_bytes={};permissions={}",
+                mattermost_config.base_url,
+                secret_fingerprint(&mattermost_config.token),
+                mattermost_config.team_id,
+                mattermost_config.max_attachment_bytes,
+                mattermost_permissions_fingerprint(&permissions_snapshot)
+            );
+            match crate::messaging::mattermost::MattermostAdapter::new(
+                "mattermost",
+                &mattermost_config.base_url,
+                mattermost_config.token.as_str(),
+                mattermost_config.team_id.as_deref().map(Arc::from),
+                mattermost_config.max_attachment_bytes,
+                permissions,
+            ) {
+                Ok(adapter) => {
+                    desired.push(crate::messaging::ConfiguredAdapter::new(
+                        adapter,
+                        fingerprint,
+                    ));
+                }
+                Err(error) => {
+                    tracing::error!(%error, "failed to build mattermost adapter from config change");
+                }
+            }
+        }
+
+        for instance in mattermost_config
+            .instances
+            .iter()
+            .filter(|instance| instance.enabled)
+        {
+            if instance.base_url.is_empty() || instance.token.is_empty() {
+                tracing::warn!(adapter = %instance.name, "skipping enabled mattermost instance with missing credentials");
+                continue;
+            }
+            let permissions_snapshot =
+                MattermostPermissions::from_instance_config(instance, &config.bindings);
+            let fingerprint = format!(
+                "base_url={};token={};team_id={:?};max_attachment_bytes={};permissions={}",
+                instance.base_url,
+                secret_fingerprint(&instance.token),
+                instance.team_id,
+                instance.max_attachment_bytes,
+                mattermost_permissions_fingerprint(&permissions_snapshot)
+            );
+            match crate::messaging::mattermost::MattermostAdapter::new(
+                binding_runtime_adapter_key("mattermost", Some(instance.name.as_str())),
+                &instance.base_url,
+                instance.token.as_str(),
+                instance.team_id.as_deref().map(Arc::from),
+                instance.max_attachment_bytes,
+                Arc::new(arc_swap::ArcSwap::from_pointee(permissions_snapshot)),
+            ) {
+                Ok(adapter) => {
+                    desired.push(crate::messaging::ConfiguredAdapter::new(
+                        adapter,
+                        fingerprint,
+                    ));
+                }
+                Err(error) => {
+                    tracing::error!(%error, adapter = %instance.name, "failed to build named mattermost adapter from config change");
+                }
+            }
+        }
+    }
+
+    // Signal named instances start independently of the root enabled flag,
+    // matching cold-start: multiple Signal accounts can run without a
+    // "default" account being enabled.
+    if let Some(signal_config) = &config.messaging.signal {
+        let tmp_dir = instance_dir.join("tmp");
+        if signal_config.enabled
+            && !signal_config.http_url.is_empty()
+            && !signal_config.account.is_empty()
+        {
+            let permissions_snapshot = SignalPermissions::from_config(signal_config);
+            let permissions = signal_permissions.unwrap_or_else(|| {
+                Arc::new(arc_swap::ArcSwap::from_pointee(
+                    permissions_snapshot.clone(),
+                ))
+            });
+            let fingerprint = format!(
+                "http_url={};account={};ignore_stories={};permissions={}",
+                secret_fingerprint(&signal_config.http_url),
+                secret_fingerprint(&signal_config.account),
+                signal_config.ignore_stories,
+                signal_permissions_fingerprint(&permissions_snapshot)
+            );
+            let adapter = crate::messaging::signal::SignalAdapter::new(
+                "signal",
+                &signal_config.http_url,
+                &signal_config.account,
+                signal_config.ignore_stories,
+                permissions,
+                tmp_dir.clone(),
+            );
+            desired.push(crate::messaging::ConfiguredAdapter::new(
+                adapter,
+                fingerprint,
+            ));
+        }
+
+        for instance in signal_config
+            .instances
+            .iter()
+            .filter(|instance| instance.enabled)
+        {
+            if instance.http_url.is_empty() || instance.account.is_empty() {
+                tracing::warn!(adapter = %instance.name, "skipping enabled signal instance with missing credentials");
+                continue;
+            }
+            let permissions_snapshot = SignalPermissions::from_instance_config(instance);
+            let fingerprint = format!(
+                "http_url={};account={};ignore_stories={};permissions={}",
+                secret_fingerprint(&instance.http_url),
+                secret_fingerprint(&instance.account),
+                instance.ignore_stories,
+                signal_permissions_fingerprint(&permissions_snapshot)
+            );
+            let adapter = crate::messaging::signal::SignalAdapter::new(
+                binding_runtime_adapter_key("signal", Some(instance.name.as_str())),
+                &instance.http_url,
+                &instance.account,
+                instance.ignore_stories,
+                Arc::new(arc_swap::ArcSwap::from_pointee(permissions_snapshot)),
+                tmp_dir.clone(),
+            );
+            desired.push(crate::messaging::ConfiguredAdapter::new(
+                adapter,
+                fingerprint,
+            ));
+        }
+    }
+
     Ok(desired)
 }
 
@@ -759,6 +934,24 @@ fn twitch_permissions_fingerprint(permissions: &TwitchPermissions) -> String {
         "channel_filter={:?};allowed_users={:?}",
         permissions.channel_filter.clone().map(sorted_strings),
         sorted_strings(permissions.allowed_users.clone())
+    )
+}
+
+fn mattermost_permissions_fingerprint(permissions: &MattermostPermissions) -> String {
+    format!(
+        "team_filter={:?};channel_filter={};dm_allowed_users={:?}",
+        permissions.team_filter.clone().map(sorted_strings),
+        format_string_map(&permissions.channel_filter),
+        sorted_strings(permissions.dm_allowed_users.clone())
+    )
+}
+
+fn signal_permissions_fingerprint(permissions: &SignalPermissions) -> String {
+    format!(
+        "group_filter={:?};dm_allowed_users={:?};group_allowed_users={:?}",
+        permissions.group_filter.clone().map(sorted_strings),
+        sorted_strings(permissions.dm_allowed_users.clone()),
+        sorted_strings(permissions.group_allowed_users.clone())
     )
 }
 

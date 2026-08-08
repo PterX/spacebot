@@ -3,6 +3,10 @@
 use crate::ProcessType;
 use std::collections::HashMap;
 
+/// Default Anthropic model identifier. Centralized here so bumping the dated
+/// model ID only requires a single change.
+const DEFAULT_ANTHROPIC_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+
 /// Model routing configuration. Lives on the agent config (via defaults).
 /// Determines which LLM model each process type uses, with task-type
 /// overrides for workers/branches and fallback chains for resilience.
@@ -36,7 +40,7 @@ pub struct RoutingConfig {
 
 impl Default for RoutingConfig {
     fn default() -> Self {
-        Self::for_model("anthropic/claude-sonnet-4".into())
+        Self::for_model(DEFAULT_ANTHROPIC_MODEL.into())
     }
 }
 
@@ -128,6 +132,7 @@ pub fn is_retriable_error(error_message: &str) -> bool {
         || lower.contains("overloaded")
         || lower.contains("timeout")
         || lower.contains("connection")
+        || lower.contains("error sending request")
         // Generic server errors (OpenRouter wraps upstream 500s in various
         // phrasings like "The server had an error while processing your request")
         || lower.contains("server error")
@@ -163,7 +168,7 @@ pub fn is_context_overflow_error(error_message: &str) -> bool {
 /// each provider sane defaults so things work out of the box.
 pub fn defaults_for_provider(provider: &str) -> RoutingConfig {
     match provider {
-        "anthropic" => RoutingConfig::for_model("anthropic/claude-sonnet-4".into()),
+        "anthropic" => RoutingConfig::for_model(DEFAULT_ANTHROPIC_MODEL.into()),
         "openrouter" => {
             let channel: String = "openrouter/anthropic/claude-sonnet-4-20250514".into();
             let worker: String = "openrouter/anthropic/claude-haiku-4.5-20250514".into();
@@ -396,6 +401,22 @@ pub fn defaults_for_provider(provider: &str) -> RoutingConfig {
         "minimax-cn" => RoutingConfig::for_model("minimax-cn/MiniMax-M2.5".into()),
         "moonshot" => RoutingConfig::for_model("moonshot/kimi-k2.5".into()),
         "zai-coding-plan" => RoutingConfig::for_model("zai-coding-plan/glm-5".into()),
+        "github-copilot" => {
+            let channel: String = "github-copilot/claude-sonnet-4".into();
+            let worker: String = "github-copilot/gpt-4.1-mini".into();
+            RoutingConfig {
+                channel: channel.clone(),
+                branch: channel.clone(),
+                worker: worker.clone(),
+                compactor: worker.clone(),
+                cortex: worker.clone(),
+                voice: String::new(),
+                task_overrides: HashMap::from([("coding".into(), channel.clone())]),
+                fallbacks: HashMap::from([(channel, vec![worker])]),
+                rate_limit_cooldown_secs: 60,
+                ..RoutingConfig::default()
+            }
+        }
         // Unknown — use the standard defaults
         _ => RoutingConfig::default(),
     }
@@ -424,6 +445,7 @@ pub fn provider_to_prefix(provider: &str) -> &str {
         "minimax-cn" => "minimax-cn/",
         "moonshot" => "moonshot/",
         "zai-coding-plan" => "zai-coding-plan/",
+        "github-copilot" => "github-copilot/",
         _ => "",
     }
 }
@@ -452,4 +474,81 @@ pub const RETRY_BASE_DELAY_MS: u64 = 500;
 pub fn is_rate_limit_error(error_message: &str) -> bool {
     let lower = error_message.to_lowercase();
     lower.contains("429") || lower.contains("rate limit")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_retriable_error_catches_network_failures() {
+        // DNS/connection failures from reqwest
+        assert!(is_retriable_error(
+            "error sending request for url (https://api.z.ai/api/anthropic/v1/messages)"
+        ));
+        assert!(is_retriable_error(
+            "error sending request: connection refused"
+        ));
+        assert!(is_retriable_error("ERROR SENDING REQUEST: timeout"));
+    }
+
+    #[test]
+    fn is_retriable_error_catches_http_errors() {
+        // 5xx server errors
+        assert!(is_retriable_error("502 Bad Gateway"));
+        assert!(is_retriable_error("503 Service Unavailable"));
+        assert!(is_retriable_error("504 Gateway Timeout"));
+        assert!(is_retriable_error("500 Internal Server Error"));
+        // Rate limiting
+        assert!(is_retriable_error("429 Too Many Requests"));
+        assert!(is_retriable_error("rate limit exceeded"));
+    }
+
+    #[test]
+    fn is_retriable_error_catches_timeout_and_connection_errors() {
+        assert!(is_retriable_error("connection timeout"));
+        assert!(is_retriable_error("connection reset by peer"));
+        assert!(is_retriable_error("timeout while waiting for response"));
+    }
+
+    #[test]
+    fn is_retriable_error_catches_server_error_phrases() {
+        assert!(is_retriable_error(
+            "The server had an error while processing your request"
+        ));
+        assert!(is_retriable_error("internal error"));
+        assert!(is_retriable_error("server error"));
+        assert!(is_retriable_error("overloaded"));
+    }
+
+    #[test]
+    fn is_retriable_error_catches_malformed_responses() {
+        assert!(is_retriable_error("empty response"));
+        assert!(is_retriable_error("failed to read response body"));
+        assert!(is_retriable_error("error decoding response body"));
+    }
+
+    #[test]
+    fn is_retriable_error_rejects_non_retriable_errors() {
+        // Auth errors should not be retriable
+        assert!(!is_retriable_error("Invalid API key"));
+        assert!(!is_retriable_error("401 Unauthorized"));
+        assert!(!is_retriable_error("403 Forbidden"));
+        // Client errors should not be retriable
+        assert!(!is_retriable_error("400 Bad Request"));
+        assert!(!is_retriable_error("404 Not Found"));
+        // Other errors should not be retriable
+        assert!(!is_retriable_error("unexpected EOF"));
+        assert!(!is_retriable_error("parse error"));
+    }
+
+    #[test]
+    fn is_rate_limit_error_detection() {
+        assert!(is_rate_limit_error("429 Too Many Requests"));
+        assert!(is_rate_limit_error("rate limit exceeded"));
+        assert!(is_rate_limit_error("RATE LIMIT: too many requests"));
+        // Other transient errors should not be rate limited
+        assert!(!is_rate_limit_error("503 Service Unavailable"));
+        assert!(!is_rate_limit_error("timeout"));
+    }
 }
