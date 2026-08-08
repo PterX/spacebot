@@ -2318,12 +2318,9 @@ fn completion_choice_to_streaming_choices(
 }
 
 fn extract_sse_block(buffer: &mut String) -> Option<String> {
-    let (block_end, separator_len) = if let Some(index) = buffer.find("\n\n") {
-        (index, 2)
-    } else if let Some(index) = buffer.find("\r\n\r\n") {
-        (index, 4)
-    } else {
-        return None;
+    let (block_end, separator_len) = match buffer.find("\n\n") {
+        Some(index) => (index, 2),
+        None => (buffer.find("\r\n\r\n")?, 4),
     };
 
     let block = buffer[..block_end].to_string();
