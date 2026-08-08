@@ -16,11 +16,22 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct ReadSkillTool {
     runtime_config: Arc<RuntimeConfig>,
+    read_tracker: Option<crate::tools::SkillReadTracker>,
 }
 
 impl ReadSkillTool {
     pub fn new(runtime_config: Arc<RuntimeConfig>) -> Self {
-        Self { runtime_config }
+        Self {
+            runtime_config,
+            read_tracker: None,
+        }
+    }
+
+    /// Record reads into a session tracker shared with `skill_manage`, which
+    /// requires autonomous writers to read a skill before patching it.
+    pub fn with_read_tracker(mut self, tracker: crate::tools::SkillReadTracker) -> Self {
+        self.read_tracker = Some(tracker);
+        self
     }
 }
 
@@ -90,6 +101,13 @@ impl Tool for ReadSkillTool {
             && let Err(error) = store.record_read(&skill.name).await
         {
             tracing::warn!(%error, skill = %skill.name, "failed to record skill read");
+        }
+
+        if let Some(tracker) = &self.read_tracker {
+            tracker
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(skill.name.to_lowercase());
         }
 
         Ok(ReadSkillOutput {
