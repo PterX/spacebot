@@ -10,11 +10,64 @@ Single binary. No server dependencies. Runs on tokio. All data lives in embedded
 
 **Stack:** Rust (edition 2024), tokio, Rig (v0.30.0, agentic loop framework), SQLite (sqlx), LanceDB (embedded vector + FTS), redb (embedded key-value).
 
+## JavaScript Tooling (Critical)
+
+- For UI work in `spacebot/interface/`, use `bun` for all JS/TS package management and scripts.
+- **NEVER** use `npm`, `pnpm`, or `yarn` in this repo unless the user explicitly asks for one.
+- Standard commands:
+  - `bun install`
+  - `bun run dev`
+  - `bun run build`
+  - `bun run test`
+  - `bunx <tool>` (instead of `npx <tool>`)
+
 ## Migration Safety
 
 - **NEVER edit an existing migration file in place** once it has been committed or applied in any environment.
 - Treat migration files as immutable; modifying historical migrations causes checksum mismatches and can block startup.
 - For schema changes, always create a new migration with a new timestamp/version.
+
+## Delivery Gates (Mandatory)
+
+Run these checks in this order for code changes before pushing or updating a PR:
+
+1. `just preflight` — validate git/remote/auth state and avoid push-loop churn.
+2. `just gate-pr` — enforce formatting, compile checks, migration safety, lib tests, and integration test compile.
+
+If `just` is unavailable, run the equivalent scripts directly in the same order: `./scripts/preflight.sh` then `./scripts/gate-pr.sh`.
+
+Additional rules:
+
+- If the same command fails twice in one session, stop rerunning it blindly. Capture root cause and switch strategy.
+- For every external review finding marked P1/P2, add a targeted verification command in the final handoff.
+- For changes in async/stateful paths (worker lifecycle, cancellation, retrigger, recall cache behavior), include explicit race/terminal-state reasoning in the PR summary and run targeted tests in addition to `just gate-pr`.
+- Do not push if any gate is red.
+
+## Nix Flake Workflow
+
+### Frontend Dependencies
+
+When updating frontend dependencies in `interface/`:
+
+1. **Update deps:** Modify `interface/package.json` or `interface/bun.lock` as needed
+2. **Update the Nix hash:** Run `just update-frontend-hash`
+   - This builds the `frontend-updater` package with `fakeHash`
+   - Extracts the new hash from the build output
+   - Updates `nix/default.nix` automatically
+3. **Verify:** Run `nix build .#frontend` to confirm the build works
+4. **Commit:** Include both the dependency changes and the hash update in the same PR
+
+**Note:** The `just update-frontend-hash` command uses the `fakeHash` pattern (standard Nix practice) where the build intentionally fails to reveal the correct hash, which is then extracted and applied automatically.
+
+### Nix Flake Inputs
+
+To update all Nix flake inputs (nixpkgs, crane, etc.) and regenerate `flake.lock`:
+
+```bash
+just update-flake
+```
+
+This runs `nix flake update` and updates all inputs to their latest versions.
 
 ## Architecture Overview
 
@@ -40,7 +93,7 @@ Creating a branch is `let branch_history = channel_history.clone()`.
 
 The branch result is injected into the channel's history as a distinct message type. Then the branch is deleted. Multiple branches can run concurrently per channel (configurable limit). First done, first incorporated.
 
-**Tools:** memory_recall, memory_save, channel_recall, spawn_worker  
+**Tools:** memory_recall, memory_save, memory_delete, channel_recall, spacebot_docs, task_create, task_list, task_update, spawn_worker  
 **Context:** Clone of channel history at fork time  
 **Lifecycle:** Short-lived. Returns a conclusion, then deleted.
 
@@ -53,11 +106,11 @@ Two kinds:
 - **Interactive:** Long-running, accepts follow-up input from the channel. Coding sessions, complex multi-step tasks.
 
 Workers are pluggable. A worker can be:
-- A Rig agent with shell/file/exec tools
+- A Rig agent with shell/file tools
 - An OpenCode subprocess
 - Any external process that accepts a task and reports status
 
-**Tools:** shell, file, exec, set_status (varies by worker type)  
+**Tools:** shell, file, set_status (varies by worker type)  
 **Context:** Fresh prompt + task description. No channel history.  
 **Lifecycle:** Fire-and-forget or long-running. Reports status via `set_status` tool.
 
@@ -79,6 +132,7 @@ System-level observer. Primary job: generate the **memory bulletin** — a perio
 Also observes system-wide signals for future health monitoring and memory consolidation.
 
 **Tools (bulletin generation):** memory_recall, memory_save  
+**Tools (interactive cortex chat):** memory + worker tools, `spacebot_docs`, `config_inspect`, task board tools  
 **Tools (future health monitoring):** memory_consolidate, system_monitor  
 **Context:** Fresh per bulletin run. No compaction needed.
 
@@ -146,12 +200,16 @@ src/
 │   ├── react.rs        — add emoji reaction (channel only)
 │   ├── memory_save.rs  — write memory to store (branch + cortex + compactor)
 │   ├── memory_recall.rs— search + curate memories (branch only)
-│   ├── channel_recall.rs— retrieve transcript from other channels (branch only)
+│   ├── channel_recall.rs— retrieve transcript from any channel (branch only)
 │   ├── set_status.rs   — update worker status (workers only)
-│   ├── shell.rs        — execute shell commands (task workers)
+│   ├── shell.rs        — execute shell commands and subprocesses (task workers)
 │   ├── file.rs         — read/write/list files (task workers)
-│   ├── exec.rs         — run subprocess (task workers)
 │   ├── browser.rs      — web browsing (task workers)
+│   ├── task_create.rs  — create task-board task (branch + cortex chat)
+│   ├── task_list.rs    — list task-board tasks (branch + cortex chat)
+│   ├── task_update.rs  — update task-board task (branch + cortex chat)
+│   ├── spacebot_docs.rs — read embedded Spacebot docs/changelog (branch + cortex chat)
+│   ├── config_inspect.rs — inspect live runtime config (cortex chat)
 │   └── cron.rs         — cron management (channel only)
 │
 ├── memory.rs           → memory/
@@ -258,8 +316,8 @@ let branch_history = channel_history.clone();
 
 **ToolServer topology:**
 - Per-channel `ToolServer` (no memory tools, just channel action tools added per turn)
-- Per-branch `ToolServer` with memory tools (memory_save, memory_recall)
-- Per-worker `ToolServer` with task-specific tools (shell, file, exec)
+- Per-branch `ToolServer` with memory tools (memory_save, memory_recall, memory_delete), channel recall, docs introspection (`spacebot_docs`), and task-board tools
+- Per-worker `ToolServer` with task-specific tools (shell, file)
 - Per-cortex `ToolServer` with memory_save
 
 **Max turns:** Rig defaults to 0 (single call). Always set explicitly.
@@ -347,7 +405,7 @@ Phase 6 — Hardening:
 
 These are validated patterns from research (see `docs/research/pattern-analysis.md`). Implement them when building the relevant module.
 
-**Tool nudging:** When an LLM responds with text instead of tool calls in the first 2 iterations, inject "Please proceed and use the available tools." Implement in `SpacebotHook.on_completion_response()`. Workers benefit most.
+**Tool nudging / outcome gate:** Workers cannot exit with a text-only response until they signal a terminal outcome via `set_status(kind: "outcome")`. If a worker returns text without an outcome signal, the hook fires `Terminate` and retries with a nudge prompt (up to 2 retries). After retries are exhausted the worker fails with `PromptCancelled`. See `docs/design-docs/tool-nudging.md`.
 
 **Fire-and-forget DB writes:** `tokio::spawn` for conversation history saves, memory writes, worker log persistence. User gets their response immediately.
 

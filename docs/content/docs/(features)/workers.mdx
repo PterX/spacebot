@@ -55,6 +55,7 @@ Conditionally added:
 |------|-----------|
 | `browser` | When `browser.enabled = true` in agent config |
 | `web_search` | When a Brave Search API key is configured |
+| `mcp_*` | One tool per connected MCP server tool, fetched at worker start |
 
 Workers don't get memory tools, channel tools, or branch tools. They can't talk to the user, recall memories, or spawn other processes. They execute their task and report status.
 
@@ -143,7 +144,7 @@ Worker execution logs are controlled by `worker_log_mode`:
 
 Logs include: worker ID, channel ID, timestamp, state, task, error (if any), and the full message history with tool calls and results.
 
-## Sandbox and Protected Paths
+## Sandbox and Environment
 
 Worker shell and exec commands run inside an OS-level sandbox (bubblewrap on Linux, sandbox-exec on macOS). The entire host filesystem is mounted read-only except:
 
@@ -151,11 +152,13 @@ Worker shell and exec commands run inside an OS-level sandbox (bubblewrap on Lin
 - `/tmp` (private per invocation)
 - Any paths listed in `[agents.sandbox].writable_paths`
 
-The agent's data directory (databases, config files) is explicitly re-mounted read-only. This is enforced at the kernel level — no amount of command creativity can bypass it.
+The agent's data directory (databases, config files) is explicitly re-mounted read-only. This is enforced at the kernel level -- no amount of command creativity can bypass it.
 
-The `file` tool additionally validates paths against the workspace boundary and blocks writes to identity files (`SOUL.md`, `IDENTITY.md`, `USER.md`). The `exec` tool blocks dangerous environment variables (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, etc.) that enable library injection.
+Worker subprocesses also start with a **clean environment**. Workers only receive `PATH` (with `tools/bin` prepended), safe variables (`HOME`, `USER`, `LANG`, `TERM`, `TMPDIR`), tool-category secrets from the [secret store](/docs/secrets), and any explicitly configured `passthrough_env` entries. `HOME` is mode-dependent: workspace path when sandboxed, parent `HOME` in passthrough mode. System secrets like LLM API keys are hidden by default unless explicitly forwarded via `passthrough_env`. Environment sanitization applies regardless of whether the sandbox is enabled or disabled.
 
-Sandbox mode is configurable per agent via `[agents.sandbox]`. See [Configuration](/docs/config#agentssandbox).
+The `file` tool validates all paths against the workspace boundary. Identity files (`SOUL.md`, `IDENTITY.md`, `ROLE.md`) live in the agent root directory (`~/.spacebot/agents/{id}/`), outside the workspace, so they are naturally inaccessible to worker file tools — no special-case rejection is needed. The `exec` tool blocks dangerous environment variables (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, etc.) that enable library injection.
+
+See [Sandbox](/docs/sandbox) for full details on containment, environment sanitization, leak detection, and durable binaries.
 
 ## Configuration
 
@@ -171,10 +174,11 @@ worker = "anthropic/claude-haiku-4.5-20250514"
 coding = "anthropic/claude-sonnet-4-20250514"
 
 # Sandbox is enabled by default. Disable for self-hosted/local setups
-# that need full host filesystem access.
+# that need full host filesystem access. Env sanitization always applies.
 [agents.sandbox]
 mode = "enabled"
 writable_paths = []
+passthrough_env = []
 ```
 
 ## OpenCode Workers

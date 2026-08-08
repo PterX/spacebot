@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { generateId } from "@/lib/id";
 import {
 	api,
 	type BranchCompletedEvent,
 	type BranchStartedEvent,
 	type InboundMessageEvent,
+	type OutboundMessageDeltaEvent,
 	type OutboundMessageEvent,
 	type TimelineItem,
 	type ToolCompletedEvent,
@@ -12,6 +14,7 @@ import {
 	type WorkerCompletedEvent,
 	type WorkerStartedEvent,
 	type WorkerStatusEvent,
+	type WorkerIdleEvent,
 	type ChannelInfo,
 } from "../api/client";
 
@@ -22,6 +25,17 @@ export interface ActiveWorker {
 	startedAt: number;
 	toolCalls: number;
 	currentTool: string | null;
+	/** Whether the worker is idle (waiting for follow-up input). */
+	isIdle: boolean;
+	/** Whether this worker accepts follow-up input via route. */
+	interactive: boolean;
+	/** Worker type: "builtin", "opencode", "task", etc. */
+	workerType: string;
+}
+
+/** Check whether a worker is an opencode worker (by type or task prefix). */
+export function isOpenCodeWorker(worker: { workerType?: string; task?: string }): boolean {
+	return worker.workerType === "opencode" || (worker.task?.startsWith("[opencode]") ?? false);
 }
 
 export interface ActiveBranch {
@@ -38,6 +52,7 @@ export interface ChannelLiveState {
 	timeline: TimelineItem[];
 	workers: Record<string, ActiveWorker>;
 	branches: Record<string, ActiveBranch>;
+	streamingMessageId: string | null;
 	historyLoaded: boolean;
 	hasMore: boolean;
 	loadingMore: boolean;
@@ -45,8 +60,23 @@ export interface ChannelLiveState {
 
 const PAGE_SIZE = 50;
 
+/** Conversation/routing tools that should never appear in the channel tool call UI. */
+const HIDDEN_CHANNEL_TOOLS = new Set([
+	"reply", "react", "skip", "set_outcome",
+	"spawn_worker", "branch", "route", "cancel",
+]);
+
 function emptyLiveState(): ChannelLiveState {
-	return { isTyping: false, timeline: [], workers: {}, branches: {}, historyLoaded: false, hasMore: true, loadingMore: false };
+	return {
+		isTyping: false,
+		timeline: [],
+		workers: {},
+		branches: {},
+		streamingMessageId: null,
+		historyLoaded: false,
+		hasMore: true,
+		loadingMore: false,
+	};
 }
 
 /** Get a sortable timestamp from any timeline item. */
@@ -55,7 +85,28 @@ function itemTimestamp(item: TimelineItem): string {
 		case "message": return item.created_at;
 		case "branch_run": return item.started_at;
 		case "worker_run": return item.started_at;
+		case "tool_call_run": return item.started_at;
 	}
+}
+
+function itemKey(item: TimelineItem): string {
+	return `${item.type}:${item.id}`;
+}
+
+function assistantMessageItem(
+	id: string,
+	agentId: string,
+	content: string,
+): TimelineItem {
+	return {
+		type: "message",
+		id,
+		role: "assistant",
+		sender_name: agentId,
+		sender_id: null,
+		content,
+		created_at: new Date().toISOString(),
+	};
 }
 
 /**
@@ -124,6 +175,9 @@ export function useChannelLiveState(channels: ChannelInfo[]) {
 							startedAt: new Date(w.started_at).getTime(),
 							toolCalls: w.tool_calls,
 							currentTool: existingWorker?.currentTool ?? null,
+							isIdle: w.status === "idle",
+							interactive: w.interactive,
+							workerType: existingWorker?.workerType ?? (w.task.startsWith("[opencode]") ? "opencode" : "builtin"),
 						};
 					}
 					const branches: Record<string, ActiveBranch> = {};
@@ -146,6 +200,9 @@ export function useChannelLiveState(channels: ChannelInfo[]) {
 			console.warn("Failed to fetch channel status:", error);
 		});
 	}, []);
+
+	// Track pending channel tool call IDs per channel+tool_name (FIFO queue).
+	const pendingChannelToolCallsRef = useRef<Record<string, string[]>>({});
 
 	// Initial status snapshot load
 	const initialSyncDone = useRef(false);
@@ -187,31 +244,135 @@ export function useChannelLiveState(channels: ChannelInfo[]) {
 		const event = data as InboundMessageEvent;
 		pushItem(event.channel_id, {
 			type: "message",
-			id: `in-${Date.now()}-${crypto.randomUUID()}`,
+			id: `in-${generateId()}`,
 			role: "user",
 			sender_name: event.sender_name ?? event.sender_id,
 			sender_id: event.sender_id,
 			content: event.text,
 			created_at: new Date().toISOString(),
+			...(event.attachments && event.attachments.length > 0
+				? {attachments: event.attachments}
+				: {}),
 		});
 	}, [pushItem]);
 
 	const handleOutboundMessage = useCallback((data: unknown) => {
 		const event = data as OutboundMessageEvent;
-		pushItem(event.channel_id, {
-			type: "message",
-			id: `out-${Date.now()}-${crypto.randomUUID()}`,
-			role: "assistant",
-			sender_name: event.agent_id,
-			sender_id: null,
-			content: event.text,
-			created_at: new Date().toISOString(),
-		});
 		setLiveStates((prev) => {
 			const existing = getOrCreate(prev, event.channel_id);
-			return { ...prev, [event.channel_id]: { ...existing, isTyping: false } };
+			const streamingMessageId = existing.streamingMessageId;
+			if (streamingMessageId) {
+				const streamIndex = existing.timeline.findIndex(
+					(item) => item.type === "message" && item.id === streamingMessageId,
+				);
+
+				const timeline = [...existing.timeline];
+				if (streamIndex >= 0) {
+					const streamItem = timeline[streamIndex];
+					if (streamItem.type === "message") {
+						timeline[streamIndex] = { ...streamItem, content: event.text };
+					}
+				} else {
+					timeline.push(
+						assistantMessageItem(
+							`out-${generateId()}`,
+							event.agent_id,
+							event.text,
+						),
+					);
+				}
+
+				return {
+					...prev,
+					[event.channel_id]: {
+						...existing,
+						timeline,
+						streamingMessageId: null,
+						isTyping: false,
+					},
+				};
+			}
+
+			return {
+				...prev,
+				[event.channel_id]: {
+					...existing,
+					timeline: [
+						...existing.timeline,
+						assistantMessageItem(
+							`out-${generateId()}`,
+							event.agent_id,
+							event.text,
+						),
+					],
+					isTyping: false,
+				},
+			};
 		});
-	}, [pushItem]);
+	}, []);
+
+	const handleOutboundMessageDelta = useCallback((data: unknown) => {
+		const event = data as OutboundMessageDeltaEvent;
+		setLiveStates((prev) => {
+			const existing = getOrCreate(prev, event.channel_id);
+			const streamMessageId = existing.streamingMessageId;
+
+			if (streamMessageId) {
+				const streamIndex = existing.timeline.findIndex(
+					(item) => item.type === "message" && item.id === streamMessageId,
+				);
+
+				if (streamIndex >= 0) {
+					const timeline = [...existing.timeline];
+					const streamItem = timeline[streamIndex];
+					if (streamItem.type === "message") {
+						timeline[streamIndex] = {
+							...streamItem,
+							content: event.aggregated_text,
+						};
+					}
+					return {
+						...prev,
+						[event.channel_id]: { ...existing, timeline },
+					};
+				}
+
+				const messageId = `stream-${generateId()}`;
+				return {
+					...prev,
+					[event.channel_id]: {
+						...existing,
+						timeline: [
+							...existing.timeline,
+							assistantMessageItem(
+								messageId,
+								event.agent_id,
+								event.aggregated_text,
+							),
+						],
+						streamingMessageId: messageId,
+					},
+				};
+			}
+
+			const messageId = `stream-${generateId()}`;
+			return {
+				...prev,
+				[event.channel_id]: {
+					...existing,
+					timeline: [
+						...existing.timeline,
+						assistantMessageItem(
+							messageId,
+							event.agent_id,
+							event.aggregated_text,
+						),
+					],
+					streamingMessageId: messageId,
+				},
+			};
+		});
+	}, []);
 
 	const handleTypingState = useCallback((data: unknown) => {
 		const event = data as TypingStateEvent;
@@ -235,14 +396,17 @@ export function useChannelLiveState(channels: ChannelInfo[]) {
 					...existing,
 					workers: {
 						...existing.workers,
-						[event.worker_id]: {
-							id: event.worker_id,
-							task: event.task,
-							status: "starting",
-							startedAt: Date.now(),
-							toolCalls: 0,
-							currentTool: null,
-						},
+					[event.worker_id]: {
+						id: event.worker_id,
+						task: event.task,
+						status: "starting",
+						startedAt: Date.now(),
+						toolCalls: 0,
+						currentTool: null,
+						isIdle: false,
+						interactive: event.interactive ?? false,
+						workerType: event.worker_type ?? "builtin",
+					},
 					},
 				},
 			};
@@ -274,7 +438,7 @@ export function useChannelLiveState(channels: ChannelInfo[]) {
 						...state,
 						workers: {
 							...state.workers,
-							[event.worker_id]: { ...worker, status: event.status },
+							[event.worker_id]: { ...worker, status: event.status, isIdle: false },
 						},
 					},
 				};
@@ -296,7 +460,52 @@ export function useChannelLiveState(channels: ChannelInfo[]) {
 								...state,
 								workers: {
 									...state.workers,
-									[event.worker_id]: { ...worker, status: event.status },
+									[event.worker_id]: { ...worker, status: event.status, isIdle: false },
+								},
+							},
+						};
+					}
+				}
+				return prev;
+			});
+		}
+	}, [updateItem]);
+
+	const handleWorkerIdle = useCallback((data: unknown) => {
+		const event = data as WorkerIdleEvent;
+		if (event.channel_id) {
+			setLiveStates((prev) => {
+				const state = prev[event.channel_id!];
+				const worker = state?.workers[event.worker_id];
+				if (!worker) return prev;
+				return {
+					...prev,
+					[event.channel_id!]: {
+						...state,
+						workers: {
+							...state.workers,
+							[event.worker_id]: { ...worker, isIdle: true },
+						},
+					},
+				};
+			});
+			// Update timeline item status to idle
+			updateItem(event.channel_id, event.worker_id, (item) => {
+				if (item.type !== "worker_run") return item;
+				return { ...item, status: "idle" };
+			});
+		} else {
+			setLiveStates((prev) => {
+				for (const [channelId, state] of Object.entries(prev)) {
+					const worker = state.workers[event.worker_id];
+					if (worker) {
+						return {
+							...prev,
+							[channelId]: {
+								...state,
+								workers: {
+									...state.workers,
+									[event.worker_id]: { ...worker, isIdle: true },
 								},
 							},
 						};
@@ -401,6 +610,28 @@ export function useChannelLiveState(channels: ChannelInfo[]) {
 		const event = data as ToolStartedEvent;
 		const channelId = event.channel_id;
 
+		if (channelId && event.process_type === "channel") {
+			// Skip conversation/routing tools — they're infrastructure, not user-visible.
+			if (HIDDEN_CHANNEL_TOOLS.has(event.tool_name)) return;
+
+			const toolCallId = event.call_id || `tool-${generateId()}`;
+			const queueKey = `${channelId}:${event.tool_name}`;
+			const queue = pendingChannelToolCallsRef.current[queueKey] ?? [];
+			pendingChannelToolCallsRef.current[queueKey] = [...queue, toolCallId];
+
+			pushItem(channelId, {
+				type: "tool_call_run",
+				id: toolCallId,
+				tool_name: event.tool_name,
+				args: event.args,
+				result: null,
+				status: "running",
+				started_at: new Date().toISOString(),
+				completed_at: null,
+			});
+			return;
+		}
+
 		if (channelId) {
 			setLiveStates((prev) => {
 				const state = prev[channelId];
@@ -470,11 +701,27 @@ export function useChannelLiveState(channels: ChannelInfo[]) {
 				return prev;
 			});
 		}
-	}, []);
+	}, [pushItem]);
 
 	const handleToolCompleted = useCallback((data: unknown) => {
 		const event = data as ToolCompletedEvent;
 		const channelId = event.channel_id;
+
+		if (channelId && event.process_type === "channel") {
+			const queueKey = `${channelId}:${event.tool_name}`;
+			const queue = pendingChannelToolCallsRef.current[queueKey] ?? [];
+			const toolCallId = event.call_id || queue[0];
+			if (toolCallId) {
+				pendingChannelToolCallsRef.current[queueKey] = queue.filter(
+					(id) => id !== toolCallId,
+				);
+				updateItem(channelId, toolCallId, (item) => {
+					if (item.type !== "tool_call_run") return item;
+					return { ...item, result: event.result, status: "completed", completed_at: new Date().toISOString() };
+				});
+			}
+			return;
+		}
 
 		if (channelId) {
 			setLiveStates((prev) => {
@@ -579,12 +826,15 @@ export function useChannelLiveState(channels: ChannelInfo[]) {
 					setLiveStates((current) => {
 						const existing = current[channelId];
 						if (!existing) return current;
+						const existingKeys = new Set(existing.timeline.map(itemKey));
+						const olderItems = data.items.filter((item) => !existingKeys.has(itemKey(item)));
+						const hasMore = olderItems.length === 0 ? false : data.has_more;
 						return {
 							...current,
 							[channelId]: {
 								...existing,
-								timeline: [...data.items, ...existing.timeline],
-								hasMore: data.has_more,
+								timeline: [...olderItems, ...existing.timeline],
+								hasMore,
 								loadingMore: false,
 							},
 						};
@@ -606,9 +856,11 @@ export function useChannelLiveState(channels: ChannelInfo[]) {
 	const handlers = {
 		inbound_message: handleInboundMessage,
 		outbound_message: handleOutboundMessage,
+		outbound_message_delta: handleOutboundMessageDelta,
 		typing_state: handleTypingState,
 		worker_started: handleWorkerStarted,
 		worker_status: handleWorkerStatus,
+		worker_idle: handleWorkerIdle,
 		worker_completed: handleWorkerCompleted,
 		branch_started: handleBranchStarted,
 		branch_completed: handleBranchCompleted,

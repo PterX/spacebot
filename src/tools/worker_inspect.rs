@@ -6,6 +6,8 @@
 use crate::conversation::history::ProcessRunLogger;
 use crate::conversation::worker_transcript;
 
+use super::truncate_utf8_ellipsis;
+
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use schemars::JsonSchema;
@@ -25,15 +27,6 @@ impl WorkerInspectTool {
             agent_id,
         }
     }
-}
-
-fn truncate_utf8(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.to_string();
-    }
-
-    let boundary = text.floor_char_boundary(max_bytes);
-    format!("{}...", &text[..boundary])
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -139,6 +132,12 @@ impl Tool for WorkerInspectTool {
                                     }
                                 }
                             }
+                            worker_transcript::TranscriptStep::UserText { text } => {
+                                summary.push_str(&format!("**User:** {text}\n\n"));
+                            }
+                            worker_transcript::TranscriptStep::SystemText { text } => {
+                                summary.push_str(&format!("**System:** {text}\n\n"));
+                            }
                             worker_transcript::TranscriptStep::ToolResult {
                                 name, text, ..
                             } => {
@@ -146,7 +145,7 @@ impl Tool for WorkerInspectTool {
                                 let display = if text.len() > 500 {
                                     format!(
                                         "{}\n[truncated, {} bytes total]",
-                                        truncate_utf8(text, 500),
+                                        truncate_utf8_ellipsis(text, 500),
                                         text.len()
                                     )
                                 } else {
@@ -199,6 +198,7 @@ impl WorkerInspectTool {
                 "running" => "[running]",
                 "done" => "[done]",
                 "failed" => "[failed]",
+                "cancelled" => "[cancelled]",
                 _ => "[-]",
             };
             summary.push_str(&format!(

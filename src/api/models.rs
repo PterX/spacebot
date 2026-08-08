@@ -7,36 +7,36 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, utoipa::ToSchema)]
 pub(super) struct ModelInfo {
     /// Full routing string (e.g. "openrouter/anthropic/claude-sonnet-4")
-    id: String,
+    pub(super) id: String,
     /// Human-readable name
-    name: String,
+    pub(super) name: String,
     /// Provider ID for routing ("anthropic", "openrouter", "openai", etc.)
-    provider: String,
+    pub(super) provider: String,
     /// Context window size in tokens, if known
-    context_window: Option<u64>,
+    pub(super) context_window: Option<u64>,
     /// Whether this model supports tool/function calling
-    tool_call: bool,
+    pub(super) tool_call: bool,
     /// Whether this model has reasoning/thinking capability
-    reasoning: bool,
+    pub(super) reasoning: bool,
     /// Whether this model accepts audio input.
-    input_audio: bool,
+    pub(super) input_audio: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct ModelsResponse {
     models: Vec<ModelInfo>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
 pub(super) struct ModelsQuery {
     provider: Option<String>,
     capability: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 struct ModelsDevProvider {
     #[allow(dead_code)]
     id: Option<String>,
@@ -46,7 +46,7 @@ struct ModelsDevProvider {
     models: HashMap<String, ModelsDevModel>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 struct ModelsDevModel {
     #[allow(dead_code)]
     id: Option<String>,
@@ -60,12 +60,12 @@ struct ModelsDevModel {
     status: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 struct ModelsDevLimit {
     context: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 struct ModelsDevModalities {
     input: Option<Vec<String>>,
     output: Option<Vec<String>>,
@@ -105,6 +105,7 @@ fn direct_provider_mapping(models_dev_id: &str) -> Option<&'static str> {
     match models_dev_id {
         "anthropic" => Some("anthropic"),
         "openai" => Some("openai"),
+        "kilo" => Some("kilo"),
         "deepseek" => Some("deepseek"),
         "xai" => Some("xai"),
         "mistral" => Some("mistral"),
@@ -113,6 +114,11 @@ fn direct_provider_mapping(models_dev_id: &str) -> Option<&'static str> {
         "togetherai" => Some("together"),
         "fireworks-ai" => Some("fireworks"),
         "zhipuai" => Some("zhipu"),
+        "opencode" => Some("opencode-zen"),
+        "opencode-go" => Some("opencode-go"),
+        "zai-coding-plan" => Some("zai-coding-plan"),
+        "minimax" => Some("minimax"),
+        "moonshotai" => Some("moonshot"),
         _ => None,
     }
 }
@@ -141,108 +147,7 @@ fn as_openai_chatgpt_model(model: &ModelInfo) -> Option<ModelInfo> {
 /// Models from providers not in models.dev (private/custom endpoints).
 fn extra_models() -> Vec<ModelInfo> {
     vec![
-        ModelInfo {
-            id: "opencode-zen/kimi-k2.5".into(),
-            name: "Kimi K2.5".into(),
-            provider: "opencode-zen".into(),
-            context_window: None,
-            tool_call: true,
-            reasoning: true,
-            input_audio: false,
-        },
-        ModelInfo {
-            id: "opencode-zen/kimi-k2".into(),
-            name: "Kimi K2".into(),
-            provider: "opencode-zen".into(),
-            context_window: None,
-            tool_call: true,
-            reasoning: false,
-            input_audio: false,
-        },
-        ModelInfo {
-            id: "opencode-zen/kimi-k2-thinking".into(),
-            name: "Kimi K2 Thinking".into(),
-            provider: "opencode-zen".into(),
-            context_window: None,
-            tool_call: true,
-            reasoning: true,
-            input_audio: false,
-        },
-        ModelInfo {
-            id: "opencode-zen/glm-5".into(),
-            name: "GLM 5".into(),
-            provider: "opencode-zen".into(),
-            context_window: None,
-            tool_call: true,
-            reasoning: false,
-            input_audio: false,
-        },
-        ModelInfo {
-            id: "opencode-zen/minimax-m2.5".into(),
-            name: "MiniMax M2.5".into(),
-            provider: "opencode-zen".into(),
-            context_window: None,
-            tool_call: true,
-            reasoning: false,
-            input_audio: false,
-        },
-        ModelInfo {
-            id: "opencode-zen/qwen3-coder".into(),
-            name: "Qwen3 Coder 480B".into(),
-            provider: "opencode-zen".into(),
-            context_window: None,
-            tool_call: true,
-            reasoning: false,
-            input_audio: false,
-        },
-        ModelInfo {
-            id: "opencode-zen/big-pickle".into(),
-            name: "Big Pickle".into(),
-            provider: "opencode-zen".into(),
-            context_window: None,
-            tool_call: true,
-            reasoning: false,
-            input_audio: false,
-        },
-        // Z.AI Coding Plan
-        ModelInfo {
-            id: "zai-coding-plan/glm-4.7".into(),
-            name: "GLM 4.7 (Coding)".into(),
-            provider: "zai-coding-plan".into(),
-            context_window: None,
-            tool_call: true,
-            reasoning: false,
-            input_audio: false,
-        },
-        ModelInfo {
-            id: "zai-coding-plan/glm-5".into(),
-            name: "GLM 5 (Coding)".into(),
-            provider: "zai-coding-plan".into(),
-            context_window: None,
-            tool_call: true,
-            reasoning: false,
-            input_audio: false,
-        },
-        ModelInfo {
-            id: "zai-coding-plan/glm-4.5-air".into(),
-            name: "GLM 4.5 Air (Coding)".into(),
-            provider: "zai-coding-plan".into(),
-            context_window: None,
-            tool_call: true,
-            reasoning: false,
-            input_audio: false,
-        },
-        // MiniMax
-        ModelInfo {
-            id: "minimax/MiniMax-M2.5".into(),
-            name: "MiniMax M2.5".into(),
-            provider: "minimax".into(),
-            context_window: Some(200000),
-            tool_call: true,
-            reasoning: true,
-            input_audio: false,
-        },
-        // MiniMax CN
+        // MiniMax CN - China-specific endpoint, not on models.dev
         ModelInfo {
             id: "minimax-cn/MiniMax-M2.5".into(),
             name: "MiniMax M2.5".into(),
@@ -252,16 +157,7 @@ fn extra_models() -> Vec<ModelInfo> {
             reasoning: true,
             input_audio: false,
         },
-        // Moonshot AI (Kimi)
-        ModelInfo {
-            id: "moonshot/kimi-k2.5".into(),
-            name: "Kimi K2.5".into(),
-            provider: "moonshot".into(),
-            context_window: None,
-            tool_call: true,
-            reasoning: true,
-            input_audio: false,
-        },
+        // Moonshot AI (Kimi) - moonshot-v1-8k not on models.dev
         ModelInfo {
             id: "moonshot/moonshot-v1-8k".into(),
             name: "Moonshot V1 8K".into(),
@@ -346,7 +242,7 @@ async fn fetch_models_dev() -> anyhow::Result<Vec<ModelInfo>> {
 }
 
 /// Ensure the cache is populated (fetches on first call, then uses TTL).
-async fn ensure_models_cache() -> Vec<ModelInfo> {
+pub(super) async fn ensure_models_cache() -> Vec<ModelInfo> {
     {
         let cache = MODELS_CACHE.read().await;
         if !cache.0.is_empty() && cache.1.elapsed() < MODELS_CACHE_TTL {
@@ -406,6 +302,9 @@ pub(super) async fn configured_providers(config_path: &std::path::Path) -> Vec<&
     if has_key("openrouter_key", "OPENROUTER_API_KEY") {
         providers.push("openrouter");
     }
+    if has_key("kilo_key", "KILO_API_KEY") {
+        providers.push("kilo");
+    }
     if has_key("zhipu_key", "ZHIPU_API_KEY") {
         providers.push("zhipu");
     }
@@ -433,6 +332,9 @@ pub(super) async fn configured_providers(config_path: &std::path::Path) -> Vec<&
     if has_key("opencode_zen_key", "OPENCODE_ZEN_API_KEY") {
         providers.push("opencode-zen");
     }
+    if has_key("opencode_go_key", "OPENCODE_GO_API_KEY") {
+        providers.push("opencode-go");
+    }
     if has_key("minimax_key", "MINIMAX_API_KEY") {
         providers.push("minimax");
     }
@@ -449,6 +351,19 @@ pub(super) async fn configured_providers(config_path: &std::path::Path) -> Vec<&
     providers
 }
 
+#[utoipa::path(
+    get,
+    path = "/models",
+    params(
+        ("provider" = Option<String>, Query, description = "Filter by provider ID"),
+        ("capability" = Option<String>, Query, description = "Filter by capability (input_audio, voice_transcription)"),
+    ),
+    responses(
+        (status = 200, body = ModelsResponse),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "models",
+)]
 pub(super) async fn get_models(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ModelsQuery>,
@@ -539,6 +454,15 @@ pub(super) async fn get_models(
     Ok(Json(ModelsResponse { models }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/models/refresh",
+    responses(
+        (status = 200, body = ModelsResponse),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "models",
+)]
 pub(super) async fn refresh_models(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ModelsResponse>, StatusCode> {

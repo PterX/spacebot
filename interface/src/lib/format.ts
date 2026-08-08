@@ -21,7 +21,18 @@ export function formatTimestamp(ts: number): string {
 
 export function formatDuration(seconds: number): string {
 	if (seconds < 60) return `${seconds}s`;
+	if (seconds % 86400 === 0) return `${seconds / 86400}d`;
+	if (seconds % 3600 === 0) return `${seconds / 3600}h`;
+	if (seconds % 60 === 0) return `${seconds / 60}m`;
 	return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
+
+export function formatCronSchedule(cronExpr: string | null, intervalSecs: number): string {
+	if (cronExpr) return cronExpr;
+	if (intervalSecs % 86400 === 0) return `every ${intervalSecs / 86400}d`;
+	if (intervalSecs % 3600 === 0) return `every ${intervalSecs / 3600}h`;
+	if (intervalSecs % 60 === 0) return `every ${intervalSecs / 60}m`;
+	return `every ${intervalSecs}s`;
 }
 
 export function platformIcon(platform: string): string {
@@ -45,4 +56,58 @@ export function platformColor(platform: string): string {
 		case "cron": return "bg-amber-500/20 text-amber-400";
 		default: return "bg-gray-500/20 text-gray-400";
 	}
+}
+
+// E.164 Phone Number Validation
+// Validates international phone numbers in format: + followed by country code and 6-15 digits
+export const E164_REGEX = /^\+[1-9]\d{5,14}$/;
+
+export const E164_ERROR_TEXT = 
+	"Phone number must be in E.164 format: + followed by 6-15 digits after '+', with the first digit 1-9 (e.g., +1234567890)";
+
+export function isValidE164(phoneNumber: string): boolean {
+	return E164_REGEX.test(phoneNumber.trim());
+}
+
+export function validateE164(phoneNumber: string): { valid: boolean; error?: string } {
+	const trimmed = phoneNumber.trim();
+	if (!trimmed) {
+		return { valid: false, error: "Phone number is required" };
+	}
+	if (!E164_REGEX.test(trimmed)) {
+		return { valid: false, error: E164_ERROR_TEXT };
+	}
+	return { valid: true };
+}
+
+/**
+ * Validate Signal DM allowed-users entries.
+ * Each entry must be E.164 phone or uuid:xxx.
+ */
+export function validateSignalDmAllowedUsers(
+	raw: string
+): { valid: true; entries: string[] } | { valid: false; error: string } {
+	const entries = raw.split(',').map(s => s.trim()).filter(s => s.length > 0);
+	const invalid: string[] = [];
+	const valid: string[] = [];
+
+	for (const entry of entries) {
+		if (
+			isValidE164(entry) ||
+			(entry.startsWith('uuid:') && entry.length > 5)
+		) {
+			valid.push(entry);
+		} else {
+			invalid.push(entry);
+		}
+	}
+
+	if (invalid.length > 0) {
+		return {
+			valid: false,
+			error: `Invalid entries: ${invalid.join(', ')}. Must be E.164 phone numbers (+1234567890) or uuid:xxx`,
+		};
+	}
+
+	return { valid: true, entries: valid };
 }

@@ -58,8 +58,9 @@ pub fn build_anthropic_request(
     model_name: &str,
     request: &CompletionRequest,
     thinking_effort: &str,
+    force_bearer: bool,
 ) -> AnthropicRequest {
-    let is_oauth = auth::detect_auth_path(api_key) == AnthropicAuthPath::OAuthToken;
+    let is_oauth = auth::detect_auth_path(api_key, force_bearer) == AnthropicAuthPath::OAuthToken;
     let adaptive_thinking = supports_adaptive_thinking(model_name);
     let retention = cache::resolve_cache_retention(None);
     let url = messages_url(base_url);
@@ -96,12 +97,15 @@ pub fn build_anthropic_request(
         body["output_config"] = serde_json::json!({ "effort": effort });
     }
 
+    // Override the global 120s client timeout — large completions with
+    // extended thinking can easily take 5–10 minutes to generate.
     let builder = http_client
         .post(&url)
+        .timeout(std::time::Duration::from_secs(10 * 60))
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json");
 
-    let (builder, auth_path) = auth::apply_auth_headers(builder, api_key, false);
+    let (builder, auth_path) = auth::apply_auth_headers(builder, api_key, false, force_bearer);
     let builder = builder.json(&body);
 
     AnthropicRequest {

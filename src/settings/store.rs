@@ -11,6 +11,7 @@ const SETTINGS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("settin
 
 /// Default key for worker log mode setting.
 pub const WORKER_LOG_MODE_KEY: &str = "worker_log_mode";
+const PROMPT_CAPTURE_PREFIX: &str = "prompt_capture:";
 
 /// How worker execution logs are stored.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -159,6 +160,18 @@ impl SettingsStore {
     /// Set the worker log mode setting.
     pub fn set_worker_log_mode(&self, mode: WorkerLogMode) -> Result<()> {
         self.set_raw(WORKER_LOG_MODE_KEY, &mode.to_string())
+    }
+
+    /// Check whether prompt capture is enabled for a specific channel.
+    pub fn prompt_capture_enabled(&self, channel_id: &str) -> bool {
+        let key = format!("{PROMPT_CAPTURE_PREFIX}{channel_id}");
+        matches!(self.get_raw(&key), Ok(v) if v == "true")
+    }
+
+    /// Enable or disable prompt capture for a specific channel.
+    pub fn set_prompt_capture(&self, channel_id: &str, enabled: bool) -> Result<()> {
+        let key = format!("{PROMPT_CAPTURE_PREFIX}{channel_id}");
+        self.set_raw(&key, if enabled { "true" } else { "false" })
     }
 }
 

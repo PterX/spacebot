@@ -5,14 +5,16 @@
 //! + memory extraction) happens in the spawned worker, not here.
 
 use crate::error::Result;
+use crate::hooks::SpacebotHook;
 use crate::llm::SpacebotModel;
-use crate::{AgentDeps, ChannelId, ProcessType};
+use crate::{AgentDeps, ChannelId, ProcessId, ProcessType};
 use rig::agent::AgentBuilder;
-use rig::completion::{CompletionModel as _, Prompt as _};
+use rig::completion::CompletionModel;
 use rig::message::{AssistantContent, Message, UserContent};
-use rig::tool::server::{ToolServer, ToolServerHandle};
+// ToolServerHandle removed — compactor no longer has tools (Phase 5b).
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 /// Programmatic monitor that watches channel context size and triggers compaction.
 pub struct Compactor {
@@ -21,16 +23,24 @@ pub struct Compactor {
     pub history: Arc<RwLock<Vec<Message>>>,
     /// Is a compaction currently running.
     is_compacting: Arc<RwLock<bool>>,
+    /// Model override from conversation settings.
+    model_override: Option<String>,
 }
 
 impl Compactor {
     /// Create a new compactor for a channel.
-    pub fn new(channel_id: ChannelId, deps: AgentDeps, history: Arc<RwLock<Vec<Message>>>) -> Self {
+    pub fn new(
+        channel_id: ChannelId,
+        deps: AgentDeps,
+        history: Arc<RwLock<Vec<Message>>>,
+        model_override: Option<String>,
+    ) -> Self {
         Self {
             channel_id,
             deps,
             history,
             is_compacting: Arc::new(RwLock::new(false)),
+            model_override,
         }
     }
 
@@ -70,6 +80,21 @@ impl Compactor {
                 ?action,
                 "compaction triggered"
             );
+            if let Err(error) = self
+                .deps
+                .event_tx
+                .send(crate::ProcessEvent::CompactionTriggered {
+                    agent_id: self.deps.agent_id.clone(),
+                    channel_id: self.channel_id.clone(),
+                    threshold_reached: usage,
+                })
+            {
+                tracing::debug!(
+                    channel_id = %self.channel_id,
+                    %error,
+                    "failed to emit compaction-triggered event"
+                );
+            }
 
             match action {
                 CompactionAction::EmergencyTruncate => {
@@ -107,9 +132,12 @@ impl Compactor {
         let is_compacting = self.is_compacting.clone();
         let channel_id = self.channel_id.clone();
         let deps = self.deps.clone();
+        let model_override = self.model_override.clone();
         let prompt_engine = deps.runtime_config.prompts.load();
+        // The compactor is a toolless agent (summary-only), so tool-use
+        // enforcement is skipped — there are no tools to enforce.
         let compactor_prompt = match prompt_engine.render_static("compactor") {
-            Ok(p) => p,
+            Ok(prompt) => prompt,
             Err(error) => {
                 tracing::error!(%error, "failed to render compactor prompt");
                 let mut flag = is_compacting.write().await;
@@ -119,7 +147,15 @@ impl Compactor {
         };
 
         tokio::spawn(async move {
-            let result = run_compaction(&deps, &compactor_prompt, &history, fraction).await;
+            let result = run_compaction(
+                &deps,
+                &compactor_prompt,
+                &history,
+                &channel_id,
+                fraction,
+                model_override,
+            )
+            .await;
 
             match result {
                 Ok(turns_compacted) => {
@@ -181,7 +217,9 @@ async fn run_compaction(
     deps: &AgentDeps,
     compactor_prompt: &str,
     history: &Arc<RwLock<Vec<Message>>>,
+    channel_id: &ChannelId,
     fraction: f32,
+    model_override: Option<String>,
 ) -> Result<usize> {
     // 1. Read and remove the oldest messages from history
     let (removed_messages, remove_count) = {
@@ -202,28 +240,33 @@ async fn run_compaction(
 
     // 3. Run the compaction LLM to produce summary + extracted memories
     let routing = deps.runtime_config.routing.load();
-    let model_name = routing.resolve(ProcessType::Worker, None).to_string();
+    let model_name = match model_override {
+        Some(ref m) => m.clone(),
+        None => routing.resolve(ProcessType::Compactor, None).to_string(),
+    };
     let model = SpacebotModel::make(&deps.llm_manager, &model_name)
         .with_context(&*deps.agent_id, "compactor")
         .with_routing((**routing).clone());
 
     // Give the compaction worker memory_save so it can directly persist memories
-    let tool_server: ToolServerHandle = ToolServer::new()
-        .tool(crate::tools::MemorySaveTool::new(
-            deps.memory_search.clone(),
-        ))
-        .run();
-
+    // No tool server — the compactor's sole job is producing a summary.
+    // Memory extraction is handled by persistence branches (Phase 5a).
     let agent = AgentBuilder::new(model)
         .preamble(compactor_prompt)
-        .default_max_turns(10)
-        .tool_server_handle(tool_server)
+        .default_max_turns(1)
         .build();
 
+    let hook = SpacebotHook::new(
+        deps.agent_id.clone(),
+        ProcessId::Worker(Uuid::new_v4()),
+        ProcessType::Compactor,
+        Some(channel_id.clone()),
+        deps.event_tx.clone(),
+    );
+
     let mut compaction_history = Vec::new();
-    let response = agent
-        .prompt(&transcript)
-        .with_history(&mut compaction_history)
+    let response = hook
+        .prompt_once(&agent, &mut compaction_history, &transcript)
         .await;
 
     let summary = match response {
@@ -263,6 +306,9 @@ pub fn estimate_history_tokens(history: &[Message]) -> usize {
                     chars += estimate_assistant_content_chars(item);
                 }
             }
+            Message::System { content } => {
+                chars += content.len();
+            }
         }
     }
 
@@ -296,7 +342,21 @@ fn estimate_assistant_content_chars(content: &AssistantContent) -> usize {
         AssistantContent::ToolCall(tc) => {
             tc.function.name.len() + tc.function.arguments.to_string().len()
         }
-        AssistantContent::Reasoning(r) => r.reasoning.iter().map(|s| s.len()).sum(),
+        AssistantContent::Reasoning(r) => r
+            .content
+            .iter()
+            .map(|content| match content {
+                rig::message::ReasoningContent::Text { text, signature } => {
+                    text.len() + signature.as_ref().map_or(0, String::len)
+                }
+                rig::message::ReasoningContent::Encrypted(data) => data.len(),
+                rig::message::ReasoningContent::Redacted { data } => data.len(),
+                rig::message::ReasoningContent::Summary(summary) => summary.len(),
+                // Future variants default to 0; update this match when new variants are added
+                #[allow(unreachable_patterns)]
+                _ => 0,
+            })
+            .sum(),
         AssistantContent::Image(_) => 500,
     }
 }
@@ -345,6 +405,11 @@ fn render_messages_as_transcript(messages: &[Message]) -> String {
                         _ => {}
                     }
                 }
+            }
+            Message::System { content } => {
+                output.push_str("System: ");
+                output.push_str(content);
+                output.push('\n');
             }
         }
     }

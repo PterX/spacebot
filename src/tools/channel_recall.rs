@@ -1,4 +1,4 @@
-//! Cross-channel transcript recall tool for branches.
+//! Channel transcript recall tool for branches. Queries any channel including the current one.
 
 use crate::conversation::channels::ChannelStore;
 use crate::conversation::history::ConversationLogger;
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 /// Maximum messages to return in a single recall.
 const MAX_TRANSCRIPT_MESSAGES: i64 = 100;
 
-/// Tool for recalling conversation transcript from other channels.
+/// Tool for recalling conversation transcript from any channel.
 #[derive(Debug, Clone)]
 pub struct ChannelRecallTool {
     conversation_logger: ConversationLogger,
@@ -43,6 +43,16 @@ pub struct ChannelRecallArgs {
     /// Maximum number of messages to return (default 50, max 100).
     #[serde(default = "default_message_limit")]
     pub limit: i64,
+    /// Only return messages sent before this timestamp (RFC 3339, e.g. "2026-01-15T00:00:00Z").
+    #[serde(default)]
+    pub before: Option<String>,
+    /// Only return messages sent after this timestamp (RFC 3339, e.g. "2026-01-15T00:00:00Z").
+    #[serde(default)]
+    pub after: Option<String>,
+    /// When true, returns the oldest matching messages first instead of the most recent.
+    /// Useful for finding the earliest messages in a channel.
+    #[serde(default)]
+    pub oldest_first: bool,
 }
 
 fn default_message_limit() -> i64 {
@@ -107,6 +117,19 @@ impl Tool for ChannelRecallTool {
                         "maximum": 100,
                         "default": 50,
                         "description": "Maximum number of messages to retrieve (1-100)"
+                    },
+                    "before": {
+                        "type": "string",
+                        "description": "Only return messages before this timestamp (RFC 3339, e.g. \"2026-01-15T00:00:00Z\")"
+                    },
+                    "after": {
+                        "type": "string",
+                        "description": "Only return messages after this timestamp (RFC 3339, e.g. \"2026-01-15T00:00:00Z\")"
+                    },
+                    "oldest_first": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Return oldest messages first instead of most recent. Use this to find the earliest messages in a channel."
                     }
                 }
             }),
@@ -139,17 +162,45 @@ impl Tool for ChannelRecallTool {
         // Load transcript
         let messages = self
             .conversation_logger
-            .load_channel_transcript(&channel.id, limit)
+            .load_channel_transcript(
+                &channel.id,
+                limit,
+                args.before.as_deref(),
+                args.after.as_deref(),
+                args.oldest_first,
+            )
             .await
             .map_err(|e| ChannelRecallError(format!("Failed to load transcript: {e}")))?;
 
         let transcript: Vec<TranscriptMessage> = messages
             .iter()
-            .map(|message| TranscriptMessage {
-                role: message.role.clone(),
-                sender: message.sender_name.clone(),
-                content: message.content.clone(),
-                timestamp: message.created_at.to_rfc3339(),
+            .map(|message| {
+                // Append saved attachment annotations from metadata if present
+                let content = if let Some(ref metadata_json) = message.metadata {
+                    if let Ok(metadata_value) =
+                        serde_json::from_str::<serde_json::Value>(metadata_json)
+                    {
+                        if let Some(annotation) =
+                            crate::agent::channel_attachments::annotation_from_metadata(
+                                &metadata_value,
+                            )
+                        {
+                            format!("{}\n{}", message.content, annotation)
+                        } else {
+                            message.content.clone()
+                        }
+                    } else {
+                        message.content.clone()
+                    }
+                } else {
+                    message.content.clone()
+                };
+                TranscriptMessage {
+                    role: message.role.clone(),
+                    sender: message.sender_name.clone(),
+                    content,
+                    timestamp: message.created_at.to_rfc3339(),
+                }
             })
             .collect();
 

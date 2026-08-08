@@ -1,13 +1,17 @@
-//! Send message to another agent through the communication graph.
+//! Assign a task to another agent through the communication graph.
+//!
+//! When called, creates a task in the target agent's task store (skipping
+//! `pending_approval` for agent-delegated tasks) and logs a system message
+//! in the link channel between the two agents. The calling agent's turn ends
+//! immediately — the result will be delivered when the target agent's cortex
+//! picks up and completes the task.
 
-use crate::conversation::ChannelStore;
+use crate::conversation::history::ConversationLogger;
 use crate::links::AgentLink;
-use crate::messaging::MessagingManager;
+use crate::tasks::TaskStore;
 use crate::tools::SkipFlag;
-use crate::{AgentId, InboundMessage, MessageContent, ProcessEvent};
 
 use arc_swap::ArcSwap;
-use chrono::Utc;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use schemars::JsonSchema;
@@ -15,34 +19,32 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use tokio::sync::broadcast;
 
-/// Tool for sending messages to other agents through the agent communication graph.
+/// Tool for delegating tasks to other agents through the agent communication graph.
 ///
 /// Resolves the target agent by ID or name, validates the link exists and permits
-/// messaging in this direction, constructs an `InboundMessage` with source "internal",
-/// and delivers via `MessagingManager::inject_message()`.
+/// this direction, creates a task in the target agent's task store, and logs the
+/// delegation in the link channel. The calling agent's turn ends after delegation.
 #[derive(Clone)]
 pub struct SendAgentMessageTool {
-    agent_id: AgentId,
-    agent_name: String,
-    channel_id: crate::ChannelId,
+    agent_id: crate::AgentId,
     links: Arc<ArcSwap<Vec<AgentLink>>>,
-    messaging_manager: Arc<MessagingManager>,
-    channel_store: ChannelStore,
-    event_tx: broadcast::Sender<ProcessEvent>,
     /// Map of known agent IDs to display names, for resolving targets.
     agent_names: Arc<HashMap<String, String>>,
-    /// Per-turn skip flag. When set after sending, the channel turn ends immediately
-    /// instead of looping back to the LLM (which would burn depth calling skip).
+    /// Global task store shared across all agents.
+    task_store: Arc<TaskStore>,
+    /// Per-agent conversation logger for writing link channel audit records.
+    conversation_logger: ConversationLogger,
+    /// Per-turn skip flag. When set after delegation, the channel turn ends immediately.
     skip_flag: Option<SkipFlag>,
-    /// Source of the originating channel's inbound message (e.g. "webchat", "discord").
-    /// Propagated through metadata so conclusion routing uses the correct adapter.
-    originating_source: Option<String>,
-    /// Channel that originated the current link conversation (if any).
-    /// Used for guardrails to prevent re-delegating to the upstream counterparty
-    /// instead of concluding back to them.
+    /// The originating channel (conversation_id) where the user request came from.
+    /// Set per-turn so task completion notifications route back to the right place.
     originating_channel: Option<String>,
+    working_memory: Option<Arc<crate::memory::WorkingMemoryStore>>,
+    /// Wake dispatcher for the receiving agent. Fired after task insert so
+    /// dormant-mode receivers wake up immediately instead of waiting for a
+    /// (non-existent) tick. No-op when None or when the receiver is active.
+    wake_tx: Option<crate::agent::wake::WakeSender>,
 }
 
 impl std::fmt::Debug for SendAgentMessageTool {
@@ -54,50 +56,68 @@ impl std::fmt::Debug for SendAgentMessageTool {
 }
 
 impl SendAgentMessageTool {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        agent_id: AgentId,
-        agent_name: String,
-        channel_id: crate::ChannelId,
+        agent_id: crate::AgentId,
         links: Arc<ArcSwap<Vec<AgentLink>>>,
-        messaging_manager: Arc<MessagingManager>,
-        channel_store: ChannelStore,
-        event_tx: broadcast::Sender<ProcessEvent>,
         agent_names: Arc<HashMap<String, String>>,
+        task_store: Arc<TaskStore>,
+        conversation_logger: ConversationLogger,
     ) -> Self {
         Self {
             agent_id,
-            agent_name,
-            channel_id,
             links,
-            messaging_manager,
-            channel_store,
-            event_tx,
             agent_names,
+            task_store,
+            conversation_logger,
             skip_flag: None,
-            originating_source: None,
             originating_channel: None,
+            working_memory: None,
+            wake_tx: None,
         }
     }
-}
 
-impl SendAgentMessageTool {
-    /// Set the per-turn skip flag so the channel turn ends after sending.
+    /// Attach the instance-wide wake dispatcher so dormant receivers get
+    /// woken immediately on delegation.
+    pub fn with_wake_tx(mut self, tx: crate::agent::wake::WakeSender) -> Self {
+        self.wake_tx = Some(tx);
+        self
+    }
+
+    /// Set the per-turn skip flag so the channel turn ends after delegation.
     pub fn with_skip_flag(mut self, flag: SkipFlag) -> Self {
         self.skip_flag = Some(flag);
         self
     }
 
-    /// Set the originating source (adapter name) for conclusion routing.
-    pub fn with_originating_source(mut self, source: String) -> Self {
-        self.originating_source = Some(source);
-        self
-    }
-
-    /// Set the direct originating channel for this turn.
+    /// Set the originating channel for this turn so task completion notifications
+    /// route back to the conversation where the user asked for the work.
     pub fn with_originating_channel(mut self, channel_id: String) -> Self {
         self.originating_channel = Some(channel_id);
         self
+    }
+
+    pub fn with_working_memory(mut self, store: Arc<crate::memory::WorkingMemoryStore>) -> Self {
+        self.working_memory = Some(store);
+        self
+    }
+
+    /// Resolve an agent target string to an agent ID.
+    /// Checks both IDs and display names (case-insensitive).
+    fn resolve_agent_id(&self, target: &str) -> Option<String> {
+        // Direct ID match
+        if self.agent_names.contains_key(target) {
+            return Some(target.to_string());
+        }
+
+        // Name match (case-insensitive)
+        let target_lower = target.to_lowercase();
+        for (agent_id, name) in self.agent_names.iter() {
+            if name.to_lowercase() == target_lower {
+                return Some(agent_id.clone());
+            }
+        }
+
+        None
     }
 }
 
@@ -111,7 +131,8 @@ pub struct SendAgentMessageError(String);
 pub struct SendAgentMessageArgs {
     /// Target agent ID or name.
     pub target: String,
-    /// The message content to send.
+    /// The task to assign. First sentence is used as the task title;
+    /// full content becomes the task description.
     pub message: String,
 }
 
@@ -120,7 +141,8 @@ pub struct SendAgentMessageArgs {
 pub struct SendAgentMessageOutput {
     pub success: bool,
     pub target_agent: String,
-    pub channel_id: String,
+    pub task_number: Option<i64>,
+    pub message: String,
 }
 
 impl Tool for SendAgentMessageTool {
@@ -143,7 +165,7 @@ impl Tool for SendAgentMessageTool {
                     },
                     "message": {
                         "type": "string",
-                        "description": "The message content to send to the target agent."
+                        "description": "The task to assign. First sentence becomes the title; full content is the description."
                     }
                 },
                 "required": ["target", "message"]
@@ -167,32 +189,6 @@ impl Tool for SendAgentMessageTool {
             ))
         })?;
 
-        // In link channels, responding to the current counterparty should use the reply tool
-        // so metadata and conclusion routing stay on the same conversation chain.
-        if self
-            .current_link_counterparty_id()
-            .as_deref()
-            .is_some_and(|counterparty| counterparty == target_agent_id)
-        {
-            return Err(SendAgentMessageError(
-                "you are already in a direct link conversation with this agent. Use reply to respond in the current link channel. Use send_agent_message to contact a different agent.".to_string(),
-            ));
-        }
-
-        // In nested link flows, if the target is the upstream counterparty
-        // from the parent link channel, the correct action is conclude_link.
-        // Re-sending to that agent creates parallel link threads with incorrect
-        // originating metadata.
-        if self
-            .upstream_counterparty_id()
-            .as_deref()
-            .is_some_and(|counterparty| counterparty == target_agent_id)
-        {
-            return Err(SendAgentMessageError(
-                "this target is the upstream counterparty for this link conversation. Use conclude_link to route the result back up the chain instead of send_agent_message.".to_string(),
-            ));
-        }
-
         // Look up the link between sending agent and target
         let links = self.links.load();
         let link = crate::links::find_link_between(&links, &self.agent_id, &target_agent_id)
@@ -201,12 +197,10 @@ impl Tool for SendAgentMessageTool {
                     "no communication link exists between you and agent '{}'.",
                     args.target
                 ))
-            })?
-            .clone();
+            })?;
 
         // Check direction: if the link is one_way, only from_agent can initiate
         let sending_agent_id = self.agent_id.as_ref();
-        let is_from_agent = link.from_agent_id == sending_agent_id;
         let is_to_agent = link.to_agent_id == sending_agent_id;
 
         if link.direction == crate::links::LinkDirection::OneWay && is_to_agent {
@@ -216,87 +210,11 @@ impl Tool for SendAgentMessageTool {
             )));
         }
 
-        // Determine the receiving agent and the relationship from sender's perspective
-        let receiving_agent_id = if is_from_agent {
+        let receiving_agent_id = if link.from_agent_id == sending_agent_id {
             &link.to_agent_id
         } else {
             &link.from_agent_id
         };
-
-        let target_agent_arc: AgentId = Arc::from(receiving_agent_id.as_str());
-        // Each agent gets its own side of the link channel
-        let receiver_channel = link.channel_id_for(receiving_agent_id);
-        let sender_channel = link.channel_id_for(sending_agent_id);
-
-        // Materialize the sender-side link channel immediately so both sides
-        // are visible in their channel lists even before the first reply.
-        let sender_channel_metadata: HashMap<String, serde_json::Value> = HashMap::new();
-        self.channel_store
-            .upsert(&sender_channel, &sender_channel_metadata);
-
-        // Construct the internal message targeting the receiver's link channel.
-        // originating_channel is always the current channel — the direct parent
-        // of this link conversation. Conclusions route one hop back, not to the root.
-        let mut metadata = HashMap::from([
-            ("from_agent_id".into(), serde_json::json!(sending_agent_id)),
-            ("link_kind".into(), serde_json::json!(link.kind.as_str())),
-            ("reply_to_agent".into(), serde_json::json!(sending_agent_id)),
-            (
-                "reply_to_channel".into(),
-                serde_json::json!(&sender_channel),
-            ),
-            (
-                "originating_channel".into(),
-                serde_json::json!(self.channel_id.as_ref()),
-            ),
-            (
-                "original_sent_message".into(),
-                serde_json::json!(&args.message),
-            ),
-        ]);
-        // Propagate the adapter name from the originating channel so conclusion
-        // routing can look up the correct messaging adapter (e.g. "webchat").
-        if let Some(source) = &self.originating_source {
-            metadata.insert("originating_source".into(), serde_json::json!(source));
-        }
-
-        let message = InboundMessage {
-            id: uuid::Uuid::new_v4().to_string(),
-            source: "internal".into(),
-            conversation_id: receiver_channel.clone(),
-            sender_id: sending_agent_id.to_string(),
-            agent_id: Some(target_agent_arc),
-            content: MessageContent::Text(args.message),
-            timestamp: Utc::now(),
-            metadata,
-            formatted_author: Some(format!("[{}]", self.agent_name)),
-        };
-
-        // Inject into the messaging pipeline
-        self.messaging_manager
-            .inject_message(message)
-            .await
-            .map_err(|error| {
-                SendAgentMessageError(format!("failed to deliver message: {error}"))
-            })?;
-
-        // End the current turn immediately. Delegating to another agent means
-        // this agent is done — without this, the LLM loops calling skip and
-        // burns through its depth budget while waiting for a response that
-        // arrives asynchronously.
-        if let Some(ref flag) = self.skip_flag {
-            flag.store(true, Ordering::Relaxed);
-        }
-
-        // Emit process event for dashboard visibility
-        self.event_tx
-            .send(ProcessEvent::AgentMessageSent {
-                from_agent_id: self.agent_id.clone(),
-                to_agent_id: Arc::from(receiving_agent_id.as_str()),
-                link_id: receiver_channel.clone(),
-                channel_id: Arc::from(receiver_channel.as_str()),
-            })
-            .ok();
 
         let target_display = self
             .agent_names
@@ -304,67 +222,225 @@ impl Tool for SendAgentMessageTool {
             .cloned()
             .unwrap_or_else(|| receiving_agent_id.to_string());
 
+        // Extract title from the message: first sentence or first 120 chars.
+        let title = extract_task_title(&args.message);
+
+        // Build task metadata with delegation context.
+        let metadata = serde_json::json!({
+            "delegated_by": sending_agent_id,
+            "delegating_agent_id": sending_agent_id,
+            "originating_channel": self.originating_channel,
+        });
+
+        // Create the task in the global store with cross-agent assignment.
+        // Agent-delegated tasks skip pending_approval and go straight to ready.
+        let task = self
+            .task_store
+            .create(crate::tasks::CreateTaskInput {
+                owner_agent_id: sending_agent_id.to_string(),
+                assigned_agent_id: receiving_agent_id.to_string(),
+                title: title.clone(),
+                description: Some(args.message.clone()),
+                status: crate::tasks::TaskStatus::Ready,
+                priority: crate::tasks::TaskPriority::Medium,
+                subtasks: Vec::new(),
+                metadata,
+                source_memory_id: None,
+                created_by: format!("agent:{}", sending_agent_id),
+            })
+            .await
+            .map_err(|error| {
+                SendAgentMessageError(format!(
+                    "failed to create task on agent '{}': {error}",
+                    target_display
+                ))
+            })?;
+
+        let task_number = task.task_number;
+
+        // Wake the receiving agent. No-op when the receiver is in active mode
+        // (its ready-task loop will pick the task up on its own); critical when
+        // the receiver is dormant (no loop runs).
+        if let Some(tx) = self.wake_tx.as_ref() {
+            let receiver: crate::AgentId = std::sync::Arc::from(receiving_agent_id.as_str());
+            crate::agent::wake::fire_wake(tx, &receiver);
+        }
+
+        // Log delegation record in the link channel (system message).
+        let sender_display = self
+            .agent_names
+            .get(sending_agent_id)
+            .cloned()
+            .unwrap_or_else(|| sending_agent_id.to_string());
+        let link_channel_id = link.channel_id_for(sending_agent_id);
+
+        self.conversation_logger.log_system_message(
+            &link_channel_id,
+            &format!(
+                "{sender_display} assigned task #{task_number} to {target_display}: \"{title}\""
+            ),
+        );
+
+        // Also log to the receiver's side of the link channel.
+        let receiver_link_channel_id = link.channel_id_for(receiving_agent_id);
+        self.conversation_logger.log_system_message(
+            &receiver_link_channel_id,
+            &format!(
+                "{sender_display} assigned task #{task_number} to {target_display}: \"{title}\""
+            ),
+        );
+
+        // End the current turn immediately after delegation.
+        if let Some(ref flag) = self.skip_flag {
+            flag.store(true, Ordering::Relaxed);
+        }
+
         tracing::info!(
             from = %self.agent_id,
             to = %receiving_agent_id,
-            receiver_channel = %receiver_channel,
-            sender_channel = %sender_channel,
-            "agent message sent"
+            task_number,
+            "task delegated to target agent"
         );
+
+        if let Some(working_memory) = &self.working_memory {
+            working_memory
+                .emit(
+                    crate::memory::WorkingMemoryEventType::Outcome,
+                    format!("Delegated task #{task_number} to {target_display}"),
+                )
+                .importance(0.7)
+                .record();
+        }
 
         Ok(SendAgentMessageOutput {
             success: true,
             target_agent: target_display,
-            channel_id: sender_channel,
+            task_number: Some(task_number),
+            message: format!(
+                "Task #{task_number} assigned. The target agent's cortex will pick it up and execute it autonomously. \
+                 You will be notified when it completes."
+            ),
         })
     }
 }
 
-impl SendAgentMessageTool {
-    /// If this tool is running in a link channel, return the peer agent ID.
-    fn current_link_counterparty_id(&self) -> Option<String> {
-        self.channel_id
-            .as_ref()
-            .strip_prefix("link:")
-            .and_then(|rest| {
-                let (self_id, peer_id) = rest.split_once(':')?;
-                if self_id == self.agent_id.as_ref() {
-                    Some(peer_id.to_string())
-                } else {
-                    None
+/// Extract a task title from the message content.
+/// Uses the first sentence (up to first `.`, `!`, or `?`) or truncates at 120 chars.
+fn extract_task_title(message: &str) -> String {
+    let first_line = message.lines().next().unwrap_or(message);
+
+    // Find the first sentence-ending punctuation
+    if let Some(position) = first_line.find(['.', '!', '?']) {
+        let title = &first_line[..=position];
+        if title.len() <= 120 {
+            return title.trim().to_string();
+        }
+    }
+
+    // Fall back to first 120 chars
+    if first_line.len() <= 120 {
+        first_line.trim().to_string()
+    } else {
+        let boundary = first_line.floor_char_boundary(120);
+        format!("{}...", first_line[..boundary].trim())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::links::{AgentLink, LinkDirection, LinkKind};
+    use crate::memory::working::WorkingMemoryEvent;
+    use crate::memory::{WorkingMemoryEventType, WorkingMemoryStore};
+    use crate::tasks::store::setup_test_store;
+    use arc_swap::ArcSwap;
+    use chrono_tz::Tz;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    async fn wait_for_single_event(store: &WorkingMemoryStore) -> WorkingMemoryEvent {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let events = store
+                    .get_recent_events(10, 0.0)
+                    .await
+                    .expect("working memory query");
+                if let Some(event) = events.into_iter().next() {
+                    break event;
                 }
-            })
-    }
-
-    /// If this link conversation was initiated from another link channel,
-    /// return that upstream link's counterparty agent ID.
-    fn upstream_counterparty_id(&self) -> Option<String> {
-        let originating = self.originating_channel.as_deref()?;
-        let rest = originating.strip_prefix("link:")?;
-        let (self_id, counterparty_id) = rest.split_once(':')?;
-        if self_id == self.agent_id.as_ref() {
-            Some(counterparty_id.to_string())
-        } else {
-            None
-        }
-    }
-
-    /// Resolve an agent target string to an agent ID.
-    /// Checks both IDs and display names.
-    fn resolve_agent_id(&self, target: &str) -> Option<String> {
-        // Direct ID match
-        if self.agent_names.contains_key(target) {
-            return Some(target.to_string());
-        }
-
-        // Name match (case-insensitive)
-        let target_lower = target.to_lowercase();
-        for (agent_id, name) in self.agent_names.iter() {
-            if name.to_lowercase() == target_lower {
-                return Some(agent_id.clone());
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }
+        })
+        .await
+        .expect("timed out waiting for working memory event")
+    }
 
-        None
+    #[tokio::test]
+    async fn send_agent_message_emits_outcome_event() {
+        let task_store = setup_test_store().await;
+        let pool = task_store.pool().clone();
+        sqlx::query(
+            "CREATE TABLE conversation_messages (
+                id TEXT PRIMARY KEY,
+                channel_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                sender_name TEXT,
+                sender_id TEXT,
+                content TEXT NOT NULL,
+                metadata TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("conversation messages schema should be created");
+        let task_store = Arc::new(task_store);
+        let conversation_logger = ConversationLogger::new(pool.clone());
+        let working_memory_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite connect");
+        sqlx::migrate!("./migrations")
+            .run(&working_memory_pool)
+            .await
+            .expect("working memory migrations");
+        let working_memory = WorkingMemoryStore::new(working_memory_pool, Tz::UTC);
+
+        let links = Arc::new(ArcSwap::from_pointee(vec![AgentLink {
+            from_agent_id: "planner".to_string(),
+            to_agent_id: "executor".to_string(),
+            direction: LinkDirection::TwoWay,
+            kind: LinkKind::Peer,
+        }]));
+        let agent_names = Arc::new(HashMap::from([
+            ("planner".to_string(), "Planner".to_string()),
+            ("executor".to_string(), "Executor".to_string()),
+        ]));
+
+        let tool = SendAgentMessageTool::new(
+            crate::AgentId::from("planner"),
+            links,
+            agent_names,
+            task_store,
+            conversation_logger,
+        )
+        .with_working_memory(working_memory.clone());
+
+        let output = tool
+            .call(SendAgentMessageArgs {
+                target: "executor".to_string(),
+                message: "Implement the working-memory renderer. Include tests.".to_string(),
+            })
+            .await
+            .expect("send agent message should succeed");
+
+        assert!(output.success);
+
+        let event = wait_for_single_event(&working_memory).await;
+        assert_eq!(event.event_type, WorkingMemoryEventType::Outcome);
+        assert_eq!(event.summary, "Delegated task #1 to Executor");
     }
 }

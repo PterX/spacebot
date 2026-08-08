@@ -16,19 +16,19 @@ use std::sync::Arc;
 use zip::CompressionMethod;
 use zip::write::SimpleFileOptions;
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct HealthResponse {
     status: &'static str,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct IdleResponse {
     idle: bool,
     active_workers: usize,
     active_branches: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct StatusResponse {
     status: &'static str,
     version: &'static str,
@@ -36,12 +36,28 @@ pub(super) struct StatusResponse {
     uptime_seconds: u64,
 }
 
+#[utoipa::path(
+    get,
+    path = "/health",
+    responses(
+        (status = 200, body = HealthResponse),
+    ),
+    tag = "system",
+)]
 pub(super) async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
 
 /// Reports whether the instance is idle (no active workers or branches).
 /// Used by the platform to gate rolling updates.
+#[utoipa::path(
+    get,
+    path = "/idle",
+    responses(
+        (status = 200, body = IdleResponse),
+    ),
+    tag = "system",
+)]
 pub(super) async fn idle(State(state): State<Arc<ApiState>>) -> Json<IdleResponse> {
     let blocks = state.channel_status_blocks.read().await;
     let mut total_workers = 0;
@@ -60,6 +76,14 @@ pub(super) async fn idle(State(state): State<Arc<ApiState>>) -> Json<IdleRespons
     })
 }
 
+#[utoipa::path(
+    get,
+    path = "/status",
+    responses(
+        (status = 200, body = StatusResponse),
+    ),
+    tag = "system",
+)]
 pub(super) async fn status(State(state): State<Arc<ApiState>>) -> Json<StatusResponse> {
     let uptime = state.started_at.elapsed();
     Json(StatusResponse {
@@ -71,6 +95,14 @@ pub(super) async fn status(State(state): State<Arc<ApiState>>) -> Json<StatusRes
 }
 
 /// SSE endpoint streaming all agent events to connected clients.
+#[utoipa::path(
+    get,
+    path = "/events",
+    responses(
+        (status = 200, description = "SSE event stream", content_type = "text/event-stream"),
+    ),
+    tag = "system",
+)]
 pub(super) async fn events_sse(
     State(state): State<Arc<ApiState>>,
 ) -> Sse<impl Stream<Item = Result<axum::response::sse::Event, Infallible>>> {
@@ -84,9 +116,11 @@ pub(super) async fn events_sse(
                         let event_type = match &event {
                             ApiEvent::InboundMessage { .. } => "inbound_message",
                             ApiEvent::OutboundMessage { .. } => "outbound_message",
+                            ApiEvent::OutboundMessageDelta { .. } => "outbound_message_delta",
                             ApiEvent::TypingState { .. } => "typing_state",
                             ApiEvent::WorkerStarted { .. } => "worker_started",
                             ApiEvent::WorkerStatusUpdate { .. } => "worker_status",
+                            ApiEvent::WorkerIdle { .. } => "worker_idle",
                             ApiEvent::WorkerCompleted { .. } => "worker_completed",
                             ApiEvent::BranchStarted { .. } => "branch_started",
                             ApiEvent::BranchCompleted { .. } => "branch_completed",
@@ -95,19 +129,33 @@ pub(super) async fn events_sse(
                             ApiEvent::ConfigReloaded => "config_reloaded",
                             ApiEvent::AgentMessageSent { .. } => "agent_message_sent",
                             ApiEvent::AgentMessageReceived { .. } => "agent_message_received",
+                            ApiEvent::TaskUpdated { .. } => "task_updated",
+                            ApiEvent::OpenCodePartUpdated { .. } => "opencode_part_updated",
+                            ApiEvent::WorkerText { .. } => "worker_text",
+                            ApiEvent::CortexChatMessage { .. } => "cortex_chat_message",
+                            ApiEvent::NotificationCreated { .. } => "notification_created",
+                            ApiEvent::NotificationUpdated { .. } => "notification_updated",
+                            ApiEvent::ToolOutput { .. } => "tool_output",
                         };
                         yield Ok(axum::response::sse::Event::default()
                             .event(event_type)
                             .data(json));
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
-                    tracing::debug!(count, "SSE client lagged");
-                    yield Ok(axum::response::sse::Event::default()
-                        .event("lagged")
-                        .data(format!("{{\"skipped\":{count}}}")));
+                Err(error) => {
+                    match crate::classify_broadcast_recv_result::<ApiEvent>(Err(error)) {
+                        crate::BroadcastRecvResult::Lagged(count) => {
+                            tracing::debug!(count, "SSE client lagged");
+                            yield Ok(axum::response::sse::Event::default()
+                                .event("lagged")
+                                .data(format!("{{\"skipped\":{count}}}")));
+                        }
+                        crate::BroadcastRecvResult::Closed => break,
+                        crate::BroadcastRecvResult::Event(_) => unreachable!(
+                            "classifying an Err recv result should never produce Event"
+                        ),
+                    }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     };
@@ -119,13 +167,22 @@ pub(super) async fn events_sse(
     )
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct StorageStatus {
     used_bytes: u64,
     total_bytes: u64,
     available_bytes: u64,
 }
 
+#[utoipa::path(
+    get,
+    path = "/system/storage",
+    responses(
+        (status = 200, body = StorageStatus),
+        (status = 503, description = "No runtime config available"),
+    ),
+    tag = "system",
+)]
 pub(super) async fn storage_status(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<StorageStatus>, (axum::http::StatusCode, String)> {
@@ -214,6 +271,15 @@ fn directory_size_bytes(root: &Path) -> anyhow::Result<u64> {
     Ok(total)
 }
 
+#[utoipa::path(
+    get,
+    path = "/system/backup/export",
+    responses(
+        (status = 200, description = "Backup archive", content_type = "application/zip"),
+        (status = 503, description = "No runtime config available"),
+    ),
+    tag = "system",
+)]
 pub(super) async fn backup_export(
     State(state): State<Arc<ApiState>>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, String)> {
@@ -254,6 +320,17 @@ pub(super) async fn backup_export(
     Ok((headers, archive_bytes))
 }
 
+#[utoipa::path(
+    post,
+    path = "/system/backup/restore",
+    request_body = Vec<u8>,
+    responses(
+        (status = 200, description = "Backup restored successfully"),
+        (status = 400, description = "Empty payload"),
+        (status = 503, description = "No runtime config available"),
+    ),
+    tag = "system",
+)]
 pub(super) async fn backup_restore(
     State(state): State<Arc<ApiState>>,
     body: Bytes,

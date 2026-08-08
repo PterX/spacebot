@@ -4,14 +4,15 @@ use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use std::sync::Arc;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
 pub(super) struct CronQuery {
     agent_id: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
 pub(super) struct CronExecutionsQuery {
     agent_id: String,
     #[serde(default)]
@@ -24,11 +25,13 @@ fn default_cron_executions_limit() -> i64 {
     50
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, utoipa::ToSchema)]
 pub(super) struct CreateCronRequest {
     agent_id: String,
     id: String,
     prompt: String,
+    #[serde(default)]
+    cron_expr: Option<String>,
     #[serde(default = "default_interval")]
     interval_secs: u64,
     delivery_target: String,
@@ -52,58 +55,75 @@ fn default_enabled() -> bool {
     true
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub(super) struct DeleteCronRequest {
     agent_id: String,
     cron_id: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub(super) struct TriggerCronRequest {
     agent_id: String,
     cron_id: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub(super) struct ToggleCronRequest {
     agent_id: String,
     cron_id: String,
     enabled: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct CronJobWithStats {
     id: String,
     prompt: String,
+    cron_expr: Option<String>,
     interval_secs: u64,
     delivery_target: String,
     enabled: bool,
     run_once: bool,
     active_hours: Option<(u8, u8)>,
     timeout_secs: Option<u64>,
-    success_count: u64,
-    failure_count: u64,
+    execution_success_count: u64,
+    execution_failure_count: u64,
+    delivery_success_count: u64,
+    delivery_failure_count: u64,
+    delivery_skipped_count: u64,
     last_executed_at: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct CronListResponse {
     jobs: Vec<CronJobWithStats>,
     timezone: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct CronExecutionsResponse {
     executions: Vec<crate::cron::CronExecutionEntry>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct CronActionResponse {
     success: bool,
     message: String,
 }
 
 /// List all cron jobs for an agent with execution statistics.
+#[utoipa::path(
+    get,
+    path = "/agents/cron",
+    params(
+        ("agent_id" = String, Query, description = "Agent ID"),
+    ),
+    responses(
+        (status = 200, body = CronListResponse),
+        (status = 404, description = "Agent not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "cron",
+)]
 pub(super) async fn list_cron_jobs(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<CronQuery>,
@@ -130,14 +150,18 @@ pub(super) async fn list_cron_jobs(
         jobs.push(CronJobWithStats {
             id: config.id,
             prompt: config.prompt,
+            cron_expr: config.cron_expr,
             interval_secs: config.interval_secs,
             delivery_target: config.delivery_target,
             enabled: config.enabled,
             run_once: config.run_once,
             active_hours: config.active_hours,
             timeout_secs: config.timeout_secs,
-            success_count: stats.success_count,
-            failure_count: stats.failure_count,
+            execution_success_count: stats.execution_success_count,
+            execution_failure_count: stats.execution_failure_count,
+            delivery_success_count: stats.delivery_success_count,
+            delivery_failure_count: stats.delivery_failure_count,
+            delivery_skipped_count: stats.delivery_skipped_count,
             last_executed_at: stats.last_executed_at,
         });
     }
@@ -149,6 +173,21 @@ pub(super) async fn list_cron_jobs(
 }
 
 /// Get execution history for cron jobs.
+#[utoipa::path(
+    get,
+    path = "/agents/cron/executions",
+    params(
+        ("agent_id" = String, Query, description = "Agent ID"),
+        ("cron_id" = Option<String>, Query, description = "Cron job ID (optional)"),
+        ("limit" = i64, Query, description = "Maximum number of executions to return (default 50)"),
+    ),
+    responses(
+        (status = 200, body = CronExecutionsResponse),
+        (status = 404, description = "Agent not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "cron",
+)]
 pub(super) async fn cron_executions(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<CronExecutionsQuery>,
@@ -177,18 +216,148 @@ pub(super) async fn cron_executions(
     Ok(Json(CronExecutionsResponse { executions }))
 }
 
+const MIN_CRON_INTERVAL_SECS: u64 = 60;
+const MAX_CRON_PROMPT_LENGTH: usize = 10_000;
+
+fn validate_cron_request(request: &CreateCronRequest) -> Result<(), (StatusCode, String)> {
+    if request.id.is_empty()
+        || request.id.len() > 50
+        || !request
+            .id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "id must be 1-50 alphanumeric/hyphen/underscore characters".into(),
+        ));
+    }
+
+    let cron_expr = request
+        .cron_expr
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if cron_expr.is_none() && request.interval_secs < MIN_CRON_INTERVAL_SECS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "interval_secs must be at least {MIN_CRON_INTERVAL_SECS} (got {})",
+                request.interval_secs
+            ),
+        ));
+    }
+
+    if let Some(expr) = cron_expr {
+        let field_count = expr.split_whitespace().count();
+        if field_count != 5 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("cron_expr must have exactly 5 fields (got {field_count}): '{expr}'"),
+            ));
+        }
+        // The `cron` crate uses 7-field expressions (sec min hour dom month dow year).
+        // Users write standard 5-field cron (min hour dom month dow). Expand before parsing.
+        let expanded = format!("0 {expr} *");
+        cron::Schedule::from_str(&expanded).map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid cron_expr '{expr}': {error}"),
+            )
+        })?;
+    }
+
+    if request.prompt.len() > MAX_CRON_PROMPT_LENGTH {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "prompt exceeds maximum length of {MAX_CRON_PROMPT_LENGTH} characters (got {})",
+                request.prompt.len()
+            ),
+        ));
+    }
+
+    if !request.delivery_target.contains(':') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "delivery_target must be in 'adapter:target' format".into(),
+        ));
+    }
+
+    if let Some(start) = request.active_start_hour
+        && start > 23
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "active_start_hour must be 0-23".into(),
+        ));
+    }
+    if let Some(end) = request.active_end_hour
+        && end > 23
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "active_end_hour must be 0-23".into(),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Create or update a cron job.
+#[utoipa::path(
+    post,
+    path = "/agents/cron",
+    request_body = CreateCronRequest,
+    responses(
+        (status = 200, body = CronActionResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Agent not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "cron",
+)]
 pub(super) async fn create_or_update_cron(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<CreateCronRequest>,
-) -> Result<Json<CronActionResponse>, StatusCode> {
+) -> Result<Json<CronActionResponse>, (StatusCode, Json<CronActionResponse>)> {
+    if let Err((status, message)) = validate_cron_request(&request) {
+        tracing::warn!(agent_id = %request.agent_id, cron_id = %request.id, %message, "cron validation failed");
+        return Err((
+            status,
+            Json(CronActionResponse {
+                success: false,
+                message,
+            }),
+        ));
+    }
+
     let stores = state.cron_stores.load();
     let schedulers = state.cron_schedulers.load();
 
-    let store = stores.get(&request.agent_id).ok_or(StatusCode::NOT_FOUND)?;
-    let scheduler = schedulers
-        .get(&request.agent_id)
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let cron_err = |status: StatusCode, message: String| {
+        (
+            status,
+            Json(CronActionResponse {
+                success: false,
+                message,
+            }),
+        )
+    };
+
+    let store = stores.get(&request.agent_id).ok_or_else(|| {
+        cron_err(
+            StatusCode::NOT_FOUND,
+            format!("agent '{}' not found", request.agent_id),
+        )
+    })?;
+    let scheduler = schedulers.get(&request.agent_id).ok_or_else(|| {
+        cron_err(
+            StatusCode::NOT_FOUND,
+            format!("agent '{}' not found", request.agent_id),
+        )
+    })?;
 
     let active_hours = match (request.active_start_hour, request.active_end_hour) {
         (Some(start), Some(end)) => Some((start, end)),
@@ -198,22 +367,29 @@ pub(super) async fn create_or_update_cron(
     let config = crate::cron::CronConfig {
         id: request.id.clone(),
         prompt: request.prompt,
+        cron_expr: request
+            .cron_expr
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
         interval_secs: request.interval_secs,
         delivery_target: request.delivery_target,
         active_hours,
         enabled: request.enabled,
         run_once: request.run_once,
+        next_run_at: None,
         timeout_secs: request.timeout_secs,
     };
 
     store.save(&config).await.map_err(|error| {
         tracing::warn!(%error, agent_id = %request.agent_id, cron_id = %request.id, "failed to save cron job");
-        StatusCode::INTERNAL_SERVER_ERROR
+        cron_err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to save: {error}"))
     })?;
 
     scheduler.register(config).await.map_err(|error| {
         tracing::warn!(%error, agent_id = %request.agent_id, cron_id = %request.id, "failed to register cron job");
-        StatusCode::INTERNAL_SERVER_ERROR
+        cron_err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to register: {error}"))
     })?;
 
     Ok(Json(CronActionResponse {
@@ -223,6 +399,20 @@ pub(super) async fn create_or_update_cron(
 }
 
 /// Delete a cron job.
+#[utoipa::path(
+    delete,
+    path = "/agents/cron",
+    params(
+        ("agent_id" = String, Query, description = "Agent ID"),
+        ("cron_id" = String, Query, description = "Cron job ID to delete"),
+    ),
+    responses(
+        (status = 200, body = CronActionResponse),
+        (status = 404, description = "Agent not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "cron",
+)]
 pub(super) async fn delete_cron(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<DeleteCronRequest>,
@@ -249,6 +439,17 @@ pub(super) async fn delete_cron(
 }
 
 /// Trigger a cron job immediately.
+#[utoipa::path(
+    post,
+    path = "/agents/cron/trigger",
+    request_body = TriggerCronRequest,
+    responses(
+        (status = 200, body = CronActionResponse),
+        (status = 404, description = "Agent not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "cron",
+)]
 pub(super) async fn trigger_cron(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<TriggerCronRequest>,
@@ -270,6 +471,17 @@ pub(super) async fn trigger_cron(
 }
 
 /// Enable or disable a cron job.
+#[utoipa::path(
+    put,
+    path = "/agents/cron/toggle",
+    request_body = ToggleCronRequest,
+    responses(
+        (status = 200, body = CronActionResponse),
+        (status = 404, description = "Agent not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "cron",
+)]
 pub(super) async fn toggle_cron(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<ToggleCronRequest>,

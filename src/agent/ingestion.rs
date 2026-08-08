@@ -9,20 +9,25 @@
 //! skipped on the next run.
 
 use crate::AgentDeps;
+use crate::ProcessId;
 use crate::ProcessType;
 use crate::config::IngestionConfig;
+use crate::hooks::SpacebotHook;
 use crate::llm::SpacebotModel;
+use crate::tools::MemoryPersistenceContractState;
 
 use anyhow::Context as _;
 use rig::agent::AgentBuilder;
-use rig::completion::{CompletionModel, Prompt};
+use rig::completion::{CompletionModel, PromptError};
 use rig::tool::server::ToolServerHandle;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
+use uuid::Uuid;
 
 /// Spawn the ingestion polling loop for an agent.
 ///
@@ -262,6 +267,15 @@ async fn process_file(
     let final_status = if had_failure { "failed" } else { "completed" };
     complete_ingestion_file(&deps.sqlite_pool, &hash, final_status).await?;
 
+    #[cfg(feature = "metrics")]
+    {
+        let result = if had_failure { "failure" } else { "success" };
+        crate::telemetry::Metrics::global()
+            .ingestion_files_processed_total
+            .with_label_values(&[&deps.agent_id, result])
+            .inc();
+    }
+
     if had_failure {
         // Keep the source file and progress rows so the next poll cycle can
         // resume from where it left off. Deleting on failure would cause data
@@ -460,23 +474,41 @@ async fn process_chunk(
     deps: &AgentDeps,
 ) -> anyhow::Result<()> {
     let prompt_engine = deps.runtime_config.prompts.load();
-    let ingestion_prompt = prompt_engine.render_static("ingestion")?;
-
     let routing = deps.runtime_config.routing.load();
     let model_name = routing.resolve(ProcessType::Branch, None).to_string();
+    let tool_use_enforcement = deps.runtime_config.tool_use_enforcement.load();
+    let ingestion_prompt = prompt_engine.maybe_append_tool_use_enforcement(
+        prompt_engine.render_static("ingestion")?,
+        tool_use_enforcement.as_ref(),
+        &model_name,
+    )?;
     let model = SpacebotModel::make(&deps.llm_manager, &model_name)
         .with_context(&*deps.agent_id, "branch")
+        .with_worker_type("ingestion")
         .with_routing((**routing).clone());
 
     let conversation_logger =
         crate::conversation::history::ConversationLogger::new(deps.sqlite_pool.clone());
     let channel_store = crate::conversation::ChannelStore::new(deps.sqlite_pool.clone());
+    let contract_state = Arc::new(MemoryPersistenceContractState::default());
     let tool_server: ToolServerHandle = crate::tools::create_branch_tool_server(
+        None,
+        deps.agent_id.clone(),
+        deps.task_store.clone(),
         deps.memory_search.clone(),
+        deps.runtime_config.clone(),
+        deps.memory_event_tx.clone(),
         conversation_logger,
         channel_store,
         crate::conversation::ProcessRunLogger::new(deps.sqlite_pool.clone()),
-        &deps.agent_id,
+        crate::tools::BranchToolProfile::MemoryPersistence {
+            contract_state: contract_state.clone(),
+            working_memory: Some(deps.working_memory.clone()),
+            channel_id: None,
+        },
+        deps.api_state.clone(),
+        deps.wiki_store.clone(),
+        deps.sandbox.clone(),
     );
 
     let agent = AgentBuilder::new(model)
@@ -485,11 +517,38 @@ async fn process_chunk(
         .tool_server_handle(tool_server)
         .build();
 
+    let hook = SpacebotHook::new(
+        deps.agent_id.clone(),
+        ProcessId::Branch(Uuid::new_v4()),
+        ProcessType::Branch,
+        None,
+        deps.event_tx.clone(),
+    );
+    let hook = hook.with_memory_persistence_contract(contract_state.clone());
+
     let user_prompt =
         prompt_engine.render_system_ingestion_chunk(filename, chunk_number, total_chunks, chunk)?;
 
     let mut history = Vec::new();
-    match agent.prompt(&user_prompt).with_history(&mut history).await {
+    let result = hook.prompt_once(&agent, &mut history, &user_prompt).await;
+    classify_chunk_prompt_result(result, filename, chunk_number, total_chunks)?;
+
+    if !contract_state.has_terminal_outcome() {
+        return Err(anyhow::anyhow!(
+            "ingestion chunk {chunk_number}/{total_chunks} for {filename} completed without memory_persistence_complete signal"
+        ));
+    }
+
+    Ok(())
+}
+
+fn classify_chunk_prompt_result(
+    result: std::result::Result<String, PromptError>,
+    filename: &str,
+    chunk_number: usize,
+    total_chunks: usize,
+) -> anyhow::Result<()> {
+    match result {
         Ok(response) => {
             tracing::debug!(
                 file = %filename,
@@ -497,20 +556,20 @@ async fn process_chunk(
                 response = %response.chars().take(200).collect::<String>(),
                 "chunk processed"
             );
+            Ok(())
         }
-        Err(rig::completion::PromptError::MaxTurnsError { .. }) => {
+        Err(PromptError::MaxTurnsError { .. }) => {
             tracing::warn!(
                 file = %filename,
                 chunk = %format!("{chunk_number}/{total_chunks}"),
                 "chunk processing hit max turns"
             );
+            Err(anyhow::anyhow!(
+                "chunk processing hit max turns for {filename} ({chunk_number}/{total_chunks})"
+            ))
         }
-        Err(error) => {
-            return Err(error.into());
-        }
+        Err(error) => Err(error.into()),
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -614,6 +673,24 @@ mod tests {
         assert!(
             !had_failure,
             "had_failure must stay false when all chunks succeed"
+        );
+    }
+
+    #[test]
+    fn test_max_turns_classified_as_chunk_failure() {
+        let result = classify_chunk_prompt_result(
+            Err(PromptError::MaxTurnsError {
+                max_turns: 10,
+                chat_history: Box::new(Vec::new()),
+                prompt: Box::new(rig::message::Message::from("chunk prompt")),
+            }),
+            "notes.txt",
+            1,
+            3,
+        );
+        assert!(
+            result.is_err(),
+            "max turns must be treated as chunk failure for retry"
         );
     }
 }

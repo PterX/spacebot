@@ -29,6 +29,9 @@ pub enum Error {
     #[error(transparent)]
     Settings(Box<SettingsError>),
 
+    #[error(transparent)]
+    Wiki(Box<WikiError>),
+
     #[error("database error: {0}")]
     Sqlx(#[from] sqlx::Error),
 
@@ -72,6 +75,11 @@ impl From<SecretsError> for Error {
 impl From<SettingsError> for Error {
     fn from(e: SettingsError) -> Self {
         Error::Settings(Box::new(e))
+    }
+}
+impl From<WikiError> for Error {
+    fn from(e: WikiError) -> Self {
+        Error::Wiki(Box::new(e))
     }
 }
 
@@ -187,6 +195,14 @@ pub enum AgentError {
     #[error("max concurrent workers ({max}) reached for channel {channel_id}")]
     WorkerLimitReached { channel_id: String, max: usize },
 
+    #[error(
+        "duplicate worker task on channel {channel_id}: worker {existing_worker_id} is already running this task"
+    )]
+    DuplicateWorkerTask {
+        channel_id: String,
+        existing_worker_id: String,
+    },
+
     #[error("worker state transition failed: {0}")]
     InvalidStateTransition(String),
 
@@ -212,8 +228,11 @@ pub enum SecretsError {
     #[error("secret not found: {key}")]
     NotFound { key: String },
 
-    #[error("invalid key format")]
+    #[error("invalid master key")]
     InvalidKey,
+
+    #[error("secret store is locked — unlock with master key first")]
+    StoreLocked,
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),
@@ -233,4 +252,23 @@ pub enum SettingsError {
 
     #[error("settings error: {0}")]
     Other(String),
+}
+
+/// Wiki storage and edit errors.
+#[derive(Debug, thiserror::Error)]
+pub enum WikiError {
+    #[error("wiki page '{slug}' not found")]
+    NotFound { slug: String },
+
+    #[error("wiki page version {version} not found for '{slug}'")]
+    VersionNotFound { slug: String, version: i64 },
+
+    #[error("wiki edit failed: {0}")]
+    EditFailed(String),
+
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
 }

@@ -10,8 +10,29 @@
 use anyhow::Context as _;
 use std::sync::Arc;
 
+/// Set up the secrets store thread-local so `secret:` references in config.toml
+/// resolve correctly. Mirrors the bootstrap logic in main.rs.
+fn bootstrap_secrets_for_config() {
+    let instance_dir = spacebot::config::Config::default_instance_dir();
+    let secrets_path = instance_dir.join("data").join("secrets.redb");
+    if !secrets_path.exists() {
+        return;
+    }
+    if let Ok(store) = spacebot::secrets::store::SecretsStore::new(&secrets_path) {
+        let store = Arc::new(store);
+        if store.is_encrypted() {
+            let keystore = spacebot::secrets::keystore::platform_keystore();
+            if let Some(key) = keystore.load_key("instance").ok().flatten() {
+                let _ = store.unlock(&key);
+            }
+        }
+        spacebot::config::set_resolve_secrets_store(store);
+    }
+}
+
 /// Bootstrap AgentDeps from the real ~/.spacebot config (same as bulletin test).
 async fn bootstrap_deps() -> anyhow::Result<(spacebot::AgentDeps, spacebot::config::Config)> {
+    bootstrap_secrets_for_config();
     let config =
         spacebot::config::Config::load().context("failed to load ~/.spacebot/config.toml")?;
 
@@ -49,6 +70,7 @@ async fn bootstrap_deps() -> anyhow::Result<(spacebot::AgentDeps, spacebot::conf
         embedding_table,
         embedding_model,
     ));
+    let task_store = Arc::new(spacebot::tasks::TaskStore::new(db.sqlite.clone()));
 
     let identity = spacebot::identity::Identity::load(&agent_config.workspace).await;
     let prompts =
@@ -65,17 +87,24 @@ async fn bootstrap_deps() -> anyhow::Result<(spacebot::AgentDeps, spacebot::conf
         skills,
     ));
 
-    let (event_tx, _) = tokio::sync::broadcast::channel(16);
+    let process_event_buses = spacebot::create_process_event_buses_with_capacity(16, 32, 1024);
+    let event_tx = process_event_buses.control;
+    let memory_event_tx = process_event_buses.memory;
+    let tool_output_tx = process_event_buses.tool_output;
 
     let agent_id: spacebot::AgentId = Arc::from(agent_config.id.as_str());
     let mcp_manager = Arc::new(spacebot::mcp::McpManager::new(agent_config.mcp.clone()));
 
+    let sandbox_config = Arc::new(arc_swap::ArcSwap::from_pointee(
+        agent_config.sandbox.clone(),
+    ));
     let sandbox = Arc::new(
         spacebot::sandbox::Sandbox::new(
-            &agent_config.sandbox,
+            sandbox_config,
             agent_config.workspace.clone(),
             &config.instance_dir,
             agent_config.data_dir.clone(),
+            agent_id.clone(),
         )
         .await,
     );
@@ -85,14 +114,30 @@ async fn bootstrap_deps() -> anyhow::Result<(spacebot::AgentDeps, spacebot::conf
         memory_search,
         llm_manager,
         mcp_manager,
+        task_store,
+        project_store: Arc::new(spacebot::projects::ProjectStore::new(db.sqlite.clone())),
         cron_tool: None,
         runtime_config,
         event_tx,
+        memory_event_tx,
+        tool_output_tx,
         sqlite_pool: db.sqlite.clone(),
         messaging_manager: None,
         sandbox,
         links: Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
         agent_names: Arc::new(std::collections::HashMap::new()),
+        humans: Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
+        process_control_registry: Arc::new(
+            spacebot::agent::process_control::ProcessControlRegistry::new(),
+        ),
+        injection_tx: tokio::sync::mpsc::channel(1).0,
+        working_memory: spacebot::memory::WorkingMemoryStore::new(
+            db.sqlite.clone(),
+            chrono_tz::Tz::UTC,
+        ),
+        api_state: None,
+        wiki_store: None,
+        wake_tx: None,
     };
 
     Ok((deps, config))
@@ -146,11 +191,11 @@ fn build_channel_system_prompt(rc: &spacebot::config::RuntimeConfig) -> String {
     let web_search_enabled = rc.brave_search_key.load().is_some();
     let opencode_enabled = rc.opencode.load().enabled;
     let worker_capabilities = prompt_engine
-        .render_worker_capabilities(browser_enabled, web_search_enabled, opencode_enabled)
+        .render_worker_capabilities(browser_enabled, web_search_enabled, opencode_enabled, &[])
         .expect("failed to render worker capabilities");
 
     let conversation_context = prompt_engine
-        .render_conversation_context("discord", Some("Test Server"), Some("#general"))
+        .render_conversation_context("discord", Some("Test Server"), Some("#general"), None)
         .ok();
 
     let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
@@ -165,6 +210,7 @@ fn build_channel_system_prompt(rc: &spacebot::config::RuntimeConfig) -> String {
             None,
             None,
             None,
+            false,
         )
         .expect("failed to render channel prompt")
 }
@@ -188,38 +234,51 @@ async fn dump_channel_context() {
     let status_block = Arc::new(tokio::sync::RwLock::new(
         spacebot::agent::status::StatusBlock::new(),
     ));
-    let (response_tx, _response_rx) = tokio::sync::mpsc::channel(16);
+    let (raw_tx, _response_rx) = tokio::sync::mpsc::channel(16);
+    let response_tx = spacebot::RoutedSender::new(raw_tx, spacebot::InboundMessage::empty());
 
     let state = spacebot::agent::channel::ChannelState {
         channel_id,
         history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
         active_branches: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         worker_handles: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-        process_run_logger: spacebot::conversation::ProcessRunLogger::new(deps.sqlite_pool.clone()),
         active_workers: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         worker_inputs: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        worker_injections: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        reserved_tasks: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
         status_block,
         deps: deps.clone(),
         conversation_logger,
+        process_run_logger: spacebot::conversation::ProcessRunLogger::new(deps.sqlite_pool.clone()),
         channel_store,
         screenshot_dir: std::path::PathBuf::from("/tmp/screenshots"),
         logs_dir: std::path::PathBuf::from("/tmp/logs"),
         reply_target_message_id: Arc::new(tokio::sync::RwLock::new(None)),
+        prompt_snapshot_store: None,
+        live_worker_transcripts: Arc::new(tokio::sync::RwLock::new(
+            std::collections::HashMap::new(),
+        )),
+        worker_context_settings: Arc::new(tokio::sync::RwLock::new(Default::default())),
+        model_overrides: Arc::new(Default::default()),
+        active_participants: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        cron_outcome: None,
     };
 
     let tool_server = rig::tool::server::ToolServer::new().run();
     let skip_flag = spacebot::tools::new_skip_flag();
     let replied_flag = spacebot::tools::new_replied_flag();
+    let reply_target = spacebot::tools::ReplyTarget::Live(Box::new(response_tx.clone()));
     spacebot::tools::add_channel_tools(
         &tool_server,
         state,
         response_tx,
+        reply_target,
         "test-conversation",
         skip_flag,
         replied_flag,
         None,
         None,
-        None,
+        true,
         None,
         None,
         None,
@@ -265,7 +324,7 @@ async fn dump_branch_context() {
     let instance_dir = rc.instance_dir.to_string_lossy();
     let workspace_dir = rc.workspace_dir.to_string_lossy();
     let branch_prompt = prompt_engine
-        .render_branch_prompt(&instance_dir, &workspace_dir)
+        .render_branch_prompt(&instance_dir, &workspace_dir, false)
         .expect("failed to render branch prompt");
     print_section("BRANCH SYSTEM PROMPT", &branch_prompt);
     print_stats("System prompt", &branch_prompt);
@@ -276,11 +335,19 @@ async fn dump_branch_context() {
     let channel_store = spacebot::conversation::ChannelStore::new(deps.sqlite_pool.clone());
     let run_logger = spacebot::conversation::ProcessRunLogger::new(deps.sqlite_pool.clone());
     let branch_tool_server = spacebot::tools::create_branch_tool_server(
+        None,
+        deps.agent_id.clone(),
+        deps.task_store.clone(),
         deps.memory_search.clone(),
+        deps.runtime_config.clone(),
+        deps.memory_event_tx.clone(),
         conversation_logger,
         channel_store,
         run_logger,
-        "test-agent",
+        spacebot::tools::BranchToolProfile::Default,
+        None,
+        None,
+        deps.sandbox.clone(),
     );
 
     let tool_defs = branch_tool_server
@@ -320,14 +387,24 @@ async fn dump_worker_context() {
     let prompt_engine = rc.prompts.load();
     let instance_dir = rc.instance_dir.to_string_lossy();
     let workspace_dir = rc.workspace_dir.to_string_lossy();
+    let browser_config = (**rc.browser_config.load()).clone();
     let worker_prompt = prompt_engine
-        .render_worker_prompt(&instance_dir, &workspace_dir)
+        .render_worker_prompt(
+            &instance_dir,
+            &workspace_dir,
+            false,
+            false,
+            Vec::new(),
+            Vec::new(),
+            &[],
+            browser_config.persist_session,
+            None,
+            false,
+            None,
+        )
         .expect("failed to render worker prompt");
     print_section("WORKER SYSTEM PROMPT", &worker_prompt);
     print_stats("System prompt", &worker_prompt);
-
-    // Build the actual worker tool server
-    let browser_config = (**rc.browser_config.load()).clone();
     let brave_search_key = (**rc.brave_search_key.load()).clone();
     let worker_id = uuid::Uuid::new_v4();
 
@@ -335,7 +412,10 @@ async fn dump_worker_context() {
         deps.agent_id.clone(),
         worker_id,
         None,
+        deps.task_store.clone(),
         deps.event_tx.clone(),
+        deps.tool_output_tx.clone(),
+        spacebot::tools::ToolCallRegistry::default(),
         browser_config,
         std::path::PathBuf::from("/tmp/screenshots"),
         brave_search_key,
@@ -343,6 +423,11 @@ async fn dump_worker_context() {
         deps.sandbox.clone(),
         vec![],
         deps.runtime_config.clone(),
+        Default::default(),
+        deps.memory_search.clone(),
+        false,
+        None,
+        None,
     );
 
     let tool_defs = worker_tool_server
@@ -407,38 +492,51 @@ async fn dump_all_contexts() {
     let channel_prompt = build_channel_system_prompt(rc);
 
     let channel_id: spacebot::ChannelId = Arc::from("test-channel");
-    let (response_tx, _response_rx) = tokio::sync::mpsc::channel(16);
+    let (raw_tx, _response_rx) = tokio::sync::mpsc::channel(16);
+    let response_tx = spacebot::RoutedSender::new(raw_tx, spacebot::InboundMessage::empty());
     let state = spacebot::agent::channel::ChannelState {
         channel_id,
         history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
         active_branches: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         worker_handles: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-        process_run_logger: spacebot::conversation::ProcessRunLogger::new(deps.sqlite_pool.clone()),
         active_workers: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         worker_inputs: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        worker_injections: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        reserved_tasks: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
         status_block: Arc::new(tokio::sync::RwLock::new(
             spacebot::agent::status::StatusBlock::new(),
         )),
         deps: deps.clone(),
         conversation_logger: conversation_logger.clone(),
+        process_run_logger: spacebot::conversation::ProcessRunLogger::new(deps.sqlite_pool.clone()),
         channel_store: channel_store.clone(),
         screenshot_dir: std::path::PathBuf::from("/tmp/screenshots"),
         logs_dir: std::path::PathBuf::from("/tmp/logs"),
         reply_target_message_id: Arc::new(tokio::sync::RwLock::new(None)),
+        prompt_snapshot_store: None,
+        live_worker_transcripts: Arc::new(tokio::sync::RwLock::new(
+            std::collections::HashMap::new(),
+        )),
+        worker_context_settings: Arc::new(tokio::sync::RwLock::new(Default::default())),
+        model_overrides: Arc::new(Default::default()),
+        active_participants: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        cron_outcome: None,
     };
     let channel_tool_server = rig::tool::server::ToolServer::new().run();
     let skip_flag = spacebot::tools::new_skip_flag();
     let replied_flag = spacebot::tools::new_replied_flag();
+    let reply_target = spacebot::tools::ReplyTarget::Live(Box::new(response_tx.clone()));
     spacebot::tools::add_channel_tools(
         &channel_tool_server,
         state,
         response_tx,
+        reply_target,
         "test",
         skip_flag,
         replied_flag,
         None,
         None,
-        None,
+        true,
         None,
         None,
         None,
@@ -460,15 +558,23 @@ async fn dump_all_contexts() {
 
     // ── Branch ──
     let branch_prompt = prompt_engine
-        .render_branch_prompt(&instance_dir, &workspace_dir)
+        .render_branch_prompt(&instance_dir, &workspace_dir, false)
         .expect("failed to render branch prompt");
     let run_logger = spacebot::conversation::ProcessRunLogger::new(deps.sqlite_pool.clone());
     let branch_tool_server = spacebot::tools::create_branch_tool_server(
+        None,
+        deps.agent_id.clone(),
+        deps.task_store.clone(),
         deps.memory_search.clone(),
+        deps.runtime_config.clone(),
+        deps.memory_event_tx.clone(),
         conversation_logger,
         channel_store,
         run_logger,
-        "test-agent",
+        spacebot::tools::BranchToolProfile::Default,
+        None,
+        None,
+        deps.sandbox.clone(),
     );
     let branch_tool_defs = branch_tool_server.get_tool_defs(None).await.unwrap();
     let branch_tools_text = format_tool_defs(&branch_tool_defs);
@@ -484,16 +590,31 @@ async fn dump_all_contexts() {
     println!("--- TOTAL BRANCH: ~{} tokens ---", branch_total / 4);
 
     // ── Worker ──
-    let worker_prompt = prompt_engine
-        .render_worker_prompt(&instance_dir, &workspace_dir)
-        .expect("failed to render worker prompt");
     let browser_config = (**rc.browser_config.load()).clone();
+    let worker_prompt = prompt_engine
+        .render_worker_prompt(
+            &instance_dir,
+            &workspace_dir,
+            false,
+            false,
+            Vec::new(),
+            Vec::new(),
+            &[],
+            browser_config.persist_session,
+            None,
+            false,
+            None,
+        )
+        .expect("failed to render worker prompt");
     let brave_search_key = (**rc.brave_search_key.load()).clone();
     let worker_tool_server = spacebot::tools::create_worker_tool_server(
         deps.agent_id.clone(),
         uuid::Uuid::new_v4(),
         None,
+        deps.task_store.clone(),
         deps.event_tx.clone(),
+        deps.tool_output_tx.clone(),
+        spacebot::tools::ToolCallRegistry::default(),
         browser_config,
         std::path::PathBuf::from("/tmp/screenshots"),
         brave_search_key,
@@ -501,6 +622,11 @@ async fn dump_all_contexts() {
         deps.sandbox.clone(),
         vec![],
         deps.runtime_config.clone(),
+        Default::default(),
+        deps.memory_search.clone(),
+        false,
+        None,
+        None,
     );
     let worker_tool_defs = worker_tool_server.get_tool_defs(None).await.unwrap();
     let worker_tools_text = format_tool_defs(&worker_tool_defs);
@@ -638,8 +764,8 @@ async fn dump_all_contexts() {
         }
     );
     println!(
-        "  USER.md:     {}",
-        if identity.user.is_some() {
+        "  ROLE.md:     {}",
+        if identity.role.is_some() {
             "loaded"
         } else {
             "empty"
