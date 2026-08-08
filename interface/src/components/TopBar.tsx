@@ -2,6 +2,7 @@ import {
 	createContext,
 	useContext,
 	useRef,
+	useEffect,
 	useCallback,
 	useSyncExternalStore,
 	type ReactNode,
@@ -69,9 +70,14 @@ export function useSetTopBar(node: ReactNode) {
 	if (!store)
 		throw new Error("useSetTopBar must be used within TopBarProvider");
 
-	// Update content synchronously during render (like useSyncExternalStore pattern).
-	// This avoids the useEffect loop entirely.
-	store.setContent(node);
+	// Publish content from an effect: setting store state during render
+	// triggers a subscriber update while another component is rendering.
+	const nodeRef = useRef(node);
+	nodeRef.current = node;
+	useEffect(() => {
+		store.setContent(nodeRef.current);
+		return () => store.setContent(null);
+	});
 }
 
 // ── Component ────────────────────────────────────────────────────────────
