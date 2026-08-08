@@ -63,5 +63,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The memory tests share one embedding model cached at this path;
+      # without the cache every run downloads it from Hugging Face, which
+      # fails intermittently and turns unrelated PRs red.
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: /tmp/spacebot-test-embedding-cache
+          key: fastembed-onnx-v1
+
       - name: cargo test (lib)
         run: cargo test --lib
