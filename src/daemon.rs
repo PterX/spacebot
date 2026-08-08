@@ -65,6 +65,11 @@ fn truncate_for_log(message: &str, max_chars: usize) -> (&str, bool) {
 /// Check whether a daemon is already running by testing PID file liveness
 /// and socket connectivity.
 pub fn is_running(paths: &DaemonPaths) -> Option<u32> {
+    // Synchronous std IO traits, scoped here: this runs on the CLI side
+    // before any runtime exists, while the module-level imports are the
+    // daemon's tokio equivalents.
+    use std::io::{BufRead as _, Write as _};
+
     // Prefer querying the IPC socket first. This handles cases where the
     // daemon was started in foreground (or inside a container as PID 1) and
     // therefore did not create a PID file via the daemonize helper.
