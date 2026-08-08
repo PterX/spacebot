@@ -766,7 +766,7 @@ fn task_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Task> {
             .try_get::<Option<String>, _>("worker_id")
             .ok()
             .flatten()
-            .and_then(|value| if value.is_empty() { None } else { Some(value) }),
+            .filter(|value| !value.is_empty()),
         created_by: row
             .try_get("created_by")
             .context("failed to read task created_by")?,
