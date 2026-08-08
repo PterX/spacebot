@@ -428,6 +428,7 @@ function MemoryGrowthChart({data}: {data: {date: string; count: number}[]}) {
 				height="100%"
 				minWidth={100}
 				minHeight={100}
+				debounce={1}
 			>
 				<AreaChart
 					data={chartData}
@@ -520,6 +521,7 @@ function ProcessActivityChart({
 				height="100%"
 				minWidth={100}
 				minHeight={100}
+				debounce={1}
 			>
 				<AreaChart
 					data={chartData}
@@ -689,6 +691,7 @@ function MemoryDonut({counts}: {counts: Record<string, number>}) {
 					height="100%"
 					minWidth={100}
 					minHeight={100}
+					debounce={1}
 				>
 					<PieChart>
 						<Pie
