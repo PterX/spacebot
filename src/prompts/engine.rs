@@ -111,6 +111,10 @@ impl PromptEngine {
             crate::prompts::text::get("fragments/skills_worker"),
         )?;
         env.add_template(
+            "fragments/skills_branch",
+            crate::prompts::text::get("fragments/skills_branch"),
+        )?;
+        env.add_template(
             "fragments/available_channels",
             crate::prompts::text::get("fragments/available_channels"),
         )?;
@@ -290,6 +294,19 @@ impl PromptEngine {
     pub fn render_skills_channel(&self, skills: Vec<SkillInfo>) -> Result<String> {
         self.render(
             "fragments/skills_channel",
+            context! {
+                skills => skills,
+            },
+        )
+    }
+
+    /// Render the skills listing for a branch system prompt.
+    ///
+    /// Branches read skills directly via `read_skill` or pass names to
+    /// spawned workers as `suggested_skills`.
+    pub fn render_skills_branch(&self, skills: Vec<SkillInfo>) -> Result<String> {
+        self.render(
+            "fragments/skills_branch",
             context! {
                 skills => skills,
             },

@@ -166,6 +166,36 @@ pub(super) struct RegistrySkillContentResponse {
     content: Option<String>,
 }
 
+/// Deterministically reload skills into live runtime configs after a skill
+/// mutation, rather than relying on the file watcher, and record installed
+/// provenance for any newly installed skills.
+///
+/// `agent_id = None` reloads every running agent (instance-level change).
+async fn reload_after_skill_change(state: &ApiState, agent_id: Option<&str>, installed: &[String]) {
+    let configs = state.runtime_configs.load();
+    let instance_skills_dir = state.instance_dir.load().join("skills");
+
+    for (id, runtime_config) in configs.iter() {
+        if let Some(target) = agent_id
+            && target != id
+        {
+            continue;
+        }
+
+        let workspace_skills_dir = runtime_config.workspace_dir.join("skills");
+        let skills =
+            crate::skills::SkillSet::load(&instance_skills_dir, &workspace_skills_dir).await;
+        runtime_config.reload_skills(skills);
+
+        if !installed.is_empty()
+            && let Some(store) = runtime_config.skill_usage.load().as_ref()
+            && let Err(error) = store.record_installed(installed).await
+        {
+            tracing::warn!(%error, agent_id = %id, "failed to record installed skills");
+        }
+    }
+}
+
 /// List installed skills for an agent.
 #[utoipa::path(
     get,
@@ -255,6 +285,9 @@ pub(super) async fn install_skill(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
+    let reload_target = (!req.instance).then_some(req.agent_id.as_str());
+    reload_after_skill_change(&state, reload_target, &installed).await;
+
     state.send_event(ApiEvent::ConfigReloaded);
 
     Ok(Json(InstallSkillResponse { installed }))
@@ -300,6 +333,17 @@ pub(super) async fn remove_skill(
             StatusCode::INTERNAL_SERVER_ERROR
         }
     })?;
+
+    if removed_path.is_some() {
+        reload_after_skill_change(&state, Some(&req.agent_id), &[]).await;
+
+        if let Some(runtime_config) = state.runtime_configs.load().get(&req.agent_id)
+            && let Some(store) = runtime_config.skill_usage.load().as_ref()
+            && let Err(error) = store.remove(&req.name).await
+        {
+            tracing::warn!(%error, skill = %req.name, "failed to remove skill usage row");
+        }
+    }
 
     state.send_event(ApiEvent::ConfigReloaded);
 
@@ -454,6 +498,9 @@ pub(super) async fn upload_skill(
     }
 
     if !all_installed.is_empty() {
+        // Uploads are user-provided, not registry installs — seeding during
+        // reload records them with 'user' provenance.
+        reload_after_skill_change(&state, Some(&query.agent_id), &[]).await;
         state.send_event(ApiEvent::ConfigReloaded);
     }
 

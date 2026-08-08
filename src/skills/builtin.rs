@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use super::{Skill, SkillSource, parse_frontmatter};
+use super::{Skill, SkillSource, parse_skill_markdown};
 
 /// Each entry is `(directory_name, raw SKILL.md content)`.
 const BUILTIN_SKILLS: &[(&str, &str)] = &[(
@@ -19,7 +19,7 @@ pub fn load() -> Vec<Skill> {
     BUILTIN_SKILLS
         .iter()
         .filter_map(|(dir_name, raw)| match parse_builtin(dir_name, raw) {
-            Ok(skill) => Some(skill),
+            Ok(skill) => skill,
             Err(error) => {
                 tracing::warn!(
                     skill = %dir_name,
@@ -32,25 +32,31 @@ pub fn load() -> Vec<Skill> {
         .collect()
 }
 
-fn parse_builtin(dir_name: &str, raw: &str) -> anyhow::Result<Skill> {
-    let (frontmatter, body) = parse_frontmatter(raw)?;
+/// Returns `Ok(None)` when the skill declares `platforms` that don't include
+/// the host platform, matching filesystem skill loading.
+fn parse_builtin(dir_name: &str, raw: &str) -> anyhow::Result<Option<Skill>> {
+    let (frontmatter, body) = parse_skill_markdown(raw)?;
 
-    let name = frontmatter
-        .get("name")
-        .cloned()
-        .unwrap_or_else(|| dir_name.to_string());
+    if let Some(platforms) = &frontmatter.platforms
+        && !super::Platform::list_matches_host(platforms)
+    {
+        return Ok(None);
+    }
 
-    let description = frontmatter.get("description").cloned().unwrap_or_default();
+    let name = frontmatter.name.unwrap_or_else(|| dir_name.to_string());
 
-    Ok(Skill {
+    Ok(Some(Skill {
         name,
-        description,
+        description: frontmatter.description.unwrap_or_default(),
         file_path: PathBuf::from(format!("builtin://{dir_name}/SKILL.md")),
         base_dir: PathBuf::from(format!("builtin://{dir_name}")),
         content: body,
         source: SkillSource::Builtin,
         source_repo: None,
-    })
+        tags: frontmatter.tags.unwrap_or_default(),
+        related_skills: frontmatter.related_skills.unwrap_or_default(),
+        linked_files: Vec::new(),
+    }))
 }
 
 #[cfg(test)]
@@ -77,7 +83,7 @@ mod tests {
     #[test]
     fn parse_builtin_skill() {
         let raw = "---\nname: test-skill\ndescription: A test skill.\n---\n\n# Test\n\nBody here.";
-        let skill = parse_builtin("test-skill", raw).unwrap();
+        let skill = parse_builtin("test-skill", raw).unwrap().unwrap();
         assert_eq!(skill.name, "test-skill");
         assert_eq!(skill.description, "A test skill.");
         assert_eq!(skill.source, SkillSource::Builtin);
@@ -88,7 +94,15 @@ mod tests {
     #[test]
     fn parse_builtin_falls_back_to_dir_name() {
         let raw = "---\ndescription: No name field.\n---\n\nBody.";
-        let skill = parse_builtin("fallback-name", raw).unwrap();
+        let skill = parse_builtin("fallback-name", raw).unwrap().unwrap();
         assert_eq!(skill.name, "fallback-name");
+    }
+
+    #[test]
+    fn parse_builtin_respects_platform_gate() {
+        // "android" deserializes to Platform::Other, which never matches any host.
+        let raw = "---\nname: mobile-only\ndescription: Gated.\nplatforms: [android]\n---\n\nBody.";
+        let skill = parse_builtin("mobile-only", raw).unwrap();
+        assert!(skill.is_none());
     }
 }

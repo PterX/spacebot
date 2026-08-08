@@ -177,6 +177,14 @@ pub async fn spawn_branch_from_state(
             wiki_enabled,
         )
         .and_then(|prompt| {
+            let skills_prompt = rc.skills.load().render_branch_skills(&prompt_engine)?;
+            Ok(if skills_prompt.is_empty() {
+                prompt
+            } else {
+                format!("{prompt}\n\n{skills_prompt}")
+            })
+        })
+        .and_then(|prompt| {
             prompt_engine.maybe_append_tool_use_enforcement(
                 prompt,
                 tool_use_enforcement.as_ref(),

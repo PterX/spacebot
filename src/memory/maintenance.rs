@@ -488,20 +488,12 @@ pub struct MaintenanceReport {
 mod tests {
     use super::*;
     use crate::memory::{Association, RelationType};
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::time::Duration;
 
     fn shared_embedding_model() -> Arc<crate::memory::EmbeddingModel> {
-        static MODEL: OnceLock<Arc<crate::memory::EmbeddingModel>> = OnceLock::new();
-        Arc::clone(MODEL.get_or_init(|| {
-            let cache_dir = std::env::temp_dir().join("spacebot-test-embedding-cache");
-            std::fs::create_dir_all(&cache_dir).expect("failed to create embedding cache dir");
-            Arc::new(
-                crate::memory::EmbeddingModel::new(&cache_dir)
-                    .expect("failed to initialize embedding model"),
-            )
-        }))
+        crate::memory::embedding::shared_test_model()
     }
 
     async fn create_memory_with_embedding(

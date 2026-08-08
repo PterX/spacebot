@@ -41,6 +41,13 @@ pub struct ReadSkillArgs {
 pub struct ReadSkillOutput {
     /// The full skill instructions.
     pub content: String,
+    /// Files under the skill's support subdirectories (references/, templates/,
+    /// scripts/, assets/), relative to the skill directory.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub linked_files: Vec<String>,
+    /// Names of related skills worth reading for this task class.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub related_skills: Vec<String>,
 }
 
 impl Tool for ReadSkillTool {
@@ -72,14 +79,26 @@ impl Tool for ReadSkillTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let skills = self.runtime_config.skills.load();
-        match skills.get(&args.name) {
-            Some(skill) => Ok(ReadSkillOutput {
-                content: skill.content.clone(),
-            }),
-            None => Err(ReadSkillError(format!(
+        let Some(skill) = skills.get(&args.name) else {
+            return Err(ReadSkillError(format!(
                 "skill '{}' not found. Available skills are listed in <available_skills> in your system prompt.",
                 args.name
-            ))),
+            )));
+        };
+
+        if let Some(store) = self.runtime_config.skill_usage.load().as_ref()
+            && let Err(error) = store.record_read(&skill.name).await
+        {
+            tracing::warn!(%error, skill = %skill.name, "failed to record skill read");
         }
+
+        Ok(ReadSkillOutput {
+            content: crate::tools::truncate_output(
+                &skill.content,
+                crate::tools::MAX_TOOL_OUTPUT_BYTES,
+            ),
+            linked_files: skill.linked_files.clone(),
+            related_skills: skill.related_skills.clone(),
+        })
     }
 }

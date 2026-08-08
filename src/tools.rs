@@ -516,6 +516,17 @@ pub async fn add_channel_tools(
             ))
             .await?;
     }
+    handle
+        .add_tool(SkillsSearchTool::new(state.deps.runtime_config.clone()))
+        .await?;
+    if let Some(api_state) = &state.deps.api_state {
+        handle
+            .add_tool(InstallSkillTool::new(
+                state.deps.runtime_config.clone(),
+                api_state.clone(),
+            ))
+            .await?;
+    }
     handle.add_tool(CancelTool::new(state)).await?;
     handle
         .add_tool(SkipTool::new(skip_flag.clone(), response_tx.clone()))
@@ -768,6 +779,8 @@ pub async fn remove_channel_tools(
     let _ = handle.remove_tool(SendAgentMessageTool::NAME).await;
     let _ = handle.remove_tool(AttachmentRecallTool::NAME).await;
     let _ = handle.remove_tool(SetOutcomeTool::NAME).await;
+    let _ = handle.remove_tool(SkillsSearchTool::NAME).await;
+    let _ = handle.remove_tool(InstallSkillTool::NAME).await;
     Ok(())
 }
 
@@ -881,6 +894,7 @@ pub fn create_branch_tool_server(
         .tool(task_create)
         .tool(TaskListTool::new(task_store.clone(), agent_id.to_string()))
         .tool(TaskUpdateTool::for_branch(task_store, agent_id.clone()))
+        .tool(ReadSkillTool::new(runtime_config.clone()))
         .tool(FileReadTool::new(
             runtime_config.workspace_dir.clone(),
             sandbox,
@@ -1067,8 +1081,8 @@ pub fn create_cortex_tool_server(
 /// `spacebot_docs` for embedded docs/changelog retrieval.
 ///
 /// **DEPRECATED:** Cortex chat is being replaced by Channel Settings.
-/// Remaining unique tools here (skills_search, install_skill, config_inspect)
-/// need to be ported to channel/worker toolsets before removal.
+/// skills_search and install_skill are now also on the channel toolset;
+/// config_inspect is the last unique tool to port before removal.
 #[allow(clippy::too_many_arguments)]
 #[deprecated(
     note = "Cortex chat is being replaced by Channel Settings. Port remaining tools before removing."

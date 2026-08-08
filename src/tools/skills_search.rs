@@ -1,12 +1,12 @@
-//! Skills search tool — lets cortex search the skills.sh registry and list installed skills.
+//! Skills search tool — search the skills.sh registry and list installed skills.
 //!
-//! Cortex chat needs to guide users through setting up integrations. This tool
+//! Channels use this to guide users through setting up integrations. This tool
 //! provides two capabilities:
 //!
 //! 1. **Search the skills.sh registry** for skills matching a query (e.g. "github",
-//!    "aws", "docker"). This lets cortex recommend skills for users to install.
+//!    "aws", "docker"), to recommend skills for users to install.
 //!
-//! 2. **List installed skills** on the current agent so cortex can see what's
+//! 2. **List installed skills** on the current agent to see what's
 //!    already available.
 
 use crate::config::RuntimeConfig;
@@ -207,15 +207,14 @@ impl Tool for SkillsSearchTool {
                     .await
                     .map_err(|error| SkillsSearchError::RequestFailed(error.to_string()))?;
 
-                if !response.status().is_success() {
+                let status = response.status();
+                if !status.is_success() {
                     let body = response
                         .text()
                         .await
                         .unwrap_or_else(|_| "failed to read response body".into());
                     return Err(SkillsSearchError::RequestFailed(format!(
-                        "HTTP {}: {}",
-                        body.len(),
-                        body
+                        "HTTP {status}: {body}"
                     )));
                 }
 

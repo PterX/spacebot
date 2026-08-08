@@ -1793,7 +1793,7 @@ async fn run(
     let mut agents_initialized = false;
 
     // File watcher handle — started after agent init (or in setup mode with empty data)
-    let mut _file_watcher;
+    let mut _file_watcher: Option<spacebot::config::FileWatcherHandle>;
 
     // If providers are available, initialize agents immediately
     if has_providers {
@@ -1836,7 +1836,7 @@ async fn run(
         agents_initialized = true;
 
         // Start file watcher with populated agent data
-        _file_watcher = spacebot::config::spawn_file_watcher(
+        _file_watcher = Some(spacebot::config::spawn_file_watcher(
             config_path.clone(),
             config.instance_dir.clone(),
             watcher_agents,
@@ -1851,10 +1851,10 @@ async fn run(
             llm_manager.clone(),
             agent_links.clone(),
             agent_humans.clone(),
-        );
+        ));
     } else {
         // Start file watcher in setup mode (no agents to watch yet)
-        _file_watcher = spacebot::config::spawn_file_watcher(
+        _file_watcher = Some(spacebot::config::spawn_file_watcher(
             config_path.clone(),
             config.instance_dir.clone(),
             Vec::new(),
@@ -1869,7 +1869,7 @@ async fn run(
             llm_manager.clone(),
             agent_links.clone(),
             agent_humans.clone(),
-        );
+        ));
     }
 
     if foreground {
@@ -2586,6 +2586,7 @@ async fn run(
                         {
                             Ok(new_llm) => {
                                 let new_llm_manager = Arc::new(new_llm);
+                                api_state.set_llm_manager(new_llm_manager.clone()).await;
                                 // Update agent_humans from the reloaded config
                                 // before initialize_agents so agents see the
                                 // latest [[humans]] entries.
@@ -2628,7 +2629,8 @@ async fn run(
                                     Ok(()) => {
                                         agents_initialized = true;
                                         // Restart file watcher with the new agent data
-                                        _file_watcher = spacebot::config::spawn_file_watcher(
+                                        let _old_watcher = _file_watcher.take();
+                                        _file_watcher = Some(spacebot::config::spawn_file_watcher(
                                             config_path.clone(),
                                             new_config.instance_dir.clone(),
                                             new_watcher_agents,
@@ -2643,7 +2645,7 @@ async fn run(
                                             new_llm_manager.clone(),
                                             agent_links.clone(),
                                             agent_humans.clone(),
-                                        );
+                                        ));
                                         tracing::info!("agents initialized after provider setup");
                                     }
                                     Err(error) => {
@@ -2966,6 +2968,19 @@ async fn initialize_agents(
         ));
 
         runtime_config.set_settings(settings_store.clone());
+        let skill_usage_store = Arc::new(spacebot::skills::SkillUsageStore::new(db.sqlite.clone()));
+        runtime_config.set_skill_usage(skill_usage_store.clone());
+        {
+            let skill_names: Vec<String> = runtime_config
+                .skills
+                .load()
+                .iter()
+                .map(|s| s.name.to_lowercase())
+                .collect();
+            if let Err(error) = skill_usage_store.seed(&skill_names).await {
+                tracing::warn!(%error, agent = %agent_config.id, "failed to seed skill usage rows");
+            }
+        }
         runtime_config
             .prompt_snapshots
             .store(Arc::new(prompt_snapshot_store.clone()));
@@ -3462,20 +3477,7 @@ async fn initialize_agents(
                 "twitch",
                 Some(instance.name.as_str()),
             );
-            let token_file_name = {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                instance.name.hash(&mut hasher);
-                let name_hash = hasher.finish();
-                format!(
-                    "twitch_token_{}_{name_hash:016x}.json",
-                    instance
-                        .name
-                        .chars()
-                        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-                        .collect::<String>()
-                )
-            };
+            let token_file_name = spacebot::config::named_twitch_token_file_name(&instance.name);
             let token_path = config.instance_dir.join(token_file_name);
             let perms = Arc::new(ArcSwap::from_pointee(
                 spacebot::config::TwitchPermissions::from_instance_config(
@@ -3636,6 +3638,10 @@ async fn initialize_agents(
             new_messaging_manager.register(adapter).await;
         }
     }
+
+    new_messaging_manager
+        .seed_configured_fingerprints_from_registered()
+        .await;
 
     let portal_agent_pools = agents
         .iter()
