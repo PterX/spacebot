@@ -21,7 +21,7 @@ import {
 	DialogTitle,
 	DialogFooter,
 } from "@spacedrive/primitives";
-import {Switch} from "@spacedrive/primitives";
+import {Toggle as Switch} from "@/ui/Toggle";
 import {PlatformIcon} from "@/lib/platformIcons";
 import {
 	isValidE164,

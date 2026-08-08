@@ -192,3 +192,21 @@ body {
 	width: auto !important;
 	box-shadow: none !important;
 }
+
+
+/* Tailwind v4 workaround: state-variant class selectors (data-[state=checked]:* and aria-checked:*)
+   don't match at runtime in this build. Radix v1.x sets aria-checked on the root, so use it
+   directly via an attribute selector. The bg-app-dark-box class is on the Toggle root; the
+   bg-white shadow-sm combination is unique to the Toggle thumb. */
+button[aria-checked="true"].bg-app-dark-box {
+	background-color: var(--color-accent) !important;
+}
+button[aria-checked="true"].w-7 > .bg-white.shadow-sm {
+	transform: translateX(12px) !important;
+}
+button[aria-checked="true"].w-9 > .bg-white.shadow-sm {
+	transform: translateX(16px) !important;
+}
+button[aria-checked="true"].w-11 > .bg-white.shadow-sm {
+	transform: translateX(20px) !important;
+}

@@ -14,7 +14,7 @@ import {
 	DialogHeader,
 	DialogTitle,
 } from "@spacedrive/primitives";
-import {Switch} from "@spacedrive/primitives";
+import {Toggle as Switch} from "@/ui/Toggle";
 
 interface PromptInspectModalProps {
 	open: boolean;

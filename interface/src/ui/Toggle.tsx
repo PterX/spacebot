@@ -7,7 +7,7 @@ const switchStyles = cva(
 		"peer inline-flex shrink-0 cursor-pointer items-center rounded-full transition-colors",
 		"focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2",
 		"disabled:cursor-not-allowed disabled:opacity-50",
-		"data-[state=checked]:bg-accent data-[state=unchecked]:bg-app-dark-box",
+		"aria-checked:bg-accent bg-app-dark-box",
 	],
 	{
 		variants: {
@@ -30,9 +30,9 @@ const thumbStyles = cva(
 	{
 		variants: {
 			size: {
-				sm: "h-3 w-3 data-[state=checked]:translate-x-3 data-[state=unchecked]:translate-x-0",
-				md: "h-4 w-4 data-[state=checked]:translate-x-4 data-[state=unchecked]:translate-x-0",
-				lg: "h-5 w-5 data-[state=checked]:translate-x-5 data-[state=unchecked]:translate-x-0",
+				sm: "h-3 w-3 aria-checked:translate-x-3 translate-x-0",
+				md: "h-4 w-4 aria-checked:translate-x-4 translate-x-0",
+				lg: "h-5 w-5 aria-checked:translate-x-5 translate-x-0",
 			},
 		},
 		defaultVariants: {
