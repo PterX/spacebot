@@ -1,0 +1,18 @@
+Create, patch, edit, or delete a skill — a standing procedure this agent follows for a class of task.
+
+Skills are how procedure changes persist. When the user corrects how something should be done ("stop posting walls of text in Discord"), that correction belongs in the skill governing that task class, not in memory.
+
+Strongly prefer patching over creating:
+1. Patch the skill that governs this task, if one was loaded.
+2. Patch a related existing skill.
+3. Add a `references/` file to an existing skill via `write_file`.
+4. Only then create a new skill — named for the task class (`discord-formatting`), never the incident.
+
+Actions:
+- `create` — new skill from full SKILL.md text (frontmatter with a description ≤80 chars, then the body)
+- `patch` — replace exact text (`old_string` → `new_string`); read the skill first
+- `edit` — rewrite the full SKILL.md
+- `delete` — remove a workspace skill; when deleting because another skill absorbed the content, pass `absorbed_into`
+- `write_file` / `remove_file` — manage support files under `references/`, `templates/`, `scripts/`, `assets/`
+
+Never persist environment-dependent failures, claims that a tool doesn't work, transient errors that resolved, or one-off task narratives. A skill is a procedure that will be right next month, not a log of what happened today.

@@ -127,6 +127,144 @@ impl SkillUsageStore {
         Ok(())
     }
 
+    /// Record a skill created through `skill_manage`.
+    ///
+    /// `origin_conversation_id` is stored only for agent-created skills —
+    /// it's the provenance link curation and the inspector surface later.
+    pub async fn record_created(
+        &self,
+        name: &str,
+        origin: WriteOrigin,
+        conversation_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let created_by = match origin {
+            WriteOrigin::User => "user",
+            WriteOrigin::Agent => "agent",
+        };
+        let origin_conversation = match origin {
+            WriteOrigin::Agent => conversation_id,
+            WriteOrigin::User => None,
+        };
+
+        sqlx::query(
+            "INSERT INTO skill_usage (skill_name, created_by, origin_conversation_id, created_at) \
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT(skill_name) DO UPDATE SET \
+                 created_by = excluded.created_by, \
+                 origin_conversation_id = excluded.origin_conversation_id, \
+                 state = 'active', \
+                 archived_at = NULL",
+        )
+        .bind(name.to_lowercase())
+        .bind(created_by)
+        .bind(origin_conversation)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Record a patch or edit: bump the counter and stamp the time.
+    pub async fn record_patch(&self, name: &str) -> anyhow::Result<()> {
+        let key = name.to_lowercase();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        sqlx::query(
+            "INSERT OR IGNORE INTO skill_usage (skill_name, created_by, created_at) \
+             VALUES (?, 'user', ?)",
+        )
+        .bind(&key)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "UPDATE skill_usage SET \
+                 patch_count = patch_count + 1, \
+                 last_patched_at = ?, \
+                 state = CASE WHEN state = 'stale' THEN 'active' ELSE state END \
+             WHERE skill_name = ?",
+        )
+        .bind(&now)
+        .bind(&key)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Set or clear the pin flag.
+    pub async fn set_pinned(&self, name: &str, pinned: bool) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+
+        sqlx::query(
+            "INSERT INTO skill_usage (skill_name, created_by, pinned, created_at) \
+             VALUES (?, 'user', ?, ?) \
+             ON CONFLICT(skill_name) DO UPDATE SET pinned = excluded.pinned",
+        )
+        .bind(name.to_lowercase())
+        .bind(pinned as i64)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Hand a skill to curation: flip `created_by` to 'agent'.
+    ///
+    /// This is the explicit user act that puts a skill inside curator
+    /// jurisdiction; it is never done automatically.
+    pub async fn adopt(&self, name: &str) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+
+        sqlx::query(
+            "INSERT INTO skill_usage (skill_name, created_by, created_at) \
+             VALUES (?, 'agent', ?) \
+             ON CONFLICT(skill_name) DO UPDATE SET created_by = 'agent'",
+        )
+        .bind(name.to_lowercase())
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Mark a skill archived.
+    pub async fn set_archived(&self, name: &str) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+
+        sqlx::query(
+            "INSERT INTO skill_usage (skill_name, created_by, state, archived_at, created_at) \
+             VALUES (?, 'user', 'archived', ?, ?) \
+             ON CONFLICT(skill_name) DO UPDATE SET \
+                 state = 'archived', \
+                 archived_at = excluded.archived_at",
+        )
+        .bind(name.to_lowercase())
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Mark an archived skill active again.
+    pub async fn set_restored(&self, name: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE skill_usage SET state = 'active', archived_at = NULL WHERE skill_name = ?",
+        )
+        .bind(name.to_lowercase())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     /// Drop the row for a removed skill.
     pub async fn remove(&self, name: &str) -> anyhow::Result<()> {
         sqlx::query("DELETE FROM skill_usage WHERE skill_name = ?")

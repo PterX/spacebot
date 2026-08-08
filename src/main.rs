@@ -116,6 +116,46 @@ enum SkillCommand {
         #[arg(short, long)]
         agent: Option<String>,
     },
+    /// Pin a skill: blocks deletion, and all autonomous modification
+    Pin {
+        /// Skill name
+        name: String,
+        /// Agent ID (defaults to first agent)
+        #[arg(short, long)]
+        agent: Option<String>,
+    },
+    /// Unpin a skill
+    Unpin {
+        /// Skill name
+        name: String,
+        /// Agent ID (defaults to first agent)
+        #[arg(short, long)]
+        agent: Option<String>,
+    },
+    /// Hand a skill to automated curation (sets created_by = agent)
+    Adopt {
+        /// Skill name
+        name: String,
+        /// Agent ID (defaults to first agent)
+        #[arg(short, long)]
+        agent: Option<String>,
+    },
+    /// Archive a workspace skill (recoverable via restore)
+    Archive {
+        /// Skill name
+        name: String,
+        /// Agent ID (defaults to first agent)
+        #[arg(short, long)]
+        agent: Option<String>,
+    },
+    /// Restore the most recently archived copy of a skill
+    Restore {
+        /// Skill name
+        name: String,
+        /// Agent ID (defaults to first agent)
+        #[arg(short, long)]
+        agent: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1253,6 +1293,24 @@ fn cmd_skill(
                 println!("Path: {}", skill.file_path.display());
                 println!("Base directory: {}", skill.base_dir.display());
 
+                if let Ok(store) = open_skill_usage_store(&config, agent.as_deref()).await
+                    && let Ok(Some(record)) = store.get(&name).await
+                {
+                    println!("Created by: {}", record.created_by);
+                    println!("State: {}", record.state);
+                    println!("Pinned: {}", record.pinned);
+                    println!(
+                        "Reads: {} (last: {})",
+                        record.read_count,
+                        record.last_read_at.as_deref().unwrap_or("never")
+                    );
+                    println!(
+                        "Patches: {} (last: {})",
+                        record.patch_count,
+                        record.last_patched_at.as_deref().unwrap_or("never")
+                    );
+                }
+
                 // Show a preview of the content
                 let preview_len = skill.content.chars().take(500).count();
                 if preview_len < skill.content.len() {
@@ -1269,8 +1327,92 @@ fn cmd_skill(
 
                 Ok(())
             }
+            SkillCommand::Pin { name, agent } => {
+                let store = open_skill_usage_store(&config, agent.as_deref()).await?;
+                store.set_pinned(&name, true).await?;
+                println!("Pinned skill: {name}");
+                Ok(())
+            }
+            SkillCommand::Unpin { name, agent } => {
+                let store = open_skill_usage_store(&config, agent.as_deref()).await?;
+                store.set_pinned(&name, false).await?;
+                println!("Unpinned skill: {name}");
+                Ok(())
+            }
+            SkillCommand::Adopt { name, agent } => {
+                let store = open_skill_usage_store(&config, agent.as_deref()).await?;
+                store.adopt(&name).await?;
+                println!("Adopted skill into curation: {name}");
+                Ok(())
+            }
+            SkillCommand::Archive { name, agent } => {
+                let (instance_dir, workspace_dir) = resolve_skill_dirs(&config, agent.as_deref())?;
+                let skills = spacebot::skills::SkillSet::load(&instance_dir, &workspace_dir).await;
+
+                let Some(skill) = skills.get(&name) else {
+                    eprintln!("Skill not found: {name}");
+                    std::process::exit(1);
+                };
+                if skill.source != spacebot::skills::SkillSource::Workspace {
+                    eprintln!("Only workspace skills can be archived: {name}");
+                    std::process::exit(1);
+                }
+
+                let archived = spacebot::skills::archive_skill_dir(
+                    &workspace_dir,
+                    &skill.base_dir,
+                    &name.to_lowercase(),
+                )
+                .await?;
+
+                let store = open_skill_usage_store(&config, agent.as_deref()).await?;
+                store.set_archived(&name).await?;
+
+                println!("Archived skill: {name}");
+                println!("Path: {}", archived.display());
+                Ok(())
+            }
+            SkillCommand::Restore { name, agent } => {
+                let (_, workspace_dir) = resolve_skill_dirs(&config, agent.as_deref())?;
+
+                let restored =
+                    spacebot::skills::restore_skill_dir(&workspace_dir, &name.to_lowercase())
+                        .await?;
+
+                let store = open_skill_usage_store(&config, agent.as_deref()).await?;
+                store.set_restored(&name).await?;
+
+                println!("Restored skill: {name}");
+                println!("Path: {}", restored.display());
+                Ok(())
+            }
         }
     })
+}
+
+/// Open the agent's per-agent SQLite for skill usage updates.
+///
+/// Connects only the SQLite pool — not the full `Db` bundle — so the CLI
+/// never contends for the redb lock a running daemon holds.
+async fn open_skill_usage_store(
+    config: &spacebot::config::Config,
+    agent_id: Option<&str>,
+) -> anyhow::Result<spacebot::skills::SkillUsageStore> {
+    let agent_config = get_agent_config(config, agent_id)?;
+    let resolved = agent_config.resolve(&config.instance_dir, &config.defaults);
+
+    let db_path = resolved.data_dir.join("agent.db");
+    if !db_path.exists() {
+        anyhow::bail!(
+            "agent database not found at {} — has the agent run at least once?",
+            db_path.display()
+        );
+    }
+
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_path.display())).await?;
+    sqlx::migrate!("./migrations").run(&pool).await?;
+
+    Ok(spacebot::skills::SkillUsageStore::new(pool))
 }
 
 fn resolve_skills_dir(

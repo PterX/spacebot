@@ -391,11 +391,104 @@ pub struct SkillInfo {
     pub source_repo: Option<String>,
 }
 
+/// Name of the archive directory under a workspace skills root. Hidden, so
+/// archived skills are excluded from discovery.
+pub const ARCHIVE_DIR: &str = ".archive";
+
+/// Move a skill directory into the workspace archive instead of deleting it.
+///
+/// Returns the archive path. An existing archived copy of the same name is
+/// suffixed away (`{name}-1`, `{name}-2`, ...) rather than overwritten, so
+/// repeated archive cycles never destroy a prior snapshot.
+pub async fn archive_skill_dir(
+    workspace_skills_dir: &Path,
+    skill_base_dir: &Path,
+    name: &str,
+) -> anyhow::Result<PathBuf> {
+    let archive_root = workspace_skills_dir.join(ARCHIVE_DIR);
+    tokio::fs::create_dir_all(&archive_root)
+        .await
+        .with_context(|| format!("failed to create {}", archive_root.display()))?;
+
+    let mut destination = archive_root.join(name);
+    let mut suffix = 0usize;
+    while destination.exists() {
+        suffix += 1;
+        destination = archive_root.join(format!("{name}-{suffix}"));
+    }
+
+    tokio::fs::rename(skill_base_dir, &destination)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to archive {} to {}",
+                skill_base_dir.display(),
+                destination.display()
+            )
+        })?;
+
+    Ok(destination)
+}
+
+/// Restore the most recently archived copy of a skill back into the
+/// workspace skills root.
+///
+/// Fails when no archived copy exists or when an active skill directory
+/// already occupies the name.
+pub async fn restore_skill_dir(workspace_skills_dir: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    let archive_root = workspace_skills_dir.join(ARCHIVE_DIR);
+    let destination = workspace_skills_dir.join(name);
+
+    if destination.exists() {
+        anyhow::bail!(
+            "cannot restore '{name}': an active skill directory already exists at {}",
+            destination.display()
+        );
+    }
+
+    // Prefer the highest suffix — it's the most recent archive cycle.
+    let mut source = None;
+    let plain = archive_root.join(name);
+    if plain.is_dir() {
+        source = Some(plain);
+    }
+    let mut suffix = 1usize;
+    loop {
+        let candidate = archive_root.join(format!("{name}-{suffix}"));
+        if !candidate.is_dir() {
+            break;
+        }
+        source = Some(candidate);
+        suffix += 1;
+    }
+
+    let Some(source) = source else {
+        anyhow::bail!(
+            "no archived copy of '{name}' found under {}",
+            archive_root.display()
+        );
+    };
+
+    tokio::fs::rename(&source, &destination)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to restore {} to {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+
+    Ok(destination)
+}
+
 /// Load all skills from a directory.
 ///
-/// Each subdirectory containing a `SKILL.md` file is treated as a skill.
-/// Hidden directories (`.archive`, `.snapshots`, `.git`, ...) are excluded
-/// from discovery.
+/// Each subdirectory containing a `SKILL.md` file is treated as a skill. A
+/// subdirectory without one is treated as a category and scanned one level
+/// deeper, so both `skills/{name}/SKILL.md` and
+/// `skills/{category}/{name}/SKILL.md` load. Hidden directories (`.archive`,
+/// `.snapshots`, `.git`, ...) are excluded from discovery.
 async fn load_skills_from_dir(dir: &Path, source: SkillSource) -> anyhow::Result<Vec<Skill>> {
     let mut skills = Vec::new();
 
@@ -413,37 +506,59 @@ async fn load_skills_from_dir(dir: &Path, source: SkillSource) -> anyhow::Result
             continue;
         }
 
-        let skill_file = path.join("SKILL.md");
-        if !skill_file.exists() {
+        if path.join("SKILL.md").exists() {
+            load_skill_into(&mut skills, &path, source.clone()).await;
             continue;
         }
 
-        match load_skill(&skill_file, &path, source.clone()).await {
-            Ok(Some(skill)) => {
-                tracing::debug!(
-                    name = %skill.name,
-                    path = %skill_file.display(),
-                    "loaded skill"
-                );
-                skills.push(skill);
+        // Category directory: scan its direct subdirectories for skills.
+        let Ok(mut category_entries) = tokio::fs::read_dir(&path).await else {
+            continue;
+        };
+        while let Ok(Some(category_entry)) = category_entries.next_entry().await {
+            let skill_dir = category_entry.path();
+            if !skill_dir.is_dir()
+                || category_entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with('.')
+                || !skill_dir.join("SKILL.md").exists()
+            {
+                continue;
             }
-            Ok(None) => {
-                tracing::debug!(
-                    path = %skill_file.display(),
-                    "skill gated to another platform, skipping"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    path = %skill_file.display(),
-                    %error,
-                    "failed to load skill, skipping"
-                );
-            }
+            load_skill_into(&mut skills, &skill_dir, source.clone()).await;
         }
     }
 
     Ok(skills)
+}
+
+/// Load one skill directory into `skills`, logging failures and platform gates.
+async fn load_skill_into(skills: &mut Vec<Skill>, path: &Path, source: SkillSource) {
+    let skill_file = path.join("SKILL.md");
+    match load_skill(&skill_file, path, source).await {
+        Ok(Some(skill)) => {
+            tracing::debug!(
+                name = %skill.name,
+                path = %skill_file.display(),
+                "loaded skill"
+            );
+            skills.push(skill);
+        }
+        Ok(None) => {
+            tracing::debug!(
+                path = %skill_file.display(),
+                "skill gated to another platform, skipping"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %skill_file.display(),
+                %error,
+                "failed to load skill, skipping"
+            );
+        }
+    }
 }
 
 /// Load a single skill from its SKILL.md file.

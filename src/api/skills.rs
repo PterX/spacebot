@@ -65,6 +65,26 @@ pub(super) struct RemoveSkillRequest {
     name: String,
 }
 
+#[derive(Deserialize, utoipa::ToSchema)]
+pub(super) struct SkillLifecycleRequest {
+    agent_id: String,
+    name: String,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+pub(super) struct PinSkillRequest {
+    agent_id: String,
+    name: String,
+    pinned: bool,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub(super) struct SkillLifecycleResponse {
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+}
+
 #[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct RemoveSkillResponse {
     success: bool,
@@ -356,6 +376,181 @@ pub(super) async fn remove_skill(
     Ok(Json(RemoveSkillResponse {
         success: removed_path.is_some(),
         path: removed_path.map(|p| p.display().to_string()),
+    }))
+}
+
+/// Resolve the live runtime config and usage store for an agent.
+fn agent_stores(
+    state: &ApiState,
+    agent_id: &str,
+) -> Result<
+    (
+        Arc<crate::config::RuntimeConfig>,
+        Arc<crate::skills::SkillUsageStore>,
+    ),
+    StatusCode,
+> {
+    let runtime_config = state
+        .runtime_configs
+        .load()
+        .get(agent_id)
+        .cloned()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let store = (**runtime_config.skill_usage.load())
+        .clone()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    Ok((runtime_config, store))
+}
+
+/// Pin or unpin a skill.
+///
+/// A pinned skill can't be deleted by the user without unpinning, and is
+/// fully read-only for autonomous writers.
+#[utoipa::path(
+    post,
+    path = "/agents/skills/pin",
+    request_body = PinSkillRequest,
+    responses(
+        (status = 200, body = SkillLifecycleResponse),
+        (status = 404, description = "Agent not found"),
+    ),
+    tag = "skills",
+)]
+pub(super) async fn pin_skill(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Json(req): axum::extract::Json<PinSkillRequest>,
+) -> Result<Json<SkillLifecycleResponse>, StatusCode> {
+    let (_, store) = agent_stores(&state, &req.agent_id)?;
+
+    store
+        .set_pinned(&req.name, req.pinned)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, skill = %req.name, "failed to set pin");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(SkillLifecycleResponse {
+        success: true,
+        path: None,
+    }))
+}
+
+/// Adopt a skill into curation: flips `created_by` to 'agent'.
+///
+/// The explicit act of handing a user or installed skill to the curator.
+#[utoipa::path(
+    post,
+    path = "/agents/skills/adopt",
+    request_body = SkillLifecycleRequest,
+    responses(
+        (status = 200, body = SkillLifecycleResponse),
+        (status = 404, description = "Agent not found"),
+    ),
+    tag = "skills",
+)]
+pub(super) async fn adopt_skill(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Json(req): axum::extract::Json<SkillLifecycleRequest>,
+) -> Result<Json<SkillLifecycleResponse>, StatusCode> {
+    let (_, store) = agent_stores(&state, &req.agent_id)?;
+
+    store.adopt(&req.name).await.map_err(|error| {
+        tracing::warn!(%error, skill = %req.name, "failed to adopt skill");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(SkillLifecycleResponse {
+        success: true,
+        path: None,
+    }))
+}
+
+/// Archive a workspace skill: move it to `.archive/` and mark it archived.
+#[utoipa::path(
+    post,
+    path = "/agents/skills/archive",
+    request_body = SkillLifecycleRequest,
+    responses(
+        (status = 200, body = SkillLifecycleResponse),
+        (status = 403, description = "Not a workspace skill"),
+        (status = 404, description = "Agent or skill not found"),
+    ),
+    tag = "skills",
+)]
+pub(super) async fn archive_skill(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Json(req): axum::extract::Json<SkillLifecycleRequest>,
+) -> Result<Json<SkillLifecycleResponse>, StatusCode> {
+    let (runtime_config, store) = agent_stores(&state, &req.agent_id)?;
+
+    let skills = runtime_config.skills.load();
+    let skill = skills.get(&req.name).ok_or(StatusCode::NOT_FOUND)?;
+    if skill.source != crate::skills::SkillSource::Workspace {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let workspace_skills = runtime_config.workspace_dir.join("skills");
+    let archived = crate::skills::archive_skill_dir(
+        &workspace_skills,
+        &skill.base_dir,
+        &req.name.to_lowercase(),
+    )
+    .await
+    .map_err(|error| {
+        tracing::warn!(%error, skill = %req.name, "failed to archive skill");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if let Err(error) = store.set_archived(&req.name).await {
+        tracing::warn!(%error, skill = %req.name, "failed to mark skill archived");
+    }
+
+    drop(skills);
+    reload_after_skill_change(&state, Some(&req.agent_id), &[]).await;
+    state.send_event(ApiEvent::ConfigReloaded);
+
+    Ok(Json(SkillLifecycleResponse {
+        success: true,
+        path: Some(archived.display().to_string()),
+    }))
+}
+
+/// Restore the most recently archived copy of a skill.
+#[utoipa::path(
+    post,
+    path = "/agents/skills/restore",
+    request_body = SkillLifecycleRequest,
+    responses(
+        (status = 200, body = SkillLifecycleResponse),
+        (status = 404, description = "Agent not found or no archived copy"),
+    ),
+    tag = "skills",
+)]
+pub(super) async fn restore_skill(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Json(req): axum::extract::Json<SkillLifecycleRequest>,
+) -> Result<Json<SkillLifecycleResponse>, StatusCode> {
+    let (runtime_config, store) = agent_stores(&state, &req.agent_id)?;
+
+    let workspace_skills = runtime_config.workspace_dir.join("skills");
+    let restored = crate::skills::restore_skill_dir(&workspace_skills, &req.name.to_lowercase())
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, skill = %req.name, "failed to restore skill");
+            StatusCode::NOT_FOUND
+        })?;
+
+    if let Err(error) = store.set_restored(&req.name).await {
+        tracing::warn!(%error, skill = %req.name, "failed to mark skill restored");
+    }
+
+    reload_after_skill_change(&state, Some(&req.agent_id), &[]).await;
+    state.send_event(ApiEvent::ConfigReloaded);
+
+    Ok(Json(SkillLifecycleResponse {
+        success: true,
+        path: Some(restored.display().to_string()),
     }))
 }
 

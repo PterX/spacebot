@@ -56,6 +56,8 @@ pub mod send_message_to_another_channel;
 pub mod set_outcome;
 pub mod set_status;
 pub mod shell;
+pub mod skill_manage;
+pub mod skills_list;
 pub mod skills_search;
 pub mod skip;
 pub mod spacebot_docs;
@@ -139,6 +141,11 @@ pub use send_message_to_another_channel::{
 pub use set_outcome::{SetOutcomeArgs, SetOutcomeError, SetOutcomeOutput, SetOutcomeTool};
 pub use set_status::{SetStatusArgs, SetStatusError, SetStatusOutput, SetStatusTool, StatusKind};
 pub use shell::{EnvVar, ShellArgs, ShellError, ShellOutput, ShellResult, ShellTool};
+pub use skill_manage::{
+    SkillManageArgs, SkillManageError, SkillManageOutput, SkillManageTool, SkillReadTracker,
+    new_skill_read_tracker,
+};
+pub use skills_list::{SkillsListArgs, SkillsListError, SkillsListOutput, SkillsListTool};
 pub use skills_search::{
     SkillsSearchArgs, SkillsSearchError, SkillsSearchOutput, SkillsSearchTool,
 };
@@ -883,6 +890,11 @@ pub fn create_branch_tool_server(
         task_create = task_create.with_api_state(api.clone());
     }
 
+    // Branches act inside a user conversation, so skill writes carry User
+    // origin. The reflection branch (autonomous) constructs its own server
+    // with WriteOrigin::Agent and the read-before-write rail active.
+    let skill_read_tracker = new_skill_read_tracker();
+
     let mut server = ToolServer::new()
         .tool(memory_save)
         .tool(MemoryRecallTool::new(memory_search.clone()))
@@ -894,7 +906,15 @@ pub fn create_branch_tool_server(
         .tool(task_create)
         .tool(TaskListTool::new(task_store.clone(), agent_id.to_string()))
         .tool(TaskUpdateTool::for_branch(task_store, agent_id.clone()))
-        .tool(ReadSkillTool::new(runtime_config.clone()))
+        .tool(
+            ReadSkillTool::new(runtime_config.clone())
+                .with_read_tracker(skill_read_tracker.clone()),
+        )
+        .tool(
+            SkillManageTool::new(runtime_config.clone(), crate::skills::WriteOrigin::User)
+                .with_read_tracker(skill_read_tracker),
+        )
+        .tool(SkillsListTool::new(runtime_config.clone()))
         .tool(FileReadTool::new(
             runtime_config.workspace_dir.clone(),
             sandbox,

@@ -1371,7 +1371,7 @@ pub(super) fn evaluate_work_readiness(
 }
 
 /// Per-agent configuration (raw, before resolution with defaults).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AgentConfig {
     pub id: String,
     pub default: bool,
