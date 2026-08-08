@@ -524,6 +524,7 @@ async fn process_chunk(
         None,
         deps.event_tx.clone(),
     );
+    let hook = hook.with_memory_persistence_contract(contract_state.clone());
 
     let user_prompt =
         prompt_engine.render_system_ingestion_chunk(filename, chunk_number, total_chunks, chunk)?;
