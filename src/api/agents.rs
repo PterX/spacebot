@@ -905,6 +905,20 @@ pub async fn create_agent_internal(
         skills,
     ));
     runtime_config.set_settings(settings_store.clone());
+    let skill_usage_store =
+        std::sync::Arc::new(crate::skills::SkillUsageStore::new(db.sqlite.clone()));
+    runtime_config.set_skill_usage(skill_usage_store.clone());
+    {
+        let skill_names: Vec<String> = runtime_config
+            .skills
+            .load()
+            .iter()
+            .map(|s| s.name.to_lowercase())
+            .collect();
+        if let Err(error) = skill_usage_store.seed(&skill_names).await {
+            tracing::warn!(%error, "failed to seed skill usage rows");
+        }
+    }
 
     let llm_manager = {
         let guard = state.llm_manager.read().await;

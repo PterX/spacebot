@@ -1,6 +1,6 @@
-//! Install skill tool — lets cortex install skills from skills.sh into the agent workspace.
+//! Install skill tool — install skills from skills.sh into the agent workspace.
 //!
-//! After finding a skill via `skills_search`, cortex can install it directly
+//! After finding a skill via `skills_search`, the agent can install it directly
 //! using this tool. Skills are installed to the agent's workspace skills directory
 //! and become immediately available to workers.
 
@@ -131,6 +131,12 @@ impl Tool for InstallSkillTool {
         let instance_skills_dir = target_config.instance_dir.join("skills");
         let skills = SkillSet::load(&instance_skills_dir, &target_dir).await;
         target_config.reload_skills(skills);
+
+        if let Some(store) = target_config.skill_usage.load().as_ref()
+            && let Err(error) = store.record_installed(&installed).await
+        {
+            tracing::warn!(%error, "failed to record installed skills");
+        }
 
         let agent_label = args.agent_id.as_deref().unwrap_or("current agent");
         let names = installed.join(", ");

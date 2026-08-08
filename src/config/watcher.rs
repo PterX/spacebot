@@ -90,25 +90,26 @@ pub fn spawn_file_watcher(
             tracing::warn!(%error, path = %config_path.display(), "failed to watch config file");
         }
 
-        // Watch instance-level skills directory
-        let instance_skills_dir = instance_dir.join("skills");
-        if instance_skills_dir.is_dir()
-            && let Err(error) = watcher.watch(&instance_skills_dir, RecursiveMode::Recursive)
-        {
-            tracing::warn!(%error, path = %instance_skills_dir.display(), "failed to watch instance skills dir");
+        // Watch skills directories. Roots are created before watching so a
+        // dir that doesn't exist yet at startup is still covered, and kept
+        // for prefix-matching changed paths against actual skills roots.
+        let mut skill_roots: Vec<PathBuf> = Vec::new();
+        skill_roots.push(instance_dir.join("skills"));
+        for (_, workspace, _, _, _) in &agents {
+            skill_roots.push(workspace.join("skills"));
+        }
+        for root in &skill_roots {
+            if let Err(error) = std::fs::create_dir_all(root) {
+                tracing::warn!(%error, path = %root.display(), "failed to create skills dir");
+                continue;
+            }
+            if let Err(error) = watcher.watch(root, RecursiveMode::Recursive) {
+                tracing::warn!(%error, path = %root.display(), "failed to watch skills dir");
+            }
         }
 
         // Watch per-agent directories
-        for (_, workspace, identity_dir, _, _) in &agents {
-            // Watch workspace/skills for skill file changes
-            {
-                let path = workspace.join("skills");
-                if path.is_dir()
-                    && let Err(error) = watcher.watch(&path, RecursiveMode::Recursive)
-                {
-                    tracing::warn!(%error, path = %path.display(), "failed to watch agent skills dir");
-                }
-            }
+        for (_, _, identity_dir, _, _) in &agents {
             // Watch the agent root (identity_dir) for SOUL.md/IDENTITY.md/ROLE.md changes.
             // Identity files live outside the workspace, in the agent root directory.
             if let Err(error) = watcher.watch(identity_dir, RecursiveMode::NonRecursive) {
@@ -157,7 +158,7 @@ pub fn spawn_file_watcher(
             });
             let skills_changed = changed_paths
                 .iter()
-                .any(|p| p.to_string_lossy().contains("skills"));
+                .any(|p| skill_roots.iter().any(|root| p.starts_with(root)));
 
             // Skip entirely if nothing relevant changed
             if !config_changed && !identity_changed && !skills_changed {

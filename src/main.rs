@@ -2957,6 +2957,19 @@ async fn initialize_agents(
         ));
 
         runtime_config.set_settings(settings_store.clone());
+        let skill_usage_store = Arc::new(spacebot::skills::SkillUsageStore::new(db.sqlite.clone()));
+        runtime_config.set_skill_usage(skill_usage_store.clone());
+        {
+            let skill_names: Vec<String> = runtime_config
+                .skills
+                .load()
+                .iter()
+                .map(|s| s.name.to_lowercase())
+                .collect();
+            if let Err(error) = skill_usage_store.seed(&skill_names).await {
+                tracing::warn!(%error, agent = %agent_config.id, "failed to seed skill usage rows");
+            }
+        }
         runtime_config
             .prompt_snapshots
             .store(Arc::new(prompt_snapshot_store.clone()));
