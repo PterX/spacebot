@@ -1,5 +1,10 @@
 //! Cortex chat: persistent admin conversation with the cortex.
 //!
+//! **DEPRECATED:** Cortex chat is being replaced by per-channel settings
+//! (Channel Settings UI) which provide fine-grained control. Remaining
+//! functionality (skills_search, install_skill, config_inspect, etc.) is
+//! being ported to channel/worker toolsets. Do not add new features here.
+//!
 //! One session per agent. The admin talks to the cortex interactively,
 //! with the full toolset (memory, shell, file, browser, web search).
 //! When opened on a channel page, the channel's recent history is injected
@@ -134,6 +139,10 @@ fn try_acquire_send_lock(
         .map_err(|_| CortexChatSendError::Busy)
 }
 
+fn resolve_lifecycle_call_id(tool_call_id: Option<String>, internal_call_id: &str) -> String {
+    tool_call_id.unwrap_or_else(|| internal_call_id.to_string())
+}
+
 async fn persist_and_emit_cortex_chat_error(
     store: &CortexChatStore,
     event_tx: &mpsc::Sender<CortexChatEvent>,
@@ -155,6 +164,7 @@ impl<M: CompletionModel> PromptHook<M> for CortexChatHook {
         internal_call_id: &str,
         args: &str,
     ) -> ToolCallHookAction {
+        let call_id = resolve_lifecycle_call_id(tool_call_id.clone(), internal_call_id);
         let action = <SpacebotHook as PromptHook<M>>::on_tool_call(
             &self.spacebot_hook,
             tool_name,
@@ -166,8 +176,6 @@ impl<M: CompletionModel> PromptHook<M> for CortexChatHook {
         if !matches!(action, ToolCallHookAction::Continue) {
             return action;
         }
-
-        let call_id = internal_call_id.to_string();
 
         // Record tool call start in accumulated list
         {
@@ -204,13 +212,15 @@ impl<M: CompletionModel> PromptHook<M> for CortexChatHook {
                 .record_tool_result_metrics(tool_name, internal_call_id);
             return guard_action;
         }
+        let call_id = resolve_lifecycle_call_id(_tool_call_id, internal_call_id);
         let preview = crate::tools::truncate_utf8_ellipsis(result, 200);
-        self.spacebot_hook
-            .emit_tool_completed_event_from_capped(tool_name, preview.clone());
+        self.spacebot_hook.emit_tool_completed_event_from_capped(
+            tool_name,
+            call_id.clone(),
+            preview.clone(),
+        );
         self.spacebot_hook
             .record_tool_result_metrics(tool_name, internal_call_id);
-
-        let call_id = internal_call_id.to_string();
 
         // Update the accumulated tool call with the result
         {
@@ -821,8 +831,11 @@ impl CortexChatSession {
         };
 
         let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
+        let routing = runtime_config.routing.load();
+        let model_name = routing.resolve(ProcessType::Cortex, None).to_string();
+        let tool_use_enforcement = runtime_config.tool_use_enforcement.load();
 
-        prompt_engine.render_cortex_chat_prompt(
+        let system_prompt = prompt_engine.render_cortex_chat_prompt(
             empty_to_none(identity_context),
             empty_to_none(memory_bulletin.to_string()),
             channel_transcript,
@@ -831,6 +844,12 @@ impl CortexChatSession {
             empty_to_none(runtime_config_snapshot),
             worker_capabilities,
             self.factory_enabled,
+        )?;
+
+        prompt_engine.maybe_append_tool_use_enforcement(
+            system_prompt,
+            tool_use_enforcement.as_ref(),
+            &model_name,
         )
     }
 
@@ -872,6 +891,16 @@ impl CortexChatSession {
                                 transcript.push_str(&format!("*[Worker: {task}]*: {result}\n\n"));
                             }
                         }
+                        crate::conversation::history::TimelineItem::ToolCallRun {
+                            tool_name,
+                            result,
+                            ..
+                        } => {
+                            if let Some(result) = result {
+                                transcript
+                                    .push_str(&format!("*[Tool: {tool_name}]*: {result}\n\n"));
+                            }
+                        }
                     }
                 }
                 Some(transcript)
@@ -887,7 +916,7 @@ impl CortexChatSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{CortexChatSendError, try_acquire_send_lock};
+    use super::{CortexChatSendError, resolve_lifecycle_call_id, try_acquire_send_lock};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Mutex;
@@ -908,6 +937,18 @@ mod tests {
         let text = "done";
         let preview = crate::tools::truncate_utf8_ellipsis(text, 200);
         assert_eq!(preview, text);
+    }
+
+    #[test]
+    fn resolve_lifecycle_call_id_prefers_tool_call_id() {
+        let call_id = resolve_lifecycle_call_id(Some("call_external".to_string()), "internal_1");
+        assert_eq!(call_id, "call_external");
+    }
+
+    #[test]
+    fn resolve_lifecycle_call_id_falls_back_to_internal_call_id() {
+        let call_id = resolve_lifecycle_call_id(None, "internal_1");
+        assert_eq!(call_id, "internal_1");
     }
 
     #[tokio::test]

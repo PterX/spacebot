@@ -15,7 +15,14 @@ use crate::agent::compactor::Compactor;
 use crate::agent::process_control::ControlActionResult;
 use crate::agent::status::{StatusBlock, SystemInfo};
 use crate::agent::worker::Worker;
-use crate::conversation::{ChannelStore, ConversationLogger, ProcessRunLogger};
+use crate::conversation::settings::{
+    DelegationMode, MemoryMode, ResolvedConversationSettings, ResponseMode,
+};
+use crate::conversation::{
+    ActiveParticipant, ChannelStore, ConversationLogger, ProcessRunLogger,
+    participant_display_name, participant_memory_key, renderable_participants,
+    track_active_participant,
+};
 use crate::error::{AgentError, Result};
 use crate::hooks::SpacebotHook;
 use crate::llm::SpacebotModel;
@@ -57,6 +64,41 @@ struct PendingResult {
 }
 
 const EVENT_LAG_WARNING_INTERVAL_SECS: u64 = 30;
+const DECISION_MARKERS: &[&str] = &[
+    "we decided to ",
+    "i decided to ",
+    "decision:",
+    "the decision is ",
+    "approved: ",
+    "approved to ",
+    "moving forward with ",
+    "move forward with ",
+    "going with ",
+    "switching to ",
+    "we will use ",
+    "i will use ",
+    "we'll use ",
+    "i'll use ",
+    "we will switch to ",
+    "i will switch to ",
+    "we'll switch to ",
+    "i'll switch to ",
+    "we will proceed with ",
+    "i will proceed with ",
+    "we'll proceed with ",
+    "i'll proceed with ",
+];
+const CHANGE_COMPARISON_VERBS: &[&str] = &[
+    "use ",
+    "switch",
+    "adopt ",
+    "choose ",
+    "pick ",
+    "go with ",
+    "proceed with ",
+];
+const BRANCH_CANCELLED_PREFIX: &str = "Branch cancelled:";
+const BRANCH_CANCELLED_SENTENCE: &str = "Branch cancelled.";
 
 async fn recv_channel_event(
     event_rx: &mut broadcast::Receiver<ProcessEvent>,
@@ -77,6 +119,197 @@ fn should_flush_coalesce_buffer_for_event(event: &ProcessEvent) -> bool {
             | ProcessEvent::WorkerStatus { .. }
             | ProcessEvent::WorkerComplete { .. }
     )
+}
+
+fn classify_conversational_event_summary(
+    summary: &str,
+    default_event_type: crate::memory::WorkingMemoryEventType,
+) -> (crate::memory::WorkingMemoryEventType, String) {
+    let trimmed = summary.trim();
+    if trimmed.is_empty() {
+        return (default_event_type, String::new());
+    }
+
+    if let Some((prefix, rest)) = trimmed.split_once(':') {
+        let rest_trimmed = rest.trim();
+        let prefix = prefix.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+        if prefix == "outcome" {
+            return (
+                crate::memory::WorkingMemoryEventType::Outcome,
+                rest_trimmed.to_string(),
+            );
+        }
+        if prefix == "blocked_on" {
+            return (
+                crate::memory::WorkingMemoryEventType::BlockedOn,
+                rest_trimmed.to_string(),
+            );
+        }
+        if prefix == "constraint" {
+            return (
+                crate::memory::WorkingMemoryEventType::Constraint,
+                rest_trimmed.to_string(),
+            );
+        }
+        if prefix == "deadline_set" || prefix == "deadline" {
+            return (
+                crate::memory::WorkingMemoryEventType::DeadlineSet,
+                rest_trimmed.to_string(),
+            );
+        }
+    }
+
+    (default_event_type, trimmed.to_string())
+}
+
+fn format_conversational_event_summary(
+    event_type: crate::memory::WorkingMemoryEventType,
+    source: &str,
+    event_summary: &str,
+) -> String {
+    let label = match event_type {
+        crate::memory::WorkingMemoryEventType::Outcome => "outcome",
+        crate::memory::WorkingMemoryEventType::BlockedOn => "blocked on",
+        crate::memory::WorkingMemoryEventType::Constraint => "constraint",
+        crate::memory::WorkingMemoryEventType::DeadlineSet => "deadline set",
+        crate::memory::WorkingMemoryEventType::Error => "failed",
+        crate::memory::WorkingMemoryEventType::BranchCompleted
+        | crate::memory::WorkingMemoryEventType::WorkerCompleted => "completed",
+        _ => "concluded",
+    };
+
+    if event_summary.is_empty() {
+        format!("{source} {label}")
+    } else {
+        format!("{source} {label}: {event_summary}")
+    }
+}
+
+fn truncate_working_memory_summary(summary: &str) -> String {
+    if summary.len() > 200 {
+        let boundary = summary.floor_char_boundary(200);
+        format!("{}...", &summary[..boundary])
+    } else {
+        summary.to_string()
+    }
+}
+
+fn branch_working_memory_event_summary(
+    conclusion: &str,
+) -> (crate::memory::WorkingMemoryEventType, String) {
+    if let Some(reason) = parse_branch_cancellation_reason(conclusion) {
+        let reason = truncate_working_memory_summary(reason.trim());
+        let summary = if reason.is_empty() {
+            "Branch cancelled".to_string()
+        } else {
+            format!("Branch cancelled: {reason}")
+        };
+        return (crate::memory::WorkingMemoryEventType::Error, summary);
+    }
+
+    let summary = truncate_working_memory_summary(conclusion);
+    let (event_type, event_summary) = classify_conversational_event_summary(
+        &summary,
+        crate::memory::WorkingMemoryEventType::BranchCompleted,
+    );
+    (
+        event_type,
+        format_conversational_event_summary(event_type, "Branch", &event_summary),
+    )
+}
+
+fn parse_branch_cancellation_reason(conclusion: &str) -> Option<&str> {
+    let trimmed = conclusion.trim();
+    if let Some(rest) = trimmed.strip_prefix(BRANCH_CANCELLED_PREFIX) {
+        return Some(rest);
+    }
+    if let Some(rest) = trimmed.strip_prefix(BRANCH_CANCELLED_SENTENCE) {
+        return Some(rest);
+    }
+    None
+}
+
+fn sentence_contains_decision_marker(sentence: &str) -> bool {
+    let sentence_lower = sentence.to_ascii_lowercase();
+    DECISION_MARKERS
+        .iter()
+        .any(|marker| sentence_lower.contains(marker))
+        || (sentence_lower.contains(" instead of ")
+            && CHANGE_COMPARISON_VERBS
+                .iter()
+                .any(|marker| sentence_lower.contains(marker)))
+}
+
+fn extract_decision_summary_from_reply(reply_text: &str) -> Option<String> {
+    let normalized = reply_text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let has_explicit_marker = DECISION_MARKERS.iter().any(|marker| lower.contains(marker));
+    let has_change_comparison = lower.contains(" instead of ")
+        && CHANGE_COMPARISON_VERBS
+            .iter()
+            .any(|marker| lower.contains(marker));
+
+    if !has_explicit_marker && !has_change_comparison {
+        return None;
+    }
+
+    let sentences: Vec<&str> = trimmed
+        .split_terminator(['.', '!', '?', '\n'])
+        .map(str::trim)
+        .filter(|sentence| !sentence.is_empty())
+        .collect();
+
+    let mut summary = sentences
+        .iter()
+        .copied()
+        .find(|sentence| sentence_contains_decision_marker(sentence))
+        .or_else(|| sentences.first().copied())
+        .unwrap_or(trimmed)
+        .trim()
+        .to_string();
+
+    if summary.len() > 200 {
+        let boundary = summary.floor_char_boundary(200);
+        summary.truncate(boundary);
+        summary.push_str("...");
+    }
+
+    Some(summary)
+}
+
+fn decision_user_id(
+    humans: &[crate::config::HumanDef],
+    message: &InboundMessage,
+    is_retrigger: bool,
+) -> Option<String> {
+    if is_retrigger || message.source == "system" {
+        return None;
+    }
+
+    let source = message.source.trim();
+    if source.is_empty() || message.sender_id.is_empty() {
+        return None;
+    }
+
+    Some(participant_memory_key(
+        humans,
+        source,
+        message.adapter.as_deref(),
+        &message.sender_id,
+    ))
+}
+
+struct AgentTurnResult {
+    result: std::result::Result<String, rig::completion::PromptError>,
+    skip_flag: crate::tools::SkipFlag,
+    replied_flag: crate::tools::RepliedFlag,
+    retrigger_reply_preserved: bool,
+    reply_text: Option<String>,
 }
 
 /// Shared state that channel tools need to act on the channel.
@@ -124,6 +357,18 @@ pub struct ChannelState {
     /// `ToolStarted`/`ToolCompleted` events as they flow through the system.
     /// Defaults to a standalone empty map when the API layer is not active.
     pub live_worker_transcripts: LiveWorkerTranscripts,
+    /// Worker context settings inherited from conversation settings.
+    /// Determines what context workers spawned from this channel receive.
+    pub worker_context_settings: Arc<RwLock<crate::conversation::settings::WorkerContextMode>>,
+    /// Resolved model overrides from conversation settings.
+    /// Used by branches, workers, and compactor to resolve their model.
+    pub model_overrides: Arc<crate::conversation::settings::ResolvedConversationSettings>,
+    /// Active participants seen during the current channel session.
+    pub active_participants: Arc<RwLock<HashMap<String, ActiveParticipant>>>,
+    /// Optional cron outcome for the `set_outcome` tool.
+    /// When set, the `set_outcome` tool is registered for this channel,
+    /// allowing the LLM to explicitly store a delivery payload.
+    pub cron_outcome: Option<crate::cron::CronOutcome>,
 }
 
 impl ChannelState {
@@ -134,20 +379,27 @@ impl ChannelState {
             .await
     }
 
-    /// Cancel a running worker by aborting its tokio task and cleaning up state.
-    /// Emits a synthetic terminal event so downstream consumers converge.
+    /// Cancel a running worker by aborting its tokio task.
+    /// Emits a synthetic terminal event so the event handler can clean up
+    /// worker_handles and trigger a retrigger with the cancellation reason.
     pub async fn cancel_worker_with_reason(
         &self,
         worker_id: WorkerId,
         reason: &str,
     ) -> std::result::Result<(), String> {
-        let removed = self
-            .active_workers
-            .write()
-            .await
-            .remove(&worker_id)
-            .is_some();
-        let handle = self.worker_handles.write().await.remove(&worker_id);
+        // Abort via read access so the handle stays in worker_handles.
+        // The WorkerComplete event handler will remove it and trigger a retrigger.
+        let aborted = {
+            let handles = self.worker_handles.read().await;
+            if let Some(handle) = handles.get(&worker_id) {
+                handle.abort();
+                true
+            } else {
+                false
+            }
+        };
+
+        // Stop routing messages to the dead worker immediately.
         let removed_input = self
             .worker_inputs
             .write()
@@ -155,21 +407,13 @@ impl ChannelState {
             .remove(&worker_id)
             .is_some();
         self.worker_injections.write().await.remove(&worker_id);
-        let removed_status = self.status_block.write().await.remove_worker(worker_id);
-        let should_emit = removed || handle.is_some();
 
-        if !should_emit {
+        if !aborted {
+            let removed_status = self.status_block.write().await.remove_worker(worker_id);
             if removed_input || removed_status {
                 return Ok(());
             }
             return Err(format!("Worker {worker_id} not found"));
-        }
-
-        // Abort first so the worker stops producing new ToolStarted/ToolCompleted
-        // events, then drain whatever was accumulated. This avoids a race where
-        // events written between drain and abort would be lost.
-        if let Some(handle) = handle {
-            handle.abort();
         }
 
         // Now that the worker future is cancelled, drain the live transcript
@@ -269,27 +513,38 @@ impl ChannelState {
     }
 
     /// Cancel a running branch by aborting its tokio task.
-    /// Emits a synthetic terminal result so channel state converges.
+    /// Emits a synthetic terminal result so the event handler can clean up
+    /// active_branches and trigger a retrigger with the cancellation reason.
     pub async fn cancel_branch_with_reason(
         &self,
         branch_id: BranchId,
         reason: &str,
     ) -> std::result::Result<(), String> {
-        let handle = self.active_branches.write().await.remove(&branch_id);
-        let removed_status = self.status_block.write().await.remove_branch(branch_id);
-        let Some(handle) = handle else {
+        // Abort via read access so the handle stays in active_branches.
+        // The BranchResult event handler will remove it and trigger a retrigger.
+        let aborted = {
+            let branches = self.active_branches.read().await;
+            if let Some(handle) = branches.get(&branch_id) {
+                handle.abort();
+                true
+            } else {
+                false
+            }
+        };
+
+        if !aborted {
+            let removed_status = self.status_block.write().await.remove_branch(branch_id);
             if removed_status {
                 return Ok(());
             }
             return Err(format!("Branch {branch_id} not found"));
-        };
+        }
 
-        handle.abort();
         let reason = crate::summarize_first_non_empty_line(reason, crate::EVENT_SUMMARY_MAX_CHARS);
         let conclusion = if reason.is_empty() {
-            "Branch cancelled.".to_string()
+            BRANCH_CANCELLED_SENTENCE.to_string()
         } else {
-            format!("Branch cancelled: {reason}")
+            format!("{BRANCH_CANCELLED_PREFIX} {reason}")
         };
         self.process_run_logger
             .log_branch_completed(branch_id, &conclusion);
@@ -367,6 +622,43 @@ impl ChannelControlHandle {
         {
             Ok(()) => ControlActionResult::Cancelled,
             Err(_) => ControlActionResult::NotFound,
+        }
+    }
+
+    /// Cancel all active workers and branches, emitting WorkerComplete/BranchResult
+    /// for each so the channel can retrigger and synthesize partial results.
+    pub async fn cancel_all_workers_and_branches(&self, reason: &str) {
+        let worker_ids: Vec<WorkerId> = self
+            .inner
+            .state
+            .worker_handles
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect();
+        for worker_id in worker_ids {
+            let _ = self
+                .inner
+                .state
+                .cancel_worker_with_reason(worker_id, reason)
+                .await;
+        }
+        let branch_ids: Vec<BranchId> = self
+            .inner
+            .state
+            .active_branches
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect();
+        for branch_id in branch_ids {
+            let _ = self
+                .inner
+                .state
+                .cancel_branch_with_reason(branch_id, reason)
+                .await;
         }
     }
 }
@@ -448,13 +740,10 @@ pub struct Channel {
     /// Injected into the system prompt (not into chat history) so the LLM
     /// treats it as read-only context rather than actionable user messages.
     backfill_transcript: Option<String>,
-    /// Channel-local reply mode toggle.
-    /// When true, suppress unsolicited replies unless explicitly invoked.
-    listen_only_mode: bool,
-    /// Session-scoped override used when persistence is unavailable/failed.
-    listen_only_session_override: Option<bool>,
     /// Handle exposed to the supervision control plane.
     control_handle: ChannelControlHandle,
+    /// Per-conversation resolved settings (memory mode, delegation mode, model override).
+    pub resolved_settings: ResolvedConversationSettings,
 }
 
 /// RAII guard that records `message_handling_duration_seconds` when dropped,
@@ -478,6 +767,27 @@ impl Drop for MessageDurationGuard {
 }
 
 impl Channel {
+    fn record_decision_event(&self, reply_text: Option<&str>, user_id: Option<String>) {
+        let Some(decision_summary) = reply_text.and_then(extract_decision_summary_from_reply)
+        else {
+            return;
+        };
+
+        let mut event = self
+            .deps
+            .working_memory
+            .emit(
+                crate::memory::WorkingMemoryEventType::Decision,
+                decision_summary,
+            )
+            .channel(self.id.as_ref())
+            .importance(0.8);
+        if let Some(user_id) = user_id {
+            event = event.user(user_id);
+        }
+        event.record();
+    }
+
     /// Create a new channel.
     ///
     /// All tunable config (prompts, routing, thresholds, browser, skills) is read
@@ -493,6 +803,8 @@ impl Channel {
         logs_dir: std::path::PathBuf,
         prompt_snapshot_store: Option<Arc<crate::agent::prompt_snapshot::PromptSnapshotStore>>,
         live_worker_transcripts: Option<LiveWorkerTranscripts>,
+        resolved_settings: ResolvedConversationSettings,
+        cron_outcome: Option<crate::cron::CronOutcome>,
     ) -> (Self, mpsc::Sender<InboundMessage>) {
         let process_id = ProcessId::Channel(id.clone());
         let hook = SpacebotHook::new(
@@ -512,7 +824,14 @@ impl Channel {
         let process_run_logger = ProcessRunLogger::new(deps.sqlite_pool.clone());
         let channel_store = ChannelStore::new(deps.sqlite_pool.clone());
 
-        let compactor = Compactor::new(id.clone(), deps.clone(), history.clone());
+        let compactor = Compactor::new(
+            id.clone(),
+            deps.clone(),
+            history.clone(),
+            resolved_settings
+                .resolve_model("compactor")
+                .map(String::from),
+        );
 
         let state = ChannelState {
             channel_id: id.clone(),
@@ -534,6 +853,12 @@ impl Channel {
             prompt_snapshot_store,
             live_worker_transcripts: live_worker_transcripts
                 .unwrap_or_else(|| Arc::new(RwLock::new(HashMap::new()))),
+            worker_context_settings: Arc::new(RwLock::new(
+                resolved_settings.worker_context.clone(),
+            )),
+            model_overrides: Arc::new(resolved_settings.clone()),
+            active_participants: Arc::new(RwLock::new(HashMap::new())),
+            cron_outcome,
         };
 
         // Each channel gets its own isolated tool server to avoid races between
@@ -545,20 +870,23 @@ impl Channel {
             let has_links =
                 !crate::links::links_for_agent(&deps.links.load(), &deps.agent_id).is_empty();
             if has_links {
-                Some(crate::tools::SendAgentMessageTool::new(
+                let mut tool = crate::tools::SendAgentMessageTool::new(
                     deps.agent_id.clone(),
                     deps.links.clone(),
                     deps.agent_names.clone(),
                     deps.task_store.clone(),
                     ConversationLogger::new(deps.sqlite_pool.clone()),
-                ))
+                );
+                if let Some(wake_tx) = deps.wake_tx.clone() {
+                    tool = tool.with_wake_tx(wake_tx);
+                }
+                Some(tool)
             } else {
                 None
             }
         };
 
         let self_tx = message_tx.clone();
-        let resolved_listen_only_mode = deps.runtime_config.channel_config.load().listen_only_mode;
         let control_handle = ChannelControlHandle::new(state.clone());
         let channel = Self {
             id: id.clone(),
@@ -589,9 +917,8 @@ impl Channel {
             pending_results: Vec::new(),
             send_agent_message_tool,
             backfill_transcript: None,
-            listen_only_mode: resolved_listen_only_mode,
-            listen_only_session_override: None,
             control_handle,
+            resolved_settings,
         };
 
         (channel, message_tx)
@@ -622,79 +949,101 @@ impl Channel {
             .filter(|adapter| !adapter.is_empty())
     }
 
-    fn sync_listen_only_mode_from_runtime(&mut self) {
-        if let Some(override_mode) = self.listen_only_session_override {
-            self.listen_only_mode = override_mode;
-            return;
-        }
-        let runtime_default = self
-            .deps
-            .runtime_config
-            .channel_config
-            .load()
-            .listen_only_mode;
-        let explicit_listen_only = **self.deps.runtime_config.channel_listen_only_explicit.load();
-        let settings_store = self
-            .deps
-            .runtime_config
-            .settings
-            .load()
-            .as_ref()
-            .as_ref()
-            .cloned();
-        self.listen_only_mode = if explicit_listen_only.is_some() {
-            runtime_default
-        } else if let Some(settings_store) = settings_store {
-            match settings_store.channel_listen_only_mode_for(self.id.as_ref()) {
-                Ok(Some(enabled)) => enabled,
-                Ok(None) => runtime_default,
+    /// Re-load settings from the database after a SettingsUpdated event.
+    async fn reload_settings(&mut self) {
+        let agent_id = self.deps.agent_id.to_string();
+        let channel_id = self.id.as_ref();
+
+        // Try portal store first, then channel_settings
+        let new_settings = if channel_id.starts_with("portal:chat:") {
+            let store =
+                crate::conversation::PortalConversationStore::new(self.deps.sqlite_pool.clone());
+            match store.get(&agent_id, channel_id).await {
+                Ok(Some(conv)) => conv.settings,
+                Ok(None) => None,
                 Err(error) => {
                     tracing::warn!(
                         %error,
                         channel_id = %self.id,
-                        "failed to sync channel-scoped listen_only_mode setting"
+                        "failed to reload portal settings, preserving existing"
                     );
-                    runtime_default
+                    return;
                 }
             }
         } else {
-            runtime_default
+            let store =
+                crate::conversation::ChannelSettingsStore::new(self.deps.sqlite_pool.clone());
+            match store.get(&agent_id, channel_id).await {
+                Ok(settings) => settings,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        channel_id = %self.id,
+                        "failed to reload channel settings, preserving existing"
+                    );
+                    return;
+                }
+            }
         };
+
+        let resolved = crate::conversation::settings::ResolvedConversationSettings::resolve(
+            new_settings.as_ref(),
+            None,
+            None,
+        );
+
+        tracing::info!(
+            channel_id = %self.id,
+            response_mode = ?resolved.response_mode,
+            model = ?resolved.model,
+            "settings hot-reloaded"
+        );
+
+        // Update shared state for branches/workers
+        *self.state.worker_context_settings.write().await = resolved.worker_context.clone();
+        self.state.model_overrides = std::sync::Arc::new(resolved.clone());
+        self.resolved_settings = resolved;
     }
 
-    fn set_listen_only_mode(&mut self, enabled: bool) -> bool {
-        let mut persisted = false;
-        let settings_store = self
-            .deps
-            .runtime_config
-            .settings
-            .load()
-            .as_ref()
-            .as_ref()
-            .cloned();
-        if let Some(settings_store) = settings_store {
-            match settings_store.set_channel_listen_only_mode_for(self.id.as_ref(), enabled) {
-                Ok(()) => persisted = true,
+    /// Whether the channel is in a non-active response mode (Observe or MentionOnly).
+    fn is_suppressed(&self) -> bool {
+        !matches!(self.resolved_settings.response_mode, ResponseMode::Active)
+    }
+
+    /// Update the response mode and persist to the channel_settings table.
+    async fn set_response_mode(&mut self, mode: ResponseMode) {
+        self.resolved_settings.response_mode = mode;
+
+        // Persist to channel_settings table — load existing settings first so we
+        // don't overwrite other fields, then spawn the DB write to avoid blocking.
+        let pool = self.deps.sqlite_pool.clone();
+        let agent_id = self.deps.agent_id.clone();
+        let channel_id: String = self.id.as_ref().to_owned();
+        tokio::spawn(async move {
+            let store = crate::conversation::ChannelSettingsStore::new(pool);
+            let mut settings = match store.get(&agent_id, &channel_id).await {
+                Ok(Some(existing)) => existing,
+                Ok(None) => crate::conversation::ConversationSettings::default(),
                 Err(error) => {
                     tracing::warn!(
                         %error,
-                        channel_id = %self.id,
-                        listen_only_mode = enabled,
-                        "failed to persist listen_only_mode setting"
+                        %channel_id,
+                        ?mode,
+                        "failed to load existing settings before persisting response_mode"
                     );
+                    crate::conversation::ConversationSettings::default()
                 }
+            };
+            settings.response_mode = mode;
+            if let Err(error) = store.upsert(&agent_id, &channel_id, &settings).await {
+                tracing::warn!(
+                    %error,
+                    %channel_id,
+                    ?mode,
+                    "failed to persist response_mode to channel_settings"
+                );
             }
-        } else {
-            tracing::warn!(
-                channel_id = %self.id,
-                listen_only_mode = enabled,
-                "settings store unavailable; listen_only_mode is session-scoped"
-            );
-        }
-
-        self.listen_only_mode = enabled;
-        self.listen_only_session_override = if persisted { None } else { Some(enabled) };
-        persisted
+        });
     }
 
     fn persist_inbound_user_message(
@@ -706,11 +1055,7 @@ impl Channel {
         if message.source == "system" {
             return;
         }
-        let sender_name = message
-            .metadata
-            .get("sender_display_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&message.sender_id);
+        let sender_name = participant_display_name(message);
 
         // If attachments were saved, enrich the metadata with their info
         let metadata = if let Some(saved) = saved_attachments {
@@ -725,7 +1070,7 @@ impl Channel {
 
         self.state.conversation_logger.log_user_message(
             &self.state.channel_id,
-            sender_name,
+            &sender_name,
             &message.sender_id,
             raw_text,
             &metadata,
@@ -737,6 +1082,16 @@ impl Channel {
 
     fn suppress_plaintext_fallback(&self) -> bool {
         matches!(self.current_adapter(), Some("email"))
+    }
+
+    async fn track_participant_from_message(&self, message: &InboundMessage) {
+        if message.source == "system" {
+            return;
+        }
+
+        let humans = self.deps.humans.load();
+        let mut participants = self.state.active_participants.write().await;
+        track_active_participant(&mut participants, humans.as_ref(), message);
     }
 
     /// Return a handle that allows external supervision to cancel this channel's
@@ -811,6 +1166,17 @@ impl Channel {
         self.response_tx.send(routed).await
     }
 
+    /// Drain accumulated channel tool calls from ApiState and serialize as JSON.
+    /// Returns `None` if there are no tool calls or ApiState is unavailable.
+    async fn drain_tool_calls_json(&self) -> Option<String> {
+        let api_state = self.state.deps.api_state.as_ref()?;
+        let calls = api_state.take_channel_tool_calls(&self.id).await;
+        if calls.is_empty() {
+            return None;
+        }
+        serde_json::to_string(&calls).ok()
+    }
+
     async fn send_builtin_text(&mut self, text: String, log_label: &str) {
         match self.send_routed(OutboundResponse::Text(text.clone())).await {
             Ok(()) => {
@@ -822,11 +1188,15 @@ impl Channel {
                         .with_label_values(&[&self.deps.agent_id, channel_type])
                         .inc();
                 }
-                self.state.conversation_logger.log_bot_message_with_name(
-                    &self.state.channel_id,
-                    &text,
-                    Some(self.agent_display_name()),
-                );
+                let tool_calls_json = self.drain_tool_calls_json().await;
+                self.state
+                    .conversation_logger
+                    .log_bot_message_with_metadata(
+                        &self.state.channel_id,
+                        &text,
+                        Some(self.agent_display_name()),
+                        tool_calls_json,
+                    );
             }
             Err(error) => {
                 #[cfg(feature = "metrics")]
@@ -869,12 +1239,18 @@ impl Channel {
         match text {
             "/status" => {
                 let routing = self.deps.runtime_config.routing.load();
-                let channel_model = routing.resolve(ProcessType::Channel, None).to_string();
-                let branch_model = routing.resolve(ProcessType::Branch, None).to_string();
-                let mode = if self.listen_only_mode {
-                    "quiet"
-                } else {
-                    "active"
+                let channel_model = self
+                    .resolved_settings
+                    .resolve_model("channel")
+                    .unwrap_or_else(|| routing.resolve(ProcessType::Channel, None));
+                let branch_model = self
+                    .resolved_settings
+                    .resolve_model("branch")
+                    .unwrap_or_else(|| routing.resolve(ProcessType::Branch, None));
+                let mode = match self.resolved_settings.response_mode {
+                    ResponseMode::Active => "active",
+                    ResponseMode::Observe => "observe (learning, never responds)",
+                    ResponseMode::MentionOnly => "mention-only (@mention/reply only)",
                 };
                 let adapter = self.current_adapter().unwrap_or("unknown");
                 let body = format!(
@@ -882,7 +1258,7 @@ impl Channel {
                      - agent: {}\n\
                      - channel: {}\n\
                      - adapter: {}\n\
-                     - mode: {} (quiet => only command/@mention/reply-to-bot)\n\
+                     - mode: {}\n\
                      - channel model: {}\n\
                      - branch model: {}\n\
                      - time: {}",
@@ -897,25 +1273,33 @@ impl Channel {
                 self.send_builtin_text(body, "status").await;
                 return Ok(true);
             }
-            "/quiet" => {
-                let persisted = self.set_listen_only_mode(true);
-                let body = if persisted {
-                    "quiet mode enabled. i'll only reply to commands, @mentions, or replies to my message."
-                        .to_string()
-                } else {
-                    "quiet mode enabled for this session, but persistence failed; it may revert after restart.".to_string()
-                };
-                self.send_builtin_text(body, "quiet").await;
+            "/quiet" | "/observe" => {
+                self.set_response_mode(ResponseMode::Observe).await;
+                self.send_builtin_text(
+                    "observe mode enabled. i'll learn from this conversation but won't respond."
+                        .to_string(),
+                    "observe",
+                )
+                .await;
                 return Ok(true);
             }
             "/active" => {
-                let persisted = self.set_listen_only_mode(false);
-                let body = if persisted {
-                    "active mode enabled. i'll respond normally in this chat.".to_string()
-                } else {
-                    "active mode enabled for this session, but persistence failed; it may revert after restart.".to_string()
-                };
-                self.send_builtin_text(body, "active").await;
+                self.set_response_mode(ResponseMode::Active).await;
+                self.send_builtin_text(
+                    "active mode enabled. i'll respond normally in this chat.".to_string(),
+                    "active",
+                )
+                .await;
+                return Ok(true);
+            }
+            "/mention-only" => {
+                self.set_response_mode(ResponseMode::MentionOnly).await;
+                self.send_builtin_text(
+                    "mention-only mode enabled. i'll only respond when @mentioned or replied to."
+                        .to_string(),
+                    "mention-only",
+                )
+                .await;
                 return Ok(true);
             }
             "/help" => {
@@ -925,7 +1309,9 @@ impl Channel {
                     "- /today: in-progress + ready task snapshot".to_string(),
                     "- /tasks: ready task list".to_string(),
                     "- /digest: one-shot day digest (00:00 -> now)".to_string(),
-                    "- /quiet: listen-only mode".to_string(),
+                    "- /observe: learn from conversation, never respond".to_string(),
+                    "- /mention-only: only respond when @mentioned, replied to, or given a command"
+                        .to_string(),
                     "- /active: normal reply mode".to_string(),
                     "- /agent-id: runtime agent id".to_string(),
                 ];
@@ -946,6 +1332,22 @@ impl Channel {
         let mut last_lag_warning: Option<std::time::Instant> = None;
 
         loop {
+            // Cron channels have no further user messages after the initial prompt.
+            // Once all workers/branches finish and no retrigger is pending, exit so
+            // the scheduler can flush the reply buffer. Without this the channel
+            // would wait on the broadcast event_rx (which never closes) until the
+            // job timeout kills it.
+            if self.state.cron_outcome.is_some()
+                && self.message_count > 0
+                && !self.pending_retrigger
+                && self.retrigger_deadline.is_none()
+                && self.state.worker_handles.read().await.is_empty()
+                && self.state.active_branches.read().await.is_empty()
+            {
+                tracing::info!(channel_id = %self.id, "cron channel finished all work, exiting");
+                break;
+            }
+
             // Compute next deadline from coalesce and retrigger timers
             let next_deadline = match (self.coalesce_deadline, self.retrigger_deadline) {
                 (Some(a), Some(b)) => Some(a.min(b)),
@@ -1164,7 +1566,6 @@ impl Channel {
     #[tracing::instrument(skip(self, messages), fields(channel_id = %self.id, agent_id = %self.deps.agent_id, message_count = messages.len()))]
     async fn handle_message_batch(&mut self, messages: Vec<InboundMessage>) -> Result<()> {
         // Apply runtime-config updates immediately without requiring a restart.
-        self.sync_listen_only_mode_from_runtime();
 
         let message_count = messages.len();
         let batch_start_timestamp = messages
@@ -1276,11 +1677,7 @@ impl Channel {
 
         for message in &messages {
             if message.source != "system" {
-                let sender_name = message
-                    .metadata
-                    .get("sender_display_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&message.sender_id);
+                let sender_name = participant_display_name(message);
 
                 let (raw_text, attachments) = match &message.content {
                     crate::MessageContent::Text(text) => (text.clone(), Vec::new()),
@@ -1293,7 +1690,7 @@ impl Channel {
                     }
                 };
 
-                if self.listen_only_mode {
+                if self.is_suppressed() {
                     let (invoked_by_command, invoked_by_mention, invoked_by_reply) =
                         self.compute_listen_mode_invocation(message, &raw_text);
                     batch_has_invoke |=
@@ -1330,7 +1727,7 @@ impl Channel {
 
                 self.state.conversation_logger.log_user_message(
                     &self.state.channel_id,
-                    sender_name,
+                    &sender_name,
                     &message.sender_id,
                     &raw_text,
                     &metadata,
@@ -1338,6 +1735,7 @@ impl Channel {
                 self.state
                     .channel_store
                     .upsert(&message.conversation_id, &metadata);
+                self.track_participant_from_message(message).await;
 
                 conversation_id = message.conversation_id.clone();
 
@@ -1368,13 +1766,36 @@ impl Channel {
             }
         }
 
-        if self.listen_only_mode && !batch_has_invoke && !self.is_dm() {
+        // Observe mode: always suppress (even with mentions in batch).
+        // MentionOnly mode: suppress only when no invocations in the batch.
+        let should_suppress_batch = !self.is_dm()
+            && match self.resolved_settings.response_mode {
+                ResponseMode::Active => false,
+                ResponseMode::Observe => true,
+                ResponseMode::MentionOnly => !batch_has_invoke,
+            };
+
+        if should_suppress_batch {
             tracing::debug!(
                 channel_id = %self.id,
                 message_count,
-                "listen-first mode: suppressing unsolicited coalesced batch"
+                response_mode = ?self.resolved_settings.response_mode,
+                "suppressing unsolicited coalesced batch"
             );
-            // Keep passive memory capture behavior aligned with single-message flow.
+            // Inject batch messages into in-memory history so the agent
+            // retains channel context.
+            {
+                let mut history = self.state.history.write().await;
+                for (formatted_text, _, _) in &pending_batch_entries {
+                    history.push(rig::message::Message::User {
+                        content: OneOrMany::one(UserContent::text(formatted_text)),
+                    });
+                }
+            }
+            if let Err(error) = self.compactor.check_and_compact().await {
+                tracing::warn!(channel_id = %self.id, %error, "compaction check failed");
+            }
+            // Both Observe and MentionOnly keep passive memory capture.
             self.message_count += message_count;
             self.check_memory_persistence().await;
             return Ok(());
@@ -1454,7 +1875,7 @@ impl Channel {
         }
 
         // Run agent turn with any image/audio attachments preserved
-        let (result, skip_flag, replied_flag, _) = self
+        let turn_result = self
             .run_agent_turn(
                 &combined_text,
                 &system_prompt,
@@ -1465,8 +1886,19 @@ impl Channel {
             )
             .await?;
 
-        self.handle_agent_result(result, &skip_flag, &replied_flag, false)
-            .await;
+        self.handle_agent_result(
+            turn_result.result,
+            &turn_result.skip_flag,
+            &turn_result.replied_flag,
+            false,
+        )
+        .await;
+        if turn_result
+            .replied_flag
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.record_decision_event(turn_result.reply_text.as_deref(), None);
+        }
         // Check compaction
         if let Err(error) = self.compactor.check_and_compact().await {
             tracing::warn!(channel_id = %self.id, %error, "compaction check failed");
@@ -1490,7 +1922,6 @@ impl Channel {
         let prompt_engine = rc.prompts.load();
 
         let identity_context = rc.identity.load().render();
-        let memory_bulletin = rc.memory_bulletin.load();
         let skills = rc.skills.load();
         let skills_prompt = skills.render_channel_prompt(&prompt_engine)?;
 
@@ -1524,58 +1955,36 @@ impl Channel {
 
         let org_context = self.build_org_context(&prompt_engine);
 
-        let adapter_prompt = self
-            .current_adapter()
-            .and_then(|adapter| prompt_engine.render_channel_adapter_prompt(adapter));
+        let adapter_prompt = if self.state.cron_outcome.is_some() {
+            prompt_engine.render_channel_adapter_prompt("cron")
+        } else {
+            self.current_adapter()
+                .and_then(|adapter| prompt_engine.render_channel_adapter_prompt(adapter))
+        };
 
         let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
+        let non_empty_option = |value: Option<String>| value.filter(|text| !text.is_empty());
 
         let project_context = self.build_project_context(&prompt_engine).await;
 
-        // Render working memory layers (Layers 2 + 3).
-        let wm_config = **rc.working_memory.load();
-        let timezone = self.deps.working_memory.timezone();
-        let working_memory = match crate::memory::working::render_working_memory(
-            &self.deps.working_memory,
-            self.id.as_ref(),
-            &wm_config,
-            timezone,
-        )
-        .await
-        {
-            Ok(text) => {
-                if text.is_empty() {
-                    tracing::debug!(channel_id = %self.id, "working memory rendered empty (disabled?)");
-                } else {
-                    tracing::debug!(channel_id = %self.id, len = text.len(), "working memory rendered");
-                }
-                text
-            }
-            Err(error) => {
-                tracing::warn!(channel_id = %self.id, %error, "working memory render failed");
-                String::new()
-            }
-        };
+        let (
+            working_memory,
+            channel_activity_map,
+            participant_context,
+            memory_bulletin_text,
+            knowledge_synthesis_text,
+        ) = self.render_memory_layers().await;
 
-        let channel_activity_map = match crate::memory::working::render_channel_activity_map(
-            &self.deps.sqlite_pool,
-            &self.deps.working_memory,
-            self.id.as_ref(),
-            &wm_config,
-            timezone,
-        )
-        .await
-        {
-            Ok(text) => text,
-            Err(error) => {
-                tracing::warn!(channel_id = %self.id, %error, "channel activity map render failed");
-                String::new()
-            }
-        };
+        let routing = rc.routing.load();
+        let model_name = routing.resolve(ProcessType::Channel, None).to_string();
+        let tool_use_enforcement = rc.tool_use_enforcement.load();
 
-        prompt_engine.render_channel_prompt_with_links(
+        let direct_mode = self.resolved_settings.delegation == DelegationMode::Direct;
+
+        let system_prompt = prompt_engine.render_channel_prompt_with_links(
             empty_to_none(identity_context),
-            empty_to_none(memory_bulletin.to_string()),
+            non_empty_option(memory_bulletin_text),
+            non_empty_option(knowledge_synthesis_text),
             empty_to_none(skills_prompt),
             worker_capabilities,
             self.conversation_context.clone(),
@@ -1589,6 +1998,14 @@ impl Channel {
             self.backfill_transcript.clone(),
             empty_to_none(working_memory),
             empty_to_none(channel_activity_map),
+            empty_to_none(participant_context),
+            direct_mode,
+        )?;
+
+        prompt_engine.maybe_append_tool_use_enforcement(
+            system_prompt,
+            tool_use_enforcement.as_ref(),
+            &model_name,
         )
     }
 
@@ -1600,7 +2017,6 @@ impl Channel {
     #[tracing::instrument(skip(self, message), fields(channel_id = %self.id, agent_id = %self.deps.agent_id, message_id = %message.id))]
     async fn handle_message(&mut self, message: InboundMessage) -> Result<()> {
         // Apply runtime-config updates immediately without requiring a restart.
-        self.sync_listen_only_mode_from_runtime();
 
         // Track the inbound message that triggered this turn so outbound
         // responses carry the correct routing metadata (e.g. Slack thread_ts).
@@ -1689,6 +2105,7 @@ impl Channel {
             .map(|data| data.iter().map(|(meta, _)| meta.clone()).collect());
 
         self.persist_inbound_user_message(&message, &raw_text, saved_metas.as_deref());
+        self.track_participant_from_message(&message).await;
 
         // Deterministic built-in command: bypass model output drift for agent identity checks.
         if message.source != "system" && raw_text.trim() == "/agent-id" {
@@ -1708,9 +2125,12 @@ impl Channel {
             }
         }
 
-        // Deterministic ping ack for Discord quiet-mode mentions/replies to avoid
+        // Deterministic ping ack for Discord mention-only mentions/replies to avoid
         // flaky model behavior (e.g. skipping or over-formatting simple liveness checks).
-        if should_send_discord_quiet_mode_ping_ack(&message, &raw_text, self.listen_only_mode) {
+        // Skipped in Observe mode — the agent never responds in Observe.
+        if !matches!(self.resolved_settings.response_mode, ResponseMode::Observe)
+            && should_send_discord_quiet_mode_ping_ack(&message, &raw_text, self.is_suppressed())
+        {
             self.send_builtin_text("yeah i'm here".to_string(), "discord-ping")
                 .await;
             return Ok(());
@@ -1757,21 +2177,42 @@ impl Channel {
         let mut invoked_by_mention = false;
         let mut invoked_by_reply = false;
 
-        // Listen-first guardrail:
-        // ingest all messages, but only reply when explicitly invoked.
-        if self.listen_only_mode && message.source != "system" && !self.is_dm() {
-            (invoked_by_command, invoked_by_mention, invoked_by_reply) =
-                self.compute_listen_mode_invocation(&message, &raw_text);
+        // Response mode guardrail:
+        // Observe mode: always suppress — agent learns but never responds.
+        // MentionOnly mode: suppress unless explicitly invoked.
+        if !matches!(self.resolved_settings.response_mode, ResponseMode::Active)
+            && message.source != "system"
+            && !self.is_dm()
+        {
+            // Observe mode always suppresses; MentionOnly checks for invocation.
+            let should_suppress =
+                if matches!(self.resolved_settings.response_mode, ResponseMode::Observe) {
+                    true
+                } else {
+                    (invoked_by_command, invoked_by_mention, invoked_by_reply) =
+                        self.compute_listen_mode_invocation(&message, &raw_text);
+                    !invoked_by_command && !invoked_by_mention && !invoked_by_reply
+                };
 
-            if !invoked_by_command && !invoked_by_mention && !invoked_by_reply {
+            if should_suppress {
                 tracing::debug!(
                     channel_id = %self.id,
                     source = %message.source,
-                    "listen-first mode: suppressing unsolicited reply"
+                    response_mode = ?self.resolved_settings.response_mode,
+                    "suppressing unsolicited reply"
                 );
-                // In quiet/listen-first mode we still want passive memory capture.
-                // Count suppressed user messages so auto memory persistence branches
-                // continue to run on interval without requiring explicit invokes.
+                // In Observe and MentionOnly modes, inject the message into
+                // in-memory history so the agent retains channel context.
+                {
+                    let mut history = self.state.history.write().await;
+                    history.push(rig::message::Message::User {
+                        content: OneOrMany::one(UserContent::text(&user_text)),
+                    });
+                }
+                if let Err(error) = self.compactor.check_and_compact().await {
+                    tracing::warn!(channel_id = %self.id, %error, "compaction check failed");
+                }
+                // Both Observe and MentionOnly keep passive memory capture.
                 self.message_count += 1;
                 self.check_memory_persistence().await;
                 return Ok(());
@@ -1824,7 +2265,7 @@ impl Channel {
             .adapter
             .as_deref()
             .or_else(|| self.current_adapter());
-        let (result, skip_flag, replied_flag, retrigger_reply_preserved) = self
+        let turn_result = self
             .run_agent_turn(
                 &user_text,
                 &system_prompt,
@@ -1835,20 +2276,38 @@ impl Channel {
             )
             .await?;
 
-        self.handle_agent_result(result, &skip_flag, &replied_flag, is_retrigger)
-            .await;
+        self.handle_agent_result(
+            turn_result.result,
+            &turn_result.skip_flag,
+            &turn_result.replied_flag,
+            is_retrigger,
+        )
+        .await;
 
-        // Safety-net: in quiet mode, explicit mention/reply should never be dropped silently.
+        if turn_result
+            .replied_flag
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let humans = self.deps.humans.load();
+            let user_id = decision_user_id(humans.as_ref(), &message, is_retrigger);
+            self.record_decision_event(turn_result.reply_text.as_deref(), user_id);
+        }
+
+        // Safety-net: in mention-only mode, explicit mention/reply should never be dropped silently.
         if should_send_quiet_mode_fallback(
             &message,
-            QuietModeFallbackState {
-                listen_only_mode: self.listen_only_mode,
+            ObserveModeFallbackState {
+                is_suppressed: self.is_suppressed(),
                 is_retrigger,
                 invoked_by_command,
                 invoked_by_mention,
                 invoked_by_reply,
-                skip_flag: skip_flag.load(std::sync::atomic::Ordering::Relaxed),
-                replied_flag: replied_flag.load(std::sync::atomic::Ordering::Relaxed),
+                skip_flag: turn_result
+                    .skip_flag
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                replied_flag: turn_result
+                    .replied_flag
+                    .load(std::sync::atomic::Ordering::Relaxed),
             },
         ) {
             self.send_builtin_text(
@@ -1871,8 +2330,10 @@ impl Channel {
         // reply content payload, this fallback preserves a compact background
         // result record for the next user turn.
         if is_retrigger {
-            let replied = replied_flag.load(std::sync::atomic::Ordering::Relaxed);
-            if replied && retrigger_reply_preserved {
+            let replied = turn_result
+                .replied_flag
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if replied && turn_result.retrigger_reply_preserved {
                 tracing::debug!(
                     channel_id = %self.id,
                     "skipping retrigger summary injection; relay reply already preserved"
@@ -2067,102 +2528,88 @@ impl Channel {
         prompt_engine.render_org_context(org_context).ok()
     }
 
+    async fn render_memory_layers(
+        &self,
+    ) -> (String, String, String, Option<String>, Option<String>) {
+        if matches!(self.resolved_settings.memory, MemoryMode::Off) {
+            return (String::new(), String::new(), String::new(), None, None);
+        }
+
+        let rc = &self.deps.runtime_config;
+        let memory_bulletin_text = Some(rc.memory_bulletin.load().to_string());
+        let knowledge_synthesis_text = Some(rc.knowledge_synthesis.load().to_string());
+        let wm_config = **rc.working_memory.load();
+        let timezone = self.deps.working_memory.timezone();
+
+        let working_memory = match crate::memory::working::render_working_memory(
+            &self.deps.working_memory,
+            self.id.as_ref(),
+            &wm_config,
+            timezone,
+        )
+        .await
+        {
+            Ok(text) => text,
+            Err(error) => {
+                tracing::warn!(channel_id = %self.id, %error, "working memory render failed");
+                String::new()
+            }
+        };
+
+        let channel_activity_map = match crate::memory::working::render_channel_activity_map(
+            &self.deps.sqlite_pool,
+            &self.deps.working_memory,
+            self.id.as_ref(),
+            &wm_config,
+            timezone,
+        )
+        .await
+        {
+            Ok(text) => text,
+            Err(error) => {
+                tracing::warn!(channel_id = %self.id, %error, "channel activity map render failed");
+                String::new()
+            }
+        };
+
+        let participant_config = **rc.participant_context.load();
+        let tracked_participants = {
+            let participants = self.state.active_participants.read().await;
+            renderable_participants(&participants, &participant_config)
+        };
+        let participant_context = match crate::memory::working::render_participant_context(
+            &self.deps.working_memory,
+            &tracked_participants,
+            self.id.as_ref(),
+            &participant_config,
+        )
+        .await
+        {
+            Ok(text) => text,
+            Err(error) => {
+                tracing::warn!(channel_id = %self.id, %error, "participant context render failed");
+                String::new()
+            }
+        };
+
+        (
+            working_memory,
+            channel_activity_map,
+            participant_context,
+            memory_bulletin_text,
+            knowledge_synthesis_text,
+        )
+    }
+
     /// Build pre-rendered project context for prompt injection.
     ///
-    /// Fetches all active projects with their repos and worktrees, converts them
-    /// to prompt-friendly structs, and renders via the projects_context template.
-    /// Returns `None` if no projects exist or if rendering fails.
+    /// Delegates to the standalone `build_project_context` function shared
+    /// with worker spawning paths.
     async fn build_project_context(
         &self,
         prompt_engine: &crate::prompts::engine::PromptEngine,
     ) -> Option<String> {
-        use crate::prompts::engine::{ProjectContext, ProjectRepoContext, ProjectWorktreeContext};
-
-        let store = &self.deps.project_store;
-        let projects = match store
-            .list_projects(
-                &self.deps.agent_id,
-                Some(crate::projects::ProjectStatus::Active),
-            )
-            .await
-        {
-            Ok(projects) => projects,
-            Err(error) => {
-                tracing::warn!(%error, "failed to load projects for prompt injection");
-                return None;
-            }
-        };
-
-        if projects.is_empty() {
-            return None;
-        }
-
-        let mut contexts = Vec::with_capacity(projects.len());
-        for project in &projects {
-            let repos = match store.list_repos(&project.id).await {
-                Ok(repos) => repos,
-                Err(error) => {
-                    tracing::warn!(%error, project_id = %project.id, "failed to load repos for project");
-                    Vec::new()
-                }
-            };
-
-            let worktrees = match store.list_worktrees_with_repos(&project.id).await {
-                Ok(worktrees) => worktrees,
-                Err(error) => {
-                    tracing::warn!(%error, project_id = %project.id, "failed to load worktrees for project");
-                    Vec::new()
-                }
-            };
-
-            contexts.push(ProjectContext {
-                name: project.name.clone(),
-                root_path: project.root_path.clone(),
-                description: if project.description.is_empty() {
-                    None
-                } else {
-                    Some(project.description.clone())
-                },
-                tags: project.tags.clone(),
-                repos: repos
-                    .into_iter()
-                    .map(|repo| ProjectRepoContext {
-                        name: repo.name.clone(),
-                        path: repo.path.clone(),
-                        default_branch: repo.default_branch.clone(),
-                        remote_url: if repo.remote_url.is_empty() {
-                            None
-                        } else {
-                            Some(repo.remote_url.clone())
-                        },
-                    })
-                    .collect(),
-                worktrees: worktrees
-                    .into_iter()
-                    .map(|worktree_with_repo| ProjectWorktreeContext {
-                        name: worktree_with_repo.worktree.name.clone(),
-                        path: worktree_with_repo.worktree.path.clone(),
-                        branch: worktree_with_repo.worktree.branch.clone(),
-                        repo_name: worktree_with_repo.repo_name.clone(),
-                    })
-                    .collect(),
-            });
-        }
-
-        match prompt_engine.render_projects_context(contexts) {
-            Ok(rendered) => {
-                let rendered = rendered.trim().to_string();
-                if rendered.is_empty() {
-                    None
-                } else {
-                    Some(rendered)
-                }
-            }
-            Err(error) => {
-                tracing::warn!(%error, "failed to render projects context");
-                None
-            }
-        }
+        crate::agent::channel_dispatch::build_project_context(&self.deps, prompt_engine).await
     }
 
     /// Build a snapshot of the system configuration for status block injection.
@@ -2189,7 +2636,6 @@ impl Channel {
         let prompt_engine = rc.prompts.load();
 
         let identity_context = rc.identity.load().render();
-        let memory_bulletin = rc.memory_bulletin.load();
         let skills = rc.skills.load();
         let skills_prompt = skills.render_channel_prompt(&prompt_engine)?;
 
@@ -2217,58 +2663,33 @@ impl Channel {
 
         let org_context = self.build_org_context(&prompt_engine);
 
-        let adapter_prompt = self
-            .current_adapter()
-            .and_then(|adapter| prompt_engine.render_channel_adapter_prompt(adapter));
+        let adapter_prompt = if self.state.cron_outcome.is_some() {
+            prompt_engine.render_channel_adapter_prompt("cron")
+        } else {
+            self.current_adapter()
+                .and_then(|adapter| prompt_engine.render_channel_adapter_prompt(adapter))
+        };
 
         let project_context = self.build_project_context(&prompt_engine).await;
 
-        // Render working memory layers (Layers 2 + 3).
-        let wm_config = **rc.working_memory.load();
-        let timezone = self.deps.working_memory.timezone();
-        let working_memory = match crate::memory::working::render_working_memory(
-            &self.deps.working_memory,
-            self.id.as_ref(),
-            &wm_config,
-            timezone,
-        )
-        .await
-        {
-            Ok(text) => {
-                if text.is_empty() {
-                    tracing::debug!(channel_id = %self.id, "working memory rendered empty (disabled?)");
-                } else {
-                    tracing::debug!(channel_id = %self.id, len = text.len(), "working memory rendered");
-                }
-                text
-            }
-            Err(error) => {
-                tracing::warn!(channel_id = %self.id, %error, "working memory render failed");
-                String::new()
-            }
-        };
-
-        let channel_activity_map = match crate::memory::working::render_channel_activity_map(
-            &self.deps.sqlite_pool,
-            &self.deps.working_memory,
-            self.id.as_ref(),
-            &wm_config,
-            timezone,
-        )
-        .await
-        {
-            Ok(text) => text,
-            Err(error) => {
-                tracing::warn!(channel_id = %self.id, %error, "channel activity map render failed");
-                String::new()
-            }
-        };
+        let (
+            working_memory,
+            channel_activity_map,
+            participant_context,
+            memory_bulletin_text,
+            knowledge_synthesis_text,
+        ) = self.render_memory_layers().await;
 
         let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
+        let routing = rc.routing.load();
+        let model_name = routing.resolve(ProcessType::Channel, None).to_string();
+        let tool_use_enforcement = rc.tool_use_enforcement.load();
+        let direct_mode = self.resolved_settings.delegation == DelegationMode::Direct;
 
-        prompt_engine.render_channel_prompt_with_links(
+        let system_prompt = prompt_engine.render_channel_prompt_with_links(
             empty_to_none(identity_context),
-            empty_to_none(memory_bulletin.to_string()),
+            memory_bulletin_text,
+            knowledge_synthesis_text,
             empty_to_none(skills_prompt),
             worker_capabilities,
             self.conversation_context.clone(),
@@ -2282,13 +2703,20 @@ impl Channel {
             self.backfill_transcript.clone(),
             empty_to_none(working_memory),
             empty_to_none(channel_activity_map),
+            empty_to_none(participant_context),
+            direct_mode,
+        )?;
+
+        prompt_engine.maybe_append_tool_use_enforcement(
+            system_prompt,
+            tool_use_enforcement.as_ref(),
+            &model_name,
         )
     }
 
     /// Register per-turn tools, run the LLM agentic loop, and clean up.
     ///
     /// Returns the prompt result and per-turn flags for the caller to dispatch.
-    #[allow(clippy::type_complexity)]
     #[tracing::instrument(skip(self, user_text, system_prompt, attachment_content), fields(channel_id = %self.id, agent_id = %self.deps.agent_id))]
     async fn run_agent_turn(
         &self,
@@ -2298,12 +2726,7 @@ impl Channel {
         attachment_content: Vec<UserContent>,
         is_retrigger: bool,
         adapter: Option<&str>,
-    ) -> Result<(
-        std::result::Result<String, rig::completion::PromptError>,
-        crate::tools::SkipFlag,
-        crate::tools::RepliedFlag,
-        bool,
-    )> {
+    ) -> Result<AgentTurnResult> {
         let skip_flag = crate::tools::new_skip_flag();
         let replied_flag = crate::tools::new_replied_flag();
         let allow_direct_reply = !self.suppress_plaintext_fallback();
@@ -2329,23 +2752,56 @@ impl Channel {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        if let Err(error) = crate::tools::add_channel_tools(
-            &self.tool_server,
-            self.state.clone(),
-            routed_sender,
-            conversation_id,
-            skip_flag.clone(),
-            replied_flag.clone(),
-            self.deps.cron_tool.clone(),
-            send_agent_message_tool,
-            allow_direct_reply,
-            adapter.map(|s| s.to_string()),
-            slack_thread_ts.as_deref(),
-        )
-        .await
-        {
-            tracing::error!(%error, "failed to add channel tools");
-            return Err(AgentError::Other(error.into()).into());
+        // reply() always sends live — cron channels use set_outcome() for delivery.
+        let reply_target = crate::tools::ReplyTarget::Live(Box::new(routed_sender.clone()));
+
+        match self.resolved_settings.delegation {
+            DelegationMode::Standard => {
+                // Current behavior - standard channel tools only
+                if let Err(error) = crate::tools::add_channel_tools(
+                    &self.tool_server,
+                    self.state.clone(),
+                    routed_sender,
+                    reply_target,
+                    conversation_id,
+                    skip_flag.clone(),
+                    replied_flag.clone(),
+                    self.deps.cron_tool.clone(),
+                    send_agent_message_tool,
+                    allow_direct_reply,
+                    adapter.map(|s| s.to_string()),
+                    slack_thread_ts.as_deref(),
+                    self.state.cron_outcome.clone(),
+                )
+                .await
+                {
+                    tracing::error!(%error, "failed to add channel tools");
+                    return Err(AgentError::Other(error.into()).into());
+                }
+            }
+            DelegationMode::Direct => {
+                // Full tool access (cortex chat style)
+                if let Err(error) = crate::tools::add_direct_mode_tools(
+                    &self.tool_server,
+                    self.state.clone(),
+                    routed_sender,
+                    reply_target,
+                    conversation_id,
+                    skip_flag.clone(),
+                    replied_flag.clone(),
+                    self.deps.cron_tool.clone(),
+                    send_agent_message_tool,
+                    allow_direct_reply,
+                    adapter.map(|s| s.to_string()),
+                    slack_thread_ts.as_deref(),
+                    self.state.cron_outcome.clone(),
+                )
+                .await
+                {
+                    tracing::error!(%error, "failed to add direct mode tools");
+                    return Err(AgentError::Other(error.into()).into());
+                }
+            }
         }
 
         let rc = &self.deps.runtime_config;
@@ -2355,10 +2811,23 @@ impl Channel {
         } else {
             **rc.max_turns.load()
         };
-        let model_name = routing.resolve(ProcessType::Channel, None);
+
+        // Check for model override from conversation settings.
+        // Priority: per-process override > blanket override > routing config.
+        let model_name =
+            if let Some(override_model) = self.resolved_settings.resolve_model("channel") {
+                override_model
+            } else {
+                routing.resolve(ProcessType::Channel, None)
+            };
+
+        let usage_accumulator = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::llm::usage::UsageAccumulator::new(),
+        ));
         let model = SpacebotModel::make(&self.deps.llm_manager, model_name)
             .with_context(&*self.deps.agent_id, "channel")
-            .with_routing((**routing).clone());
+            .with_routing((**routing).clone())
+            .with_accumulator(usage_accumulator.clone());
 
         let agent = AgentBuilder::new(model)
             .preamble(system_prompt)
@@ -2415,7 +2884,10 @@ impl Channel {
         // ── Prompt snapshot capture (fire-and-forget) ──
         self.maybe_capture_snapshot(system_prompt, user_text, &history);
 
-        let mut result = self.hook.prompt_once(&agent, &mut history, user_text).await;
+        let mut result = self
+            .hook
+            .prompt_once_streaming(&agent, &mut history, user_text, max_turns)
+            .await;
 
         // If the LLM responded with text that looks like tool call syntax, it failed
         // to use the tool calling API. Inject a correction and retry a couple
@@ -2440,11 +2912,11 @@ impl Channel {
             let correction = prompt_engine.render_system_tool_syntax_correction()?;
             result = self
                 .hook
-                .prompt_once(&agent, &mut history, &correction)
+                .prompt_once_streaming(&agent, &mut history, &correction, max_turns)
                 .await;
         }
 
-        let retrigger_reply_preserved = {
+        let applied_history = {
             let mut guard = self.state.history.write().await;
             apply_history_after_turn(
                 &result,
@@ -2456,13 +2928,39 @@ impl Channel {
             )
         };
 
-        if let Err(error) =
-            crate::tools::remove_channel_tools(&self.tool_server, allow_direct_reply).await
-        {
+        let remove_result = match self.resolved_settings.delegation {
+            DelegationMode::Direct => {
+                crate::tools::remove_direct_mode_tools(&self.tool_server, allow_direct_reply).await
+            }
+            DelegationMode::Standard => {
+                crate::tools::remove_channel_tools(&self.tool_server, allow_direct_reply).await
+            }
+        };
+        if let Err(error) = remove_result {
             tracing::warn!(%error, "failed to remove channel tools");
         }
 
-        Ok((result, skip_flag, replied_flag, retrigger_reply_preserved))
+        // Flush accumulated token usage to the database.
+        let acc = usage_accumulator.lock().await;
+        if let Err(error) = acc
+            .flush(
+                &self.deps.sqlite_pool,
+                &self.deps.agent_id,
+                "channel",
+                Some(conversation_id),
+            )
+            .await
+        {
+            tracing::warn!(%error, "failed to flush token usage");
+        }
+
+        Ok(AgentTurnResult {
+            result,
+            skip_flag,
+            replied_flag,
+            retrigger_reply_preserved: applied_history.retrigger_reply_preserved,
+            reply_text: applied_history.reply_text,
+        })
     }
 
     /// Send outbound text and record send metrics.
@@ -2683,11 +3181,15 @@ impl Channel {
                             if extracted.is_some() {
                                 tracing::warn!(channel_id = %self.id, "extracted reply from malformed tool syntax in LLM text output");
                             }
-                            self.state.conversation_logger.log_bot_message_with_name(
-                                &self.state.channel_id,
-                                &final_text,
-                                Some(self.agent_display_name()),
-                            );
+                            let tool_calls_json = self.drain_tool_calls_json().await;
+                            self.state
+                                .conversation_logger
+                                .log_bot_message_with_metadata(
+                                    &self.state.channel_id,
+                                    &final_text,
+                                    Some(self.agent_display_name()),
+                                    tool_calls_json,
+                                );
                             self.send_outbound_text(final_text, "failed to send fallback reply")
                                 .await;
                         }
@@ -2742,7 +3244,6 @@ impl Channel {
     /// Handle a process event (branch results, worker completions, status updates).
     async fn handle_event(&mut self, event: ProcessEvent) -> Result<()> {
         // Keep mode aligned with live settings updates while this worker runs.
-        self.sync_listen_only_mode_from_runtime();
 
         // Only process events targeted at this channel
         if !event_is_for_channel(&event, &self.id) {
@@ -2814,11 +3315,12 @@ impl Channel {
                     // Regular branch: accumulate result for the next retrigger.
                     // The result text will be embedded directly in the retrigger
                     // message so the LLM knows exactly which process produced it.
+                    let branch_success = parse_branch_cancellation_reason(conclusion).is_none();
                     self.pending_results.push(PendingResult {
                         process_type: "branch",
                         process_id: branch_id.to_string(),
                         result: conclusion.clone(),
-                        success: true,
+                        success: branch_success,
                     });
                     should_retrigger = true;
 
@@ -2829,18 +3331,11 @@ impl Channel {
                         );
                     }
 
-                    // Truncate for working memory — full conclusion lives in branch_runs.
-                    let summary = if conclusion.len() > 200 {
-                        format!("{}...", &conclusion[..200])
-                    } else {
-                        conclusion.clone()
-                    };
+                    let (event_type, event_summary) =
+                        branch_working_memory_event_summary(conclusion);
                     self.deps
                         .working_memory
-                        .emit(
-                            crate::memory::WorkingMemoryEventType::BranchCompleted,
-                            format!("Branch concluded: {summary}"),
-                        )
+                        .emit(event_type, event_summary)
                         .channel(self.id.to_string())
                         .importance(0.7)
                         .record();
@@ -2908,20 +3403,18 @@ impl Channel {
                 } else {
                     result.clone()
                 };
-                let event_type = if *success {
+                let default_event_type = if *success {
                     crate::memory::WorkingMemoryEventType::WorkerCompleted
                 } else {
                     crate::memory::WorkingMemoryEventType::Error
                 };
+                let (event_type, event_summary) =
+                    classify_conversational_event_summary(&worker_summary, default_event_type);
                 self.deps
                     .working_memory
                     .emit(
                         event_type,
-                        if *success {
-                            format!("Worker completed: {worker_summary}")
-                        } else {
-                            format!("Worker failed: {worker_summary}")
-                        },
+                        format_conversational_event_summary(event_type, "Worker", &event_summary),
                     )
                     .channel(self.id.to_string())
                     .importance(if *success { 0.6 } else { 0.8 })
@@ -2967,6 +3460,9 @@ impl Channel {
                     "interactive worker result queued for retrigger"
                 );
             }
+            ProcessEvent::SettingsUpdated { channel_id, .. } if *channel_id == self.id => {
+                self.reload_settings().await;
+            }
             _ => {}
         }
 
@@ -2974,7 +3470,10 @@ impl Channel {
         // Multiple branch/worker completions within the debounce window are
         // coalesced into a single retrigger to prevent message spam.
         if should_retrigger {
-            if self.retrigger_count >= MAX_RETRIGGERS_PER_TURN {
+            // Cron channels have no user to send a reset message, so the cap would
+            // permanently stall multi-worker jobs. The job timeout is the natural bound.
+            let cap_applies = self.state.cron_outcome.is_none();
+            if cap_applies && self.retrigger_count >= MAX_RETRIGGERS_PER_TURN {
                 tracing::warn!(
                     channel_id = %self.id,
                     retrigger_count = self.retrigger_count,
@@ -3202,7 +3701,10 @@ impl Channel {
     /// 3. **Event density** — working memory events from this channel since last persistence
     async fn check_memory_persistence(&mut self) {
         let config = **self.deps.runtime_config.memory_persistence.load();
-        if !config.enabled || config.message_interval == 0 {
+        if !config.enabled
+            || config.message_interval == 0
+            || !self.resolved_settings.memory.persistence_enabled()
+        {
             return;
         }
 
@@ -3438,9 +3940,9 @@ fn looks_like_liveness_ping(text: &str) -> bool {
 fn should_send_discord_quiet_mode_ping_ack(
     message: &InboundMessage,
     raw_text: &str,
-    listen_only_mode: bool,
+    is_suppressed: bool,
 ) -> bool {
-    if message.source != "discord" || !listen_only_mode {
+    if message.source != "discord" || !is_suppressed {
         return false;
     }
 
@@ -3450,8 +3952,8 @@ fn should_send_discord_quiet_mode_ping_ack(
 }
 
 #[derive(Debug, Clone, Copy)]
-struct QuietModeFallbackState {
-    listen_only_mode: bool,
+struct ObserveModeFallbackState {
+    is_suppressed: bool,
     is_retrigger: bool,
     invoked_by_command: bool,
     invoked_by_mention: bool,
@@ -3462,9 +3964,9 @@ struct QuietModeFallbackState {
 
 fn should_send_quiet_mode_fallback(
     message: &InboundMessage,
-    state: QuietModeFallbackState,
+    state: ObserveModeFallbackState,
 ) -> bool {
-    state.listen_only_mode
+    state.is_suppressed
         && !state.is_retrigger
         && !state.invoked_by_command
         && (state.invoked_by_mention || state.invoked_by_reply)
@@ -3492,11 +3994,13 @@ fn is_dm_conversation_id(conv_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        QuietModeFallbackState, compute_listen_mode_invocation, is_dm_conversation_id,
-        recv_channel_event, should_process_event_for_channel,
+        ObserveModeFallbackState, branch_working_memory_event_summary,
+        classify_conversational_event_summary, compute_listen_mode_invocation, decision_user_id,
+        extract_decision_summary_from_reply, format_conversational_event_summary,
+        is_dm_conversation_id, recv_channel_event, should_process_event_for_channel,
         should_send_discord_quiet_mode_ping_ack, should_send_quiet_mode_fallback,
     };
-    use crate::memory::MemoryType;
+    use crate::memory::{MemoryType, WorkingMemoryEventType};
     use crate::{AgentId, ChannelId, InboundMessage, MessageContent, ProcessEvent, ProcessId};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -3565,6 +4069,78 @@ mod tests {
 
         let event = recv_channel_event(&mut event_rx).await;
         assert!(matches!(event, crate::BroadcastRecvResult::Closed));
+    }
+
+    #[test]
+    fn extracts_decision_summary_from_reply_text() {
+        let summary = extract_decision_summary_from_reply(
+            "We'll switch to the new persistence trigger thresholds and remove the old 50-message cadence.",
+        );
+
+        assert_eq!(
+            summary.as_deref(),
+            Some(
+                "We'll switch to the new persistence trigger thresholds and remove the old 50-message cadence"
+            )
+        );
+        assert_eq!(
+            extract_decision_summary_from_reply(
+                "We decided to use the participant map instead of transcript scans."
+            )
+            .as_deref(),
+            Some("We decided to use the participant map instead of transcript scans")
+        );
+        assert_eq!(
+            extract_decision_summary_from_reply(
+                "Decision: move forward with the config-backed participant resolver."
+            )
+            .as_deref(),
+            Some("Decision: move forward with the config-backed participant resolver")
+        );
+        assert!(extract_decision_summary_from_reply("Here's the current status update.").is_none());
+        assert!(extract_decision_summary_from_reply("I'll check that and report back.").is_none());
+        assert!(extract_decision_summary_from_reply("Let's debug this first.").is_none());
+        assert!(extract_decision_summary_from_reply("We'll look into it tomorrow.").is_none());
+        assert!(
+            extract_decision_summary_from_reply(
+                "I approved the review comment and will follow up."
+            )
+            .is_none()
+        );
+        assert_eq!(
+            extract_decision_summary_from_reply("Got it. We'll switch to the new routing config.")
+                .as_deref(),
+            Some("We'll switch to the new routing config")
+        );
+    }
+
+    #[test]
+    fn decision_user_id_skips_retrigger_messages() {
+        let humans = vec![crate::config::HumanDef {
+            id: "victor".to_string(),
+            display_name: Some("Victor".to_string()),
+            role: None,
+            bio: None,
+            description: None,
+            discord_id: Some("12345".to_string()),
+            telegram_id: None,
+            slack_id: None,
+            email: None,
+        }];
+        let message = InboundMessage {
+            id: "message-1".to_string(),
+            source: "system".to_string(),
+            adapter: None,
+            conversation_id: "discord:chan-1".to_string(),
+            sender_id: "12345".to_string(),
+            agent_id: None,
+            content: crate::MessageContent::Text("retrigger".to_string()),
+            timestamp: chrono::Utc::now(),
+            metadata: HashMap::new(),
+            formatted_author: None,
+        };
+
+        assert!(decision_user_id(&humans, &message, true).is_none());
     }
 
     #[test]
@@ -3666,6 +4242,115 @@ mod tests {
     }
 
     #[test]
+    fn conversational_event_summary_extracts_outcome_prefix() {
+        let (event_type, summary) = classify_conversational_event_summary(
+            "outcome: implemented the migration safety check",
+            WorkingMemoryEventType::WorkerCompleted,
+        );
+        assert_eq!(event_type, WorkingMemoryEventType::Outcome);
+        assert_eq!(summary, "implemented the migration safety check");
+    }
+
+    #[test]
+    fn conversational_event_summary_extracts_blocked_on_prefix() {
+        let (event_type, summary) = classify_conversational_event_summary(
+            "blocked_on: waiting for review from infra",
+            WorkingMemoryEventType::Error,
+        );
+        assert_eq!(event_type, WorkingMemoryEventType::BlockedOn);
+        assert_eq!(summary, "waiting for review from infra");
+    }
+
+    #[test]
+    fn conversational_event_summary_falls_back_to_default_type() {
+        let (event_type, summary) = classify_conversational_event_summary(
+            "completed with no blockers",
+            WorkingMemoryEventType::WorkerCompleted,
+        );
+        assert_eq!(event_type, WorkingMemoryEventType::WorkerCompleted);
+        assert_eq!(summary, "completed with no blockers");
+    }
+
+    #[test]
+    fn conversational_event_summary_extracts_constraint_prefix_case_insensitively() {
+        let (event_type, summary) = classify_conversational_event_summary(
+            "CoNsTrAiNt: must keep migrations immutable",
+            WorkingMemoryEventType::WorkerCompleted,
+        );
+        assert_eq!(event_type, WorkingMemoryEventType::Constraint);
+        assert_eq!(summary, "must keep migrations immutable");
+    }
+
+    #[test]
+    fn conversational_event_summary_is_case_insensitive_across_prefixes() {
+        let (event_type, summary) = classify_conversational_event_summary(
+            "OUTCOME: implemented the follow-up",
+            WorkingMemoryEventType::WorkerCompleted,
+        );
+        assert_eq!(event_type, WorkingMemoryEventType::Outcome);
+        assert_eq!(summary, "implemented the follow-up");
+
+        let (event_type, summary) = classify_conversational_event_summary(
+            "Blocked_On: waiting on reviewer signoff",
+            WorkingMemoryEventType::WorkerCompleted,
+        );
+        assert_eq!(event_type, WorkingMemoryEventType::BlockedOn);
+        assert_eq!(summary, "waiting on reviewer signoff");
+
+        let (event_type, summary) = classify_conversational_event_summary(
+            "blocked on: user approval",
+            WorkingMemoryEventType::WorkerCompleted,
+        );
+        assert_eq!(event_type, WorkingMemoryEventType::BlockedOn);
+        assert_eq!(summary, "user approval");
+    }
+
+    #[test]
+    fn conversational_event_summary_treats_empty_prefixed_content_as_empty_summary() {
+        let (event_type, summary) = classify_conversational_event_summary(
+            "outcome:   ",
+            WorkingMemoryEventType::WorkerCompleted,
+        );
+        assert_eq!(event_type, WorkingMemoryEventType::Outcome);
+        assert!(summary.is_empty());
+        assert_eq!(
+            format_conversational_event_summary(event_type, "Worker", &summary),
+            "Worker outcome"
+        );
+    }
+
+    #[test]
+    fn conversational_event_summary_extracts_deadline_prefix() {
+        let (event_type, summary) = classify_conversational_event_summary(
+            "deadline-set: ship by 2026-04-20",
+            WorkingMemoryEventType::BranchCompleted,
+        );
+        assert_eq!(event_type, WorkingMemoryEventType::DeadlineSet);
+        assert_eq!(summary, "ship by 2026-04-20");
+        assert_eq!(
+            format_conversational_event_summary(event_type, "Branch", &summary),
+            "Branch deadline set: ship by 2026-04-20"
+        );
+    }
+
+    #[test]
+    fn branch_working_memory_event_records_cancellation_as_error() {
+        let (event_type, summary) =
+            branch_working_memory_event_summary("Branch cancelled: superseded by user request");
+
+        assert_eq!(event_type, WorkingMemoryEventType::Error);
+        assert_eq!(summary, "Branch cancelled: superseded by user request");
+    }
+
+    #[test]
+    fn branch_working_memory_event_records_sentence_cancellation_as_error() {
+        let (event_type, summary) = branch_working_memory_event_summary("Branch cancelled.");
+
+        assert_eq!(event_type, WorkingMemoryEventType::Error);
+        assert_eq!(summary, "Branch cancelled");
+    }
+
+    #[test]
     fn quiet_mode_invocation_uses_discord_mention_and_reply_metadata() {
         let message = inbound_message(
             "discord",
@@ -3720,8 +4405,8 @@ mod tests {
 
         assert!(should_send_quiet_mode_fallback(
             &message,
-            QuietModeFallbackState {
-                listen_only_mode: true,
+            ObserveModeFallbackState {
+                is_suppressed: true,
                 is_retrigger: false,
                 invoked_by_command: false,
                 invoked_by_mention: true,
@@ -3732,8 +4417,8 @@ mod tests {
         ));
         assert!(!should_send_quiet_mode_fallback(
             &message,
-            QuietModeFallbackState {
-                listen_only_mode: true,
+            ObserveModeFallbackState {
+                is_suppressed: true,
                 is_retrigger: false,
                 invoked_by_command: false,
                 invoked_by_mention: true,
@@ -3744,8 +4429,8 @@ mod tests {
         ));
         assert!(!should_send_quiet_mode_fallback(
             &message,
-            QuietModeFallbackState {
-                listen_only_mode: true,
+            ObserveModeFallbackState {
+                is_suppressed: true,
                 is_retrigger: false,
                 invoked_by_command: false,
                 invoked_by_mention: true,
@@ -3756,8 +4441,8 @@ mod tests {
         ));
         assert!(!should_send_quiet_mode_fallback(
             &message,
-            QuietModeFallbackState {
-                listen_only_mode: true,
+            ObserveModeFallbackState {
+                is_suppressed: true,
                 is_retrigger: true,
                 invoked_by_command: false,
                 invoked_by_mention: true,

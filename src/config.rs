@@ -582,6 +582,7 @@ bind = "127.0.0.1"
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users,
+            settings: None,
         }
     }
 
@@ -1137,6 +1138,49 @@ maintenance_merge_similarity_threshold = 1.1
     }
 
     #[test]
+    fn test_participant_context_defaults_and_overrides_resolution() {
+        let toml = r#"
+[defaults.participant_context]
+enabled = false
+min_participants = 2
+token_budget = 280
+max_participants = 3
+
+[[agents]]
+id = "main"
+"#;
+        let parsed: TomlConfig = toml::from_str(toml).expect("failed to parse test TOML");
+        let config = Config::from_toml(parsed, PathBuf::from(".")).expect("failed to build Config");
+
+        assert!(!config.defaults.participant_context.enabled);
+        assert_eq!(config.defaults.participant_context.min_participants, 2);
+        assert_eq!(config.defaults.participant_context.token_budget, 280);
+        assert_eq!(config.defaults.participant_context.max_participants, 3);
+    }
+
+    #[test]
+    fn test_participant_context_rejects_impossible_bounds() {
+        let toml = r#"
+[defaults.participant_context]
+min_participants = 4
+max_participants = 3
+
+[[agents]]
+id = "main"
+"#;
+        let parsed: TomlConfig = toml::from_str(toml).expect("failed to parse test TOML");
+        let error = Config::from_toml(parsed, PathBuf::from("."))
+            .expect_err("expected invalid participant context bounds to fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("defaults.participant_context.max_participants (3) must be >= defaults.participant_context.min_participants (4)"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn test_work_readiness_requires_warm_state() {
         let readiness = evaluate_work_readiness(
             WarmupConfig::default(),
@@ -1439,6 +1483,7 @@ maintenance_merge_similarity_threshold = 1.1
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users: vec![],
+            settings: None,
         };
         assert_eq!(binding.runtime_adapter_key(), "telegram:sales");
     }
@@ -1456,6 +1501,7 @@ maintenance_merge_similarity_threshold = 1.1
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users: vec![],
+            settings: None,
         };
         assert!(binding.uses_default_adapter());
     }
@@ -1488,6 +1534,7 @@ maintenance_merge_similarity_threshold = 1.1
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users: vec![],
+            settings: None,
         };
         let message = test_inbound_message("telegram", None);
         assert!(binding_adapter_matches(&binding, &message));
@@ -1506,6 +1553,7 @@ maintenance_merge_similarity_threshold = 1.1
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users: vec![],
+            settings: None,
         };
         let message = test_inbound_message("telegram", Some("telegram:support"));
         assert!(binding_adapter_matches(&binding, &message));
@@ -1524,6 +1572,7 @@ maintenance_merge_similarity_threshold = 1.1
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users: vec![],
+            settings: None,
         };
         let message = test_inbound_message("telegram", None);
         assert!(!binding_adapter_matches(&binding, &message));
@@ -1542,6 +1591,7 @@ maintenance_merge_similarity_threshold = 1.1
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users: vec![],
+            settings: None,
         };
         let message = test_inbound_message("telegram", Some("telegram:support"));
         assert!(!binding_adapter_matches(&binding, &message));
@@ -1560,6 +1610,7 @@ maintenance_merge_similarity_threshold = 1.1
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users: vec![],
+            settings: None,
         };
         let message = test_inbound_message("telegram", Some("telegram:sales"));
         assert!(!binding_adapter_matches(&binding, &message));
@@ -1599,6 +1650,7 @@ maintenance_merge_similarity_threshold = 1.1
                 channel_ids: vec![],
                 require_mention: false,
                 dm_allowed_users: vec![],
+                settings: None,
             },
             Binding {
                 agent_id: "support-agent".into(),
@@ -1611,6 +1663,7 @@ maintenance_merge_similarity_threshold = 1.1
                 channel_ids: vec![],
                 require_mention: false,
                 dm_allowed_users: vec![],
+                settings: None,
             },
         ];
         let result = validate_named_messaging_adapters(&messaging, bindings, false)
@@ -1646,6 +1699,7 @@ maintenance_merge_similarity_threshold = 1.1
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users: vec![],
+            settings: None,
         }];
         let result = validate_named_messaging_adapters(&messaging, bindings, false)
             .expect("bindings should be resolvable");
@@ -1713,6 +1767,7 @@ maintenance_merge_similarity_threshold = 1.1
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users: vec![],
+            settings: None,
         }];
         let result = validate_named_messaging_adapters(&messaging, bindings, false)
             .expect("bindings should be resolvable");
@@ -1756,6 +1811,7 @@ maintenance_merge_similarity_threshold = 1.1
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users: vec![],
+            settings: None,
         }];
         let result = validate_named_messaging_adapters(&messaging, bindings, false)
             .expect("bindings should be resolvable");
@@ -1800,6 +1856,7 @@ maintenance_merge_similarity_threshold = 1.1
                 channel_ids: vec![],
                 require_mention: false,
                 dm_allowed_users: vec![],
+                settings: None,
             },
             // Invalid: references a non-existent named adapter
             Binding {
@@ -1813,6 +1870,7 @@ maintenance_merge_similarity_threshold = 1.1
                 channel_ids: vec![],
                 require_mention: false,
                 dm_allowed_users: vec![],
+                settings: None,
             },
             // Valid: references an existing named adapter
             Binding {
@@ -1826,6 +1884,7 @@ maintenance_merge_similarity_threshold = 1.1
                 channel_ids: vec![],
                 require_mention: false,
                 dm_allowed_users: vec![],
+                settings: None,
             },
             // Invalid: no discord config at all
             Binding {
@@ -1839,6 +1898,7 @@ maintenance_merge_similarity_threshold = 1.1
                 channel_ids: vec![],
                 require_mention: false,
                 dm_allowed_users: vec![],
+                settings: None,
             },
         ];
         let result = validate_named_messaging_adapters(&messaging, bindings, false)
@@ -1875,6 +1935,7 @@ maintenance_merge_similarity_threshold = 1.1
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users: vec![],
+            settings: None,
         }];
         let result = validate_named_messaging_adapters(&messaging, bindings, false)
             .expect("bindings should be resolvable");
@@ -1907,6 +1968,7 @@ maintenance_merge_similarity_threshold = 1.1
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users: vec![],
+            settings: None,
         }];
         let result = validate_named_messaging_adapters(&messaging, bindings, true);
         assert!(
@@ -1948,6 +2010,7 @@ maintenance_merge_similarity_threshold = 1.1
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users: vec![],
+            settings: None,
         }];
         let result = validate_named_messaging_adapters(&messaging, bindings, false)
             .expect("bindings should be resolvable");
@@ -1985,6 +2048,7 @@ maintenance_merge_similarity_threshold = 1.1
             channel_ids: vec![],
             require_mention: false,
             dm_allowed_users: vec![],
+            settings: None,
         }];
         let result = validate_named_messaging_adapters(&messaging, bindings, false)
             .expect("bindings should be resolvable");
@@ -2148,5 +2212,48 @@ command = "/usr/bin/test"
         let parsed: TomlConfig = toml::from_str(toml).expect("should parse without error");
         // The mcp_servers data is silently dropped — verify it's not accessible
         assert!(parsed.defaults.mcp.is_empty());
+    }
+
+    #[test]
+    fn tool_use_enforcement_parses_and_resolves() {
+        let toml = r#"
+[defaults]
+tool_use_enforcement = "always"
+
+[[agents]]
+id = "main"
+tool_use_enforcement = ["gemini", "deepseek"]
+"#;
+
+        let parsed: TomlConfig = toml::from_str(toml).expect("failed to parse test TOML");
+        let config = Config::from_toml(parsed, PathBuf::from(".")).expect("failed to build Config");
+
+        assert_eq!(
+            config.defaults.tool_use_enforcement,
+            ToolUseEnforcement::Always
+        );
+        assert_eq!(
+            config.agents[0].tool_use_enforcement,
+            Some(ToolUseEnforcement::Custom(vec![
+                "gemini".to_string(),
+                "deepseek".to_string(),
+            ]))
+        );
+
+        let resolved = config.resolve_agents();
+        assert_eq!(
+            resolved[0].tool_use_enforcement,
+            ToolUseEnforcement::Custom(vec!["gemini".to_string(), "deepseek".to_string()])
+        );
+        assert!(
+            resolved[0]
+                .tool_use_enforcement
+                .should_inject("google/gemini-2.5-pro")
+        );
+        assert!(
+            !resolved[0]
+                .tool_use_enforcement
+                .should_inject("anthropic/claude-sonnet-4")
+        );
     }
 }
