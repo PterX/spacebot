@@ -9,6 +9,7 @@ pub mod channel_prompt;
 pub mod compactor;
 pub mod cortex;
 pub mod cortex_chat;
+pub mod inbound_relay;
 pub mod ingestion;
 #[cfg(test)]
 mod invariant_harness;
