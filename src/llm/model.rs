@@ -4003,7 +4003,7 @@ mod tests {
         let messages = OneOrMany::one(Message::System {
             content: "You are a helpful assistant".to_string(),
         });
-        let converted = convert_messages_to_openai(&messages);
+        let converted = convert_messages_to_openai(&messages, false);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0]["role"], "user");
         assert_eq!(converted[0]["content"], "You are a helpful assistant");
@@ -4130,7 +4130,7 @@ mod tests {
             .expect("non-empty assistant content"),
         });
 
-        let converted = convert_messages_to_openai(&messages);
+        let converted = convert_messages_to_openai(&messages, false);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0]["role"], "assistant");
         assert!(converted[0]["content"].is_null());
@@ -4176,7 +4176,7 @@ mod tests {
             .expect("non-empty assistant content"),
         });
 
-        let converted = convert_messages_to_openai(&messages);
+        let converted = convert_messages_to_openai(&messages, false);
         assert_eq!(converted.len(), 1);
         assert!(converted[0]["content"].is_null());
         assert_eq!(converted[0]["reasoning_content"], "");
@@ -4230,7 +4230,7 @@ mod tests {
             })),
         });
 
-        let converted = convert_messages_to_openai(&messages);
+        let converted = convert_messages_to_openai(&messages, false);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0]["role"], "tool");
         assert_eq!(converted[0]["tool_call_id"], "stable-call-id");
