@@ -105,13 +105,19 @@ impl SkillUsageStore {
     }
 
     /// Mark skills as registry-installed, creating rows as needed.
+    ///
+    /// An install that replaces an existing row also clears any agent
+    /// conversation origin — the content on disk no longer comes from that
+    /// conversation.
     pub async fn record_installed(&self, names: &[String]) -> anyhow::Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
         for name in names {
             sqlx::query(
                 "INSERT INTO skill_usage (skill_name, created_by, created_at) \
                  VALUES (?, 'installed', ?) \
-                 ON CONFLICT(skill_name) DO UPDATE SET created_by = 'installed'",
+                 ON CONFLICT(skill_name) DO UPDATE SET \
+                     created_by = 'installed', \
+                     origin_conversation_id = NULL",
             )
             .bind(name.to_lowercase())
             .bind(&now)
@@ -222,6 +228,28 @@ mod tests {
 
         let record = store.get("github").await.unwrap().unwrap();
         assert_eq!(record.created_by, "installed");
+    }
+
+    #[tokio::test]
+    async fn record_installed_clears_agent_conversation_origin() {
+        let store = test_store().await;
+
+        sqlx::query(
+            "INSERT INTO skill_usage (skill_name, created_by, origin_conversation_id, created_at) \
+             VALUES ('deploy', 'agent', 'conv-123', '2026-08-08T00:00:00Z')",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        store
+            .record_installed(&["deploy".to_string()])
+            .await
+            .unwrap();
+
+        let record = store.get("deploy").await.unwrap().unwrap();
+        assert_eq!(record.created_by, "installed");
+        assert!(record.origin_conversation_id.is_none());
     }
 
     #[tokio::test]

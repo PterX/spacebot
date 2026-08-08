@@ -86,6 +86,16 @@ impl Platform {
             _ => Platform::Other,
         }
     }
+
+    /// Whether a skill's platform list matches the host.
+    ///
+    /// `Other` never matches — a skill gated to unrecognized platforms stays
+    /// off every host, and an unrecognized host OS fails all gates rather
+    /// than passing them.
+    pub fn list_matches_host(platforms: &[Platform]) -> bool {
+        let host = Platform::host();
+        host != Platform::Other && platforms.contains(&host)
+    }
 }
 
 /// A loaded skill definition.
@@ -353,12 +363,21 @@ impl SkillSet {
     }
 }
 
-/// Truncate a description to the index budget with an ellipsis.
+/// Truncate a description to the index budget (in characters) with an
+/// ellipsis.
 ///
 /// The budget is enforced on create/edit paths; skills that predate it (or
 /// were installed from a registry) render truncated rather than failing.
 fn index_description(description: &str) -> String {
-    crate::tools::truncate_utf8_ellipsis(description, DESCRIPTION_BUDGET)
+    if description.chars().count() <= DESCRIPTION_BUDGET {
+        return description.to_string();
+    }
+
+    let truncated: String = description
+        .chars()
+        .take(DESCRIPTION_BUDGET.saturating_sub(3))
+        .collect();
+    format!("{truncated}...")
 }
 
 /// Public skill information for API responses.
@@ -443,7 +462,7 @@ async fn load_skill(
     let (frontmatter, body) = parse_skill_markdown(&raw)?;
 
     if let Some(platforms) = &frontmatter.platforms
-        && !platforms.contains(&Platform::host())
+        && !Platform::list_matches_host(platforms)
     {
         return Ok(None);
     }
@@ -485,15 +504,30 @@ async fn collect_linked_files(base_dir: &Path) -> Vec<String> {
         let mut pending = vec![base_dir.join(subdir)];
 
         while let Some(dir) = pending.pop() {
-            let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
-                continue;
+            let mut entries = match tokio::fs::read_dir(&dir).await {
+                Ok(entries) => entries,
+                // Support directories are optional; absence is the common case.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    tracing::warn!(%error, path = %dir.display(), "failed to read skill support dir");
+                    continue;
+                }
             };
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let path = entry.path();
-                if path.is_dir() {
-                    pending.push(path);
-                } else if let Ok(relative) = path.strip_prefix(base_dir) {
-                    files.push(relative.to_string_lossy().to_string());
+            loop {
+                match entries.next_entry().await {
+                    Ok(Some(entry)) => {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            pending.push(path);
+                        } else if let Ok(relative) = path.strip_prefix(base_dir) {
+                            files.push(relative.to_string_lossy().to_string());
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::warn!(%error, path = %dir.display(), "failed to enumerate skill support dir");
+                        break;
+                    }
                 }
             }
         }
@@ -659,11 +693,34 @@ mod tests {
     fn test_index_description_truncated() {
         let long = "x".repeat(DESCRIPTION_BUDGET + 40);
         let rendered = index_description(&long);
-        assert!(rendered.len() <= DESCRIPTION_BUDGET);
+        assert!(rendered.chars().count() <= DESCRIPTION_BUDGET);
         assert!(rendered.ends_with("..."));
 
         let short = "fits fine";
         assert_eq!(index_description(short), short);
+    }
+
+    #[test]
+    fn test_index_description_budget_is_chars_not_bytes() {
+        // 79 two-byte chars: 158 bytes, but within the 80-char budget.
+        let multibyte = "é".repeat(DESCRIPTION_BUDGET - 1);
+        assert_eq!(index_description(&multibyte), multibyte);
+
+        let over = "é".repeat(DESCRIPTION_BUDGET + 10);
+        let rendered = index_description(&over);
+        assert_eq!(rendered.chars().count(), DESCRIPTION_BUDGET);
+        assert!(rendered.ends_with("..."));
+    }
+
+    #[test]
+    fn test_platform_other_never_matches_host() {
+        assert!(!Platform::list_matches_host(&[Platform::Other]));
+        assert!(!Platform::list_matches_host(&[]));
+        // The full list contains the host on any supported platform.
+        assert_eq!(
+            Platform::list_matches_host(&[Platform::Linux, Platform::Macos, Platform::Windows]),
+            Platform::host() != Platform::Other
+        );
     }
 
     #[test]

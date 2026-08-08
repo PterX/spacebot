@@ -498,7 +498,9 @@ pub(super) async fn upload_skill(
     }
 
     if !all_installed.is_empty() {
-        reload_after_skill_change(&state, Some(&query.agent_id), &all_installed).await;
+        // Uploads are user-provided, not registry installs — seeding during
+        // reload records them with 'user' provenance.
+        reload_after_skill_change(&state, Some(&query.agent_id), &[]).await;
         state.send_event(ApiEvent::ConfigReloaded);
     }
 
