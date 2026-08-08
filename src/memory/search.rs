@@ -580,7 +580,7 @@ mod tests {
             .await
             .unwrap();
         let embedding_table = EmbeddingTable::open_or_create(&lance_conn).await.unwrap();
-        let embedding_model = Arc::new(EmbeddingModel::new(lance_dir.path()).unwrap());
+        let embedding_model = crate::memory::embedding::shared_test_model();
         let search = MemorySearch::new(store, embedding_table, embedding_model);
 
         let config = SearchConfig {
@@ -608,7 +608,7 @@ mod tests {
             .await
             .unwrap();
         let embedding_table = EmbeddingTable::open_or_create(&lance_conn).await.unwrap();
-        let embedding_model = Arc::new(EmbeddingModel::new(lance_dir.path()).unwrap());
+        let embedding_model = crate::memory::embedding::shared_test_model();
         let search = MemorySearch::new(store, embedding_table, embedding_model);
 
         let config = SearchConfig {
@@ -633,7 +633,7 @@ mod tests {
             .await
             .unwrap();
         let embedding_table = EmbeddingTable::open_or_create(&lance_conn).await.unwrap();
-        let embedding_model = Arc::new(EmbeddingModel::new(lance_dir.path()).unwrap());
+        let embedding_model = crate::memory::embedding::shared_test_model();
         let search = MemorySearch::new(store, embedding_table, embedding_model);
 
         let config = SearchConfig {
@@ -658,7 +658,7 @@ mod tests {
             .await
             .unwrap();
         let embedding_table = EmbeddingTable::open_or_create(&lance_conn).await.unwrap();
-        let embedding_model = Arc::new(EmbeddingModel::new(lance_dir.path()).unwrap());
+        let embedding_model = crate::memory::embedding::shared_test_model();
         let search = MemorySearch::new(store, embedding_table, embedding_model);
 
         let config = SearchConfig {

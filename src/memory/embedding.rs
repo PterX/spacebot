@@ -65,3 +65,18 @@ impl EmbeddingModel {
 pub async fn embed_text(model: &Arc<EmbeddingModel>, text: &str) -> Result<Vec<f32>> {
     model.embed_one(text).await
 }
+
+/// Shared embedding model for tests. Downloads once into a stable cache
+/// directory and is reused by every test in the binary, so CI can cache the
+/// model files across runs instead of fetching them from Hugging Face on
+/// each test that needs embeddings.
+#[cfg(test)]
+pub(crate) fn shared_test_model() -> std::sync::Arc<EmbeddingModel> {
+    use std::sync::{Arc, OnceLock};
+    static MODEL: OnceLock<Arc<EmbeddingModel>> = OnceLock::new();
+    Arc::clone(MODEL.get_or_init(|| {
+        let cache_dir = std::env::temp_dir().join("spacebot-test-embedding-cache");
+        std::fs::create_dir_all(&cache_dir).expect("failed to create embedding cache dir");
+        Arc::new(EmbeddingModel::new(&cache_dir).expect("failed to initialize embedding model"))
+    }))
+}
