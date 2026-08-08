@@ -176,9 +176,12 @@ enum SecretsCommand {
     },
 }
 
-/// Tracks an active conversation channel and its message sender.
+/// Tracks an active conversation channel and its message relay.
 struct ActiveChannel {
-    message_tx: mpsc::Sender<spacebot::InboundMessage>,
+    /// Non-blocking, order-preserving path into the channel's message queue.
+    /// The router must never await channel delivery: a saturated channel
+    /// would stall inbound routing for every other conversation.
+    relay: spacebot::agent::inbound_relay::InboundRelay,
     /// Retained so the outbound routing task stays alive.
     _outbound_handle: tokio::task::JoinHandle<()>,
 }
@@ -2172,7 +2175,11 @@ async fn run(
                     active_channels.insert(
                         channel_key,
                         ActiveChannel {
-                            message_tx: channel_tx,
+                            relay: spacebot::agent::inbound_relay::spawn(
+                                &conversation_id,
+                                agent_id,
+                                channel_tx,
+                            ),
                             _outbound_handle: outbound_handle,
                         },
                     );
@@ -2415,7 +2422,11 @@ async fn run(
                     });
 
                     active_channels.insert(channel_key.clone(), ActiveChannel {
-                        message_tx: channel_tx,
+                        relay: spacebot::agent::inbound_relay::spawn(
+                            &conversation_id,
+                            &agent_id,
+                            channel_tx,
+                        ),
                         _outbound_handle: outbound_handle,
                     });
 
@@ -2427,9 +2438,9 @@ async fn run(
                 }
 
                 // Forward the message to the channel
-                if let Some(message_tx) = active_channels
+                if let Some(relay) = active_channels
                     .get(&channel_key)
-                    .map(|active| active.message_tx.clone())
+                    .map(|active| active.relay.clone())
                 {
                     let mut pending_delivery_failed = false;
                     if let Some(pending_injections) = deferred_injections.remove(&channel_key) {
@@ -2437,13 +2448,13 @@ async fn run(
                         let mut pending_injections = pending_injections.into_iter();
 
                         while let Some(injection_message) = pending_injections.next() {
-                            if let Err(error) = message_tx.send(injection_message).await {
+                            if let Err(error) = relay.send(injection_message) {
                                 tracing::warn!(
                                     conversation_id = %conversation_id,
                                     agent_id = %agent_id,
                                     "failed to deliver deferred injected message to channel"
                                 );
-                                remaining_injections.push(error.0);
+                                remaining_injections.push(*error.0);
                                 remaining_injections.extend(pending_injections);
                                 // Also re-queue the current inbound message so it isn't lost
                                 remaining_injections.push(message.clone());
@@ -2484,7 +2495,7 @@ async fn run(
                         attachments: inbound_attachments,
                     }).ok();
 
-                    if let Err(error) = message_tx.send(message).await {
+                    if let Err(error) = relay.send(message) {
                         tracing::error!(
                             conversation_id = %conversation_id,
                             %error,
@@ -2515,11 +2526,11 @@ async fn run(
                     injection.conversation_id.clone(),
                 );
 
-                if let Some(message_tx) = active_channels
+                if let Some(relay) = active_channels
                     .get(&channel_key)
-                    .map(|active| active.message_tx.clone())
+                    .map(|active| active.relay.clone())
                 {
-                    if let Err(error) = message_tx.send(injection.message.clone()).await {
+                    if let Err(error) = relay.send(injection.message.clone()) {
                         tracing::warn!(
                             %error,
                             conversation_id = %injection.conversation_id,
