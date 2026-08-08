@@ -56,11 +56,16 @@ impl InboundRelay {
     /// Enqueue a message for in-order delivery to the channel. Never blocks.
     /// Fails only when the relay task has exited (channel shut down).
     pub fn send(&self, message: InboundMessage) -> Result<(), RelaySendError> {
-        self.tx
-            .send(message)
-            .map_err(|error| RelaySendError(Box::new(error.0)))?;
-
+        // Count before enqueueing: the relay task decrements after each
+        // forward, and incrementing after `tx.send` would let it observe the
+        // counter at zero while a message is in flight, underflowing it.
         let depth = self.state.queued.fetch_add(1, Ordering::Relaxed) + 1;
+
+        if let Err(error) = self.tx.send(message) {
+            self.state.queued.fetch_sub(1, Ordering::Relaxed);
+            return Err(RelaySendError(Box::new(error.0)));
+        }
+
         let warn_at = self.state.warn_at.load(Ordering::Relaxed);
         if depth >= warn_at
             && self
@@ -186,6 +191,50 @@ mod tests {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "relay should reject sends after the channel receiver dropped"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn depth_accounting_survives_concurrent_drain() {
+        let (channel_tx, mut channel_rx) = mpsc::channel(1);
+        let relay = spawn("conv", "agent", channel_tx);
+
+        // Drain concurrently so the relay task's decrements race the
+        // sender's increments. A decrement observing the counter at zero
+        // underflows and panics in debug builds.
+        let consumer = tokio::spawn(async move {
+            let mut received = 0usize;
+            while channel_rx.recv().await.is_some() {
+                received += 1;
+                if received == 2000 {
+                    break;
+                }
+            }
+            received
+        });
+
+        for id in 0..2000 {
+            relay.send(message(id)).expect("relay accepts while alive");
+            if id % 32 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        assert_eq!(consumer.await.expect("consumer task"), 2000);
+
+        // Once the relay task finishes forwarding, the counter must return
+        // to exactly zero — any drift means accounting raced.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if relay.state.queued.load(Ordering::Relaxed) == 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "relay depth never returned to zero: {}",
+                relay.state.queued.load(Ordering::Relaxed)
             );
             tokio::task::yield_now().await;
         }
