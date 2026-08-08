@@ -1,218 +1,3 @@
-<<<<<<< HEAD
-import { useState, useEffect, useRef } from "react";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { api, type GlobalSettingsResponse } from "@/api/client";
-import { Button, Input, SettingSidebarButton, Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter, Select, SelectTrigger, SelectValue, SelectContent, SelectItem, Toggle } from "@/ui";
-import { useSearch, useNavigate } from "@tanstack/react-router";
-import { ChannelSettingCard, DisabledChannelCard } from "@/components/ChannelSettingCard";
-import { ModelSelect } from "@/components/ModelSelect";
-import { ProviderIcon } from "@/lib/providerIcons";
-import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
-import { faSearch } from "@fortawesome/free-solid-svg-icons";
-
-import { parse as parseToml } from "smol-toml";
-
-type SectionId = "providers" | "channels" | "api-keys" | "server" | "opencode" | "worker-logs" | "config-file";
-
-const SECTIONS = [
-	{
-		id: "providers" as const,
-		label: "Providers",
-		group: "general" as const,
-		description: "LLM provider credentials",
-	},
-	{
-		id: "channels" as const,
-		label: "Channels",
-		group: "messaging" as const,
-		description: "Messaging platforms and bindings",
-	},
-	{
-		id: "api-keys" as const,
-		label: "API Keys",
-		group: "general" as const,
-		description: "Third-party service keys",
-	},
-	{
-		id: "server" as const,
-		label: "Server",
-		group: "system" as const,
-		description: "API server configuration",
-	},
-	{
-		id: "opencode" as const,
-		label: "OpenCode",
-		group: "system" as const,
-		description: "OpenCode worker integration",
-	},
-	{
-		id: "worker-logs" as const,
-		label: "Worker Logs",
-		group: "system" as const,
-		description: "Worker execution logging",
-	},
-	{
-		id: "config-file" as const,
-		label: "Config File",
-		group: "system" as const,
-		description: "Raw config.toml editor",
-	},
-] satisfies {
-	id: SectionId;
-	label: string;
-	group: string;
-	description: string;
-}[];
-
-const PROVIDERS = [
-	{
-		id: "openrouter",
-		name: "OpenRouter",
-		description: "Multi-provider gateway with unified API",
-		placeholder: "sk-or-...",
-		envVar: "OPENROUTER_API_KEY",
-		defaultModel: "openrouter/anthropic/claude-sonnet-4",
-	},
-	{
-		id: "opencode-zen",
-		name: "OpenCode Zen",
-		description: "Multi-format gateway (Kimi, GLM, MiniMax, Qwen)",
-		placeholder: "...",
-		envVar: "OPENCODE_ZEN_API_KEY",
-		defaultModel: "opencode-zen/kimi-k2.5",
-	},
-	{
-		id: "anthropic",
-		name: "Anthropic",
-		description: "Claude models (Sonnet, Opus, Haiku)",
-		placeholder: "sk-ant-...",
-		envVar: "ANTHROPIC_API_KEY",
-		defaultModel: "anthropic/claude-sonnet-4",
-	},
-	{
-		id: "openai",
-		name: "OpenAI",
-		description: "GPT models",
-		placeholder: "sk-...",
-		envVar: "OPENAI_API_KEY",
-		defaultModel: "openai/gpt-4.1",
-	},
-	{
-		id: "zai-coding-plan",
-		name: "Z.AI Coding Plan",
-		description: "GLM coding models (glm-4.7, glm-5, glm-4.5-air)",
-		placeholder: "...",
-		envVar: "ZAI_CODING_PLAN_API_KEY",
-		defaultModel: "glm-5",
-	},
-	{
-		id: "zhipu",
-		name: "Z.ai (GLM)",
-		description: "GLM models (GLM-4, GLM-4-Flash)",
-		placeholder: "...",
-		envVar: "ZHIPU_API_KEY",
-		defaultModel: "zhipu/glm-4-plus",
-	},
-	{
-		id: "groq",
-		name: "Groq",
-		description: "Fast inference for Llama, Mixtral models",
-		placeholder: "gsk_...",
-		envVar: "GROQ_API_KEY",
-		defaultModel: "groq/llama-3.3-70b-versatile",
-	},
-	{
-		id: "together",
-		name: "Together AI",
-		description: "Wide model selection with competitive pricing",
-		placeholder: "...",
-		envVar: "TOGETHER_API_KEY",
-		defaultModel: "together/meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo",
-	},
-	{
-		id: "fireworks",
-		name: "Fireworks AI",
-		description: "Fast inference for popular OSS models",
-		placeholder: "...",
-		envVar: "FIREWORKS_API_KEY",
-		defaultModel: "fireworks/accounts/fireworks/models/minimax-m2p5",
-	},
-	{
-		id: "deepseek",
-		name: "DeepSeek",
-		description: "DeepSeek Chat and Reasoner models",
-		placeholder: "sk-...",
-		envVar: "DEEPSEEK_API_KEY",
-		defaultModel: "deepseek/deepseek-chat",
-	},
-	{
-		id: "xai",
-		name: "xAI",
-		description: "Grok models",
-		placeholder: "xai-...",
-		envVar: "XAI_API_KEY",
-		defaultModel: "xai/grok-2-latest",
-	},
-	{
-		id: "mistral",
-		name: "Mistral AI",
-		description: "Mistral Large, Small, Codestral models",
-		placeholder: "...",
-		envVar: "MISTRAL_API_KEY",
-		defaultModel: "mistral/mistral-large-latest",
-	},
-	{
-		id: "gemini",
-		name: "Google Gemini",
-		description: "Google Gemini experimental and production models",
-		placeholder: "AIza...",
-		envVar: "GEMINI_API_KEY",
-		defaultModel: "gemini/gemini-2.5-flash",
-	},
-	{
-		id: "nvidia",
-		name: "NVIDIA NIM",
-		description: "NVIDIA-hosted models via NIM API",
-		placeholder: "nvapi-...",
-		envVar: "NVIDIA_API_KEY",
-		defaultModel: "nvidia/meta/llama-3.1-405b-instruct",
-	},
-	{
-		id: "minimax",
-		name: "MiniMax",
-		description: "MiniMax (Anthropic message format)",
-		placeholder: "sk-...",
-		envVar: "MINIMAX_API_KEY",
-		defaultModel: "minimax/MiniMax-M2.5",
-	},
-	{
-		id: "minimax-cn",
-		name: "MiniMax CN",
-		description: "MiniMax China (Anthropic message format)",
-		placeholder: "sk-...",
-		envVar: "MINIMAX_CN_API_KEY",
-		defaultModel: "minimax-cn/MiniMax-M2.5",
-	},
-	{
-		id: "moonshot",
-		name: "Moonshot AI",
-		description: "Kimi models (Kimi K2, Kimi K2.5)",
-		placeholder: "sk-...",
-		envVar: "MOONSHOT_API_KEY",
-		defaultModel: "moonshot/kimi-k2.5",
-	},
-	{
-		id: "ollama",
-		name: "Ollama",
-		description: "Local or remote Ollama API endpoint",
-		placeholder: "http://localhost:11434",
-		envVar: "OLLAMA_BASE_URL",
-		defaultModel: "ollama/llama3.2",
-	},
-] as const;
-
-const CHATGPT_OAUTH_DEFAULT_MODEL = "openai-chatgpt/gpt-5.3-codex";
-=======
 import {useState, useEffect, useRef} from "react";
 import {useQuery, useMutation, useQueryClient} from "@tanstack/react-query";
 import {api} from "@/api/client";
@@ -248,7 +33,6 @@ import {
 	CHATGPT_OAUTH_DEFAULT_MODEL,
 	type SectionId,
 } from "@/components/settings";
->>>>>>> origin/main
 
 export function Settings() {
 	const queryClient = useQueryClient();
@@ -843,7 +627,16 @@ export function Settings() {
 											onEdit={() => {
 												setEditingProvider(provider.id);
 												setKeyInput("");
-												setModelInput(provider.defaultModel ?? "");
+												// When the provider is already configured, pre-populate
+												// the model field with the current routing model so the
+												// user sees what's actually active rather than the
+												// hardcoded defaultModel placeholder.
+												const currentChannel = defaultAgentConfig?.routing?.channel;
+												const currentModel =
+													isConfigured(provider.id) && currentChannel?.startsWith(`${provider.id}/`)
+														? currentChannel
+														: null;
+												setModelInput(currentModel ?? provider.defaultModel ?? "");
 												setTestedSignature(null);
 												setTestResult(null);
 												setMessage(null);
@@ -891,32 +684,6 @@ export function Settings() {
 										/>,
 										provider.id === "openai" ? (
 											<ProviderCard
-<<<<<<< HEAD
-												key={provider.id}
-												provider={provider.id}
-												name={provider.name}
-												description={provider.description}
-												configured={isConfigured(provider.id)}
-												defaultModel={provider.defaultModel}
-												onEdit={() => {
-													setEditingProvider(provider.id);
-													setKeyInput("");
-													// When the provider is already configured, pre-populate
-													// the model field with the current routing model so the
-													// user sees (and can adjust) what's actually active,
-													// rather than the hardcoded defaultModel placeholder.
-													const currentChannel = defaultAgentConfig?.routing?.channel;
-													const currentModel =
-														isConfigured(provider.id) && currentChannel?.startsWith(`${provider.id}/`)
-															? currentChannel
-															: null;
-													setModelInput(currentModel ?? provider.defaultModel ?? "");
-													setTestedSignature(null);
-													setTestResult(null);
-													setMessage(null);
-												}}
-												onRemove={() => removeMutation.mutate(provider.id)}
-=======
 												key="openai-chatgpt"
 												provider="openai-chatgpt"
 												name="ChatGPT Plus (OAuth)"
@@ -925,7 +692,6 @@ export function Settings() {
 												defaultModel={CHATGPT_OAUTH_DEFAULT_MODEL}
 												onEdit={() => setOpenAiOAuthDialogOpen(true)}
 												onRemove={() => removeMutation.mutate("openai-chatgpt")}
->>>>>>> origin/main
 												removing={removeMutation.isPending}
 												actionLabel="Sign in"
 												showRemove={isConfigured("openai-chatgpt")}
