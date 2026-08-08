@@ -108,21 +108,36 @@ impl ConversationLogger {
         content: &str,
         sender_name: Option<&str>,
     ) {
+        self.log_bot_message_with_metadata(channel_id, content, sender_name, None);
+    }
+
+    /// Log a bot message with optional tool calls packed into metadata. Fire-and-forget.
+    pub fn log_bot_message_with_metadata(
+        &self,
+        channel_id: &ChannelId,
+        content: &str,
+        sender_name: Option<&str>,
+        tool_calls_json: Option<String>,
+    ) {
         let pool = self.pool.clone();
         let id = uuid::Uuid::new_v4().to_string();
         let channel_id = channel_id.to_string();
         let content = content.to_string();
         let sender_name = sender_name.map(String::from);
 
+        // Pack tool_calls into the metadata JSON if present.
+        let metadata_json = tool_calls_json.map(|tc| format!(r#"{{"tool_calls":{tc}}}"#));
+
         tokio::spawn(async move {
             if let Err(error) = sqlx::query(
-                "INSERT INTO conversation_messages (id, channel_id, role, sender_name, content) \
-                 VALUES (?, ?, 'assistant', ?, ?)",
+                "INSERT INTO conversation_messages (id, channel_id, role, sender_name, content, metadata) \
+                 VALUES (?, ?, 'assistant', ?, ?, ?)",
             )
             .bind(&id)
             .bind(&channel_id)
             .bind(&sender_name)
             .bind(&content)
+            .bind(&metadata_json)
             .execute(&pool)
             .await
             {
@@ -244,7 +259,7 @@ impl ConversationLogger {
 }
 
 /// A unified timeline item combining messages, branch runs, and worker runs.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TimelineItem {
     Message {
@@ -254,6 +269,8 @@ pub enum TimelineItem {
         sender_id: Option<String>,
         content: String,
         created_at: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<crate::agent::channel_attachments::SavedAttachmentMeta>,
     },
     BranchRun {
         id: String,
@@ -265,6 +282,15 @@ pub enum TimelineItem {
     WorkerRun {
         id: String,
         task: String,
+        result: Option<String>,
+        status: String,
+        started_at: String,
+        completed_at: Option<String>,
+    },
+    ToolCallRun {
+        id: String,
+        tool_name: String,
+        args: String,
         result: Option<String>,
         status: String,
         started_at: String,
@@ -475,14 +501,24 @@ impl ProcessRunLogger {
 
     /// Record a worker completing with its result. Fire-and-forget.
     pub fn log_worker_completed(&self, worker_id: WorkerId, result: &str, success: bool) {
+        let status = if success { "done" } else { "failed" };
+        self.log_worker_completed_with_status(worker_id, result, status);
+    }
+
+    /// Record a worker as cancelled. Fire-and-forget.
+    pub fn log_worker_cancelled(&self, worker_id: WorkerId, result: &str) {
+        self.log_worker_completed_with_status(worker_id, result, "cancelled");
+    }
+
+    fn log_worker_completed_with_status(&self, worker_id: WorkerId, result: &str, status: &str) {
         let pool = self.pool.clone();
         let id = worker_id.to_string();
         let result = result.to_string();
-        let status = if success { "done" } else { "failed" };
+        let status = status.to_string();
 
         tokio::spawn(async move {
             if let Err(error) = sqlx::query(
-                "UPDATE worker_runs SET result = ?, status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?"
+                "UPDATE worker_runs SET result = ?, status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ? AND completed_at IS NULL"
             )
             .bind(&result)
             .bind(status)
@@ -671,7 +707,7 @@ impl ProcessRunLogger {
                      WHEN result IS NULL OR result = '' THEN 'Worker cancelled' \
                      ELSE result \
                  END, \
-                 status = 'failed', \
+                 status = 'cancelled', \
                  completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP) \
              WHERE id = ? AND channel_id = ? AND status = 'running'",
         )
@@ -697,7 +733,7 @@ impl ProcessRunLogger {
                      WHEN result IS NULL OR result = '' THEN 'Worker cancelled' \
                      ELSE result \
                  END, \
-                 status = 'failed', \
+                 status = 'cancelled', \
                  completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP) \
              WHERE id = ? AND channel_id IS NULL AND status = 'running'",
         )
@@ -728,17 +764,17 @@ impl ProcessRunLogger {
 
         let query_str = format!(
             "SELECT * FROM ( \
-                SELECT 'message' AS item_type, id, role, sender_name, sender_id, content, \
+                SELECT 'message' AS item_type, id, role, sender_name, sender_id, content, metadata, \
                        NULL AS description, NULL AS conclusion, NULL AS task, NULL AS result, NULL AS status, \
                        created_at AS timestamp, NULL AS completed_at \
                 FROM conversation_messages WHERE channel_id = ?1 \
                 UNION ALL \
-                SELECT 'branch_run' AS item_type, id, NULL, NULL, NULL, NULL, \
+                SELECT 'branch_run' AS item_type, id, NULL, NULL, NULL, NULL, NULL AS metadata, \
                        description, conclusion, NULL, NULL, NULL, \
                        started_at AS timestamp, completed_at \
                 FROM branch_runs WHERE channel_id = ?1 \
                 UNION ALL \
-                SELECT 'worker_run' AS item_type, id, NULL, NULL, NULL, NULL, \
+                SELECT 'worker_run' AS item_type, id, NULL, NULL, NULL, NULL, NULL AS metadata, \
                        NULL, NULL, task, result, status, \
                        started_at AS timestamp, completed_at \
                 FROM worker_runs WHERE channel_id = ?1 \
@@ -758,21 +794,67 @@ impl ProcessRunLogger {
 
         let mut items: Vec<TimelineItem> = rows
             .into_iter()
-            .filter_map(|row| {
+            .filter_map(|row| -> Option<Vec<TimelineItem>> {
                 let item_type: String = row.try_get("item_type").ok()?;
                 match item_type.as_str() {
-                    "message" => Some(TimelineItem::Message {
-                        id: row.try_get("id").unwrap_or_default(),
-                        role: row.try_get("role").unwrap_or_default(),
-                        sender_name: row.try_get("sender_name").ok(),
-                        sender_id: row.try_get("sender_id").ok(),
-                        content: row.try_get("content").unwrap_or_default(),
-                        created_at: row
-                            .try_get::<chrono::DateTime<chrono::Utc>, _>("timestamp")
-                            .map(|t| t.to_rfc3339())
-                            .unwrap_or_default(),
-                    }),
-                    "branch_run" => Some(TimelineItem::BranchRun {
+                    "message" => {
+                        let metadata_json: Option<String> = row.try_get("metadata").ok().flatten();
+                        let metadata_value = metadata_json
+                            .as_deref()
+                            .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok());
+                        let attachments = metadata_value
+                            .as_ref()
+                            .and_then(|v| v.get("attachments").cloned())
+                            .and_then(|a| {
+                                serde_json::from_value::<
+                                    Vec<crate::agent::channel_attachments::SavedAttachmentMeta>,
+                                >(a)
+                                .ok()
+                            })
+                            .unwrap_or_default();
+
+                        // Expand tool calls stored in message metadata into ToolCallRun items.
+                        let tool_call_items: Vec<TimelineItem> = metadata_value
+                            .as_ref()
+                            .and_then(|v| v.get("tool_calls"))
+                            .and_then(|tc| {
+                                serde_json::from_value::<Vec<crate::api::ChannelToolCallEntry>>(
+                                    tc.clone(),
+                                )
+                                .ok()
+                            })
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|tc| TimelineItem::ToolCallRun {
+                                id: tc.id,
+                                tool_name: tc.tool_name,
+                                args: tc.args,
+                                result: tc.result,
+                                status: tc.status,
+                                started_at: tc.started_at,
+                                completed_at: tc.completed_at,
+                            })
+                            .collect();
+
+                        let message = TimelineItem::Message {
+                            id: row.try_get("id").unwrap_or_default(),
+                            role: row.try_get("role").unwrap_or_default(),
+                            sender_name: row.try_get("sender_name").ok().flatten(),
+                            sender_id: row.try_get("sender_id").ok().flatten(),
+                            content: row.try_get("content").unwrap_or_default(),
+                            created_at: row
+                                .try_get::<chrono::DateTime<chrono::Utc>, _>("timestamp")
+                                .map(|t| t.to_rfc3339())
+                                .unwrap_or_default(),
+                            attachments,
+                        };
+
+                        // Tool calls come before the message they belong to.
+                        let mut result = tool_call_items;
+                        result.push(message);
+                        Some(result)
+                    }
+                    "branch_run" => Some(vec![TimelineItem::BranchRun {
                         id: row.try_get("id").unwrap_or_default(),
                         description: row.try_get("description").unwrap_or_default(),
                         conclusion: row.try_get("conclusion").ok(),
@@ -784,8 +866,8 @@ impl ProcessRunLogger {
                             .try_get::<chrono::DateTime<chrono::Utc>, _>("completed_at")
                             .ok()
                             .map(|t| t.to_rfc3339()),
-                    }),
-                    "worker_run" => Some(TimelineItem::WorkerRun {
+                    }]),
+                    "worker_run" => Some(vec![TimelineItem::WorkerRun {
                         id: row.try_get("id").unwrap_or_default(),
                         task: row.try_get("task").unwrap_or_default(),
                         result: row.try_get("result").ok(),
@@ -798,10 +880,11 @@ impl ProcessRunLogger {
                             .try_get::<chrono::DateTime<chrono::Utc>, _>("completed_at")
                             .ok()
                             .map(|t| t.to_rfc3339()),
-                    }),
+                    }]),
                     _ => None,
                 }
             })
+            .flatten()
             .collect();
 
         // Reverse to chronological order
@@ -831,11 +914,17 @@ impl ProcessRunLogger {
 
         let count_query =
             format!("SELECT COUNT(*) as total FROM worker_runs w {count_where_clause}");
+        // NOTE: The `projects` table lives in the global instance DB (spacebot.db),
+        // not in the per-agent DB, as of migration 20260404120000. Worker rows keep
+        // their `project_id` column locally, but project names must be resolved by
+        // the caller via the global `ProjectStore`.
         let list_query = format!(
             "SELECT w.id, w.task, w.status, w.worker_type, w.channel_id, w.started_at, \
                     w.completed_at, w.transcript IS NOT NULL as has_transcript, \
-                    w.tool_calls, w.opencode_port, w.interactive, \
-                    c.display_name as channel_name \
+                    w.tool_calls, w.opencode_port, w.opencode_session_id, w.directory, \
+                    w.interactive, \
+                    c.display_name as channel_name, \
+                    w.project_id \
              FROM worker_runs w \
              LEFT JOIN channels c ON w.channel_id = c.id \
              {list_where_clause} \
@@ -888,7 +977,12 @@ impl ProcessRunLogger {
                 has_transcript: row.try_get::<bool, _>("has_transcript").unwrap_or(false),
                 tool_calls: row.try_get::<i64, _>("tool_calls").unwrap_or(0),
                 opencode_port: row.try_get::<i32, _>("opencode_port").ok(),
+                opencode_session_id: row.try_get("opencode_session_id").ok().flatten(),
+                directory: row.try_get("directory").ok().flatten(),
                 interactive: row.try_get::<bool, _>("interactive").unwrap_or(false),
+                project_id: row.try_get("project_id").ok().flatten(),
+                // Resolved by caller via the global `ProjectStore` — see module note.
+                project_name: None,
             })
             .collect();
 
@@ -960,7 +1054,11 @@ pub struct WorkerRunRow {
     pub has_transcript: bool,
     pub tool_calls: i64,
     pub opencode_port: Option<i32>,
+    pub opencode_session_id: Option<String>,
+    pub directory: Option<String>,
     pub interactive: bool,
+    pub project_id: Option<String>,
+    pub project_name: Option<String>,
 }
 
 /// A worker that was idle at shutdown, loaded for reconnection at startup.
@@ -1050,8 +1148,129 @@ mod tests {
 
         let status: String = sqlx::Row::try_get(&row, "status").expect("missing status");
         let result: String = sqlx::Row::try_get(&row, "result").expect("missing result");
-        assert_eq!(status, "failed");
+        assert_eq!(status, "cancelled");
         assert_eq!(result, "Worker cancelled");
+    }
+
+    #[tokio::test]
+    async fn cancel_running_worker_sets_cancelled_status() {
+        let pool = setup_worker_runs_table().await;
+        let logger = ProcessRunLogger::new(pool.clone());
+        let worker_id = uuid::Uuid::new_v4();
+
+        sqlx::query("INSERT INTO worker_runs (id, channel_id, status, result) VALUES (?, 'ch-1', 'running', '')")
+            .bind(worker_id.to_string())
+            .execute(&pool)
+            .await
+            .expect("insert");
+
+        let cancelled = logger
+            .cancel_running_worker("ch-1", worker_id)
+            .await
+            .expect("cancel should succeed");
+        assert!(cancelled);
+
+        let row = sqlx::query("SELECT status, result FROM worker_runs WHERE id = ?")
+            .bind(worker_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("fetch");
+        let status: String = sqlx::Row::try_get(&row, "status").expect("status");
+        let result: String = sqlx::Row::try_get(&row, "result").expect("result");
+        assert_eq!(status, "cancelled");
+        assert_eq!(result, "Worker cancelled");
+    }
+
+    /// Poll until a worker's status changes from "running", with a timeout.
+    async fn poll_worker_status(
+        pool: &sqlx::SqlitePool,
+        worker_id: uuid::Uuid,
+        timeout_ms: u64,
+    ) -> String {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            let row = sqlx::query("SELECT status FROM worker_runs WHERE id = ?")
+                .bind(worker_id.to_string())
+                .fetch_one(pool)
+                .await
+                .expect("fetch");
+            let status: String = sqlx::Row::try_get(&row, "status").expect("status");
+            if status != "running" {
+                return status;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("worker status did not transition within {timeout_ms}ms");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn log_worker_completed_success_sets_done_status() {
+        let pool = setup_worker_runs_table().await;
+        let logger = ProcessRunLogger::new(pool.clone());
+        let worker_id = uuid::Uuid::new_v4();
+
+        sqlx::query("INSERT INTO worker_runs (id, channel_id, status, result) VALUES (?, 'ch-1', 'running', '')")
+            .bind(worker_id.to_string())
+            .execute(&pool)
+            .await
+            .expect("insert");
+
+        logger.log_worker_completed(worker_id, "task finished", true);
+        let status = poll_worker_status(&pool, worker_id, 2000).await;
+
+        assert_eq!(status, "done");
+        let row = sqlx::query("SELECT result FROM worker_runs WHERE id = ?")
+            .bind(worker_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("fetch");
+        let result: String = sqlx::Row::try_get(&row, "result").expect("result");
+        assert_eq!(result, "task finished");
+    }
+
+    #[tokio::test]
+    async fn log_worker_completed_failure_sets_failed_status() {
+        let pool = setup_worker_runs_table().await;
+        let logger = ProcessRunLogger::new(pool.clone());
+        let worker_id = uuid::Uuid::new_v4();
+
+        sqlx::query("INSERT INTO worker_runs (id, channel_id, status, result) VALUES (?, 'ch-1', 'running', '')")
+            .bind(worker_id.to_string())
+            .execute(&pool)
+            .await
+            .expect("insert");
+
+        logger.log_worker_completed(worker_id, "something broke", false);
+        let status = poll_worker_status(&pool, worker_id, 2000).await;
+
+        assert_eq!(status, "failed");
+    }
+
+    #[tokio::test]
+    async fn log_worker_cancelled_sets_cancelled_status() {
+        let pool = setup_worker_runs_table().await;
+        let logger = ProcessRunLogger::new(pool.clone());
+        let worker_id = uuid::Uuid::new_v4();
+
+        sqlx::query("INSERT INTO worker_runs (id, channel_id, status, result) VALUES (?, 'ch-1', 'running', '')")
+            .bind(worker_id.to_string())
+            .execute(&pool)
+            .await
+            .expect("insert");
+
+        logger.log_worker_cancelled(worker_id, "Worker cancelled: user requested");
+        let status = poll_worker_status(&pool, worker_id, 2000).await;
+
+        assert_eq!(status, "cancelled");
+        let row = sqlx::query("SELECT result FROM worker_runs WHERE id = ?")
+            .bind(worker_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("fetch");
+        let result: String = sqlx::Row::try_get(&row, "result").expect("result");
+        assert_eq!(result, "Worker cancelled: user requested");
     }
 
     #[tokio::test]

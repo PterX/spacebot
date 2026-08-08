@@ -59,6 +59,15 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         ("en", "worker") => include_str!("../../prompts/en/worker.md.j2"),
         ("en", "cortex") => include_str!("../../prompts/en/cortex.md.j2"),
         ("en", "cortex_bulletin") => include_str!("../../prompts/en/cortex_bulletin.md.j2"),
+        ("en", "cortex_knowledge_synthesis") => {
+            include_str!("../../prompts/en/cortex_knowledge_synthesis.md.j2")
+        }
+        ("en", "cortex_intraday_synthesis") => {
+            include_str!("../../prompts/en/cortex_intraday_synthesis.md.j2")
+        }
+        ("en", "cortex_daily_summary") => {
+            include_str!("../../prompts/en/cortex_daily_summary.md.j2")
+        }
         ("en", "cortex_profile") => include_str!("../../prompts/en/cortex_profile.md.j2"),
         ("en", "compactor") => include_str!("../../prompts/en/compactor.md.j2"),
         ("en", "memory_persistence") => include_str!("../../prompts/en/memory_persistence.md.j2"),
@@ -119,6 +128,9 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         ("en", "fragments/system/tool_syntax_correction") => {
             include_str!("../../prompts/en/fragments/system/tool_syntax_correction.md.j2")
         }
+        ("en", "fragments/tool_use_enforcement") => {
+            include_str!("../../prompts/en/fragments/tool_use_enforcement.md.j2")
+        }
         // Agent Communication Fragments
         ("en", "fragments/org_context") => {
             include_str!("../../prompts/en/fragments/org_context.md.j2")
@@ -142,6 +154,9 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         ("en", "tools/cancel") => include_str!("../../prompts/en/tools/cancel_description.md.j2"),
         ("en", "tools/skip") => include_str!("../../prompts/en/tools/skip_description.md.j2"),
         ("en", "tools/react") => include_str!("../../prompts/en/tools/react_description.md.j2"),
+        ("en", "tools/set_outcome") => {
+            include_str!("../../prompts/en/tools/set_outcome_description.md.j2")
+        }
         ("en", "tools/set_status") => {
             include_str!("../../prompts/en/tools/set_status_description.md.j2")
         }
@@ -198,6 +213,24 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         }
         ("en", "tools/send_agent_message") => {
             include_str!("../../prompts/en/tools/send_agent_message_description.md.j2")
+        }
+        ("en", "tools/wiki_create") => {
+            include_str!("../../prompts/en/tools/wiki_create_description.md.j2")
+        }
+        ("en", "tools/wiki_edit") => {
+            include_str!("../../prompts/en/tools/wiki_edit_description.md.j2")
+        }
+        ("en", "tools/wiki_read") => {
+            include_str!("../../prompts/en/tools/wiki_read_description.md.j2")
+        }
+        ("en", "tools/wiki_list") => {
+            include_str!("../../prompts/en/tools/wiki_list_description.md.j2")
+        }
+        ("en", "tools/wiki_search") => {
+            include_str!("../../prompts/en/tools/wiki_search_description.md.j2")
+        }
+        ("en", "tools/wiki_history") => {
+            include_str!("../../prompts/en/tools/wiki_history_description.md.j2")
         }
         ("en", "tools/task_create") => {
             include_str!("../../prompts/en/tools/task_create_description.md.j2")

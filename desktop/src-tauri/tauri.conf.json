@@ -4,8 +4,10 @@
   "version": "0.1.0",
   "identifier": "sh.spacebot.desktop",
   "build": {
+    "beforeDevCommand": "cd ../interface && bun install --frozen-lockfile && bun run dev",
+    "beforeBuildCommand": "cd ../interface && bun install --frozen-lockfile && bun run build",
     "devUrl": "http://localhost:19840",
-    "frontendDist": "http://localhost:19898"
+    "frontendDist": "../../interface/dist"
   },
   "app": {
     "macOSPrivateApi": true,
@@ -36,6 +38,7 @@
   },
   "bundle": {
     "active": true,
+    "externalBin": ["binaries/spacebot"],
     "resources": {
       "gen/icon/**/*": "./"
     },

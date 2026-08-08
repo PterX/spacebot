@@ -1,27 +1,109 @@
-export const BASE_PATH: string = (window as any).__SPACEBOT_BASE_PATH || "";
-export const IS_TAURI: boolean = !!(window as any).__TAURI_INTERNALS__;
-const API_BASE = BASE_PATH + "/api";
-
-export interface StatusResponse {
-	status: string;
-	version: string;
-	pid: number;
-	uptime_seconds: number;
+declare global {
+	interface Window {
+		__SPACEBOT_BASE_PATH?: string;
+	}
 }
 
-export interface ChannelInfo {
-	agent_id: string;
-	id: string;
-	platform: string;
-	display_name: string | null;
-	is_active: boolean;
-	last_activity_at: string;
-	created_at: string;
+export const BASE_PATH: string = window.__SPACEBOT_BASE_PATH || "";
+
+/**
+ * Dynamic server URL for the Tauri desktop app. When set, all API
+ * requests target this absolute URL (e.g. "http://localhost:19898/api/...").
+ * When empty the app uses relative paths (same-origin / proxy mode).
+ */
+let _serverUrl = "";
+export function setServerUrl(url: string) {
+	_serverUrl = url.replace(/\/+$/, "");
+}
+export function getServerUrl(): string {
+	return _serverUrl;
 }
 
-export interface ChannelsResponse {
-	channels: ChannelInfo[];
+export function getApiBase(): string {
+	if (_serverUrl) return `${_serverUrl}/api`;
+	return BASE_PATH + "/api";
 }
+
+import type * as Types from "./types";
+
+// Re-export commonly used types from schema for backward compatibility
+// Only re-export types that don't have local definitions with extra fields
+export type {
+	// System
+	StatusResponse,
+	InstanceOverviewResponse,
+	// Channels
+	ChannelResponse,
+	ChannelsResponse,
+	MessagesResponse,
+	TimelineItem,
+	// Workers
+	WorkerListItem,
+	WorkerListResponse,
+	WorkerDetailResponse,
+	TranscriptStep,
+	// Agents
+	AgentInfo,
+	AgentsResponse,
+	AgentSummary,
+	AgentOverviewResponse,
+	AgentProfile,
+	AgentProfileResponse,
+	CronJobInfo,
+	// Memory (schema types only)
+	Memory,
+	Association,
+	RelationType,
+	MemoryGraphResponse,
+	MemoryGraphNeighborsResponse,
+	// Cortex chat (schema types)
+	CortexChatMessage,
+	CortexChatThread,
+	CortexChatToolCall,
+	CortexChatMessagesResponse,
+	CortexChatThreadsResponse,
+	// Config (schema types only)
+	GlobalSettingsResponse,
+	GlobalSettingsUpdateResponse,
+	RawConfigResponse,
+	RawConfigUpdateResponse,
+	// Providers
+	ProvidersResponse,
+	ProviderUpdateResponse,
+	ProviderModelTestResponse,
+	OpenAiOAuthBrowserStartResponse,
+	OpenAiOAuthBrowserStatusResponse,
+	ModelInfo,
+	ModelsResponse,
+	// Ingest
+	IngestFileInfo,
+	IngestFilesResponse,
+	IngestUploadResponse,
+	IngestDeleteResponse,
+	// Messaging
+	PlatformStatus,
+	AdapterInstanceStatus,
+	MessagingStatusResponse,
+	CreateMessagingInstanceRequest,
+	MessagingInstanceActionResponse,
+} from "./types";
+
+// Import and re-export Topology types from schema
+import type {
+	TopologyAgent,
+	TopologyLink,
+	TopologyGroup,
+	TopologyHuman,
+	TopologyResponse,
+} from "./types";
+
+export type { TopologyAgent, TopologyLink, TopologyGroup, TopologyHuman, TopologyResponse };
+
+// Conversation-related types
+export type { ConversationSettings, ConversationDefaultsResponse } from "./types";
+export type ChannelInfo = Types.ChannelResponse;
+export type WorkerRunInfo = Types.WorkerListItem;
+export type AssociationItem = Types.Association;
 
 export type ProcessType = "channel" | "branch" | "worker";
 
@@ -32,6 +114,7 @@ export interface InboundMessageEvent {
 	sender_name?: string | null;
 	sender_id: string;
 	text: string;
+	attachments?: AttachmentMeta[];
 }
 
 export interface OutboundMessageEvent {
@@ -112,8 +195,22 @@ export interface ToolStartedEvent {
 	channel_id: string | null;
 	process_type: ProcessType;
 	process_id: string;
+	call_id: string;
 	tool_name: string;
 	args: string;
+}
+
+export interface ToolOutputEvent {
+	type: "tool_output";
+	agent_id: string;
+	channel_id: string | null;
+	process_type: ProcessType;
+	process_id: string;
+	/** Stable identifier matching the tool_call that initiated this stream. */
+	call_id: string;
+	tool_name: string;
+	line: string;
+	stream: "stdout" | "stderr";
 }
 
 export interface ToolCompletedEvent {
@@ -122,8 +219,18 @@ export interface ToolCompletedEvent {
 	channel_id: string | null;
 	process_type: ProcessType;
 	process_id: string;
+	call_id: string;
 	tool_name: string;
 	result: string;
+}
+
+// -- Agent link events --
+
+export interface AgentMessageEvent {
+	from_agent_id: string;
+	to_agent_id: string;
+	link_id: string;
+	channel_id: string;
 }
 
 // -- OpenCode live transcript part types --
@@ -159,7 +266,7 @@ export interface CortexChatMessageEvent {
 	agent_id: string;
 	thread_id: string;
 	content: string;
-	tool_calls?: CortexChatToolCall[];
+	tool_calls?: Types.CortexChatToolCall[];
 }
 
 export type ApiEvent =
@@ -175,16 +282,19 @@ export type ApiEvent =
 	| BranchCompletedEvent
 	| ToolStartedEvent
 	| ToolCompletedEvent
+	| ToolOutputEvent
 	| OpenCodePartUpdatedEvent
 	| WorkerTextEvent
 	| CortexChatMessageEvent;
 
-async function fetchJson<T>(path: string): Promise<T> {
-	const response = await fetch(`${API_BASE}${path}`);
-	if (!response.ok) {
-		throw new Error(`API error: ${response.status}`);
-	}
-	return response.json();
+// -- Timeline types (discriminated union parts) --
+
+export interface AttachmentMeta {
+	id: string;
+	filename: string;
+	saved_filename: string;
+	mime_type: string;
+	size_bytes: number;
 }
 
 export interface TimelineMessage {
@@ -195,6 +305,7 @@ export interface TimelineMessage {
 	sender_id: string | null;
 	content: string;
 	created_at: string;
+	attachments?: AttachmentMeta[];
 }
 
 export interface TimelineBranchRun {
@@ -216,12 +327,18 @@ export interface TimelineWorkerRun {
 	completed_at: string | null;
 }
 
-export type TimelineItem = TimelineMessage | TimelineBranchRun | TimelineWorkerRun;
+// Note: TimelineItem is re-exported from types.ts as a union type
 
-export interface MessagesResponse {
-	items: TimelineItem[];
-	has_more: boolean;
+async function fetchJson<T>(path: string): Promise<T> {
+	const response = await fetch(`${getApiBase()}${path}`);
+	if (!response.ok) {
+		throw new Error(`API error: ${response.status}`);
+	}
+	return response.json();
 }
+
+/** channel_id -> StatusBlockSnapshot */
+export type ChannelStatusResponse = Record<string, StatusBlockSnapshot>;
 
 export interface WorkerStatusInfo {
 	id: string;
@@ -253,15 +370,45 @@ export interface StatusBlockSnapshot {
 	completed_items: CompletedItemInfo[];
 }
 
-/** channel_id -> StatusBlockSnapshot */
-export type ChannelStatusResponse = Record<string, StatusBlockSnapshot>;
+/**
+ * One entry in the prompt history. Mirrors rig's `Message` enum as
+ * serialized to JSON: role plus content that may be a plain string,
+ * a single block, or an array of blocks depending on the LLM provider.
+ */
+export interface PromptHistoryMessage {
+	role: string;
+	content: PromptHistoryContent;
+}
+
+export type PromptHistoryContent =
+	| string
+	| PromptHistoryBlock
+	| PromptHistoryBlock[];
+
+/**
+ * A single content block inside a `PromptHistoryMessage`. Fields are
+ * optional because rig's content variants are structurally different:
+ * text blocks, tool calls, tool results, and reasoning all flow through
+ * the same channel.
+ */
+export interface PromptHistoryBlock {
+	type?: string;
+	text?: string;
+	id?: string;
+	content?: unknown;
+	function?: {
+		name: string;
+		arguments: string | Record<string, unknown>;
+	};
+	reasoning?: string[];
+}
 
 export interface PromptInspectResponse {
 	channel_id: string;
 	system_prompt: string;
 	total_chars: number;
 	history_length: number;
-	history: unknown[];
+	history: PromptHistoryMessage[];
 	capture_enabled: boolean;
 	/** Present when the channel is not active */
 	error?: string;
@@ -286,7 +433,7 @@ export interface PromptSnapshot {
 	user_message: string;
 	system_prompt: string;
 	system_prompt_chars: number;
-	history: unknown;
+	history: PromptHistoryMessage[];
 	history_length: number;
 }
 
@@ -295,149 +442,9 @@ export interface PromptCaptureResponse {
 	capture_enabled: boolean;
 }
 
-// --- Workers API types ---
+// --- Memory helper types (extended beyond schema) ---
 
-export type ActionContent =
-	| { type: "text"; text: string }
-	| { type: "tool_call"; id: string; name: string; args: string };
-
-export type TranscriptStep =
-	| { type: "action"; content: ActionContent[] }
-	| { type: "tool_result"; call_id: string; name: string; text: string };
-
-export interface WorkerRunInfo {
-	id: string;
-	task: string;
-	status: string;
-	worker_type: string;
-	channel_id: string | null;
-	channel_name: string | null;
-	started_at: string;
-	completed_at: string | null;
-	has_transcript: boolean;
-	live_status: string | null;
-	tool_calls: number;
-	opencode_port: number | null;
-	interactive: boolean;
-}
-
-export interface WorkerDetailResponse {
-	id: string;
-	task: string;
-	result: string | null;
-	status: string;
-	worker_type: string;
-	channel_id: string | null;
-	channel_name: string | null;
-	started_at: string;
-	completed_at: string | null;
-	transcript: TranscriptStep[] | null;
-	tool_calls: number;
-	opencode_session_id: string | null;
-	opencode_port: number | null;
-	interactive: boolean;
-	directory: string | null;
-}
-
-export interface WorkerListResponse {
-	workers: WorkerRunInfo[];
-	total: number;
-}
-
-export interface AgentInfo {
-	id: string;
-	display_name?: string;
-	role?: string;
-	gradient_start?: string;
-	gradient_end?: string;
-	workspace: string;
-	context_window: number;
-	max_turns: number;
-	max_concurrent_branches: number;
-	max_concurrent_workers: number;
-}
-
-export interface AgentsResponse {
-	agents: AgentInfo[];
-}
-
-export interface CronJobInfo {
-	id: string;
-	prompt: string;
-	cron_expr: string | null;
-	interval_secs: number;
-	delivery_target: string;
-	enabled: boolean;
-	run_once: boolean;
-	active_hours: [number, number] | null;
-}
-
-export interface AgentOverviewResponse {
-	memory_counts: Record<string, number>;
-	memory_total: number;
-	channel_count: number;
-	cron_jobs: CronJobInfo[];
-	last_bulletin_at: string | null;
-	recent_cortex_events: CortexEvent[];
-	memory_daily: { date: string; count: number }[];
-	activity_daily: { date: string; branches: number; workers: number }[];
-	activity_heatmap: { day: number; hour: number; count: number }[];
-	latest_bulletin: string | null;
-}
-
-export interface AgentProfile {
-	agent_id: string;
-	display_name: string | null;
-	status: string | null;
-	bio: string | null;
-	avatar_seed: string | null;
-	generated_at: string;
-	updated_at: string;
-}
-
-export interface AgentProfileResponse {
-	profile: AgentProfile | null;
-}
-
-export interface AgentSummary {
-	id: string;
-	channel_count: number;
-	memory_total: number;
-	cron_job_count: number;
-	activity_sparkline: number[];
-	last_activity_at: string | null;
-	last_bulletin_at: string | null;
-	profile: AgentProfile | null;
-}
-
-export interface InstanceOverviewResponse {
-	version: string;
-	uptime_seconds: number;
-	pid: number;
-	agents: AgentSummary[];
-}
-
-export type Deployment = "docker" | "hosted" | "native";
-
-export interface UpdateStatus {
-	current_version: string;
-	latest_version: string | null;
-	update_available: boolean;
-	release_url: string | null;
-	release_notes: string | null;
-	deployment: Deployment;
-	can_apply: boolean;
-	cannot_apply_reason: string | null;
-	docker_image: string | null;
-	checked_at: string | null;
-	error: string | null;
-}
-
-export interface UpdateApplyResponse {
-	status: "updating" | "error";
-	error?: string;
-}
-
+// Extended MemoryType with additional values not yet in schema
 export type MemoryType =
 	| "fact"
 	| "preference"
@@ -455,6 +462,7 @@ export const MEMORY_TYPES: MemoryType[] = [
 
 export type MemorySort = "recent" | "importance" | "most_accessed";
 
+// Extended MemoryItem with forgotten field (not yet in schema)
 export interface MemoryItem {
 	id: string;
 	content: string;
@@ -484,34 +492,6 @@ export interface MemoriesSearchResponse {
 	results: MemorySearchResultItem[];
 }
 
-export type RelationType =
-	| "related_to"
-	| "updates"
-	| "contradicts"
-	| "caused_by"
-	| "result_of"
-	| "part_of";
-
-export interface AssociationItem {
-	id: string;
-	source_id: string;
-	target_id: string;
-	relation_type: RelationType;
-	weight: number;
-	created_at: string;
-}
-
-export interface MemoryGraphResponse {
-	nodes: MemoryItem[];
-	edges: AssociationItem[];
-	total: number;
-}
-
-export interface MemoryGraphNeighborsResponse {
-	nodes: MemoryItem[];
-	edges: AssociationItem[];
-}
-
 export interface MemoryGraphParams {
 	limit?: number;
 	offset?: number;
@@ -535,6 +515,8 @@ export interface MemoriesSearchParams {
 	limit?: number;
 	memory_type?: MemoryType;
 }
+
+// --- Cortex event types ---
 
 export type CortexEventType =
 	| "bulletin_generated"
@@ -578,48 +560,13 @@ export interface CortexEventsParams {
 	event_type?: CortexEventType;
 }
 
-// -- Cortex Chat --
-
-export interface CortexChatToolCall {
-	id: string;
-	tool: string;
-	args: string;
-	result: string | null;
-	status: "running" | "completed" | "error";
-}
-
-export interface CortexChatMessage {
-	id: string;
-	thread_id: string;
-	role: "user" | "assistant";
-	content: string;
-	channel_context: string | null;
-	created_at: string;
-	tool_calls?: CortexChatToolCall[];
-}
-
-export interface CortexChatMessagesResponse {
-	messages: CortexChatMessage[];
-	thread_id: string;
-}
-
-export interface CortexChatThread {
-	thread_id: string;
-	preview: string;
-	message_count: number;
-	first_message_at: string;
-	last_message_at: string;
-}
-
-export interface CortexChatThreadsResponse {
-	threads: CortexChatThread[];
-}
+// -- Cortex Chat SSE types (not in schema) --
 
 export type CortexChatSSEEvent =
 	| { type: "thinking" }
 	| { type: "tool_started"; tool: string; call_id: string; args: string }
 	| { type: "tool_completed"; tool: string; call_id: string; args: string; result: string; result_preview: string }
-	| { type: "done"; full_text: string; tool_calls: CortexChatToolCall[] }
+	| { type: "done"; full_text: string; tool_calls: Types.CortexChatToolCall[] }
 	| { type: "error"; message: string };
 
 // -- Factory Presets --
@@ -642,20 +589,7 @@ export interface PresetsResponse {
 	presets: PresetMeta[];
 }
 
-export interface IdentityFiles {
-	soul: string | null;
-	identity: string | null;
-	role: string | null;
-}
-
-export interface IdentityUpdateRequest {
-	agent_id: string;
-	soul?: string | null;
-	identity?: string | null;
-	role?: string | null;
-}
-
-// -- Agent Config Types --
+// -- Config types with frontend-specific extensions --
 
 export interface RoutingSection {
 	channel: string;
@@ -866,16 +800,25 @@ export interface CronJobWithStats {
 	run_once: boolean;
 	active_hours: [number, number] | null;
 	timeout_secs: number | null;
-	success_count: number;
-	failure_count: number;
+	execution_success_count: number;
+	execution_failure_count: number;
+	delivery_success_count: number;
+	delivery_failure_count: number;
+	delivery_skipped_count: number;
 	last_executed_at: string | null;
 }
 
 export interface CronExecutionEntry {
 	id: string;
+	cron_id: string | null;
 	executed_at: string;
 	success: boolean;
+	execution_succeeded: boolean;
+	delivery_attempted: boolean;
+	delivery_succeeded: boolean | null;
 	result_summary: string | null;
+	execution_error: string | null;
+	delivery_error: string | null;
 }
 
 export interface CronListResponse {
@@ -910,103 +853,63 @@ export interface CronExecutionsParams {
 	limit?: number;
 }
 
-export interface ProviderStatus {
-	anthropic: boolean;
-	openai: boolean;
-	openai_chatgpt: boolean;
-	openrouter: boolean;
-	kilo: boolean;
-	zhipu: boolean;
-	groq: boolean;
-	together: boolean;
-	fireworks: boolean;
-	deepseek: boolean;
-	xai: boolean;
-	mistral: boolean;
-	gemini: boolean;
-	ollama: boolean;
-	opencode_zen: boolean;
-	opencode_go: boolean;
-	nvidia: boolean;
-	minimax: boolean;
-	minimax_cn: boolean;
-	moonshot: boolean;
-	zai_coding_plan: boolean;
-	github_copilot: boolean;
+// -- Update Types --
+
+export type Deployment = "docker" | "hosted" | "native";
+
+export interface UpdateStatus {
+	current_version: string;
+	latest_version: string | null;
+	update_available: boolean;
+	release_url: string | null;
+	release_notes: string | null;
+	deployment: Deployment;
+	can_apply: boolean;
+	cannot_apply_reason: string | null;
+	docker_image: string | null;
+	checked_at: string | null;
+	error: string | null;
 }
 
-export interface ProvidersResponse {
-	providers: ProviderStatus;
-	has_any: boolean;
+export interface UpdateApplyResponse {
+	status: "updating" | "error";
+	error?: string;
 }
 
-export interface ProviderActionResponse {
-	success: boolean;
-	message: string;
+// -- Global Settings Types --
+
+export interface OpenCodePermissions {
+	edit: string;
+	bash: string;
+	webfetch: string;
 }
 
-export interface ProviderModelTestResponse {
-	success: boolean;
-	message: string;
-	provider: string;
-	model: string;
-	sample: string | null;
+export interface OpenCodeSettings {
+	enabled: boolean;
+	path: string;
+	max_servers: number;
+	server_startup_timeout_secs: number;
+	max_restart_retries: number;
+	permissions: OpenCodePermissions;
 }
 
-export interface OpenAiOAuthBrowserStartResponse {
-	success: boolean;
-	message: string;
-	user_code: string | null;
-	verification_url: string | null;
-	state: string | null;
+export interface OpenCodeSettingsUpdate {
+	enabled?: boolean;
+	path?: string;
+	max_servers?: number;
+	server_startup_timeout_secs?: number;
+	max_restart_retries?: number;
+	permissions?: Partial<OpenCodePermissions>;
 }
 
-export interface OpenAiOAuthBrowserStatusResponse {
-	found: boolean;
-	done: boolean;
-	success: boolean;
-	message: string | null;
-}
-
-// -- Model Types --
-
-export interface ModelInfo {
-	id: string;
-	name: string;
-	provider: string;
-	context_window: number | null;
-	tool_call: boolean;
-	reasoning: boolean;
-	input_audio: boolean;
-}
-
-export interface ModelsResponse {
-	models: ModelInfo[];
-}
-
-// -- Ingest Types --
-
-export interface IngestFileInfo {
-	content_hash: string;
-	filename: string;
-	file_size: number;
-	total_chunks: number;
-	chunks_completed: number;
-	status: "queued" | "processing" | "completed" | "failed";
-	started_at: string;
-	completed_at: string | null;
-}
-
-export interface IngestFilesResponse {
-	files: IngestFileInfo[];
-}
-
-export interface IngestUploadResponse {
-	uploaded: string[];
-}
-
-export interface IngestDeleteResponse {
-	success: boolean;
+export interface GlobalSettingsUpdate {
+	company_name?: string;
+	brave_search_key?: string | null;
+	api_enabled?: boolean;
+	api_port?: number;
+	api_bind?: string;
+	worker_log_mode?: string;
+	opencode?: OpenCodeSettingsUpdate;
 }
 
 // -- Skills Types --
@@ -1016,7 +919,7 @@ export interface SkillInfo {
 	description: string;
 	file_path: string;
 	base_dir: string;
-	source: "instance" | "workspace";
+	source: "builtin" | "instance" | "workspace";
 	source_repo?: string;
 }
 
@@ -1083,12 +986,6 @@ export interface UploadSkillResponse {
 	installed: string[];
 }
 
-export interface RegistrySkillContentResponse {
-	source: string;
-	skill_id: string;
-	content: string | null;
-}
-
 // -- Task Types --
 
 export type TaskStatus = "pending_approval" | "backlog" | "ready" | "in_progress" | "done";
@@ -1101,12 +998,13 @@ export interface TaskSubtask {
 
 export interface TaskItem {
 	id: string;
-	agent_id: string;
 	task_number: number;
 	title: string;
 	description?: string;
 	status: TaskStatus;
 	priority: TaskPriority;
+	owner_agent_id: string;
+	assigned_agent_id: string;
 	subtasks: TaskSubtask[];
 	metadata: Record<string, unknown>;
 	source_memory_id?: string;
@@ -1133,6 +1031,8 @@ export interface TaskActionResponse {
 }
 
 export interface CreateTaskRequest {
+	owner_agent_id: string;
+	assigned_agent_id?: string;
 	title: string;
 	description?: string;
 	status?: TaskStatus;
@@ -1148,6 +1048,7 @@ export interface UpdateTaskRequest {
 	description?: string;
 	status?: TaskStatus;
 	priority?: TaskPriority;
+	assigned_agent_id?: string;
 	subtasks?: TaskSubtask[];
 	metadata?: Record<string, unknown>;
 	complete_subtask?: number;
@@ -1155,70 +1056,48 @@ export interface UpdateTaskRequest {
 	approved_by?: string;
 }
 
+// -- Notification Types --
+
+export type NotificationKind = "task_approval" | "worker_failed" | "cortex_observation";
+export type NotificationSeverity = "info" | "warn" | "error";
+
+export interface NotificationItem {
+	id: string;
+	kind: NotificationKind;
+	severity: NotificationSeverity;
+	title: string;
+	body?: string;
+	agent_id?: string;
+	related_entity_type?: string;
+	related_entity_id?: string;
+	action_url?: string;
+	metadata?: string;
+	created_at: string;
+	read_at?: string;
+	dismissed_at?: string;
+}
+
+export interface NotificationsResponse {
+	notifications: NotificationItem[];
+}
+
+export interface UnreadCountResponse {
+	count: number;
+}
+
+export interface NotificationCreatedEvent {
+	type: "notification_created";
+	notification: NotificationItem;
+}
+
+export interface NotificationUpdatedEvent {
+	type: "notification_updated";
+	id: string;
+	read: boolean;
+	dismissed: boolean;
+}
+
 // -- Messaging / Bindings Types --
-
-export interface PlatformStatus {
-	configured: boolean;
-	enabled: boolean;
-}
-
-export interface AdapterInstanceStatus {
-	platform: string;
-	name: string | null;
-	runtime_key: string;
-	configured: boolean;
-	enabled: boolean;
-	binding_count: number;
-}
-
-export interface MessagingStatusResponse {
-	discord: PlatformStatus;
-	slack: PlatformStatus;
-	telegram: PlatformStatus;
-	webhook: PlatformStatus;
-	twitch: PlatformStatus;
-	email: PlatformStatus;
-	instances: AdapterInstanceStatus[];
-}
-
-export interface CreateMessagingInstanceRequest {
-	platform: string;
-	name?: string;
-	enabled?: boolean;
-	credentials: {
-		discord_token?: string;
-		slack_bot_token?: string;
-		slack_app_token?: string;
-		telegram_token?: string;
-		twitch_username?: string;
-		twitch_oauth_token?: string;
-		twitch_client_id?: string;
-		twitch_client_secret?: string;
-		twitch_refresh_token?: string;
-		email_imap_host?: string;
-		email_imap_port?: number;
-		email_imap_username?: string;
-		email_imap_password?: string;
-		email_smtp_host?: string;
-		email_smtp_port?: number;
-		email_smtp_username?: string;
-		email_smtp_password?: string;
-		email_from_address?: string;
-		webhook_port?: number;
-		webhook_bind?: string;
-		webhook_auth_token?: string;
-	};
-}
-
-export interface DeleteMessagingInstanceRequest {
-	platform: string;
-	name?: string;
-}
-
-export interface MessagingInstanceActionResponse {
-	success: boolean;
-	message: string;
-}
 
 export interface BindingInfo {
 	agent_id: string;
@@ -1312,66 +1191,7 @@ export interface DeleteBindingResponse {
 	message: string;
 }
 
-// -- Global Settings Types --
-
-export interface OpenCodePermissions {
-	edit: string;
-	bash: string;
-	webfetch: string;
-}
-
-export interface OpenCodeSettings {
-	enabled: boolean;
-	path: string;
-	max_servers: number;
-	server_startup_timeout_secs: number;
-	max_restart_retries: number;
-	permissions: OpenCodePermissions;
-}
-
-export interface OpenCodeSettingsUpdate {
-	enabled?: boolean;
-	path?: string;
-	max_servers?: number;
-	server_startup_timeout_secs?: number;
-	max_restart_retries?: number;
-	permissions?: Partial<OpenCodePermissions>;
-}
-
-export interface GlobalSettingsResponse {
-	brave_search_key: string | null;
-	api_enabled: boolean;
-	api_port: number;
-	api_bind: string;
-	worker_log_mode: string;
-	opencode: OpenCodeSettings;
-}
-
-export interface GlobalSettingsUpdate {
-	brave_search_key?: string | null;
-	api_enabled?: boolean;
-	api_port?: number;
-	api_bind?: string;
-	worker_log_mode?: string;
-	opencode?: OpenCodeSettingsUpdate;
-}
-
-export interface GlobalSettingsUpdateResponse {
-	success: boolean;
-	message: string;
-	requires_restart: boolean;
-}
-
-export interface RawConfigResponse {
-	content: string;
-}
-
-export interface RawConfigUpdateResponse {
-	success: boolean;
-	message: string;
-}
-
-// -- Agent Links & Topology --
+// -- Links & Topology Types --
 
 export type LinkDirection = "one_way" | "two_way";
 export type LinkKind = "hierarchical" | "peer";
@@ -1385,45 +1205,6 @@ export interface AgentLinkResponse {
 
 export interface LinksResponse {
 	links: AgentLinkResponse[];
-}
-
-export interface TopologyAgent {
-	id: string;
-	name: string;
-	display_name?: string;
-	role?: string;
-}
-
-export interface TopologyLink {
-	from: string;
-	to: string;
-	direction: string;
-	kind: string;
-}
-
-export interface TopologyGroup {
-	name: string;
-	agent_ids: string[];
-	color?: string;
-}
-
-export interface TopologyHuman {
-	id: string;
-	display_name?: string;
-	role?: string;
-	bio?: string;
-	description?: string;
-	discord_id?: string;
-	telegram_id?: string;
-	slack_id?: string;
-	email?: string;
-}
-
-export interface TopologyResponse {
-	agents: TopologyAgent[];
-	humans: TopologyHuman[];
-	links: TopologyLink[];
-	groups: TopologyGroup[];
 }
 
 export interface CreateHumanRequest {
@@ -1473,27 +1254,21 @@ export interface UpdateLinkRequest {
 	kind?: LinkKind;
 }
 
-export interface AgentMessageEvent {
-	from_agent_id: string;
-	to_agent_id: string;
-	link_id: string;
-	channel_id: string;
-}
-
-// ── Projects ─────────────────────────────────────────────────────────────
+// -- Projects Types --
 
 export type ProjectStatus = "active" | "archived";
 
 export interface Project {
 	id: string;
-	agent_id: string;
 	name: string;
 	description: string;
 	icon: string;
 	tags: string[];
 	root_path: string;
+	logo_path: string | null;
 	settings: Record<string, unknown>;
 	status: ProjectStatus;
+	sort_order: number;
 	created_at: string;
 	updated_at: string;
 }
@@ -1540,11 +1315,6 @@ export interface ProjectWithRelations extends Project {
 	worktrees: ProjectWorktreeWithRepo[];
 }
 
-export interface ProjectDetailResponse {
-	/** The flattened project + repos + worktrees (serde #[flatten]) */
-	[key: string]: unknown;
-}
-
 export interface ProjectActionResponse {
 	success: boolean;
 	message: string;
@@ -1576,6 +1346,7 @@ export interface UpdateProjectRequest {
 	description?: string;
 	icon?: string;
 	tags?: string[];
+	logo_path?: string | null;
 	settings?: Record<string, unknown>;
 	status?: ProjectStatus;
 }
@@ -1595,7 +1366,7 @@ export interface CreateWorktreeRequest {
 	start_point?: string;
 }
 
-// ── Secrets ──────────────────────────────────────────────────────────────
+// -- Secrets Types --
 
 export type SecretCategory = "system" | "tool";
 export type StoreState = "unencrypted" | "locked" | "unlocked";
@@ -1656,29 +1427,29 @@ export interface MigrateResponse {
 }
 
 export const api = {
-	status: () => fetchJson<StatusResponse>("/status"),
-	overview: () => fetchJson<InstanceOverviewResponse>("/overview"),
-	agents: () => fetchJson<AgentsResponse>("/agents"),
+	status: () => fetchJson<Types.StatusResponse>("/status"),
+	overview: () => fetchJson<Types.InstanceOverviewResponse>("/agents/instance"),
+	agents: () => fetchJson<Types.AgentsResponse>("/agents"),
 	factoryPresets: () => fetchJson<PresetsResponse>("/factory/presets"),
 	agentOverview: (agentId: string) =>
-		fetchJson<AgentOverviewResponse>(`/agents/overview?agent_id=${encodeURIComponent(agentId)}`),
-	channels: () => fetchJson<ChannelsResponse>("/channels"),
+		fetchJson<Types.AgentOverviewResponse>(`/agents/overview?agent_id=${encodeURIComponent(agentId)}`),
+	channels: () => fetchJson<Types.ChannelsResponse>("/channels"),
 	deleteChannel: async (agentId: string, channelId: string) => {
 		const params = new URLSearchParams({ agent_id: agentId, channel_id: channelId });
-		const response = await fetch(`${API_BASE}/channels?${params}`, { method: "DELETE" });
+		const response = await fetch(`${getApiBase()}/channels?${params}`, { method: "DELETE" });
 		if (!response.ok) throw new Error(`API error: ${response.status}`);
 		return response.json() as Promise<{ success: boolean }>;
 	},
 	channelMessages: (channelId: string, limit = 20, before?: string) => {
 		const params = new URLSearchParams({ channel_id: channelId, limit: String(limit) });
 		if (before) params.set("before", before);
-		return fetchJson<MessagesResponse>(`/channels/messages?${params}`);
+		return fetchJson<Types.MessagesResponse>(`/channels/messages?${params}`);
 	},
 	channelStatus: () => fetchJson<ChannelStatusResponse>("/channels/status"),
 	inspectPrompt: (channelId: string) =>
-		fetchJson<PromptInspectResponse>(`/channels/inspect?channel_id=${encodeURIComponent(channelId)}`),
+		fetchJson<PromptInspectResponse>(`/channels/prompt/inspect?channel_id=${encodeURIComponent(channelId)}`),
 	setPromptCapture: async (channelId: string, enabled: boolean) => {
-		const response = await fetch(`${API_BASE}/channels/inspect/capture`, {
+		const response = await fetch(`${getApiBase()}/channels/prompt/capture`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ channel_id: channelId, enabled }),
@@ -1688,22 +1459,22 @@ export const api = {
 	},
 	listPromptSnapshots: (channelId: string, limit = 50) =>
 		fetchJson<PromptSnapshotListResponse>(
-			`/channels/inspect/snapshots?channel_id=${encodeURIComponent(channelId)}&limit=${limit}`,
+			`/channels/prompt/snapshots?channel_id=${encodeURIComponent(channelId)}&limit=${limit}`,
 		),
 	getPromptSnapshot: (channelId: string, timestampMs: number) =>
 		fetchJson<PromptSnapshot>(
-			`/channels/inspect/snapshot?channel_id=${encodeURIComponent(channelId)}&timestamp_ms=${timestampMs}`,
+			`/channels/prompt/snapshots/get?channel_id=${encodeURIComponent(channelId)}&timestamp_ms=${timestampMs}`,
 		),
 	workersList: (agentId: string, params: { limit?: number; offset?: number; status?: string } = {}) => {
 		const search = new URLSearchParams({ agent_id: agentId });
 		if (params.limit) search.set("limit", String(params.limit));
 		if (params.offset) search.set("offset", String(params.offset));
 		if (params.status) search.set("status", params.status);
-		return fetchJson<WorkerListResponse>(`/agents/workers?${search}`);
+		return fetchJson<Types.WorkerListResponse>(`/agents/workers?${search}`);
 	},
 	workerDetail: (agentId: string, workerId: string) =>
-		fetchJson<WorkerDetailResponse>(`/agents/workers/detail?agent_id=${encodeURIComponent(agentId)}&worker_id=${encodeURIComponent(workerId)}`),
-	agentMemories: (agentId: string, params: MemoriesListParams = {}) => {
+		fetchJson<Types.WorkerDetailResponse>(`/agents/workers/detail?agent_id=${encodeURIComponent(agentId)}&worker_id=${encodeURIComponent(workerId)}`),
+	agentMemories: (agentId: string, params: MemoryGraphParams = {}) => {
 		const search = new URLSearchParams({ agent_id: agentId });
 		if (params.limit) search.set("limit", String(params.limit));
 		if (params.offset) search.set("offset", String(params.offset));
@@ -1723,13 +1494,13 @@ export const api = {
 		if (params.offset) search.set("offset", String(params.offset));
 		if (params.memory_type) search.set("memory_type", params.memory_type);
 		if (params.sort) search.set("sort", params.sort);
-		return fetchJson<MemoryGraphResponse>(`/agents/memories/graph?${search}`);
+		return fetchJson<Types.MemoryGraphResponse>(`/agents/memories/graph?${search}`);
 	},
 	memoryGraphNeighbors: (agentId: string, memoryId: string, params: MemoryGraphNeighborsParams = {}) => {
 		const search = new URLSearchParams({ agent_id: agentId, memory_id: memoryId });
 		if (params.depth) search.set("depth", String(params.depth));
 		if (params.exclude?.length) search.set("exclude", params.exclude.join(","));
-		return fetchJson<MemoryGraphNeighborsResponse>(`/agents/memories/graph/neighbors?${search}`);
+		return fetchJson<Types.MemoryGraphNeighborsResponse>(`/agents/memories/graph/neighbors?${search}`);
 	},
 	cortexEvents: (agentId: string, params: CortexEventsParams = {}) => {
 		const search = new URLSearchParams({ agent_id: agentId });
@@ -1741,10 +1512,10 @@ export const api = {
 	cortexChatMessages: (agentId: string, threadId?: string, limit = 50) => {
 		const search = new URLSearchParams({ agent_id: agentId, limit: String(limit) });
 		if (threadId) search.set("thread_id", threadId);
-		return fetchJson<CortexChatMessagesResponse>(`/cortex-chat/messages?${search}`);
+		return fetchJson<Types.CortexChatMessagesResponse>(`/cortex-chat/messages?${search}`);
 	},
 	cortexChatSend: (agentId: string, threadId: string, message: string, channelId?: string) =>
-		fetch(`${API_BASE}/cortex-chat/send`, {
+		fetch(`${getApiBase()}/cortex-chat/send`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({
@@ -1755,11 +1526,11 @@ export const api = {
 			}),
 		}),
 	cortexChatThreads: (agentId: string) =>
-		fetchJson<CortexChatThreadsResponse>(
+		fetchJson<Types.CortexChatThreadsResponse>(
 			`/cortex-chat/threads?agent_id=${encodeURIComponent(agentId)}`,
 		),
 	cortexChatDeleteThread: async (agentId: string, threadId: string) => {
-		const response = await fetch(`${API_BASE}/cortex-chat/thread`, {
+		const response = await fetch(`${getApiBase()}/cortex-chat/thread`, {
 			method: "DELETE",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ agent_id: agentId, thread_id: threadId }),
@@ -1767,11 +1538,11 @@ export const api = {
 		if (!response.ok) throw new Error(`HTTP ${response.status}`);
 	},
 	agentProfile: (agentId: string) =>
-		fetchJson<AgentProfileResponse>(`/agents/profile?agent_id=${encodeURIComponent(agentId)}`),
+		fetchJson<Types.AgentProfileResponse>(`/agents/profile?agent_id=${encodeURIComponent(agentId)}`),
 	agentIdentity: (agentId: string) =>
-		fetchJson<IdentityFiles>(`/agents/identity?agent_id=${encodeURIComponent(agentId)}`),
-	updateIdentity: async (request: IdentityUpdateRequest) => {
-		const response = await fetch(`${API_BASE}/agents/identity`, {
+		fetchJson<{ soul: string | null; identity: string | null; role: string | null }>(`/agents/identity?agent_id=${encodeURIComponent(agentId)}`),
+	updateIdentity: async (request: { agent_id: string; soul?: string | null; identity?: string | null; role?: string | null }) => {
+		const response = await fetch(`${getApiBase()}/agents/identity`, {
 			method: "PUT",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(request),
@@ -1779,10 +1550,10 @@ export const api = {
 		if (!response.ok) {
 			throw new Error(`API error: ${response.status}`);
 		}
-		return response.json() as Promise<IdentityFiles>;
+		return response.json() as Promise<{ soul: string | null; identity: string | null; role: string | null }>;
 	},
 	createAgent: async (agentId: string, displayName?: string, role?: string) => {
-		const response = await fetch(`${API_BASE}/agents`, {
+		const response = await fetch(`${getApiBase()}/agents`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ agent_id: agentId, display_name: displayName || undefined, role: role || undefined }),
@@ -1794,7 +1565,7 @@ export const api = {
 	},
 
 	updateAgent: async (agentId: string, update: { display_name?: string; role?: string; gradient_start?: string; gradient_end?: string }) => {
-		const response = await fetch(`${API_BASE}/agents`, {
+		const response = await fetch(`${getApiBase()}/agents`, {
 			method: "PUT",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ agent_id: agentId, ...update }),
@@ -1807,7 +1578,7 @@ export const api = {
 
 	deleteAgent: async (agentId: string) => {
 		const params = new URLSearchParams({ agent_id: agentId });
-		const response = await fetch(`${API_BASE}/agents?${params}`, {
+		const response = await fetch(`${getApiBase()}/agents?${params}`, {
 			method: "DELETE",
 		});
 		if (!response.ok) {
@@ -1817,12 +1588,12 @@ export const api = {
 	},
 
 	/** Get the avatar URL for an agent (returns the raw URL, not fetched). */
-	agentAvatarUrl: (agentId: string) => `${API_BASE}/agents/avatar?agent_id=${encodeURIComponent(agentId)}`,
+	agentAvatarUrl: (agentId: string) => `${getApiBase()}/agents/avatar?agent_id=${encodeURIComponent(agentId)}`,
 
 	/** Upload an avatar image for an agent. */
 	uploadAvatar: async (agentId: string, file: File) => {
 		const params = new URLSearchParams({ agent_id: agentId });
-		const response = await fetch(`${API_BASE}/agents/avatar?${params}`, {
+		const response = await fetch(`${getApiBase()}/agents/avatar?${params}`, {
 			method: "POST",
 			headers: { "Content-Type": file.type },
 			body: file,
@@ -1836,7 +1607,7 @@ export const api = {
 	/** Delete the avatar for an agent. */
 	deleteAvatar: async (agentId: string) => {
 		const params = new URLSearchParams({ agent_id: agentId });
-		const response = await fetch(`${API_BASE}/agents/avatar?${params}`, {
+		const response = await fetch(`${getApiBase()}/agents/avatar?${params}`, {
 			method: "DELETE",
 		});
 		if (!response.ok) {
@@ -1848,7 +1619,7 @@ export const api = {
 	agentConfig: (agentId: string) =>
 		fetchJson<AgentConfigResponse>(`/agents/config?agent_id=${encodeURIComponent(agentId)}`),
 	updateAgentConfig: async (request: AgentConfigUpdateRequest) => {
-		const response = await fetch(`${API_BASE}/agents/config`, {
+		const response = await fetch(`${getApiBase()}/agents/config`, {
 			method: "PUT",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(request),
@@ -1871,7 +1642,7 @@ export const api = {
 	},
 
 	createCronJob: async (agentId: string, request: CreateCronRequest) => {
-		const response = await fetch(`${API_BASE}/agents/cron`, {
+		const response = await fetch(`${getApiBase()}/agents/cron`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ ...request, agent_id: agentId }),
@@ -1884,7 +1655,7 @@ export const api = {
 
 	deleteCronJob: async (agentId: string, cronId: string) => {
 		const search = new URLSearchParams({ agent_id: agentId, cron_id: cronId });
-		const response = await fetch(`${API_BASE}/agents/cron?${search}`, {
+		const response = await fetch(`${getApiBase()}/agents/cron?${search}`, {
 			method: "DELETE",
 		});
 		if (!response.ok) {
@@ -1894,7 +1665,7 @@ export const api = {
 	},
 
 	toggleCronJob: async (agentId: string, cronId: string, enabled: boolean) => {
-		const response = await fetch(`${API_BASE}/agents/cron/toggle`, {
+		const response = await fetch(`${getApiBase()}/agents/cron/toggle`, {
 			method: "PUT",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ agent_id: agentId, cron_id: cronId, enabled }),
@@ -1906,7 +1677,7 @@ export const api = {
 	},
 
 	triggerCronJob: async (agentId: string, cronId: string) => {
-		const response = await fetch(`${API_BASE}/agents/cron/trigger`, {
+		const response = await fetch(`${getApiBase()}/agents/cron/trigger`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ agent_id: agentId, cron_id: cronId }),
@@ -1918,7 +1689,7 @@ export const api = {
 	},
 
 	cancelProcess: async (channelId: string, processType: "worker" | "branch", processId: string) => {
-		const response = await fetch(`${API_BASE}/channels/cancel`, {
+		const response = await fetch(`${getApiBase()}/channels/cancel-process`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ channel_id: channelId, process_type: processType, process_id: processId }),
@@ -1930,31 +1701,47 @@ export const api = {
 	},
 
 	// Provider management
-	providers: () => fetchJson<ProvidersResponse>("/providers"),
-	updateProvider: async (provider: string, apiKey: string, model: string) => {
-		const response = await fetch(`${API_BASE}/providers`, {
-			method: "PUT",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ provider, api_key: apiKey, model }),
-		});
-		if (!response.ok) {
-			throw new Error(`API error: ${response.status}`);
-		}
-		return response.json() as Promise<ProviderActionResponse>;
-	},
-	testProviderModel: async (provider: string, apiKey: string, model: string) => {
-		const response = await fetch(`${API_BASE}/providers/test`, {
+	providers: () => fetchJson<Types.ProvidersResponse>("/providers"),
+	updateProvider: async (provider: string, apiKey: string, model: string, baseUrl?: string, apiVersion?: string, deployment?: string) => {
+		const response = await fetch(`${getApiBase()}/providers`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ provider, api_key: apiKey, model }),
+			body: JSON.stringify({ provider, api_key: apiKey, model, base_url: baseUrl, api_version: apiVersion, deployment }),
 		});
 		if (!response.ok) {
 			throw new Error(`API error: ${response.status}`);
 		}
-		return response.json() as Promise<ProviderModelTestResponse>;
+		return response.json() as Promise<Types.ProviderUpdateResponse>;
+	},
+	testProviderModel: async (provider: string, apiKey: string, model: string, baseUrl?: string, apiVersion?: string, deployment?: string) => {
+		const response = await fetch(`${getApiBase()}/providers/test-model`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ provider, api_key: apiKey, model, base_url: baseUrl, api_version: apiVersion, deployment }),
+		});
+		if (!response.ok) {
+			throw new Error(`API error: ${response.status}`);
+		}
+		return response.json() as Promise<Types.ProviderModelTestResponse>;
+	},
+	getProviderConfig: async (provider: string, options?: { signal?: AbortSignal }) => {
+		const response = await fetch(`${getApiBase()}/providers/${provider}/config`, {
+			method: "GET",
+			signal: options?.signal,
+		});
+		if (!response.ok) {
+			throw new Error(`API error: ${response.status}`);
+		}
+		return response.json() as Promise<{
+			success: boolean;
+			message: string;
+			base_url?: string | null;
+			api_version?: string | null;
+			deployment?: string | null;
+		}>;
 	},
 	startOpenAiOAuthBrowser: async (params: {model: string}) => {
-		const response = await fetch(`${API_BASE}/providers/openai/oauth/browser/start`, {
+		const response = await fetch(`${getApiBase()}/providers/openai/browser-oauth/start`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({
@@ -1964,25 +1751,25 @@ export const api = {
 		if (!response.ok) {
 			throw new Error(`API error: ${response.status}`);
 		}
-		return response.json() as Promise<OpenAiOAuthBrowserStartResponse>;
+		return response.json() as Promise<Types.OpenAiOAuthBrowserStartResponse>;
 	},
 	openAiOAuthBrowserStatus: async (state: string) => {
 		const response = await fetch(
-			`${API_BASE}/providers/openai/oauth/browser/status?state=${encodeURIComponent(state)}`,
+			`${getApiBase()}/providers/openai/browser-oauth/status?state=${encodeURIComponent(state)}`,
 		);
 		if (!response.ok) {
 			throw new Error(`API error: ${response.status}`);
 		}
-		return response.json() as Promise<OpenAiOAuthBrowserStatusResponse>;
+		return response.json() as Promise<Types.OpenAiOAuthBrowserStatusResponse>;
 	},
 	removeProvider: async (provider: string) => {
-		const response = await fetch(`${API_BASE}/providers/${encodeURIComponent(provider)}`, {
+		const response = await fetch(`${getApiBase()}/providers/${encodeURIComponent(provider)}`, {
 			method: "DELETE",
 		});
 		if (!response.ok) {
 			throw new Error(`API error: ${response.status}`);
 		}
-		return response.json() as Promise<ProviderActionResponse>;
+		return response.json() as Promise<Types.ProviderUpdateResponse>;
 	},
 
 	// Model listing
@@ -1991,21 +1778,21 @@ export const api = {
 		if (provider) params.set("provider", provider);
 		if (capability) params.set("capability", capability);
 		const query = params.toString() ? `?${params.toString()}` : "";
-		return fetchJson<ModelsResponse>(`/models${query}`);
+		return fetchJson<Types.ModelsResponse>(`/models${query}`);
 	},
 	refreshModels: async () => {
-		const response = await fetch(`${API_BASE}/models/refresh`, {
+		const response = await fetch(`${getApiBase()}/models/refresh`, {
 			method: "POST",
 		});
 		if (!response.ok) {
 			throw new Error(`API error: ${response.status}`);
 		}
-		return response.json() as Promise<ModelsResponse>;
+		return response.json() as Promise<Types.ModelsResponse>;
 	},
 
 	// Ingest API
 	ingestFiles: (agentId: string) =>
-		fetchJson<IngestFilesResponse>(`/agents/ingest/files?agent_id=${encodeURIComponent(agentId)}`),
+		fetchJson<Types.IngestFilesResponse>(`/agents/ingest/files?agent_id=${encodeURIComponent(agentId)}`),
 
 	uploadIngestFiles: async (agentId: string, files: File[]) => {
 		const formData = new FormData();
@@ -2013,28 +1800,28 @@ export const api = {
 			formData.append("files", file);
 		}
 		const response = await fetch(
-			`${API_BASE}/agents/ingest/upload?agent_id=${encodeURIComponent(agentId)}`,
+			`${getApiBase()}/agents/ingest/files?agent_id=${encodeURIComponent(agentId)}`,
 			{ method: "POST", body: formData },
 		);
 		if (!response.ok) {
 			throw new Error(`API error: ${response.status}`);
 		}
-		return response.json() as Promise<IngestUploadResponse>;
+		return response.json() as Promise<Types.IngestUploadResponse>;
 	},
 
 	deleteIngestFile: async (agentId: string, contentHash: string) => {
 		const params = new URLSearchParams({ agent_id: agentId, content_hash: contentHash });
-		const response = await fetch(`${API_BASE}/agents/ingest/files?${params}`, {
+		const response = await fetch(`${getApiBase()}/agents/ingest/files?${params}`, {
 			method: "DELETE",
 		});
 		if (!response.ok) {
 			throw new Error(`API error: ${response.status}`);
 		}
-		return response.json() as Promise<IngestDeleteResponse>;
+		return response.json() as Promise<Types.IngestDeleteResponse>;
 	},
 
 	// Messaging / Bindings API
-	messagingStatus: () => fetchJson<MessagingStatusResponse>("/messaging/status"),
+	messagingStatus: () => fetchJson<Types.MessagingStatusResponse>("/messaging/status"),
 
 	bindings: (agentId?: string) => {
 		const params = agentId
@@ -2044,7 +1831,7 @@ export const api = {
 	},
 
 	createBinding: async (request: CreateBindingRequest) => {
-		const response = await fetch(`${API_BASE}/bindings`, {
+		const response = await fetch(`${getApiBase()}/bindings`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(request),
@@ -2056,7 +1843,7 @@ export const api = {
 	},
 
 	updateBinding: async (request: UpdateBindingRequest) => {
-		const response = await fetch(`${API_BASE}/bindings`, {
+		const response = await fetch(`${getApiBase()}/bindings`, {
 			method: "PUT",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(request),
@@ -2068,7 +1855,7 @@ export const api = {
 	},
 
 	deleteBinding: async (request: DeleteBindingRequest) => {
-		const response = await fetch(`${API_BASE}/bindings`, {
+		const response = await fetch(`${getApiBase()}/bindings`, {
 			method: "DELETE",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(request),
@@ -2080,9 +1867,12 @@ export const api = {
 	},
 
 	togglePlatform: async (platform: string, enabled: boolean, adapter?: string) => {
-		const body: Record<string, unknown> = { platform, enabled };
-		if (adapter) body.adapter = adapter;
-		const response = await fetch(`${API_BASE}/messaging/toggle`, {
+		const body: Types.TogglePlatformRequest = {
+			platform,
+			enabled,
+			adapter: adapter ?? null,
+		};
+		const response = await fetch(`${getApiBase()}/messaging/toggle`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(body),
@@ -2094,9 +1884,11 @@ export const api = {
 	},
 
 	disconnectPlatform: async (platform: string, adapter?: string) => {
-		const body: Record<string, unknown> = { platform };
-		if (adapter) body.adapter = adapter;
-		const response = await fetch(`${API_BASE}/messaging/disconnect`, {
+		const body: Types.DisconnectPlatformRequest = {
+			platform,
+			adapter: adapter ?? null,
+		};
+		const response = await fetch(`${getApiBase()}/messaging/disconnect`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(body),
@@ -2107,8 +1899,8 @@ export const api = {
 		return response.json() as Promise<{ success: boolean; message: string }>;
 	},
 
-	createMessagingInstance: async (request: CreateMessagingInstanceRequest) => {
-		const response = await fetch(`${API_BASE}/messaging/instances`, {
+	createMessagingInstance: async (request: Types.CreateMessagingInstanceRequest) => {
+		const response = await fetch(`${getApiBase()}/messaging/instances`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(request),
@@ -2116,11 +1908,11 @@ export const api = {
 		if (!response.ok) {
 			throw new Error(`API error: ${response.status}`);
 		}
-		return response.json() as Promise<MessagingInstanceActionResponse>;
+		return response.json() as Promise<Types.MessagingInstanceActionResponse>;
 	},
 
-	deleteMessagingInstance: async (request: DeleteMessagingInstanceRequest) => {
-		const response = await fetch(`${API_BASE}/messaging/instances`, {
+	deleteMessagingInstance: async (request: Types.DeleteMessagingInstanceRequest) => {
+		const response = await fetch(`${getApiBase()}/messaging/instances`, {
 			method: "DELETE",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(request),
@@ -2128,14 +1920,14 @@ export const api = {
 		if (!response.ok) {
 			throw new Error(`API error: ${response.status}`);
 		}
-		return response.json() as Promise<MessagingInstanceActionResponse>;
+		return response.json() as Promise<Types.MessagingInstanceActionResponse>;
 	},
 
 	// Global Settings API
-	globalSettings: () => fetchJson<GlobalSettingsResponse>("/settings"),
+	globalSettings: () => fetchJson<Types.GlobalSettingsResponse>("/settings"),
 	
-	updateGlobalSettings: async (settings: GlobalSettingsUpdate) => {
-		const response = await fetch(`${API_BASE}/settings`, {
+	updateGlobalSettings: async (settings: Types.GlobalSettingsUpdate) => {
+		const response = await fetch(`${getApiBase()}/settings`, {
 			method: "PUT",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(settings),
@@ -2143,13 +1935,13 @@ export const api = {
 		if (!response.ok) {
 			throw new Error(`API error: ${response.status}`);
 		}
-		return response.json() as Promise<GlobalSettingsUpdateResponse>;
+		return response.json() as Promise<Types.GlobalSettingsUpdateResponse>;
 	},
 
 	// Raw config API
-	rawConfig: () => fetchJson<RawConfigResponse>("/config/raw"),
+	rawConfig: () => fetchJson<Types.RawConfigResponse>("/settings/raw"),
 	updateRawConfig: async (content: string) => {
-		const response = await fetch(`${API_BASE}/config/raw`, {
+		const response = await fetch(`${getApiBase()}/settings/raw`, {
 			method: "PUT",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ content }),
@@ -2157,7 +1949,7 @@ export const api = {
 		if (!response.ok) {
 			throw new Error(`API error: ${response.status}`);
 		}
-		return response.json() as Promise<RawConfigUpdateResponse>;
+		return response.json() as Promise<Types.RawConfigUpdateResponse>;
 	},
 
 	// Changelog API
@@ -2167,16 +1959,16 @@ export const api = {
 	},
 
 	// Update API
-	updateCheck: () => fetchJson<UpdateStatus>("/update/check"),
+	updateCheck: () => fetchJson<UpdateStatus>("/update-check"),
 	updateCheckNow: async () => {
-		const response = await fetch(`${API_BASE}/update/check`, { method: "POST" });
+		const response = await fetch(`${getApiBase()}/update-check`, { method: "POST" });
 		if (!response.ok) {
 			throw new Error(`API error: ${response.status}`);
 		}
 		return response.json() as Promise<UpdateStatus>;
 	},
 	updateApply: async () => {
-		const response = await fetch(`${API_BASE}/update/apply`, { method: "POST" });
+		const response = await fetch(`${getApiBase()}/update-apply`, { method: "POST" });
 		if (!response.ok) {
 			throw new Error(`API error: ${response.status}`);
 		}
@@ -2188,7 +1980,7 @@ export const api = {
 		fetchJson<SkillsListResponse>(`/agents/skills?agent_id=${encodeURIComponent(agentId)}`),
 	
 	installSkill: async (request: InstallSkillRequest) => {
-		const response = await fetch(`${API_BASE}/agents/skills/install`, {
+		const response = await fetch(`${getApiBase()}/agents/skills/install`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(request),
@@ -2200,7 +1992,7 @@ export const api = {
 	},
 	
 	removeSkill: async (request: RemoveSkillRequest) => {
-		const response = await fetch(`${API_BASE}/agents/skills/remove`, {
+		const response = await fetch(`${getApiBase()}/agents/skills/remove`, {
 			method: "DELETE",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(request),
@@ -2222,7 +2014,7 @@ export const api = {
 			form.append("file", file);
 		}
 		const response = await fetch(
-			`${API_BASE}/agents/skills/upload?agent_id=${encodeURIComponent(agentId)}`,
+			`${getApiBase()}/agents/skills/upload?agent_id=${encodeURIComponent(agentId)}`,
 			{ method: "POST", body: form },
 		);
 		if (!response.ok) {
@@ -2243,7 +2035,7 @@ export const api = {
 		),
 
 	registrySkillContent: (source: string, skillId: string) =>
-		fetchJson<RegistrySkillContentResponse>(
+		fetchJson<SkillContentResponse>(
 			`/skills/registry/content?source=${encodeURIComponent(source)}&skill_id=${encodeURIComponent(skillId)}`,
 		),
 
@@ -2253,7 +2045,7 @@ export const api = {
 	agentLinks: (agentId: string) =>
 		fetchJson<LinksResponse>(`/agents/${encodeURIComponent(agentId)}/links`),
 	createLink: async (request: CreateLinkRequest): Promise<{ link: AgentLinkResponse }> => {
-		const response = await fetch(`${API_BASE}/links`, {
+		const response = await fetch(`${getApiBase()}/links`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(request),
@@ -2261,11 +2053,11 @@ export const api = {
 		if (!response.ok) {
 			throw new Error(`API error: ${response.status}`);
 		}
-		return response.json();
+		return response.json() as Promise<{ link: AgentLinkResponse }>;
 	},
 	updateLink: async (from: string, to: string, request: UpdateLinkRequest): Promise<{ link: AgentLinkResponse }> => {
 		const response = await fetch(
-			`${API_BASE}/links/${encodeURIComponent(from)}/${encodeURIComponent(to)}`,
+			`${getApiBase()}/links/${encodeURIComponent(from)}/${encodeURIComponent(to)}`,
 			{
 				method: "PUT",
 				headers: { "Content-Type": "application/json" },
@@ -2275,11 +2067,11 @@ export const api = {
 		if (!response.ok) {
 			throw new Error(`API error: ${response.status}`);
 		}
-		return response.json();
+		return response.json() as Promise<{ link: AgentLinkResponse }>;
 	},
 	deleteLink: async (from: string, to: string): Promise<void> => {
 		const response = await fetch(
-			`${API_BASE}/links/${encodeURIComponent(from)}/${encodeURIComponent(to)}`,
+			`${getApiBase()}/links/${encodeURIComponent(from)}/${encodeURIComponent(to)}`,
 			{ method: "DELETE" },
 		);
 		if (!response.ok) {
@@ -2288,9 +2080,9 @@ export const api = {
 	},
 
 	// Agent Groups API
-	groups: () => fetchJson<{ groups: TopologyGroup[] }>("/groups"),
+	groups: () => fetchJson<{ groups: TopologyGroup[] }>("/links/groups"),
 	createGroup: async (request: CreateGroupRequest): Promise<{ group: TopologyGroup }> => {
-		const response = await fetch(`${API_BASE}/groups`, {
+		const response = await fetch(`${getApiBase()}/links/groups`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(request),
@@ -2298,11 +2090,11 @@ export const api = {
 		if (!response.ok) {
 			throw new Error(`API error: ${response.status}`);
 		}
-		return response.json();
+		return response.json() as Promise<{ group: TopologyGroup }>;
 	},
 	updateGroup: async (name: string, request: UpdateGroupRequest): Promise<{ group: TopologyGroup }> => {
 		const response = await fetch(
-			`${API_BASE}/groups/${encodeURIComponent(name)}`,
+			`${getApiBase()}/links/groups/${encodeURIComponent(name)}`,
 			{
 				method: "PUT",
 				headers: { "Content-Type": "application/json" },
@@ -2312,11 +2104,11 @@ export const api = {
 		if (!response.ok) {
 			throw new Error(`API error: ${response.status}`);
 		}
-		return response.json();
+		return response.json() as Promise<{ group: TopologyGroup }>;
 	},
 	deleteGroup: async (name: string): Promise<void> => {
 		const response = await fetch(
-			`${API_BASE}/groups/${encodeURIComponent(name)}`,
+			`${getApiBase()}/links/groups/${encodeURIComponent(name)}`,
 			{ method: "DELETE" },
 		);
 		if (!response.ok) {
@@ -2325,9 +2117,9 @@ export const api = {
 	},
 
 	// Humans API
-	humans: () => fetchJson<{ humans: TopologyHuman[] }>("/humans"),
+	humans: () => fetchJson<{ humans: TopologyHuman[] }>("/links/humans"),
 	createHuman: async (request: CreateHumanRequest): Promise<{ human: TopologyHuman }> => {
-		const response = await fetch(`${API_BASE}/humans`, {
+		const response = await fetch(`${getApiBase()}/links/humans`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(request),
@@ -2335,11 +2127,11 @@ export const api = {
 		if (!response.ok) {
 			throw new Error(`API error: ${response.status}`);
 		}
-		return response.json();
+		return response.json() as Promise<{ human: TopologyHuman }>;
 	},
 	updateHuman: async (id: string, request: UpdateHumanRequest): Promise<{ human: TopologyHuman }> => {
 		const response = await fetch(
-			`${API_BASE}/humans/${encodeURIComponent(id)}`,
+			`${getApiBase()}/links/humans/${encodeURIComponent(id)}`,
 			{
 				method: "PUT",
 				headers: { "Content-Type": "application/json" },
@@ -2349,11 +2141,11 @@ export const api = {
 		if (!response.ok) {
 			throw new Error(`API error: ${response.status}`);
 		}
-		return response.json();
+		return response.json() as Promise<{ human: TopologyHuman }>;
 	},
 	deleteHuman: async (id: string): Promise<void> => {
 		const response = await fetch(
-			`${API_BASE}/humans/${encodeURIComponent(id)}`,
+			`${getApiBase()}/links/humans/${encodeURIComponent(id)}`,
 			{ method: "DELETE" },
 		);
 		if (!response.ok) {
@@ -2361,9 +2153,36 @@ export const api = {
 		}
 	},
 
-	// Web Chat API
-	webChatSend: (agentId: string, sessionId: string, message: string, senderName?: string) =>
-		fetch(`${API_BASE}/webchat/send`, {
+	// Attachment API
+	uploadAttachment: (agentId: string, channelId: string, file: File) => {
+		const form = new FormData();
+		form.append("file", file, file.name);
+		return fetch(
+			`${getApiBase()}/agents/${encodeURIComponent(agentId)}/channels/${encodeURIComponent(channelId)}/attachments/upload`,
+			{ method: "POST", body: form },
+		);
+	},
+
+	attachmentUrl: (agentId: string, attachmentId: string, opts?: { thumbnail?: boolean; download?: boolean }) => {
+		const params = new URLSearchParams();
+		if (opts?.thumbnail) params.set("thumbnail", "true");
+		if (opts?.download) params.set("download", "true");
+		const qs = params.toString();
+		return `${getApiBase()}/agents/${encodeURIComponent(agentId)}/attachments/${encodeURIComponent(attachmentId)}${qs ? `?${qs}` : ""}`;
+	},
+
+	listAttachments: (agentId: string, channelId: string, params?: { message_id?: string; limit?: number }) => {
+		const search = new URLSearchParams();
+		if (params?.message_id) search.set("message_id", params.message_id);
+		if (params?.limit) search.set("limit", String(params.limit));
+		return fetchJson<{ attachments: Array<{ id: string; original_filename: string; mime_type: string; size_bytes: number; created_at: string }> }>(
+			`/agents/${encodeURIComponent(agentId)}/channels/${encodeURIComponent(channelId)}/attachments${search.toString() ? `?${search}` : ""}`,
+		);
+	},
+
+	// Portal API (renamed from webchat)
+	portalSend: (agentId: string, sessionId: string, message: string, senderName?: string, attachmentIds?: string[]) =>
+		fetch(`${getApiBase()}/portal/send`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({
@@ -2371,61 +2190,146 @@ export const api = {
 				session_id: sessionId,
 				sender_name: senderName ?? "user",
 				message,
+				...(attachmentIds?.length ? { attachment_ids: attachmentIds } : {}),
 			}),
 		}),
 
-	webChatHistory: (agentId: string, sessionId: string, limit = 100) =>
-		fetch(`${API_BASE}/webchat/history?agent_id=${encodeURIComponent(agentId)}&session_id=${encodeURIComponent(sessionId)}&limit=${limit}`),
+	portalHistory: (agentId: string, sessionId: string, limit = 100) =>
+		fetch(`${getApiBase()}/portal/history?agent_id=${encodeURIComponent(agentId)}&session_id=${encodeURIComponent(sessionId)}&limit=${limit}`),
 
-	// Tasks API
-	listTasks: (agentId: string, params?: { status?: TaskStatus; priority?: TaskPriority; limit?: number }) => {
-		const search = new URLSearchParams({ agent_id: agentId });
-		if (params?.status) search.set("status", params.status);
-		if (params?.priority) search.set("priority", params.priority);
-		if (params?.limit) search.set("limit", String(params.limit));
-		return fetchJson<TaskListResponse>(`/agents/tasks?${search}`);
-	},
-	getTask: (agentId: string, taskNumber: number) =>
-		fetchJson<TaskResponse>(`/agents/tasks/${taskNumber}?agent_id=${encodeURIComponent(agentId)}`),
-	createTask: async (agentId: string, request: CreateTaskRequest): Promise<TaskResponse> => {
-		const response = await fetch(`${API_BASE}/agents/tasks`, {
+	listPortalConversations: (
+		agentId: string,
+		includeArchived = false,
+		limit = 100,
+	): Promise<Types.PortalConversationsResponse> =>
+		fetchJson<Types.PortalConversationsResponse>(
+			`/portal/conversations?agent_id=${encodeURIComponent(agentId)}&include_archived=${includeArchived}&limit=${limit}`,
+		),
+
+	createPortalConversation: async (
+		agentId: string,
+		title?: string,
+		settings?: Types.ConversationSettings,
+	): Promise<Types.PortalConversationResponse> => {
+		const response = await fetch(`${getApiBase()}/portal/conversations`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ ...request, agent_id: agentId }),
+			body: JSON.stringify({ agent_id: agentId, title, settings }),
 		});
 		if (!response.ok) throw new Error(`API error: ${response.status}`);
-		return response.json() as Promise<TaskResponse>;
+		return response.json() as Promise<Types.PortalConversationResponse>;
 	},
-	updateTask: async (agentId: string, taskNumber: number, request: UpdateTaskRequest): Promise<TaskResponse> => {
-		const response = await fetch(`${API_BASE}/agents/tasks/${taskNumber}`, {
+
+	updatePortalConversation: async (
+		agentId: string,
+		sessionId: string,
+		title?: string,
+		archived?: boolean,
+		settings?: Types.ConversationSettings,
+	): Promise<Types.PortalConversationResponse> => {
+		const response = await fetch(
+			`${getApiBase()}/portal/conversations/${encodeURIComponent(sessionId)}`,
+			{
+				method: "PUT",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ agent_id: agentId, title, archived, settings }),
+			},
+		);
+		if (!response.ok) throw new Error(`API error: ${response.status}`);
+		return response.json() as Promise<Types.PortalConversationResponse>;
+	},
+
+	deletePortalConversation: async (
+		agentId: string,
+		sessionId: string,
+	): Promise<{ success: boolean }> => {
+		const response = await fetch(
+			`${getApiBase()}/portal/conversations/${encodeURIComponent(sessionId)}?agent_id=${encodeURIComponent(agentId)}`,
+			{ method: "DELETE" },
+		);
+		if (!response.ok) throw new Error(`API error: ${response.status}`);
+		return { success: true };
+	},
+
+	getConversationDefaults: (agentId: string) =>
+		fetchJson<Types.ConversationDefaultsResponse>(`/conversation-defaults?agent_id=${encodeURIComponent(agentId)}`),
+
+	// Channel settings API
+	getChannelSettings: (channelId: string, agentId: string) =>
+		fetchJson<{ conversation_id: string; settings: Types.ConversationSettings }>(
+			`/channels/${encodeURIComponent(channelId)}/settings?agent_id=${encodeURIComponent(agentId)}`
+		),
+
+	updateChannelSettings: (channelId: string, agentId: string, settings: Types.ConversationSettings) =>
+		fetch(`${getApiBase()}/channels/${encodeURIComponent(channelId)}/settings`, {
 			method: "PUT",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ ...request, agent_id: agentId }),
+			body: JSON.stringify({ agent_id: agentId, settings }),
+		}),
+
+	// Tasks API
+	listTasks: (params?: { agent_id?: string; owner_agent_id?: string; assigned_agent_id?: string; status?: TaskStatus; priority?: TaskPriority; created_by?: string; limit?: number }) => {
+		const search = new URLSearchParams();
+		if (params?.agent_id) search.set("agent_id", params.agent_id);
+		if (params?.owner_agent_id) search.set("owner_agent_id", params.owner_agent_id);
+		if (params?.assigned_agent_id) search.set("assigned_agent_id", params.assigned_agent_id);
+		if (params?.status) search.set("status", params.status);
+		if (params?.priority) search.set("priority", params.priority);
+		if (params?.created_by) search.set("created_by", params.created_by);
+		if (params?.limit) search.set("limit", String(params.limit));
+		const query = search.toString();
+		return fetchJson<TaskListResponse>(query ? `/tasks?${query}` : "/tasks");
+	},
+	getTask: (taskNumber: number) =>
+		fetchJson<TaskResponse>(`/tasks/${taskNumber}`),
+	createTask: async (request: CreateTaskRequest): Promise<TaskResponse> => {
+		const response = await fetch(`${getApiBase()}/tasks`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(request),
 		});
 		if (!response.ok) throw new Error(`API error: ${response.status}`);
 		return response.json() as Promise<TaskResponse>;
 	},
-	deleteTask: async (agentId: string, taskNumber: number): Promise<TaskActionResponse> => {
-		const response = await fetch(`${API_BASE}/agents/tasks/${taskNumber}?agent_id=${encodeURIComponent(agentId)}`, {
+	updateTask: async (taskNumber: number, request: UpdateTaskRequest): Promise<TaskResponse> => {
+		const response = await fetch(`${getApiBase()}/tasks/${taskNumber}`, {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(request),
+		});
+		if (!response.ok) throw new Error(`API error: ${response.status}`);
+		return response.json() as Promise<TaskResponse>;
+	},
+	deleteTask: async (taskNumber: number): Promise<TaskActionResponse> => {
+		const response = await fetch(`${getApiBase()}/tasks/${taskNumber}`, {
 			method: "DELETE",
 		});
 		if (!response.ok) throw new Error(`API error: ${response.status}`);
 		return response.json() as Promise<TaskActionResponse>;
 	},
-	approveTask: async (agentId: string, taskNumber: number, approvedBy?: string): Promise<TaskResponse> => {
-		const response = await fetch(`${API_BASE}/agents/tasks/${taskNumber}/approve`, {
+	approveTask: async (taskNumber: number, approvedBy?: string): Promise<TaskResponse> => {
+		const response = await fetch(`${getApiBase()}/tasks/${taskNumber}/approve`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ agent_id: agentId, approved_by: approvedBy }),
+			body: JSON.stringify({ approved_by: approvedBy }),
 		});
 		if (!response.ok) throw new Error(`API error: ${response.status}`);
 		return response.json() as Promise<TaskResponse>;
 	},
-	executeTask: async (agentId: string, taskNumber: number): Promise<TaskResponse> => {
-		const response = await fetch(`${API_BASE}/agents/tasks/${taskNumber}/execute`, {
+	executeTask: async (taskNumber: number): Promise<TaskResponse> => {
+		const response = await fetch(`${getApiBase()}/tasks/${taskNumber}/execute`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ agent_id: agentId }),
+			body: JSON.stringify({}),
+		});
+		if (!response.ok) throw new Error(`API error: ${response.status}`);
+		return response.json() as Promise<TaskResponse>;
+	},
+	assignTask: async (taskNumber: number, assignedAgentId: string): Promise<TaskResponse> => {
+		const response = await fetch(`${getApiBase()}/tasks/${taskNumber}/assign`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ assigned_agent_id: assignedAgentId }),
 		});
 		if (!response.ok) throw new Error(`API error: ${response.status}`);
 		return response.json() as Promise<TaskResponse>;
@@ -2435,7 +2339,7 @@ export const api = {
 	secretsStatus: () => fetchJson<SecretStoreStatus>("/secrets/status"),
 	listSecrets: () => fetchJson<SecretListResponse>("/secrets"),
 	putSecret: async (name: string, value: string, category?: SecretCategory): Promise<PutSecretResponse> => {
-		const response = await fetch(`${API_BASE}/secrets/${encodeURIComponent(name)}`, {
+		const response = await fetch(`${getApiBase()}/secrets/${encodeURIComponent(name)}`, {
 			method: "PUT",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ value, category }),
@@ -2447,7 +2351,7 @@ export const api = {
 		return response.json() as Promise<PutSecretResponse>;
 	},
 	deleteSecret: async (name: string): Promise<DeleteSecretResponse> => {
-		const response = await fetch(`${API_BASE}/secrets/${encodeURIComponent(name)}`, {
+		const response = await fetch(`${getApiBase()}/secrets/${encodeURIComponent(name)}`, {
 			method: "DELETE",
 		});
 		if (!response.ok) {
@@ -2457,7 +2361,7 @@ export const api = {
 		return response.json() as Promise<DeleteSecretResponse>;
 	},
 	enableEncryption: async (): Promise<EncryptResponse> => {
-		const response = await fetch(`${API_BASE}/secrets/encrypt`, { method: "POST" });
+		const response = await fetch(`${getApiBase()}/secrets/encrypt`, { method: "POST" });
 		if (!response.ok) {
 			const body = await response.json().catch(() => ({}));
 			throw new Error(body.error || `API error: ${response.status}`);
@@ -2465,7 +2369,7 @@ export const api = {
 		return response.json() as Promise<EncryptResponse>;
 	},
 	unlockSecrets: async (masterKey: string): Promise<UnlockResponse> => {
-		const response = await fetch(`${API_BASE}/secrets/unlock`, {
+		const response = await fetch(`${getApiBase()}/secrets/unlock`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ master_key: masterKey }),
@@ -2477,23 +2381,23 @@ export const api = {
 		return response.json() as Promise<UnlockResponse>;
 	},
 	lockSecrets: async (): Promise<{ state: string; message: string }> => {
-		const response = await fetch(`${API_BASE}/secrets/lock`, { method: "POST" });
+		const response = await fetch(`${getApiBase()}/secrets/lock`, { method: "POST" });
 		if (!response.ok) {
 			const body = await response.json().catch(() => ({}));
 			throw new Error(body.error || `API error: ${response.status}`);
 		}
-		return response.json();
+		return response.json() as Promise<{ state: string; message: string }>;
 	},
 	rotateKey: async (): Promise<{ master_key: string; message: string }> => {
-		const response = await fetch(`${API_BASE}/secrets/rotate`, { method: "POST" });
+		const response = await fetch(`${getApiBase()}/secrets/rotate`, { method: "POST" });
 		if (!response.ok) {
 			const body = await response.json().catch(() => ({}));
 			throw new Error(body.error || `API error: ${response.status}`);
 		}
-		return response.json();
+		return response.json() as Promise<{ master_key: string; message: string }>;
 	},
 	migrateSecrets: async (): Promise<MigrateResponse> => {
-		const response = await fetch(`${API_BASE}/secrets/migrate`, { method: "POST" });
+		const response = await fetch(`${getApiBase()}/secrets/migrate`, { method: "POST" });
 		if (!response.ok) {
 			const body = await response.json().catch(() => ({}));
 			throw new Error(body.error || `API error: ${response.status}`);
@@ -2502,97 +2406,392 @@ export const api = {
 	},
 
 	// Projects API
-	listProjects: (agentId: string, status?: ProjectStatus) => {
-		const search = new URLSearchParams({ agent_id: agentId });
+	listProjects: (status?: ProjectStatus) => {
+		const search = new URLSearchParams();
 		if (status) search.set("status", status);
-		return fetchJson<ProjectListResponse>(`/agents/projects?${search}`);
+		const qs = search.toString();
+		return fetchJson<ProjectListResponse>(`/agents/projects${qs ? `?${qs}` : ""}`);
 	},
 
-	getProject: (agentId: string, projectId: string) =>
+	getProject: (projectId: string) =>
 		fetchJson<ProjectWithRelations>(
-			`/agents/projects/${encodeURIComponent(projectId)}?agent_id=${encodeURIComponent(agentId)}`,
+			`/agents/projects/${encodeURIComponent(projectId)}`,
 		),
 
-	createProject: async (agentId: string, request: CreateProjectRequest): Promise<ProjectWithRelations> => {
-		const response = await fetch(`${API_BASE}/agents/projects`, {
+	createProject: async (request: CreateProjectRequest): Promise<ProjectWithRelations> => {
+		const response = await fetch(`${getApiBase()}/agents/projects`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ ...request, agent_id: agentId }),
+			body: JSON.stringify(request),
 		});
 		if (!response.ok) throw new Error(`API error: ${response.status}`);
 		return response.json() as Promise<ProjectWithRelations>;
 	},
 
-	updateProject: async (agentId: string, projectId: string, request: UpdateProjectRequest): Promise<ProjectWithRelations> => {
-		const response = await fetch(`${API_BASE}/agents/projects/${encodeURIComponent(projectId)}`, {
+	updateProject: async (projectId: string, request: UpdateProjectRequest): Promise<ProjectWithRelations> => {
+		const response = await fetch(`${getApiBase()}/agents/projects/${encodeURIComponent(projectId)}`, {
 			method: "PUT",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ ...request, agent_id: agentId }),
+			body: JSON.stringify(request),
 		});
 		if (!response.ok) throw new Error(`API error: ${response.status}`);
 		return response.json() as Promise<ProjectWithRelations>;
 	},
 
-	deleteProject: async (agentId: string, projectId: string): Promise<ProjectActionResponse> => {
+	deleteProject: async (projectId: string): Promise<ProjectActionResponse> => {
 		const response = await fetch(
-			`${API_BASE}/agents/projects/${encodeURIComponent(projectId)}?agent_id=${encodeURIComponent(agentId)}`,
+			`${getApiBase()}/agents/projects/${encodeURIComponent(projectId)}`,
 			{ method: "DELETE" },
 		);
 		if (!response.ok) throw new Error(`API error: ${response.status}`);
 		return response.json() as Promise<ProjectActionResponse>;
 	},
 
-	scanProject: async (agentId: string, projectId: string): Promise<ProjectWithRelations> => {
+	scanProject: async (projectId: string): Promise<ProjectWithRelations> => {
 		const response = await fetch(
-			`${API_BASE}/agents/projects/${encodeURIComponent(projectId)}/scan?agent_id=${encodeURIComponent(agentId)}`,
+			`${getApiBase()}/agents/projects/${encodeURIComponent(projectId)}/scan`,
 			{ method: "POST" },
 		);
 		if (!response.ok) throw new Error(`API error: ${response.status}`);
 		return response.json() as Promise<ProjectWithRelations>;
 	},
 
-	projectDiskUsage: (agentId: string, projectId: string) =>
+	reorderProjects: async (ids: string[]): Promise<void> => {
+		const response = await fetch(`${getApiBase()}/agents/projects/reorder`, {
+			method: "PUT",
+			headers: {"Content-Type": "application/json"},
+			body: JSON.stringify({ids}),
+		});
+		if (!response.ok) throw new Error(`API error: ${response.status}`);
+	},
+
+	projectDiskUsage: (projectId: string) =>
 		fetchJson<DiskUsageResponse>(
-			`/agents/projects/${encodeURIComponent(projectId)}/disk-usage?agent_id=${encodeURIComponent(agentId)}`,
+			`/agents/projects/${encodeURIComponent(projectId)}/disk-usage`,
 		),
 
-	createProjectRepo: async (agentId: string, projectId: string, request: CreateRepoRequest): Promise<{ repo: ProjectRepo }> => {
-		const response = await fetch(`${API_BASE}/agents/projects/${encodeURIComponent(projectId)}/repos`, {
+	createProjectRepo: async (projectId: string, request: CreateRepoRequest): Promise<{ repo: ProjectRepo }> => {
+		const response = await fetch(`${getApiBase()}/agents/projects/${encodeURIComponent(projectId)}/repos`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ ...request, agent_id: agentId }),
+			body: JSON.stringify(request),
 		});
 		if (!response.ok) throw new Error(`API error: ${response.status}`);
 		return response.json() as Promise<{ repo: ProjectRepo }>;
 	},
 
-	deleteProjectRepo: async (agentId: string, projectId: string, repoId: string): Promise<ProjectActionResponse> => {
+	deleteProjectRepo: async (projectId: string, repoId: string): Promise<ProjectActionResponse> => {
 		const response = await fetch(
-			`${API_BASE}/agents/projects/${encodeURIComponent(projectId)}/repos/${encodeURIComponent(repoId)}?agent_id=${encodeURIComponent(agentId)}`,
+			`${getApiBase()}/agents/projects/${encodeURIComponent(projectId)}/repos/${encodeURIComponent(repoId)}`,
 			{ method: "DELETE" },
 		);
 		if (!response.ok) throw new Error(`API error: ${response.status}`);
 		return response.json() as Promise<ProjectActionResponse>;
 	},
 
-	createProjectWorktree: async (agentId: string, projectId: string, request: CreateWorktreeRequest): Promise<{ worktree: ProjectWorktree }> => {
-		const response = await fetch(`${API_BASE}/agents/projects/${encodeURIComponent(projectId)}/worktrees`, {
+	createProjectWorktree: async (projectId: string, request: CreateWorktreeRequest): Promise<{ worktree: ProjectWorktree }> => {
+		const response = await fetch(`${getApiBase()}/agents/projects/${encodeURIComponent(projectId)}/worktrees`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ ...request, agent_id: agentId }),
+			body: JSON.stringify(request),
 		});
 		if (!response.ok) throw new Error(`API error: ${response.status}`);
 		return response.json() as Promise<{ worktree: ProjectWorktree }>;
 	},
 
-	deleteProjectWorktree: async (agentId: string, projectId: string, worktreeId: string): Promise<ProjectActionResponse> => {
+	deleteProjectWorktree: async (projectId: string, worktreeId: string): Promise<ProjectActionResponse> => {
 		const response = await fetch(
-			`${API_BASE}/agents/projects/${encodeURIComponent(projectId)}/worktrees/${encodeURIComponent(worktreeId)}?agent_id=${encodeURIComponent(agentId)}`,
+			`${getApiBase()}/agents/projects/${encodeURIComponent(projectId)}/worktrees/${encodeURIComponent(worktreeId)}`,
 			{ method: "DELETE" },
 		);
 		if (!response.ok) throw new Error(`API error: ${response.status}`);
 		return response.json() as Promise<ProjectActionResponse>;
 	},
 
-	eventsUrl: `${API_BASE}/events`,
+	// TTS / Voice overlay methods (stubs)
+	ttsProfiles: async (_agentId: string): Promise<{ id: string; name: string }[]> => {
+		// TODO: Implement actual TTS profiles endpoint
+		return [];
+	},
+
+	portalSendAudio: async (agentId: string, _sessionId: string, _blob: Blob): Promise<Response> => {
+		// TODO: Implement actual audio sending endpoint
+		console.warn("portalSendAudio not implemented", agentId);
+		return new Response(null, { status: 501 });
+	},
+
+	// -- Notifications --
+
+	listNotifications: async (params?: {
+		filter?: "unread" | "all";
+		agent_id?: string;
+		kind?: NotificationKind;
+		limit?: number;
+		offset?: number;
+	}): Promise<NotificationsResponse> => {
+		const query = new URLSearchParams();
+		if (params?.filter) query.set("filter", params.filter);
+		if (params?.agent_id) query.set("agent_id", params.agent_id);
+		if (params?.kind) query.set("kind", params.kind);
+		if (params?.limit !== undefined) query.set("limit", String(params.limit));
+		if (params?.offset !== undefined) query.set("offset", String(params.offset));
+		const qs = query.toString();
+		const response = await fetch(`${getApiBase()}/notifications${qs ? `?${qs}` : ""}`);
+		if (!response.ok) throw new Error(`API error: ${response.status}`);
+		return response.json() as Promise<NotificationsResponse>;
+	},
+
+	getUnreadCount: async (): Promise<UnreadCountResponse> => {
+		const response = await fetch(`${getApiBase()}/notifications/unread_count`);
+		if (!response.ok) throw new Error(`API error: ${response.status}`);
+		return response.json() as Promise<UnreadCountResponse>;
+	},
+
+	markNotificationRead: async (id: string): Promise<void> => {
+		const response = await fetch(`${getApiBase()}/notifications/${encodeURIComponent(id)}/read`, {
+			method: "POST",
+		});
+		if (!response.ok && response.status !== 404) throw new Error(`API error: ${response.status}`);
+	},
+
+	dismissNotification: async (id: string): Promise<void> => {
+		const response = await fetch(`${getApiBase()}/notifications/${encodeURIComponent(id)}/dismiss`, {
+			method: "POST",
+		});
+		if (!response.ok && response.status !== 404) throw new Error(`API error: ${response.status}`);
+	},
+
+	markAllNotificationsRead: async (): Promise<void> => {
+		const response = await fetch(`${getApiBase()}/notifications/read_all`, { method: "POST" });
+		if (!response.ok) throw new Error(`API error: ${response.status}`);
+	},
+
+	dismissReadNotifications: async (): Promise<void> => {
+		const response = await fetch(`${getApiBase()}/notifications/dismiss_read`, { method: "POST" });
+		if (!response.ok) throw new Error(`API error: ${response.status}`);
+	},
+
+	getEventsUrl: () => `${getApiBase()}/events`,
+
+	// Wiki API
+	listWikiPages: (params?: { page_type?: string }) => {
+		const qs = new URLSearchParams();
+		if (params?.page_type) qs.set("page_type", params.page_type);
+		const query = qs.toString();
+		return fetchJson<WikiListResponse>(`/wiki${query ? `?${query}` : ""}`);
+	},
+
+	searchWikiPages: (params: { query: string; page_type?: string }) => {
+		const qs = new URLSearchParams({ query: params.query });
+		if (params.page_type) qs.set("page_type", params.page_type);
+		return fetchJson<WikiListResponse>(`/wiki/search?${qs}`);
+	},
+
+	getWikiPage: (slug: string, version?: number) => {
+		const qs = version !== undefined ? `?version=${version}` : "";
+		return fetchJson<WikiPageResponse>(`/wiki/${encodeURIComponent(slug)}${qs}`);
+	},
+
+	createWikiPage: async (request: CreateWikiPageRequest): Promise<WikiPageResponse> => {
+		const response = await fetch(`${getApiBase()}/wiki`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(request),
+		});
+		if (!response.ok) throw new Error(`API error: ${response.status}`);
+		return response.json() as Promise<WikiPageResponse>;
+	},
+
+	editWikiPage: async (slug: string, request: EditWikiPageRequest): Promise<WikiPageResponse> => {
+		const response = await fetch(`${getApiBase()}/wiki/${encodeURIComponent(slug)}/edit`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(request),
+		});
+		if (!response.ok) throw new Error(`API error: ${response.status}`);
+		return response.json() as Promise<WikiPageResponse>;
+	},
+
+	getWikiHistory: (slug: string, limit = 20) =>
+		fetchJson<WikiHistoryResponse>(`/wiki/${encodeURIComponent(slug)}/history?limit=${limit}`),
+
+	restoreWikiVersion: async (slug: string, version: number): Promise<WikiPageResponse> => {
+		const response = await fetch(`${getApiBase()}/wiki/${encodeURIComponent(slug)}/restore`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ version }),
+		});
+		if (!response.ok) throw new Error(`API error: ${response.status}`);
+		return response.json() as Promise<WikiPageResponse>;
+	},
+
+	archiveWikiPage: async (slug: string): Promise<{ success: boolean; message: string }> => {
+		const response = await fetch(`${getApiBase()}/wiki/${encodeURIComponent(slug)}`, {
+			method: "DELETE",
+		});
+		if (!response.ok) throw new Error(`API error: ${response.status}`);
+		return response.json();
+	},
+
+	usage: (params?: { agent_id?: string; since?: string; until?: string; group_by?: string }) => {
+		const qs = new URLSearchParams();
+		if (params?.agent_id) qs.set("agent_id", params.agent_id);
+		if (params?.since) qs.set("since", params.since);
+		if (params?.until) qs.set("until", params.until);
+		if (params?.group_by) qs.set("group_by", params.group_by);
+		const query = qs.toString();
+		return fetchJson<UsageResponse>(`/usage${query ? `?${query}` : ""}`);
+	},
+
+	activity: (params?: { since?: string; until?: string }) => {
+		const qs = new URLSearchParams();
+		if (params?.since) qs.set("since", params.since);
+		if (params?.until) qs.set("until", params.until);
+		const query = qs.toString();
+		return fetchJson<ActivityResponse>(`/activity${query ? `?${query}` : ""}`);
+	},
+}
+
+export interface UsageTotals {
+	input_tokens: number;
+	output_tokens: number;
+	cache_read_tokens: number;
+	cache_write_tokens: number;
+	reasoning_tokens: number;
+	request_count: number;
+	estimated_cost_usd: number | null;
+	cost_status: string;
+}
+
+export interface UsageByModel {
+	model: string;
+	input_tokens: number;
+	output_tokens: number;
+	cache_read_tokens: number;
+	cache_write_tokens: number;
+	reasoning_tokens: number;
+	request_count: number;
+	estimated_cost_usd: number | null;
+}
+
+export interface UsageResponse {
+	total: UsageTotals;
+	by_model?: UsageByModel[];
+	by_day?: Array<{ date: string } & UsageTotals>;
+	by_agent?: Array<{ agent_id: string } & UsageTotals>;
 };
+
+// Activity types
+export interface ProcessTokens {
+	input: number;
+	output: number;
+	cache_read: number;
+	reasoning: number;
+	cost_usd: number;
+}
+
+export interface TokenSummary {
+	input: number;
+	output: number;
+	cache_read: number;
+	reasoning: number;
+	cost_usd: number;
+	by_process: Record<string, ProcessTokens>;
+}
+
+export interface ActivityDay {
+	date: string;
+	messages: number;
+	branches: number;
+	workers: number;
+	cortex: number;
+	cron: number;
+	active_channels: number;
+	tokens: TokenSummary;
+}
+
+export interface ActivityTotals {
+	messages: number;
+	branches: number;
+	workers: number;
+	cortex: number;
+	cron: number;
+	active_channels: number;
+	tokens: TokenSummary;
+}
+
+export interface ActivityResponse {
+	daily: ActivityDay[];
+	totals: ActivityTotals;
+}
+
+// Wiki types
+export type WikiPageType = "entity" | "concept" | "decision" | "project" | "reference";
+
+export interface WikiPageSummary {
+	id: string;
+	slug: string;
+	title: string;
+	page_type: string;
+	version: number;
+	updated_at: string;
+	updated_by: string;
+}
+
+export interface WikiPage {
+	id: string;
+	slug: string;
+	title: string;
+	page_type: string;
+	content: string;
+	related: string[];
+	created_by: string;
+	updated_by: string;
+	version: number;
+	archived: boolean;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface WikiPageVersion {
+	id: string;
+	page_id: string;
+	version: number;
+	content: string;
+	edit_summary: string | null;
+	author_type: string;
+	author_id: string;
+	created_at: string;
+}
+
+export interface WikiListResponse {
+	pages: WikiPageSummary[];
+	total: number;
+}
+
+export interface WikiPageResponse {
+	page: WikiPage;
+}
+
+export interface WikiHistoryResponse {
+	versions: WikiPageVersion[];
+}
+
+export interface CreateWikiPageRequest {
+	title: string;
+	page_type: WikiPageType;
+	content: string;
+	related?: string[];
+	edit_summary?: string;
+	author_id?: string;
+	author_type?: string;
+}
+
+export interface EditWikiPageRequest {
+	old_string: string;
+	new_string: string;
+	replace_all?: boolean;
+	edit_summary?: string;
+	author_id?: string;
+	author_type?: string;
+}

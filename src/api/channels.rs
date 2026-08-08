@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct ChannelResponse {
     agent_id: String,
     id: String,
@@ -19,14 +19,16 @@ pub(super) struct ChannelResponse {
     is_active: bool,
     last_activity_at: String,
     created_at: String,
+    response_mode: Option<String>,
+    model: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct ChannelsResponse {
     channels: Vec<ChannelResponse>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, utoipa::ToSchema, utoipa::IntoParams)]
 pub(super) struct ListChannelsQuery {
     #[serde(default)]
     include_inactive: bool,
@@ -57,13 +59,13 @@ fn sort_channels_newest_first(channels: &mut [AgentChannel]) {
     );
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct MessagesResponse {
     items: Vec<crate::conversation::history::TimelineItem>,
     has_more: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
 pub(super) struct MessagesQuery {
     channel_id: String,
     #[serde(default = "default_message_limit")]
@@ -75,20 +77,34 @@ fn default_message_limit() -> i64 {
     20
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub(super) struct CancelProcessRequest {
     channel_id: String,
     process_type: String,
     process_id: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct CancelProcessResponse {
     success: bool,
     message: String,
 }
 
 /// List channels across agents, with optional activity and agent filters.
+#[utoipa::path(
+    get,
+    path = "/channels",
+    params(
+        ("include_inactive" = bool, Query, description = "Include inactive channels"),
+        ("agent_id" = Option<String>, Query, description = "Filter by agent ID"),
+        ("is_active" = Option<bool>, Query, description = "Filter by active state"),
+    ),
+    responses(
+        (status = 200, body = ChannelsResponse),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "channels",
+)]
 pub(super) async fn list_channels(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ListChannelsQuery>,
@@ -116,16 +132,39 @@ pub(super) async fn list_channels(
 
     sort_channels_newest_first(&mut collected_channels);
 
+    // Read settings from running channel states for response_mode/model display.
+    let channel_states = state.channel_states.read().await;
+
     let all_channels = collected_channels
         .into_iter()
-        .map(|(agent_id, channel)| ChannelResponse {
-            agent_id,
-            id: channel.id,
-            platform: channel.platform,
-            display_name: channel.display_name,
-            is_active: channel.is_active,
-            last_activity_at: channel.last_activity_at.to_rfc3339(),
-            created_at: channel.created_at.to_rfc3339(),
+        .map(|(agent_id, channel)| {
+            let (response_mode, model) = channel_states
+                .get(&channel.id)
+                .map(|cs| {
+                    let settings = &cs.model_overrides;
+                    let mode = match settings.response_mode {
+                        crate::conversation::ResponseMode::Active => None,
+                        crate::conversation::ResponseMode::Observe => Some("observe".to_string()),
+                        crate::conversation::ResponseMode::MentionOnly => {
+                            Some("mention_only".to_string())
+                        }
+                    };
+                    let model = settings.resolve_model("channel").map(String::from);
+                    (mode, model)
+                })
+                .unwrap_or((None, None));
+
+            ChannelResponse {
+                agent_id,
+                id: channel.id,
+                platform: channel.platform,
+                display_name: channel.display_name,
+                is_active: channel.is_active,
+                last_activity_at: channel.last_activity_at.to_rfc3339(),
+                created_at: channel.created_at.to_rfc3339(),
+                response_mode,
+                model,
+            }
         })
         .collect();
 
@@ -136,6 +175,20 @@ pub(super) async fn list_channels(
 
 /// Get the unified timeline for a channel: messages, branch runs, and worker runs
 /// interleaved chronologically.
+#[utoipa::path(
+    get,
+    path = "/channels/messages",
+    params(
+        ("channel_id" = String, Query, description = "Channel ID"),
+        ("limit" = i64, Query, description = "Maximum number of messages to return (default: 20, max: 100)"),
+        ("before" = Option<String>, Query, description = "Pagination cursor for fetching older messages"),
+    ),
+    responses(
+        (status = 200, body = MessagesResponse),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "channels",
+)]
 pub(super) async fn channel_messages(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<MessagesQuery>,
@@ -144,7 +197,7 @@ pub(super) async fn channel_messages(
     let limit = query.limit.min(100);
     let fetch_limit = limit + 1;
 
-    for (_agent_id, pool) in pools.iter() {
+    for pool in pools.values() {
         let logger = ProcessRunLogger::new(pool.clone());
         match logger
             .load_channel_timeline(&query.channel_id, fetch_limit, query.before.as_deref())
@@ -174,6 +227,14 @@ pub(super) async fn channel_messages(
 }
 
 /// Get live status (active workers, branches, completed items) for all channels.
+#[utoipa::path(
+    get,
+    path = "/channels/status",
+    responses(
+        (status = 200, body = serde_json::Value),
+    ),
+    tag = "channels",
+)]
 pub(super) async fn channel_status(
     State(state): State<Arc<ApiState>>,
 ) -> Json<HashMap<String, serde_json::Value>> {
@@ -193,13 +254,13 @@ pub(super) async fn channel_status(
     Json(result)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
 pub(super) struct DeleteChannelQuery {
     agent_id: String,
     channel_id: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub(super) struct SetChannelArchiveRequest {
     agent_id: String,
     channel_id: String,
@@ -207,6 +268,20 @@ pub(super) struct SetChannelArchiveRequest {
 }
 
 /// Delete a channel and its message history.
+#[utoipa::path(
+    delete,
+    path = "/channels",
+    params(
+        ("agent_id" = String, Query, description = "Agent ID that owns the channel"),
+        ("channel_id" = String, Query, description = "Channel ID to delete"),
+    ),
+    responses(
+        (status = 200, body = serde_json::Value),
+        (status = 404, description = "Channel or agent not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "channels",
+)]
 pub(super) async fn delete_channel(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<DeleteChannelQuery>,
@@ -234,6 +309,17 @@ pub(super) async fn delete_channel(
 }
 
 /// Archive or unarchive a channel without deleting its history.
+#[utoipa::path(
+    post,
+    path = "/channels/archive",
+    request_body = SetChannelArchiveRequest,
+    responses(
+        (status = 200, body = serde_json::Value),
+        (status = 404, description = "Channel or agent not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "channels",
+)]
 pub(super) async fn set_channel_archive(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<SetChannelArchiveRequest>,
@@ -274,6 +360,18 @@ fn archive_update_response_payload(archived: bool) -> serde_json::Value {
 }
 
 /// Cancel a running worker or branch via the API.
+#[utoipa::path(
+    post,
+    path = "/channels/cancel-process",
+    request_body = CancelProcessRequest,
+    responses(
+        (status = 200, body = CancelProcessResponse),
+        (status = 400, description = "Invalid process type or process ID"),
+        (status = 404, description = "Process or channel not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "channels",
+)]
 pub(super) async fn cancel_process(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<CancelProcessRequest>,
@@ -326,7 +424,7 @@ pub(super) async fn cancel_process(
             // Fallback for detached workers (for example after restart): no live
             // channel state exists, but the DB row is still marked running.
             let pools = state.agent_pools.load();
-            for (_agent_id, pool) in pools.iter() {
+            for pool in pools.values() {
                 let logger = ProcessRunLogger::new(pool.clone());
                 match logger.cancel_running_detached_worker(worker_id).await {
                     Ok(true) => {
@@ -379,7 +477,7 @@ pub(super) async fn cancel_process(
 
 // ── Prompt Inspect ──────────────────────────────────────────────────
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
 pub(super) struct PromptInspectQuery {
     channel_id: String,
 }
@@ -388,6 +486,19 @@ pub(super) struct PromptInspectQuery {
 /// given channel. Returns the rendered system prompt and conversation
 /// history — useful for debugging prompt construction, coalescing,
 /// status block content, and context window usage.
+#[utoipa::path(
+    get,
+    path = "/channels/prompt/inspect",
+    params(
+        ("channel_id" = String, Query, description = "Channel ID to inspect"),
+    ),
+    responses(
+        (status = 200, body = serde_json::Value),
+        (status = 404, description = "Channel not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "channels",
+)]
 pub(super) async fn inspect_prompt(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<PromptInspectQuery>,
@@ -412,6 +523,7 @@ pub(super) async fn inspect_prompt(
     // ── Gather all dynamic sections ──
     let identity_context = rc.identity.load().render();
     let memory_bulletin = rc.memory_bulletin.load();
+    let knowledge_synthesis = rc.knowledge_synthesis.load();
     let skills = rc.skills.load();
     let skills_prompt = skills
         .render_channel_prompt(&prompt_engine)
@@ -456,6 +568,7 @@ pub(super) async fn inspect_prompt(
                     &info.platform,
                     server_name,
                     info.display_name.as_deref(),
+                    Some(&info.id),
                 )
                 .ok()
         }
@@ -463,28 +576,232 @@ pub(super) async fn inspect_prompt(
     };
 
     let sandbox_enabled = channel_state.deps.sandbox.containment_active();
+    let adapter = query.channel_id.split(':').next().filter(|a| !a.is_empty());
+
+    // ── Render working memory layers (Layers 2 + 3) ──
+    let wm_config = **rc.working_memory.load();
+    let wm_timezone = channel_state.deps.working_memory.timezone();
+    let working_memory = crate::memory::working::render_working_memory(
+        &channel_state.deps.working_memory,
+        &query.channel_id,
+        &wm_config,
+        wm_timezone,
+    )
+    .await
+    .unwrap_or_default();
+
+    let channel_activity_map = crate::memory::working::render_channel_activity_map(
+        &channel_state.deps.sqlite_pool,
+        &channel_state.deps.working_memory,
+        &query.channel_id,
+        &wm_config,
+        wm_timezone,
+    )
+    .await
+    .unwrap_or_default();
+
+    let participant_config = **rc.participant_context.load();
+    let tracked_participants = {
+        let participants = channel_state.active_participants.read().await;
+        crate::conversation::renderable_participants(&participants, &participant_config)
+    };
+    let participant_context = crate::memory::working::render_participant_context(
+        &channel_state.deps.working_memory,
+        &tracked_participants,
+        &query.channel_id,
+        &participant_config,
+    )
+    .await
+    .unwrap_or_else(|error| {
+        tracing::warn!(
+            %error,
+            channel_id = %query.channel_id,
+            "failed to render participant context for prompt inspection"
+        );
+        String::new()
+    });
+
+    // ── Available channels ──
+    let available_channels = {
+        let channels = channel_state
+            .channel_store
+            .list_active()
+            .await
+            .unwrap_or_default();
+        let entries: Vec<crate::prompts::engine::ChannelEntry> = channels
+            .into_iter()
+            .filter(|channel| {
+                channel.id.as_str() != query.channel_id.as_str()
+                    && channel.platform != "cron"
+                    && channel.platform != "webhook"
+            })
+            .map(|channel| crate::prompts::engine::ChannelEntry {
+                name: channel.display_name.unwrap_or_else(|| channel.id.clone()),
+                platform: channel.platform,
+                id: channel.id,
+            })
+            .collect();
+        if entries.is_empty() {
+            None
+        } else {
+            prompt_engine.render_available_channels(entries).ok()
+        }
+    };
+
+    // ── Org context ──
+    let org_context = {
+        let agent_id = channel_state.deps.agent_id.as_ref();
+        let all_links = channel_state.deps.links.load();
+        let links = crate::links::links_for_agent(&all_links, agent_id);
+        if links.is_empty() {
+            None
+        } else {
+            let all_humans = channel_state.deps.humans.load();
+            let humans_by_id: std::collections::HashMap<&str, &crate::config::HumanDef> =
+                all_humans.iter().map(|h| (h.id.as_str(), h)).collect();
+
+            let mut superiors = Vec::new();
+            let mut subordinates = Vec::new();
+            let mut peers = Vec::new();
+
+            for link in &links {
+                let is_from = link.from_agent_id == agent_id;
+                let other_id = if is_from {
+                    &link.to_agent_id
+                } else {
+                    &link.from_agent_id
+                };
+                let is_human = humans_by_id.contains_key(other_id.as_str());
+                let (name, role, description) =
+                    if let Some(human) = humans_by_id.get(other_id.as_str()) {
+                        let name = human
+                            .display_name
+                            .clone()
+                            .unwrap_or_else(|| other_id.clone());
+                        (name, human.role.clone(), human.description.clone())
+                    } else {
+                        let name = channel_state
+                            .deps
+                            .agent_names
+                            .get(other_id.as_str())
+                            .cloned()
+                            .unwrap_or_else(|| other_id.clone());
+                        (name, None, None)
+                    };
+                let info = crate::prompts::engine::LinkedAgent {
+                    name,
+                    id: other_id.clone(),
+                    is_human,
+                    role,
+                    description,
+                };
+                match link.kind {
+                    crate::links::LinkKind::Hierarchical => {
+                        if is_from {
+                            subordinates.push(info);
+                        } else {
+                            superiors.push(info);
+                        }
+                    }
+                    crate::links::LinkKind::Peer => peers.push(info),
+                }
+            }
+
+            if superiors.is_empty() && subordinates.is_empty() && peers.is_empty() {
+                None
+            } else {
+                prompt_engine
+                    .render_org_context(crate::prompts::engine::OrgContext {
+                        superiors,
+                        subordinates,
+                        peers,
+                    })
+                    .ok()
+            }
+        }
+    };
+
+    // ── Adapter prompt ──
+    let adapter_prompt =
+        adapter.and_then(|adapter| prompt_engine.render_channel_adapter_prompt(adapter));
+
+    // ── Project context ──
+    let project_context = {
+        use crate::prompts::engine::{ProjectContext, ProjectRepoContext, ProjectWorktreeContext};
+        let store = &channel_state.deps.project_store;
+        let projects = store
+            .list_projects(Some(crate::projects::ProjectStatus::Active))
+            .await
+            .unwrap_or_default();
+        if projects.is_empty() {
+            None
+        } else {
+            let mut contexts = Vec::with_capacity(projects.len());
+            for project in &projects {
+                let repos = store.list_repos(&project.id).await.unwrap_or_default();
+                let worktrees = store
+                    .list_worktrees_with_repos(&project.id)
+                    .await
+                    .unwrap_or_default();
+                contexts.push(ProjectContext {
+                    name: project.name.clone(),
+                    root_path: project.root_path.clone(),
+                    description: if project.description.is_empty() {
+                        None
+                    } else {
+                        Some(project.description.clone())
+                    },
+                    tags: project.tags.clone(),
+                    repos: repos
+                        .into_iter()
+                        .map(|repo| ProjectRepoContext {
+                            name: repo.name.clone(),
+                            path: repo.path.clone(),
+                            default_branch: repo.default_branch.clone(),
+                            remote_url: if repo.remote_url.is_empty() {
+                                None
+                            } else {
+                                Some(repo.remote_url.clone())
+                            },
+                        })
+                        .collect(),
+                    worktrees: worktrees
+                        .into_iter()
+                        .map(|worktree_with_repo| ProjectWorktreeContext {
+                            name: worktree_with_repo.worktree.name.clone(),
+                            path: worktree_with_repo.worktree.path.clone(),
+                            branch: worktree_with_repo.worktree.branch.clone(),
+                            repo_name: worktree_with_repo.repo_name.clone(),
+                        })
+                        .collect(),
+                });
+            }
+            prompt_engine.render_projects_context(contexts).ok()
+        }
+    };
 
     // ── Render the full system prompt ──
-    // This is a best-effort reconstruction from the API layer. It lacks
-    // available_channels, org_context, adapter_prompt, and project_context
-    // (those require Channel methods not available from ChannelState).
-    // Captured snapshots store the exact prompt the model received.
     let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
     let system_prompt = prompt_engine
         .render_channel_prompt_with_links(
             empty_to_none(identity_context),
             empty_to_none(memory_bulletin.to_string()),
+            empty_to_none(knowledge_synthesis.to_string()),
             empty_to_none(skills_prompt),
             worker_capabilities,
             conversation_context,
             empty_to_none(status_text),
-            None, // coalesce_hint
-            None, // available_channels — not available from API layer
+            None, // coalesce_hint — only set during batched message handling
+            available_channels,
             sandbox_enabled,
-            None, // org_context — not available from API layer
-            None, // adapter_prompt — not available from API layer
-            None, // project_context — not available from API layer
-            None, // backfill_transcript — not available from API layer
+            org_context,
+            adapter_prompt,
+            project_context,
+            None, // backfill_transcript — only set during channel initialization
+            empty_to_none(working_memory),
+            empty_to_none(channel_activity_map),
+            empty_to_none(participant_context),
+            false, // direct_mode — resolved at runtime by the channel, not available here
         )
         .unwrap_or_default();
 
@@ -521,13 +838,24 @@ pub(super) async fn inspect_prompt(
 
 // ── Prompt Capture Toggle ──────────────────────────────────────────
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub(super) struct PromptCaptureBody {
     channel_id: String,
     enabled: bool,
 }
 
 /// Enable or disable prompt capture for a specific channel.
+#[utoipa::path(
+    post,
+    path = "/channels/prompt/capture",
+    request_body = PromptCaptureBody,
+    responses(
+        (status = 200, body = serde_json::Value),
+        (status = 404, description = "Agent or settings not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "channels",
+)]
 pub(super) async fn set_prompt_capture(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<PromptCaptureBody>,
@@ -567,7 +895,7 @@ pub(super) async fn set_prompt_capture(
 
 // ── Prompt Snapshot History ────────────────────────────────────────
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
 pub(super) struct SnapshotListQuery {
     channel_id: String,
     #[serde(default = "default_snapshot_limit")]
@@ -579,6 +907,20 @@ fn default_snapshot_limit() -> usize {
 }
 
 /// List prompt snapshots for a channel (newest first).
+#[utoipa::path(
+    get,
+    path = "/channels/prompt/snapshots",
+    params(
+        ("channel_id" = String, Query, description = "Channel ID to list snapshots for"),
+        ("limit" = usize, Query, description = "Maximum number of snapshots to return (default: 50)"),
+    ),
+    responses(
+        (status = 200, body = serde_json::Value),
+        (status = 404, description = "Snapshot store not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "channels",
+)]
 pub(super) async fn list_prompt_snapshots(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<SnapshotListQuery>,
@@ -598,13 +940,27 @@ pub(super) async fn list_prompt_snapshots(
     })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
 pub(super) struct SnapshotGetQuery {
     channel_id: String,
     timestamp_ms: i64,
 }
 
 /// Retrieve a specific prompt snapshot.
+#[utoipa::path(
+    get,
+    path = "/channels/prompt/snapshots/get",
+    params(
+        ("channel_id" = String, Query, description = "Channel ID the snapshot belongs to"),
+        ("timestamp_ms" = i64, Query, description = "Snapshot timestamp in milliseconds"),
+    ),
+    responses(
+        (status = 200, body = serde_json::Value),
+        (status = 404, description = "Snapshot or store not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "channels",
+)]
 pub(super) async fn get_prompt_snapshot(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<SnapshotGetQuery>,
@@ -651,6 +1007,141 @@ async fn find_snapshot_store(
     }
 
     Err(StatusCode::NOT_FOUND)
+}
+
+// --- Channel Settings Endpoints ---
+
+#[derive(Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
+pub(super) struct ChannelSettingsQuery {
+    agent_id: String,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub(super) struct ChannelSettingsResponse {
+    conversation_id: String,
+    settings: crate::conversation::ConversationSettings,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+pub(super) struct UpdateChannelSettingsRequest {
+    agent_id: String,
+    settings: crate::conversation::ConversationSettings,
+}
+
+#[utoipa::path(
+    get,
+    path = "/channels/{channel_id}/settings",
+    params(
+        ("channel_id" = String, Path, description = "Channel conversation ID"),
+        ChannelSettingsQuery,
+    ),
+    responses(
+        (status = 200, body = ChannelSettingsResponse),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "channels",
+)]
+pub(super) async fn get_channel_settings(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(channel_id): axum::extract::Path<String>,
+    Query(query): Query<ChannelSettingsQuery>,
+) -> Result<Json<ChannelSettingsResponse>, StatusCode> {
+    let pools = state.agent_pools.load();
+    let pool = pools.get(&query.agent_id).ok_or(StatusCode::NOT_FOUND)?;
+
+    // Validate channel exists
+    let channel_store = ChannelStore::new(pool.clone());
+    channel_store
+        .get(&channel_id)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, %channel_id, "failed to load channel for settings fetch");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let store = crate::conversation::ChannelSettingsStore::new(pool.clone());
+    let settings = store
+        .get(&query.agent_id, &channel_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, %channel_id, "failed to get channel settings");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .unwrap_or_default();
+
+    Ok(Json(ChannelSettingsResponse {
+        conversation_id: channel_id,
+        settings,
+    }))
+}
+
+#[utoipa::path(
+    put,
+    path = "/channels/{channel_id}/settings",
+    request_body = UpdateChannelSettingsRequest,
+    params(
+        ("channel_id" = String, Path, description = "Channel conversation ID"),
+    ),
+    responses(
+        (status = 200, body = ChannelSettingsResponse),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "channels",
+)]
+pub(super) async fn update_channel_settings(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(channel_id): axum::extract::Path<String>,
+    Json(request): Json<UpdateChannelSettingsRequest>,
+) -> Result<Json<ChannelSettingsResponse>, StatusCode> {
+    let pools = state.agent_pools.load();
+    let pool = pools.get(&request.agent_id).ok_or(StatusCode::NOT_FOUND)?;
+
+    // Validate channel exists
+    let channel_store = ChannelStore::new(pool.clone());
+    channel_store
+        .get(&channel_id)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, %channel_id, "failed to load channel for settings update");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let store = crate::conversation::ChannelSettingsStore::new(pool.clone());
+    store
+        .upsert(&request.agent_id, &channel_id, &request.settings)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, %channel_id, "failed to update channel settings");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Notify the running channel to hot-reload its settings.
+    {
+        let channel_states = state.channel_states.read().await;
+        if let Some(channel_state) = channel_states.get(&channel_id)
+            && let Err(error) =
+                channel_state
+                    .deps
+                    .event_tx
+                    .send(crate::ProcessEvent::SettingsUpdated {
+                        agent_id: channel_state.deps.agent_id.clone(),
+                        channel_id: channel_state.channel_id.clone(),
+                    })
+        {
+            tracing::warn!(
+                %error,
+                %channel_id,
+                "failed to send SettingsUpdated event to channel"
+            );
+        }
+    }
+
+    Ok(Json(ChannelSettingsResponse {
+        conversation_id: channel_id,
+        settings: request.settings,
+    }))
 }
 
 #[cfg(test)]

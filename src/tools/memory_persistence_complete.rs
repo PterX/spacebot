@@ -58,11 +58,28 @@ impl MemoryPersistenceContractState {
 #[derive(Debug, Clone)]
 pub struct MemoryPersistenceCompleteTool {
     state: Arc<MemoryPersistenceContractState>,
+    working_memory: Option<Arc<crate::memory::WorkingMemoryStore>>,
+    channel_id: Option<String>,
 }
 
 impl MemoryPersistenceCompleteTool {
     pub fn new(state: Arc<MemoryPersistenceContractState>) -> Self {
-        Self { state }
+        Self {
+            state,
+            working_memory: None,
+            channel_id: None,
+        }
+    }
+
+    /// Enable working memory event writing for extracted events.
+    pub fn with_working_memory(
+        mut self,
+        store: Arc<crate::memory::WorkingMemoryStore>,
+        channel_id: Option<String>,
+    ) -> Self {
+        self.working_memory = Some(store);
+        self.channel_id = channel_id;
+        self
     }
 }
 
@@ -83,6 +100,27 @@ pub struct MemoryPersistenceCompleteArgs {
     /// was worth saving.
     #[serde(default)]
     pub reason: Option<String>,
+    /// Optional events extracted from the conversation. Each event becomes a
+    /// working memory entry for temporal context.
+    #[serde(default)]
+    pub events: Vec<WorkingMemoryEventInput>,
+}
+
+/// A single event extracted by the persistence branch for the working memory log.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct WorkingMemoryEventInput {
+    /// Event type: "decision", "user_correction", "decision_revised", "deadline_set",
+    /// "blocked_on", "constraint", "outcome", "error", or "system".
+    pub event_type: String,
+    /// One-line summary of the event.
+    pub summary: String,
+    /// Importance score (0.0-1.0). Defaults to 0.5.
+    #[serde(default = "default_importance")]
+    pub importance: f32,
+}
+
+fn default_importance() -> f32 {
+    0.5
 }
 
 #[derive(Debug, Serialize)]
@@ -120,6 +158,39 @@ impl Tool for MemoryPersistenceCompleteTool {
                     "reason": {
                         "type": "string",
                         "description": "Required for outcome=no_memories. Brief reason why no memories were saved"
+                    },
+                    "events": {
+                        "type": "array",
+                        "description": "Optional events extracted from the conversation for working memory",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "event_type": {
+                                "type": "string",
+                                    "enum": [
+                                        "decision",
+                                        "user_correction",
+                                        "decision_revised",
+                                        "deadline_set",
+                                        "blocked_on",
+                                        "constraint",
+                                        "outcome",
+                                        "error",
+                                        "system"
+                                    ],
+                                    "description": "Type of event"
+                                },
+                                "summary": {
+                                    "type": "string",
+                                    "description": "One-line summary of the event"
+                                },
+                                "importance": {
+                                    "type": "number",
+                                    "description": "Importance score 0.0-1.0, defaults to 0.5"
+                                }
+                            },
+                            "required": ["event_type", "summary"]
+                        }
                     }
                 },
                 "required": ["outcome"]
@@ -130,8 +201,7 @@ impl Tool for MemoryPersistenceCompleteTool {
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let outcome = args.outcome.trim();
         let recorded_ids = self.state.saved_memory_ids();
-
-        match outcome {
+        let output = match outcome {
             "saved" => {
                 if args.saved_memory_ids.is_empty() {
                     return Err(MemoryPersistenceCompleteError(
@@ -161,12 +231,12 @@ impl Tool for MemoryPersistenceCompleteTool {
                     )));
                 }
 
-                Ok(MemoryPersistenceCompleteOutput {
+                MemoryPersistenceCompleteOutput {
                     success: true,
                     outcome: "saved".to_string(),
                     saved_memory_ids: provided_ids,
                     reason: None,
-                })
+                }
             }
             "no_memories" => {
                 if !args.saved_memory_ids.is_empty() {
@@ -188,17 +258,52 @@ impl Tool for MemoryPersistenceCompleteTool {
                     ));
                 }
 
-                Ok(MemoryPersistenceCompleteOutput {
+                MemoryPersistenceCompleteOutput {
                     success: true,
                     outcome: "no_memories".to_string(),
                     saved_memory_ids: Vec::new(),
                     reason: Some(reason.trim().to_string()),
-                })
+                }
             }
-            _ => Err(MemoryPersistenceCompleteError(format!(
-                "invalid outcome '{outcome}'; expected 'saved' or 'no_memories'"
-            ))),
+            _ => {
+                return Err(MemoryPersistenceCompleteError(format!(
+                    "invalid outcome '{outcome}'; expected 'saved' or 'no_memories'"
+                )));
+            }
+        };
+
+        // Write extracted events to working memory only after validation succeeds.
+        if let Some(working_memory) = &self.working_memory {
+            for event_input in &args.events {
+                let event_type =
+                    match crate::memory::WorkingMemoryEventType::parse(&event_input.event_type) {
+                        Some(event_type) => event_type,
+                        None => {
+                            tracing::trace!(
+                                raw_event_type = %event_input.event_type,
+                                "unrecognized event_type, falling back to System"
+                            );
+                            crate::memory::WorkingMemoryEventType::System
+                        }
+                    };
+                let importance = event_input.importance.clamp(0.0, 1.0);
+                let mut builder = working_memory
+                    .emit(event_type, &event_input.summary)
+                    .importance(importance);
+                if let Some(channel_id) = &self.channel_id {
+                    builder = builder.channel(channel_id.clone());
+                }
+                builder.record();
+            }
+            if !args.events.is_empty() {
+                tracing::info!(
+                    event_count = args.events.len(),
+                    "persistence branch extracted events into working memory"
+                );
+            }
         }
+
+        Ok(output)
     }
 }
 
@@ -217,6 +322,7 @@ mod tests {
                 outcome: "saved".to_string(),
                 saved_memory_ids: vec!["mem_fake".to_string()],
                 reason: None,
+                events: vec![],
             })
             .await
             .expect_err("fabricated ids should fail");
@@ -236,6 +342,7 @@ mod tests {
                 outcome: "saved".to_string(),
                 saved_memory_ids: vec!["mem_2".to_string(), "mem_1".to_string()],
                 reason: None,
+                events: vec![],
             })
             .await
             .expect("exact ids should pass");
@@ -254,11 +361,71 @@ mod tests {
                 outcome: "no_memories".to_string(),
                 saved_memory_ids: Vec::new(),
                 reason: Some("No durable facts in recent turns".to_string()),
+                events: vec![],
             })
             .await
             .expect("no_memories should pass with reason");
 
         assert!(output.success);
         assert_eq!(output.outcome, "no_memories");
+    }
+
+    #[tokio::test]
+    async fn persists_conversational_events() {
+        let state = Arc::new(MemoryPersistenceContractState::default());
+
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("sqlite connect");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations");
+
+        let working_memory = crate::memory::WorkingMemoryStore::new(pool, chrono_tz::Tz::UTC);
+        let tool = MemoryPersistenceCompleteTool::new(state)
+            .with_working_memory(working_memory.clone(), Some("test-channel".to_string()));
+
+        tool.call(MemoryPersistenceCompleteArgs {
+            outcome: "no_memories".to_string(),
+            saved_memory_ids: Vec::new(),
+            reason: Some("Nothing worth retaining".to_string()),
+            events: vec![
+                WorkingMemoryEventInput {
+                    event_type: "user_correction".to_string(),
+                    summary: "User corrected a payment split assumption".to_string(),
+                    importance: 0.8,
+                },
+                WorkingMemoryEventInput {
+                    event_type: "decision_revised".to_string(),
+                    summary: "Decision changed after user feedback".to_string(),
+                    importance: 0.8,
+                },
+            ],
+        })
+        .await
+        .expect("persistence complete should pass");
+
+        let events = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let events = working_memory
+                    .get_events_for_channel("test-channel", 10)
+                    .await
+                    .expect("working memory query");
+                if events.len() == 2 {
+                    break events;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for working memory events");
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|event| {
+            event.event_type == crate::memory::WorkingMemoryEventType::UserCorrection
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == crate::memory::WorkingMemoryEventType::DecisionRevised
+        }));
     }
 }

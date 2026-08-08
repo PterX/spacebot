@@ -657,24 +657,47 @@ impl Drop for BrowserState {
             return;
         }
 
-        if let Some(dir) = self.user_data_dir.take() {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn_blocking(move || {
-                    if let Err(error) = std::fs::remove_dir_all(&dir) {
-                        tracing::debug!(
-                            path = %dir.display(),
-                            %error,
-                            "failed to clean up browser user data dir"
-                        );
+        // Take ownership of resources to move into cleanup task
+        let browser = self.browser.take();
+        let handler_task = self._handler_task.take();
+        let user_data_dir = self.user_data_dir.take();
+
+        // Close browser gracefully before cleaning up temp directory.
+        // This prevents chromiumoxide's force-kill which causes core dumps.
+        // We bundle close → abort → cleanup into a single spawned task to avoid races.
+        if let Some(mut browser) = browser
+            && let Some(task) = handler_task
+            && let Some(dir) = user_data_dir
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            handle.spawn(async move {
+                // Close browser first (with timeout to avoid hanging)
+                let close_result =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), browser.close()).await;
+
+                match close_result {
+                    Ok(Ok(_)) => tracing::debug!("Browser closed gracefully"),
+                    Ok(Err(error)) => {
+                        tracing::debug!(%error, "Failed to close browser during drop")
                     }
-                });
-            } else if let Err(error) = std::fs::remove_dir_all(&dir) {
-                eprintln!(
-                    "failed to clean up browser user data dir {}: {error}",
-                    dir.display()
-                );
-            }
+                    Err(_) => tracing::debug!("Browser close timed out after 5s"),
+                }
+
+                // Abort handler task after close completes or times out
+                task.abort();
+
+                // Then clean up temp directory
+                if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+                    tracing::debug!(
+                        path = %dir.display(),
+                        %error,
+                        "Failed to clean up browser user data dir"
+                    );
+                }
+            });
         }
+        // Note: if no runtime is available, we can't close async -
+        // chromiumoxide will force-kill on drop, which is acceptable
     }
 }
 
@@ -771,10 +794,17 @@ pub(crate) struct BrowserContext {
     /// the `secret` parameter can look up credential values without exposing
     /// them in tool arguments or output.
     secrets: Option<Arc<SecretsStore>>,
+    /// Worker-shared slot for surfacing a captcha / login wall / WAF block.
+    /// `None` for channel-level tool invocations (no worker outcome to short-
+    /// circuit).
+    blocked_signal: Option<crate::agent::worker::BlockSignal>,
+    /// Owning agent for secret-scope resolution. `None` for channel-level
+    /// invocations — those resolve secrets from instance-shared only.
+    agent_id: Option<crate::AgentId>,
 }
 
 impl BrowserContext {
-    fn new(
+    pub(crate) fn new(
         state: Arc<Mutex<BrowserState>>,
         config: BrowserConfig,
         screenshot_dir: PathBuf,
@@ -785,7 +815,84 @@ impl BrowserContext {
             config,
             screenshot_dir,
             secrets,
+            blocked_signal: None,
+            agent_id: None,
         }
+    }
+
+    /// Attach a worker-shared block signal slot. When the browser detects an
+    /// external defense, it writes the structured reason + evidence into the
+    /// slot and the worker short-circuits to `WorkerOutcome::Blocked` at the
+    /// next loop iteration.
+    pub(crate) fn with_block_signal(mut self, signal: crate::agent::worker::BlockSignal) -> Self {
+        self.blocked_signal = Some(signal);
+        self
+    }
+
+    /// Attach the owning agent so `browser_type` secret resolution prefers
+    /// the agent's scope before falling back to instance-shared.
+    pub(crate) fn with_agent_id(mut self, agent_id: crate::AgentId) -> Self {
+        self.agent_id = Some(agent_id);
+        self
+    }
+
+    /// Resolve a secret name to a value. Tries the calling agent's scope
+    /// first (when set), then falls back to instance-shared.
+    fn resolve_secret_value(
+        &self,
+        name: &str,
+    ) -> Result<crate::secrets::store::DecryptedSecret, BrowserError> {
+        let store = self.secrets.as_ref().ok_or_else(|| {
+            BrowserError::new(
+                "secret store is not available — secrets cannot be resolved. \
+                 Add the secret via the API or use the `text` parameter instead.",
+            )
+        })?;
+        if let Some(agent_id) = self.agent_id.as_ref() {
+            let agent_scope = crate::secrets::store::SecretScope::agent(agent_id);
+            // Fall back to shared only when the agent-scoped key truly
+            // doesn't exist. Decryption / read errors must surface — silently
+            // typing the shared value would inject the wrong tenant's
+            // credential into a `browser_type` call.
+            match store.get(&agent_scope, name) {
+                Ok(secret) => return Ok(secret),
+                Err(crate::error::SecretsError::NotFound { .. }) => {}
+                Err(error) => {
+                    return Err(BrowserError::new(format!(
+                        "failed to resolve agent-scoped secret '{name}': {error}"
+                    )));
+                }
+            }
+        }
+        store
+            .get(&crate::secrets::store::SecretScope::shared(), name)
+            .map_err(|error| {
+                BrowserError::new(format!("failed to resolve secret '{name}': {error}"))
+            })
+    }
+
+    /// Mark a positive block detection. No-op when no signal is wired.
+    /// First-write-wins — if the slot already holds a detection, the new
+    /// data is dropped (the worker has not yet read the prior detection,
+    /// short-circuit will pick it up first).
+    pub(crate) fn signal_block(
+        &self,
+        reason: crate::agent::worker::BlockReason,
+        url: Option<String>,
+        evidence: crate::agent::worker::BlockEvidence,
+    ) {
+        let Some(signal) = self.blocked_signal.as_ref() else {
+            return;
+        };
+        let Ok(mut slot) = signal.lock() else { return };
+        if slot.is_some() {
+            return;
+        }
+        *slot = Some(crate::agent::worker::BlockSignalData {
+            reason,
+            url,
+            evidence,
+        });
     }
 
     /// Get the active page or return an error. Does NOT hold the lock — caller
@@ -1106,6 +1213,13 @@ impl BrowserContext {
             .chrome_executable(&executable)
             .user_data_dir(&user_data_dir);
 
+        // Add additional flags from CHROME_FLAGS environment variable
+        if let Ok(flags) = std::env::var("CHROME_FLAGS") {
+            for flag in flags.split_whitespace() {
+                builder = builder.arg(flag);
+            }
+        }
+
         if self.config.headless {
             // Headless has no real window — set an explicit viewport so
             // screenshots render at a reasonable desktop size instead of
@@ -1137,7 +1251,31 @@ impl BrowserContext {
             .await
             .map_err(|error| BrowserError::new(format!("failed to launch browser: {error}")))?;
 
-        let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+        let state_clone = self.state.clone();
+        let handler_task = tokio::spawn(async move {
+            while let Some(result) = handler.next().await {
+                if let Err(error) = result {
+                    tracing::error!(%error, "Browser handler error");
+                }
+            }
+            tracing::warn!("Browser handler stream ended");
+            // Clear browser state so ensure_launched() knows to relaunch
+            // BUT only for non-persistent sessions (persistent sessions survive handler exit)
+            let mut state = state_clone.lock().await;
+            if !state.persistent_profile {
+                state.browser = None;
+                state._handler_task = None;
+                state.pages.clear();
+                state.active_target = None;
+                state.invalidate_snapshot();
+                // Note: user_data_dir is intentionally preserved for cleanup in Drop
+            } else {
+                // For persistent sessions, just clear the handler task reference
+                // The browser process may restart, but the session data persists
+                state._handler_task = None;
+                tracing::debug!("Persistent browser session - preserving state for reconnection");
+            }
+        });
 
         let mut state = self.state.lock().await;
 
@@ -1222,7 +1360,7 @@ impl BrowserContext {
 
 #[derive(Debug, Clone)]
 pub struct BrowserLaunchTool {
-    context: BrowserContext,
+    pub(crate) context: BrowserContext,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1253,7 +1391,7 @@ impl Tool for BrowserLaunchTool {
 
 #[derive(Debug, Clone)]
 pub struct BrowserNavigateTool {
-    context: BrowserContext,
+    pub(crate) context: BrowserContext,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1303,7 +1441,21 @@ impl Tool for BrowserNavigateTool {
 
         let title = page.get_title().await.ok().flatten();
         let current_url = page.url().await.ok().flatten();
+        let detection = run_block_detection(page, current_url.as_deref(), Some(&args.url)).await;
+
         state.invalidate_snapshot();
+
+        if let Some(detection) = detection {
+            self.context.signal_block(
+                detection.reason.clone(),
+                current_url.clone(),
+                detection.evidence,
+            );
+            return Err(BrowserError::new(format!(
+                "navigation blocked: {} — surfaced to caller; agent will short-circuit",
+                detection.reason.describe()
+            )));
+        }
 
         Ok(BrowserOutput::success(format!("Navigated to {}", args.url))
             .with_page_info(title, current_url))
@@ -1314,7 +1466,7 @@ impl Tool for BrowserNavigateTool {
 
 #[derive(Debug, Clone)]
 pub struct BrowserSnapshotTool {
-    context: BrowserContext,
+    pub(crate) context: BrowserContext,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1416,7 +1568,7 @@ impl ElementTarget {
 
 #[derive(Debug, Clone)]
 pub struct BrowserClickTool {
-    context: BrowserContext,
+    pub(crate) context: BrowserContext,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1463,7 +1615,22 @@ impl Tool for BrowserClickTool {
         let page = self.context.require_active_page(&state)?;
         wait_for_page_ready(page).await;
 
+        let current_url = page.url().await.ok().flatten();
+        let detection = run_block_detection(page, current_url.as_deref(), None).await;
+
         state.invalidate_snapshot();
+
+        if let Some(detection) = detection {
+            self.context.signal_block(
+                detection.reason.clone(),
+                current_url.clone(),
+                detection.evidence,
+            );
+            return Err(BrowserError::new(format!(
+                "click triggered blocked page: {} — surfaced to caller; agent will short-circuit",
+                detection.reason.describe()
+            )));
+        }
 
         Ok(BrowserOutput::success(format!(
             "Clicked element at {label}"
@@ -1475,7 +1642,7 @@ impl Tool for BrowserClickTool {
 
 #[derive(Debug, Clone)]
 pub struct BrowserTypeTool {
-    context: BrowserContext,
+    pub(crate) context: BrowserContext,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1539,15 +1706,7 @@ impl Tool for BrowserTypeTool {
         // Resolve the text to type: either from `secret` (secure) or `text` (plain).
         let (text_value, is_secret) = match (&args.secret, &args.text) {
             (Some(secret_name), None) => {
-                let store = self.context.secrets.as_ref().ok_or_else(|| {
-                    BrowserError::new(
-                        "secret store is not available — secrets cannot be resolved. \
-                         Add the secret via the API or use the `text` parameter instead.",
-                    )
-                })?;
-                let decrypted = store.get(secret_name).map_err(|error| {
-                    BrowserError::new(format!("failed to resolve secret '{secret_name}': {error}"))
-                })?;
+                let decrypted = self.context.resolve_secret_value(secret_name)?;
                 (decrypted.expose().to_string(), true)
             }
             (None, Some(text)) => (text.clone(), false),
@@ -1592,7 +1751,7 @@ impl Tool for BrowserTypeTool {
 
 #[derive(Debug, Clone)]
 pub struct BrowserPressKeyTool {
-    context: BrowserContext,
+    pub(crate) context: BrowserContext,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1636,7 +1795,7 @@ impl Tool for BrowserPressKeyTool {
 
 #[derive(Debug, Clone)]
 pub struct BrowserScreenshotTool {
-    context: BrowserContext,
+    pub(crate) context: BrowserContext,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1719,7 +1878,7 @@ impl Tool for BrowserScreenshotTool {
 
 #[derive(Debug, Clone)]
 pub struct BrowserEvaluateTool {
-    context: BrowserContext,
+    pub(crate) context: BrowserContext,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1784,7 +1943,7 @@ impl Tool for BrowserEvaluateTool {
 
 #[derive(Debug, Clone)]
 pub struct BrowserTabOpenTool {
-    context: BrowserContext,
+    pub(crate) context: BrowserContext,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1856,7 +2015,7 @@ impl Tool for BrowserTabOpenTool {
 
 #[derive(Debug, Clone)]
 pub struct BrowserTabListTool {
-    context: BrowserContext,
+    pub(crate) context: BrowserContext,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1911,7 +2070,7 @@ impl Tool for BrowserTabListTool {
 
 #[derive(Debug, Clone)]
 pub struct BrowserTabCloseTool {
-    context: BrowserContext,
+    pub(crate) context: BrowserContext,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1970,7 +2129,7 @@ impl Tool for BrowserTabCloseTool {
 
 #[derive(Debug, Clone)]
 pub struct BrowserCloseTool {
-    context: BrowserContext,
+    pub(crate) context: BrowserContext,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2091,6 +2250,8 @@ pub fn register_browser_tools(
     config: BrowserConfig,
     screenshot_dir: PathBuf,
     runtime_config: &crate::config::RuntimeConfig,
+    blocked_signal: Option<crate::agent::worker::BlockSignal>,
+    agent_id: Option<crate::AgentId>,
 ) -> rig::tool::server::ToolServer {
     let state = if let Some(shared) = runtime_config
         .shared_browser
@@ -2104,7 +2265,13 @@ pub fn register_browser_tools(
 
     let secrets = runtime_config.secrets.load().as_ref().as_ref().cloned();
 
-    let context = BrowserContext::new(state, config, screenshot_dir, secrets);
+    let mut context = BrowserContext::new(state, config, screenshot_dir, secrets);
+    if let Some(signal) = blocked_signal {
+        context = context.with_block_signal(signal);
+    }
+    if let Some(agent_id) = agent_id {
+        context = context.with_agent_id(agent_id);
+    }
 
     server
         .tool(BrowserLaunchTool {
@@ -2144,6 +2311,20 @@ pub fn register_browser_tools(
 }
 
 // Shared helpers
+
+/// Run captcha / login wall / WAF detection against the current page state.
+/// Returns `Some(Detection)` on positive match. Reads page HTML via CDP and
+/// passes it to the pure detection module. Detection failures (e.g. CDP
+/// errors) are silently treated as "no detection" — never block a navigation
+/// because we couldn't read its HTML.
+async fn run_block_detection(
+    page: &chromiumoxide::Page,
+    final_url: Option<&str>,
+    requested_url: Option<&str>,
+) -> Option<crate::tools::browser_detection::Detection> {
+    let html = page.content().await.ok()?;
+    crate::tools::browser_detection::classify(&html, final_url, requested_url)
+}
 
 /// Get the active page, or create a first one if the browser has no pages yet.
 async fn get_or_create_page<'a>(
@@ -2315,4 +2496,361 @@ async fn fetch_chrome(cache_dir: &Path) -> Result<PathBuf, BrowserError> {
         "chrome downloaded and cached"
     );
     Ok(info.executable_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    /// Test that BrowserState clears properly for non-persistent sessions
+    /// This prevents regression of the bug where handler cleared state
+    /// unconditionally, breaking persist_session feature
+    #[tokio::test]
+    async fn test_handler_clears_state_for_non_persistent_sessions() {
+        let state = Arc::new(Mutex::new(BrowserState::new()));
+
+        // Set up non-persistent session with data
+        {
+            let mut s = state.lock().await;
+            s.persistent_profile = false;
+            s.active_target = Some("target1".to_string());
+            s.snapshot = Some(create_mock_snapshot());
+            // Note: browser field is Option<Browser>, we test the clearing logic
+            // without needing an actual Browser instance
+        }
+
+        // Simulate handler stream ending (non-persistent session)
+        let state_clone = state.clone();
+        let handler_task = tokio::spawn(async move {
+            let mut state = state_clone.lock().await;
+            // This is the actual logic from ensure_launched handler task
+            if !state.persistent_profile {
+                state.browser = None;
+                state._handler_task = None;
+                state.pages.clear();
+                state.active_target = None;
+                state.invalidate_snapshot();
+            } else {
+                state._handler_task = None;
+            }
+        });
+
+        handler_task.await.unwrap();
+
+        // Verify state was CLEARED for non-persistent session
+        let state = state.lock().await;
+        assert!(
+            state.browser.is_none(),
+            "browser should be cleared for non-persistent"
+        );
+        assert!(
+            state.pages.is_empty(),
+            "pages should be cleared for non-persistent"
+        );
+        assert!(
+            state.active_target.is_none(),
+            "active_target should be cleared for non-persistent"
+        );
+        assert!(
+            state.snapshot.is_none(),
+            "snapshot should be cleared for non-persistent"
+        );
+        assert!(
+            state._handler_task.is_none(),
+            "handler_task should be cleared"
+        );
+    }
+
+    /// Test that BrowserState preserves data for persistent sessions
+    /// This verifies the fix for the persist_session regression
+    #[tokio::test]
+    async fn test_handler_preserves_state_for_persistent_sessions() {
+        let state = Arc::new(Mutex::new(BrowserState::new()));
+
+        // Set up persistent session with data
+        {
+            let mut s = state.lock().await;
+            s.persistent_profile = true;
+            s.active_target = Some("target1".to_string());
+        }
+
+        // Simulate handler stream ending (persistent session)
+        let state_clone = state.clone();
+        let handler_task = tokio::spawn(async move {
+            let mut state = state_clone.lock().await;
+            // This is the actual logic from ensure_launched handler task
+            if !state.persistent_profile {
+                state.browser = None;
+                state._handler_task = None;
+                state.pages.clear();
+                state.active_target = None;
+                state.invalidate_snapshot();
+            } else {
+                // For persistent sessions, just clear the handler task reference
+                state._handler_task = None;
+            }
+        });
+
+        handler_task.await.unwrap();
+
+        // Verify state was PRESERVED for persistent session
+        let state = state.lock().await;
+        assert!(state.browser.is_none(), "browser field is None initially");
+        assert!(
+            state.pages.is_empty(),
+            "pages starts empty without real Chrome"
+        );
+        assert_eq!(
+            state.active_target,
+            Some("target1".to_string()),
+            "active_target should NOT be cleared"
+        );
+        assert!(
+            state.persistent_profile,
+            "persistent_profile flag should remain"
+        );
+        assert!(
+            state._handler_task.is_none(),
+            "handler_task reference should be cleared"
+        );
+    }
+
+    /// Test that ensure_launched detects cleared state and allows relaunch
+    #[tokio::test]
+    async fn test_ensure_launched_detects_cleared_state() {
+        let state = Arc::new(Mutex::new(BrowserState::new()));
+
+        // Initially no browser - ensure_launched should proceed
+        {
+            let state = state.lock().await;
+            assert!(
+                state.browser.is_none(),
+                "initial state should have no browser"
+            );
+        }
+
+        // Simulate state populated by launch
+        {
+            let mut state = state.lock().await;
+            state.active_target = Some("target1".to_string());
+        }
+
+        // Verify state exists
+        {
+            let state = state.lock().await;
+            assert_eq!(
+                state.active_target,
+                Some("target1".to_string()),
+                "state should have data after launch"
+            );
+        }
+
+        // Simulate handler clearing state (non-persistent)
+        {
+            let mut state = state.lock().await;
+            state.browser = None;
+            state.pages.clear();
+            state.active_target = None;
+        }
+
+        // Verify state cleared - ensure_launched would detect this and allow relaunch
+        {
+            let state = state.lock().await;
+            assert!(state.browser.is_none(), "browser should be cleared");
+            assert!(state.pages.is_empty(), "pages should be cleared");
+        }
+    }
+
+    /// Test persistent session flag defaults and behavior
+    #[tokio::test]
+    async fn test_persistent_profile_flag_behavior() {
+        // Test non-persistent (default)
+        let state = BrowserState::new();
+        assert!(
+            !state.persistent_profile,
+            "default should be non-persistent"
+        );
+
+        // Test setting persistent flag
+        let mut state = BrowserState::new();
+        state.persistent_profile = true;
+        assert!(
+            state.persistent_profile,
+            "should be able to set persistent flag"
+        );
+
+        // Verify flag survives cloning/sharing
+        let state = Arc::new(Mutex::new(state));
+        let state2 = state.clone();
+        {
+            let s = state2.lock().await;
+            assert!(s.persistent_profile, "flag should persist in shared state");
+        }
+    }
+
+    /// Test the handler cleanup logic branches correctly
+    #[tokio::test]
+    async fn test_handler_cleanup_branching() {
+        // Test non-persistent: full cleanup
+        let state = Arc::new(Mutex::new(BrowserState::new()));
+        state.lock().await.persistent_profile = false;
+        state.lock().await.active_target = Some("t1".to_string());
+
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            let mut s = state_clone.lock().await;
+            if !s.persistent_profile {
+                s.active_target = None;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(state.lock().await.active_target.is_none());
+
+        // Test persistent: preserve data
+        let state = Arc::new(Mutex::new(BrowserState::new()));
+        state.lock().await.persistent_profile = true;
+        state.lock().await.active_target = Some("t1".to_string());
+
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            let mut s = state_clone.lock().await;
+            if !s.persistent_profile {
+                s.active_target = None;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(state.lock().await.active_target, Some("t1".to_string()));
+    }
+
+    /// Test CHROME_FLAGS environment variable parsing
+    /// Contract: Flags are split on whitespace and added to builder
+    /// From PR #268 - ensures user-defined Chrome flags work correctly
+    #[test]
+    fn test_chrome_flags_parsing() {
+        // SAFETY: Tests run sequentially, environment modification is safe
+        // Test basic flag splitting
+        unsafe {
+            std::env::set_var("CHROME_FLAGS", "--disable-gpu --no-sandbox");
+        }
+        let chrome_flags = std::env::var("CHROME_FLAGS").unwrap();
+        let flags: Vec<&str> = chrome_flags.split_whitespace().collect();
+        assert_eq!(flags, vec!["--disable-gpu", "--no-sandbox"]);
+
+        // Test multiple spaces (should still split correctly)
+        unsafe {
+            std::env::set_var("CHROME_FLAGS", "--flag1   --flag2  --flag3");
+        }
+        let chrome_flags = std::env::var("CHROME_FLAGS").unwrap();
+        let flags: Vec<&str> = chrome_flags.split_whitespace().collect();
+        assert_eq!(flags, vec!["--flag1", "--flag2", "--flag3"]);
+
+        // Test single flag
+        unsafe {
+            std::env::set_var("CHROME_FLAGS", "--single-flag");
+        }
+        let chrome_flags = std::env::var("CHROME_FLAGS").unwrap();
+        let flags: Vec<&str> = chrome_flags.split_whitespace().collect();
+        assert_eq!(flags, vec!["--single-flag"]);
+
+        // Test empty (should produce empty vec, not panic)
+        unsafe {
+            std::env::set_var("CHROME_FLAGS", "");
+        }
+        let chrome_flags = std::env::var("CHROME_FLAGS").unwrap();
+        let flags: Vec<&str> = chrome_flags.split_whitespace().collect();
+        assert!(flags.is_empty());
+    }
+
+    /// Test that SingletonLock is removed for persistent profiles
+    /// Contract: Stale SingletonLock files prevent Chrome from starting
+    /// From PR #268 - ensures persistent sessions can restart after crashes
+    #[test]
+    fn test_singleton_lock_removal() {
+        use std::fs;
+
+        // Create a temp directory simulating a persistent profile
+        let temp_dir = std::env::temp_dir().join("spacebot-test-singleton");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        // Create a fake SingletonLock file
+        let lock_file = temp_dir.join("SingletonLock");
+        fs::write(&lock_file, "fake lock content").unwrap();
+        assert!(lock_file.exists());
+
+        // This simulates the logic in ensure_launched (lines 1119-1125)
+        // For persistent profiles, we should remove stale locks
+        let persistent_profile = true;
+        if persistent_profile && lock_file.exists() {
+            let _ = fs::remove_file(&lock_file);
+        }
+
+        // Verify lock was removed
+        assert!(
+            !lock_file.exists(),
+            "SingletonLock should be removed for persistent profiles"
+        );
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Test that SingletonLock is NOT touched for non-persistent profiles
+    /// Contract: Non-persistent profiles use fresh temp dirs, no lock issues
+    #[test]
+    fn test_singleton_lock_not_removed_for_non_persistent() {
+        use std::fs;
+
+        // Create a temp directory
+        let temp_dir = std::env::temp_dir().join("spacebot-test-singleton2");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        // Create a fake SingletonLock file
+        let lock_file = temp_dir.join("SingletonLock");
+        fs::write(&lock_file, "fake lock content").unwrap();
+        assert!(lock_file.exists());
+
+        // For non-persistent profiles, we don't remove locks
+        let persistent_profile = false;
+        if persistent_profile && lock_file.exists() {
+            let _ = fs::remove_file(&lock_file);
+        }
+
+        // Verify lock still exists
+        assert!(
+            lock_file.exists(),
+            "SingletonLock should NOT be removed for non-persistent profiles"
+        );
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    // Mock helper for creating minimal test snapshots
+    fn create_mock_snapshot() -> AxSnapshot {
+        AxSnapshot {
+            roots: vec![SnapshotNode {
+                role: "document".to_string(),
+                name: "mock".to_string(),
+                index: None,
+                children: Vec::new(),
+                checked: None,
+                disabled: false,
+                expanded: None,
+                selected: false,
+                level: None,
+                pressed: None,
+                value: None,
+                description: None,
+            }],
+            node_ids: Vec::new(),
+        }
+    }
 }

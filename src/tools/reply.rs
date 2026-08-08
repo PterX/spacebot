@@ -1,7 +1,7 @@
 //! Reply tool for sending messages to users (channel only).
 
+use crate::api::ApiState;
 use crate::conversation::ConversationLogger;
-
 use crate::{ChannelId, OutboundResponse, RoutedSender};
 use regex::Regex;
 use rig::completion::ToolDefinition;
@@ -31,39 +31,59 @@ pub fn new_replied_flag() -> RepliedFlag {
     Arc::new(AtomicBool::new(false))
 }
 
+/// Target for reply delivery.
+#[derive(Debug, Clone)]
+pub enum ReplyTarget {
+    /// Live delivery via the messaging adapter.
+    Live(Box<RoutedSender>),
+}
+
 /// Tool for replying to users.
 ///
-/// Holds a sender channel rather than a specific InboundMessage. The channel
-/// process creates a response sender per conversation turn and the tool routes
-/// replies through it. This is compatible with Rig's ToolServer which registers
-/// tools once and shares them across calls.
-#[derive(Debug, Clone)]
+/// Holds a reply target which is either a live sender channel or a buffered
+/// accumulator for cron jobs. The channel process creates a response sender per
+/// conversation turn and the tool routes replies through it. This is compatible
+/// with Rig's ToolServer which registers tools once and shares them across calls.
+#[derive(Clone)]
 pub struct ReplyTool {
-    response_tx: RoutedSender,
+    target: ReplyTarget,
     conversation_id: String,
     conversation_logger: ConversationLogger,
     channel_id: ChannelId,
     replied_flag: RepliedFlag,
     agent_display_name: String,
+    api_state: Option<Arc<ApiState>>,
+}
+
+impl std::fmt::Debug for ReplyTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplyTool")
+            .field("conversation_id", &self.conversation_id)
+            .field("channel_id", &self.channel_id)
+            .field("agent_display_name", &self.agent_display_name)
+            .finish()
+    }
 }
 
 impl ReplyTool {
     /// Create a new reply tool bound to a conversation's response channel.
     pub fn new(
-        response_tx: RoutedSender,
+        target: ReplyTarget,
         conversation_id: impl Into<String>,
         conversation_logger: ConversationLogger,
         channel_id: ChannelId,
         replied_flag: RepliedFlag,
         agent_display_name: impl Into<String>,
+        api_state: Option<Arc<ApiState>>,
     ) -> Self {
         Self {
-            response_tx,
+            target,
             conversation_id: conversation_id.into(),
             conversation_logger,
             channel_id,
             replied_flag,
             agent_display_name: agent_display_name.into(),
+            api_state,
         }
     }
 }
@@ -285,7 +305,41 @@ impl Tool for ReplyTool {
                                     "required": ["name", "value"]
                                 }
                             },
-                            "footer": { "type": "string" }
+                            "footer": {
+                                "type": "object",
+                                "properties": {
+                                    "text": { "type": "string" },
+                                    "icon_url": { "type": "string", "format": "uri" }
+                                },
+                                "required": ["text"]
+                            },
+                            "thumbnail": {
+                                "type": "object",
+                                "description": "Small image in the top-right corner of the embed.",
+                                "properties": { "url": { "type": "string", "format": "uri" } },
+                                "required": ["url"]
+                            },
+                            "image": {
+                                "type": "object",
+                                "description": "Large image at the bottom of the embed.",
+                                "properties": { "url": { "type": "string", "format": "uri" } },
+                                "required": ["url"]
+                            },
+                            "author": {
+                                "type": "object",
+                                "description": "Author bar at the top of the embed.",
+                                "properties": {
+                                    "name": { "type": "string" },
+                                    "url": { "type": "string", "format": "uri" },
+                                    "icon_url": { "type": "string", "format": "uri" }
+                                },
+                                "required": ["name"]
+                            },
+                            "timestamp": {
+                                "type": "string",
+                                "format": "date-time",
+                                "description": "ISO 8601 timestamp (e.g. 2024-01-01T00:00:00Z) displayed in the footer area."
+                            }
                         }
                     }
                 },
@@ -437,26 +491,43 @@ impl Tool for ReplyTool {
             OutboundResponse::Text(converted_content.clone())
         };
 
-        self.response_tx
-            .send(response)
-            .await
-            .map_err(|e| ReplyError(format!("failed to send reply: {e}")))?;
+        // Branch on reply target: live delivery or buffered staging
+        match &self.target {
+            ReplyTarget::Live(sender) => {
+                sender
+                    .send(response)
+                    .await
+                    .map_err(|e| ReplyError(format!("failed to send reply: {e}")))?;
 
-        self.conversation_logger.log_bot_message_with_name(
-            &self.channel_id,
-            &converted_content,
-            Some(&self.agent_display_name),
-        );
+                // Drain accumulated channel tool calls and pack into message metadata.
+                let tool_calls_json = if let Some(ref api_state) = self.api_state {
+                    let calls = api_state.take_channel_tool_calls(&self.channel_id).await;
+                    if calls.is_empty() {
+                        None
+                    } else {
+                        serde_json::to_string(&calls).ok()
+                    }
+                } else {
+                    None
+                };
+                self.conversation_logger.log_bot_message_with_metadata(
+                    &self.channel_id,
+                    &converted_content,
+                    Some(&self.agent_display_name),
+                    tool_calls_json,
+                );
+
+                tracing::debug!(conversation_id = %self.conversation_id, "reply sent to outbound channel");
+            }
+        }
 
         // Mark the turn as handled so handle_agent_result skips the fallback send.
         self.replied_flag.store(true, Ordering::Relaxed);
 
-        tracing::debug!(conversation_id = %self.conversation_id, "reply sent to outbound channel");
-
         Ok(ReplyOutput {
             success: true,
             conversation_id: self.conversation_id.clone(),
-            content: converted_content,
+            content: "Message sent.".to_string(),
         })
     }
 }

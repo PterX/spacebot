@@ -1,5 +1,7 @@
 // -- TOML deserialization types --
 
+use super::types::ToolUseEnforcement;
+
 use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
 
@@ -27,6 +29,14 @@ pub(super) struct TomlConfig {
     pub(super) metrics: TomlMetricsConfig,
     #[serde(default)]
     pub(super) telemetry: TomlTelemetryConfig,
+    #[serde(default)]
+    pub(super) memory_janitor: TomlMemoryJanitorConfig,
+}
+
+#[derive(Deserialize, Default)]
+pub(super) struct TomlMemoryJanitorConfig {
+    pub(super) enabled: Option<bool>,
+    pub(super) interval_secs: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -152,6 +162,10 @@ pub(super) struct TomlProviderConfig {
     pub(super) base_url: String,
     pub(super) api_key: String,
     pub(super) name: Option<String>,
+    #[serde(default)]
+    pub(super) api_version: Option<String>,
+    #[serde(default)]
+    pub(super) deployment: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -278,12 +292,14 @@ pub(super) struct TomlDefaultsConfig {
     pub(super) max_turns: Option<usize>,
     pub(super) branch_max_turns: Option<usize>,
     pub(super) context_window: Option<usize>,
+    pub(super) tool_use_enforcement: Option<ToolUseEnforcement>,
     pub(super) compaction: Option<TomlCompactionConfig>,
     pub(super) memory_persistence: Option<TomlMemoryPersistenceConfig>,
     pub(super) coalesce: Option<TomlCoalesceConfig>,
     pub(super) ingestion: Option<TomlIngestionConfig>,
     pub(super) cortex: Option<TomlCortexConfig>,
     pub(super) warmup: Option<TomlWarmupConfig>,
+    pub(super) participant_context: Option<TomlParticipantContextConfig>,
     pub(super) browser: Option<TomlBrowserConfig>,
     pub(super) channel: Option<TomlChannelConfig>,
     #[serde(default)]
@@ -294,6 +310,14 @@ pub(super) struct TomlDefaultsConfig {
     pub(super) opencode: Option<TomlOpenCodeConfig>,
     pub(super) worker_log_mode: Option<String>,
     pub(super) projects: Option<TomlProjectsConfig>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct TomlParticipantContextConfig {
+    pub(super) enabled: Option<bool>,
+    pub(super) min_participants: Option<usize>,
+    pub(super) token_budget: Option<usize>,
+    pub(super) max_participants: Option<usize>,
 }
 
 #[derive(Deserialize, Default)]
@@ -346,8 +370,11 @@ pub(super) struct TomlCompactionConfig {
 
 #[derive(Deserialize)]
 pub(super) struct TomlCortexConfig {
+    pub(super) mode: Option<crate::config::CortexMode>,
     pub(super) tick_interval_secs: Option<u64>,
     pub(super) worker_timeout_secs: Option<u64>,
+    pub(super) worker_wall_clock_timeout_secs: Option<u64>,
+    pub(super) cron_default_timeout_secs: Option<u64>,
     pub(super) branch_timeout_secs: Option<u64>,
     pub(super) detached_worker_timeout_retry_limit: Option<u8>,
     pub(super) supervisor_kill_budget_per_tick: Option<usize>,
@@ -364,6 +391,8 @@ pub(super) struct TomlCortexConfig {
     pub(super) association_similarity_threshold: Option<f32>,
     pub(super) association_updates_threshold: Option<f32>,
     pub(super) association_max_per_pass: Option<usize>,
+    pub(super) knowledge_synthesis_max_words: Option<usize>,
+    pub(super) knowledge_synthesis_debounce_secs: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -388,6 +417,7 @@ pub(super) struct TomlBrowserConfig {
 #[derive(Deserialize)]
 pub(super) struct TomlChannelConfig {
     pub(super) listen_only_mode: Option<bool>,
+    pub(super) response_mode: Option<String>,
     pub(super) save_attachments: Option<bool>,
 }
 
@@ -454,6 +484,7 @@ pub(super) struct TomlAgentConfig {
     pub(super) max_turns: Option<usize>,
     pub(super) branch_max_turns: Option<usize>,
     pub(super) context_window: Option<usize>,
+    pub(super) tool_use_enforcement: Option<ToolUseEnforcement>,
     pub(super) compaction: Option<TomlCompactionConfig>,
     pub(super) memory_persistence: Option<TomlMemoryPersistenceConfig>,
     pub(super) coalesce: Option<TomlCoalesceConfig>,
@@ -501,6 +532,8 @@ pub(super) struct TomlMessagingConfig {
     pub(super) webhook: Option<TomlWebhookConfig>,
     pub(super) twitch: Option<TomlTwitchConfig>,
     pub(super) signal: Option<TomlSignalConfig>,
+    #[serde(default)]
+    pub(super) mattermost: Option<TomlMattermostConfig>,
 }
 
 #[derive(Deserialize)]
@@ -770,6 +803,16 @@ pub(super) fn default_email_max_attachment_bytes() -> usize {
     10 * 1024 * 1024
 }
 
+/// Conversation settings that can be set on a binding as defaults for matched channels.
+#[derive(Deserialize, Default)]
+pub(super) struct TomlConversationSettings {
+    pub(super) model: Option<String>,
+    pub(super) memory: Option<String>,
+    pub(super) delegation: Option<String>,
+    pub(super) response_mode: Option<String>,
+    pub(super) save_attachments: Option<bool>,
+}
+
 #[derive(Deserialize)]
 pub(super) struct TomlBinding {
     pub(super) agent_id: String,
@@ -780,9 +823,46 @@ pub(super) struct TomlBinding {
     pub(super) workspace_id: Option<String>,
     pub(super) chat_id: Option<String>,
     #[serde(default)]
+    pub(super) team_id: Option<String>,
+    #[serde(default)]
     pub(super) channel_ids: Vec<String>,
     #[serde(default)]
     pub(super) require_mention: bool,
     #[serde(default)]
     pub(super) dm_allowed_users: Vec<String>,
+    #[serde(default)]
+    pub(super) settings: Option<TomlConversationSettings>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct TomlMattermostConfig {
+    #[serde(default)]
+    pub(super) enabled: bool,
+    pub(super) base_url: Option<String>,
+    pub(super) token: Option<String>,
+    pub(super) team_id: Option<String>,
+    #[serde(default)]
+    pub(super) instances: Vec<TomlMattermostInstanceConfig>,
+    #[serde(default)]
+    pub(super) dm_allowed_users: Vec<String>,
+    #[serde(default = "default_mattermost_max_attachment_bytes")]
+    pub(super) max_attachment_bytes: usize,
+}
+
+#[derive(Deserialize)]
+pub(super) struct TomlMattermostInstanceConfig {
+    pub(super) name: String,
+    #[serde(default)]
+    pub(super) enabled: bool,
+    pub(super) base_url: Option<String>,
+    pub(super) token: Option<String>,
+    pub(super) team_id: Option<String>,
+    #[serde(default)]
+    pub(super) dm_allowed_users: Vec<String>,
+    #[serde(default = "default_mattermost_max_attachment_bytes")]
+    pub(super) max_attachment_bytes: usize,
+}
+
+pub(super) fn default_mattermost_max_attachment_bytes() -> usize {
+    10 * 1024 * 1024
 }

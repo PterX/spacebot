@@ -88,7 +88,10 @@ async fn bootstrap_deps() -> anyhow::Result<spacebot::AgentDeps> {
         skills,
     ));
 
-    let (event_tx, memory_event_tx) = spacebot::create_process_event_buses_with_capacity(16, 32);
+    let process_event_buses = spacebot::create_process_event_buses_with_capacity(16, 32, 1024);
+    let event_tx = process_event_buses.control;
+    let memory_event_tx = process_event_buses.memory;
+    let tool_output_tx = process_event_buses.tool_output;
 
     let agent_id: spacebot::AgentId = Arc::from(agent_config.id.as_str());
     let mcp_manager = Arc::new(spacebot::mcp::McpManager::new(agent_config.mcp.clone()));
@@ -102,6 +105,7 @@ async fn bootstrap_deps() -> anyhow::Result<spacebot::AgentDeps> {
             agent_config.workspace.clone(),
             &config.instance_dir,
             agent_config.data_dir.clone(),
+            agent_id.clone(),
         )
         .await,
     );
@@ -117,19 +121,24 @@ async fn bootstrap_deps() -> anyhow::Result<spacebot::AgentDeps> {
         runtime_config,
         event_tx,
         memory_event_tx,
+        tool_output_tx,
         sqlite_pool: db.sqlite.clone(),
         messaging_manager: None,
         sandbox,
         links: Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
         agent_names: Arc::new(std::collections::HashMap::new()),
         humans: Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
-        task_store_registry: Arc::new(arc_swap::ArcSwap::from_pointee(
-            std::collections::HashMap::new(),
-        )),
         process_control_registry: Arc::new(
             spacebot::agent::process_control::ProcessControlRegistry::new(),
         ),
         injection_tx: tokio::sync::mpsc::channel(1).0,
+        working_memory: spacebot::memory::WorkingMemoryStore::new(
+            db.sqlite.clone(),
+            chrono_tz::Tz::UTC,
+        ),
+        api_state: None,
+        wiki_store: None,
+        wake_tx: None,
     })
 }
 
