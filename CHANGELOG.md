@@ -2,6 +2,133 @@
 
 Seeded from GitHub releases; maintained by the release bump workflow.
 
+## v0.5.0
+
+### Release Story
+
+v0.5.0 is the SpaceUI release. The entire frontend has been migrated to Spacedrive's component library — the local UI primitives are gone, replaced by `@spacedrive/primitives`, `@spacedrive/ai`, `@spacedrive/forms`, and `@spacedrive/explorer`, with Tailwind v4 and a unified design token system. This isn't a component swap; the interface has been rebuilt from the ground up.
+
+The old flat nav becomes a persistent 220px sidebar with an accordion agent sub-nav and a global workers popover in the footer. A new Dashboard lands as the home page, wired to live action items, token usage, and recent activity. The 2900-line Settings monolith was split into 12 section components; AgentConfig and TopologyGraph got the same treatment. Workbench was rewritten. The kanban TaskBoard is gone, replaced by a Linear-style task list with detail views, GitHub metadata badges, and SSE-driven updates. WebChat is now Portal — modular PortalPanel/Timeline/Composer/Header with file attachments, drag-and-drop, and tool calls rendered inline in the timeline.
+
+Three new systems ship alongside the UI rewrite. **Wiki** is a full SQLite-backed knowledge base with 6 tools (create/edit/read/list/search/history), tolerant multi-pass edit matching, and a REST API. **Notifications** are SQLite-stored with SSE real-time broadcasting, optimistic dismiss, and automatic emission for task approvals and worker failures. **Streaming** arrives via `prompt_once_streaming` with token-by-token `WorkerText` deltas and ~636 lines of OpenAI Responses API SSE handling for function call deltas, text deltas, and reasoning summaries.
+
+Backend keeps pace. `ConversationSettings` (memory mode, delegation, worker context, model selection) persist per-channel via `ChannelSettingsStore` with a clean resolution chain: per-channel DB > binding defaults > agent defaults. The legacy `listen_only_mode` system is gone, replaced by a `ResponseMode` enum (Active / Observe / MentionOnly). Direct mode gives channels full worker-level tools — shell, file, browser, wiki, web search, memory. Working memory has been hardened: participant context, expanded conversational event semantics, non-blocking cortex synthesis, dirty-state guards, and participant role preservation in knowledge synthesis. Agentic backend readiness adds per-agent secret isolation, structured `WorkerOutcome` with wall-clock timeouts, per-agent cron defaults, dormant cortex mode, and browser captcha / login-wall / WAF detection.
+
+Highlights:
+- Full SpaceUI migration (Tailwind v4, design tokens, primitives library)
+- New Dashboard with live action items, token usage, and activity cards
+- Linear-style task management replacing the kanban board
+- Wiki system with 6 tools and tolerant edit matching
+- Notification system with SSE real-time and optimistic dismiss
+- Portal (formerly WebChat) with file attachments and drag-and-drop
+- Token-by-token streaming via OpenAI Responses API SSE
+- Per-channel `ConversationSettings` with `ResponseMode` enum
+- Direct mode: channels with full worker-level tools
+- Built-in skills compiled into the binary
+- Projects elevated from per-agent to instance level
+- Working memory: participant context, non-blocking synthesis, role preservation
+- Per-agent secret isolation, dormant cortex, structured worker outcomes
+- Interactive shell streaming with live output
+
+## What's Changed
+* fix: MentionOnly mode retains channel context and memory capture by @jamiepine in https://github.com/spacedriveapp/spacebot/pull/533
+* SpaceUI migration by @jamiepine in https://github.com/spacedriveapp/spacebot/pull/555
+* feat(memory): add participant context foundation by @vsumner in https://github.com/spacedriveapp/spacebot/pull/521
+* fix(memory): tighten persistence rules and add conversational events by @vsumner in https://github.com/spacedriveapp/spacebot/pull/522
+* fix(memory): make cortex synthesis non-blocking by @vsumner in https://github.com/spacedriveapp/spacebot/pull/570
+* feat(memory): expand working-memory event semantics by @vsumner in https://github.com/spacedriveapp/spacebot/pull/567
+* feat: Interactive shell streaming with live output by @vsumner in https://github.com/spacedriveapp/spacebot/pull/562
+* [codex] Preserve participant roles in knowledge synthesis by @vsumner in https://github.com/spacedriveapp/spacebot/pull/574
+* [codex] Guard dirty knowledge synthesis by @vsumner in https://github.com/spacedriveapp/spacebot/pull/573
+* agentic-backend-readiness: per-agent secret isolation, dormant cortex, structured worker outcomes by @jamiepine in https://github.com/spacedriveapp/spacebot/pull/583
+
+
+**Full Changelog**: https://github.com/spacedriveapp/spacebot/compare/v0.4.1...v0.5.0
+## v0.4.1
+
+### Release Story
+
+A hotfix release that repairs frontend-to-backend route mismatches introduced during the v0.4.0 OpenAPI migration. Multiple UI features — ChatGPT OAuth sign-in, the raw config editor, prompt inspector, process cancellation, update checks, and groups/humans management — were silently broken by stale URL paths in the API client.
+
+All frontend API routes in `client.ts` have been audited against the backend's utoipa route annotations and corrected. The prompt inspector modal has also been widened to 80% viewport width for better readability.
+
+- **12 route fixes** across OAuth, config, channels, updates, and links endpoints
+- **Prompt inspector** modal now uses 80% viewport width
+- Community contribution: ingest file upload route fix
+
+## What's Changed
+* Fix API route mismatches from OpenAPI migration by @jamiepine in https://github.com/spacedriveapp/spacebot/pull/531
+* fix: correct ingest file upload endpoint URL by @tomasmach in https://github.com/spacedriveapp/spacebot/pull/530
+* Fix remaining API route mismatches from OpenAPI migration by @jamiepine in https://github.com/spacedriveapp/spacebot/pull/532
+
+
+**Full Changelog**: https://github.com/spacedriveapp/spacebot/compare/v0.4.0...v0.4.1
+## v0.4.0
+
+### Release Story
+
+v0.4.0 is the platform and intelligence release. Spacebot gains two new LLM providers, a new messaging adapter, a rewritten portal system with per-conversation settings, and the first layers of working memory — giving agents temporal awareness and participant context across long-running sessions.
+
+Azure OpenAI Service joins as a first-class provider with full Settings UI, deployment-based routing, and endpoint validation. Mattermost arrives as the fifth messaging adapter alongside Discord, Slack, Telegram, and Signal — with Signal also gaining web UI configuration. The API layer has been migrated to OpenAPI with auto-generated TypeScript types, replacing hand-maintained client code and enabling the new `@spacebot/api-client` package.
+
+The biggest architectural shift is working memory. Channels now maintain temporal state — tracking conversation events, participant activity, and decision history across turns. The cron scheduler has been hardened with persistent state, delivery outcome tracking, and proper channel scoping that prevents output leakage between agents. Tool-use enforcement teaches GPT and Gemini models to execute tools instead of narrating them, configurable per-agent or globally.
+
+Highlights:
+- Azure OpenAI provider with full UI configuration and deployment routing
+- Mattermost messaging adapter
+- Portal system with per-conversation settings and streaming
+- Working memory system with temporal awareness for channels
+- OpenAPI migration with generated TypeScript types
+- Tool-use enforcement for non-native tool-calling models
+- Security fix: active channels scoped by (agent_id, conversation_id) to prevent cron output leakage
+- Cron scheduler hardened with persistent state and delivery tracking
+- Global task database (instance-level scope)
+- Worker orchestration screen in the interface
+- Desktop app improvements (sidecar, connection screen, 3D orb)
+- slack-morphism upgraded to 2.19 (fixes intermittent send failures)
+
+## What's Changed
+* fix: add missing libxkbcommon0 to Docker runtime deps by @l33t0 in https://github.com/spacedriveapp/spacebot/pull/426
+* feat: desktop app sidecar, connection screen, and 3D orb by @jamiepine in https://github.com/spacedriveapp/spacebot/pull/452
+* feat: working memory system — temporal awareness for channels by @jamiepine in https://github.com/spacedriveapp/spacebot/pull/454
+* fix: keep setup mode usable when provider credentials are unavailable by @jamiepine in https://github.com/spacedriveapp/spacebot/pull/422
+* feat: worker orchestration screen by @jamiepine in https://github.com/spacedriveapp/spacebot/pull/457
+* fix: add provider prefix to zai-coding-plan default model by @tomasmach in https://github.com/spacedriveapp/spacebot/pull/456
+* fix: skill install 500 error and chart dimension warnings by @vsumner in https://github.com/spacedriveapp/spacebot/pull/447
+* feat: Add Mattermost channel support by @unverbraucht in https://github.com/spacedriveapp/spacebot/pull/428
+* fix: graceful browser shutdown and network error retries by @vsumner in https://github.com/spacedriveapp/spacebot/pull/463
+* fix: preserve nested task metadata updates by @jamiepine in https://github.com/spacedriveapp/spacebot/pull/462
+* Fix imap-proto build issues and update Nix dependencies by @vsumner in https://github.com/spacedriveapp/spacebot/pull/465
+* feat(deps): upgrade rig-core to v0.33 by @vsumner in https://github.com/spacedriveapp/spacebot/pull/480
+* fix(embed): use Array.isArray guard for agent data in OpenCode embed by @eibrahimov in https://github.com/spacedriveapp/spacebot/pull/482
+* fix: worker cancellation sets status to 'cancelled' instead of 'failed' by @l33t0 in https://github.com/spacedriveapp/spacebot/pull/399
+* fix: skip unresolvable channel bindings instead of crashing on startup by @l33t0 in https://github.com/spacedriveapp/spacebot/pull/412
+* fix(card): handle Card footer deserialization errors by @vsumner in https://github.com/spacedriveapp/spacebot/pull/479
+* feat(messaging): add signal configuration to web app by @ibhagwan in https://github.com/spacedriveapp/spacebot/pull/392
+* fix: add libxfixes3 to Docker runtime dependencies by @frizikk in https://github.com/spacedriveapp/spacebot/pull/427
+* fix: prevent unwanted scrollbars in Windows/Tauri desktop app by @TheDarkSkyXD in https://github.com/spacedriveapp/spacebot/pull/471
+* fix: prevent chat page layout shift hiding top navbar on Windows by @TheDarkSkyXD in https://github.com/spacedriveapp/spacebot/pull/473
+* fix: skip listen-only mode filtering for DMs in Slack by @ciaranashton in https://github.com/spacedriveapp/spacebot/pull/484
+* feat: elevate task system to instance-level global scope by @jamiepine in https://github.com/spacedriveapp/spacebot/pull/468
+* feat(card): add thumbnail, image, author, timestamp, footer icon_url by @vsumner in https://github.com/spacedriveapp/spacebot/pull/467
+* feat: OpenAPI Migration with Generated TypeScript Types by @jamiepine in https://github.com/spacedriveapp/spacebot/pull/486
+* feat: portal system, streaming, conversation & channel settings by @jamiepine in https://github.com/spacedriveapp/spacebot/pull/506
+* Add persisted webchat conversations and extract initial API client package by @jamiepine in https://github.com/spacedriveapp/spacebot/pull/487
+* fix(cron): persist scheduler state and delivery outcomes by @vsumner in https://github.com/spacedriveapp/spacebot/pull/509
+* feat: add complete Azure OpenAI provider support by @aspotton in https://github.com/spacedriveapp/spacebot/pull/523
+* fix: scope active channels by (agent_id, conversation_id) to prevent cron output leakage by @jamiepine in https://github.com/spacedriveapp/spacebot/pull/526
+* feat: add configurable tool-use enforcement by @jamiepine in https://github.com/spacedriveapp/spacebot/pull/505
+* Upgrade slack-morphism to 2.19 by @chandima in https://github.com/spacedriveapp/spacebot/pull/516
+
+## New Contributors
+* @unverbraucht made their first contribution in https://github.com/spacedriveapp/spacebot/pull/428
+* @eibrahimov made their first contribution in https://github.com/spacedriveapp/spacebot/pull/482
+* @frizikk made their first contribution in https://github.com/spacedriveapp/spacebot/pull/427
+* @TheDarkSkyXD made their first contribution in https://github.com/spacedriveapp/spacebot/pull/471
+* @aspotton made their first contribution in https://github.com/spacedriveapp/spacebot/pull/523
+* @chandima made their first contribution in https://github.com/spacedriveapp/spacebot/pull/516
+
+**Full Changelog**: https://github.com/spacedriveapp/spacebot/compare/v0.3.3...v0.4.0
 ## v0.3.3
 
 ### Release Story
