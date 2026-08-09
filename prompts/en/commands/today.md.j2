@@ -1,0 +1,7 @@
+use channel tools to build a local tasks snapshot and reply exactly in this format:
+- first line: today (local tasks snapshot):
+- section 1: in-progress tasks (up to 5), each line:   #<task_number> [<priority>] <title>
+- section 2: up next ready tasks (up to 5), each line:   #<task_number> [<priority>] <title>
+if a section is empty use:
+- in progress: none
+- up next (ready): none
