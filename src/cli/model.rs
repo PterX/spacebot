@@ -13,7 +13,7 @@ pub enum ModelCommand {
         #[arg(short, long)]
         provider: Option<String>,
         /// Filter by capability (input_audio, voice_transcription)
-        #[arg(short, long)]
+        #[arg(long)]
         capability: Option<String>,
     },
     /// Clear the model catalog cache and refetch it

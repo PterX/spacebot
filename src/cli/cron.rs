@@ -25,7 +25,7 @@ pub enum CronCommand {
         #[arg(short, long)]
         target: String,
         /// 5-field cron expression (takes precedence over --interval)
-        #[arg(short, long)]
+        #[arg(long)]
         cron: Option<String>,
         /// Interval between runs in seconds (default 3600)
         #[arg(short, long)]
@@ -78,7 +78,7 @@ pub enum CronCommand {
         /// Agent ID
         agent: String,
         /// Filter by cron job ID
-        #[arg(short, long)]
+        #[arg(long)]
         cron_id: Option<String>,
         /// Maximum number of executions to return
         #[arg(short, long, default_value_t = 50)]

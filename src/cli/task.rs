@@ -47,7 +47,7 @@ pub enum TaskCommand {
         #[arg(short, long)]
         assigned: Option<String>,
         /// Task description
-        #[arg(short, long)]
+        #[arg(long)]
         description: Option<String>,
         /// Priority (critical, high, medium, low)
         #[arg(short, long)]
@@ -67,7 +67,7 @@ pub enum TaskCommand {
         #[arg(long)]
         title: Option<String>,
         /// New description
-        #[arg(short, long)]
+        #[arg(long)]
         description: Option<String>,
         /// New status (pending_approval, backlog, ready, in_progress, done)
         #[arg(short, long)]
