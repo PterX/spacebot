@@ -461,6 +461,7 @@ pub async fn add_channel_tools(
     cron_outcome: Option<crate::cron::CronOutcome>,
 ) -> Result<(), rig::tool::server::ToolServerError> {
     let conversation_id = conversation_id.into();
+    let channel_kind = state.kind;
 
     if allow_direct_reply {
         let agent_display_name = state
@@ -555,7 +556,9 @@ pub async fn add_channel_tools(
         agent_msg = agent_msg.with_skip_flag(skip_flag.clone());
         handle.add_tool(agent_msg).await?;
     }
-    if let Some(outcome) = cron_outcome {
+    if channel_kind == crate::agent::channel::ChannelKind::Cron
+        && let Some(outcome) = cron_outcome
+    {
         handle
             .add_tool(SetOutcomeTool::new(outcome, conversation_id.clone()))
             .await?;

@@ -1128,6 +1128,7 @@ async fn run(
 
                     let (mut channel, channel_tx) = spacebot::agent::channel::Channel::new(
                         channel_id,
+                        spacebot::agent::channel::ChannelKind::User,
                         agent.deps.clone(),
                         response_tx,
                         event_rx,
@@ -1416,6 +1417,7 @@ async fn run(
 
                     let (mut channel, channel_tx) = spacebot::agent::channel::Channel::new(
                         channel_id,
+                        spacebot::agent::channel::ChannelKind::User,
                         agent.deps.clone(),
                         response_tx,
                         event_rx,

@@ -312,6 +312,39 @@ struct AgentTurnResult {
     reply_text: Option<String>,
 }
 
+/// What kind of conversation a channel is serving.
+///
+/// Channels behave differently depending on who is on the other end: user
+/// channels are driven by incoming messages, while cron and autonomy channels
+/// are system-initiated runs that do their work and exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelKind {
+    User,
+    Cron,
+    Autonomy,
+}
+
+impl ChannelKind {
+    /// System-initiated channels receive no further user messages after the
+    /// initial prompt, so the event loop exits once all work settles.
+    pub fn self_exits(&self) -> bool {
+        matches!(self, ChannelKind::Cron | ChannelKind::Autonomy)
+    }
+
+    /// System-initiated runs repeat the same procedure on a schedule and
+    /// would grind out noise skills, so they never trigger skill reflection.
+    pub fn suppresses_reflection(&self) -> bool {
+        matches!(self, ChannelKind::Cron | ChannelKind::Autonomy)
+    }
+
+    /// System-initiated channels have no user to send a reset message, so the
+    /// retrigger cap would permanently stall multi-worker jobs. The job
+    /// timeout is the natural bound instead.
+    pub fn caps_retriggers(&self) -> bool {
+        matches!(self, ChannelKind::User)
+    }
+}
+
 /// Shared state that channel tools need to act on the channel.
 ///
 /// Wrapped in Arc and passed to tools (branch, spawn_worker, route, cancel)
@@ -319,6 +352,7 @@ struct AgentTurnResult {
 #[derive(Clone)]
 pub struct ChannelState {
     pub channel_id: ChannelId,
+    pub kind: ChannelKind,
     pub history: Arc<RwLock<Vec<rig::message::Message>>>,
     pub active_branches: Arc<RwLock<HashMap<BranchId, tokio::task::JoinHandle<()>>>>,
     pub active_workers: Arc<RwLock<HashMap<WorkerId, Worker>>>,
@@ -802,6 +836,7 @@ impl Channel {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: ChannelId,
+        kind: ChannelKind,
         deps: AgentDeps,
         response_tx: mpsc::Sender<RoutedResponse>,
         event_rx: broadcast::Receiver<ProcessEvent>,
@@ -841,6 +876,7 @@ impl Channel {
 
         let state = ChannelState {
             channel_id: id.clone(),
+            kind,
             history: history.clone(),
             active_branches: active_branches.clone(),
             active_workers: active_workers.clone(),
@@ -1271,19 +1307,19 @@ impl Channel {
         let mut last_lag_warning: Option<std::time::Instant> = None;
 
         loop {
-            // Cron channels have no further user messages after the initial prompt.
-            // Once all workers/branches finish and no retrigger is pending, exit so
-            // the scheduler can flush the reply buffer. Without this the channel
-            // would wait on the broadcast event_rx (which never closes) until the
-            // job timeout kills it.
-            if self.state.cron_outcome.is_some()
+            // Self-exiting channels (cron, autonomy) have no further user messages
+            // after the initial prompt. Once all workers/branches finish and no
+            // retrigger is pending, exit so the caller can flush the reply buffer.
+            // Without this the channel would wait on the broadcast event_rx (which
+            // never closes) until the job timeout kills it.
+            if self.state.kind.self_exits()
                 && self.message_count > 0
                 && !self.pending_retrigger
                 && self.retrigger_deadline.is_none()
                 && self.state.worker_handles.read().await.is_empty()
                 && self.state.active_branches.read().await.is_empty()
             {
-                tracing::info!(channel_id = %self.id, "cron channel finished all work, exiting");
+                tracing::info!(channel_id = %self.id, "self-exiting channel finished all work, exiting");
                 break;
             }
 
@@ -1897,11 +1933,11 @@ impl Channel {
 
         let org_context = self.build_org_context(&prompt_engine);
 
-        let adapter_prompt = if self.state.cron_outcome.is_some() {
-            prompt_engine.render_channel_adapter_prompt("cron")
-        } else {
-            self.current_adapter()
-                .and_then(|adapter| prompt_engine.render_channel_adapter_prompt(adapter))
+        let adapter_prompt = match self.state.kind {
+            ChannelKind::Cron => prompt_engine.render_channel_adapter_prompt("cron"),
+            ChannelKind::User | ChannelKind::Autonomy => self
+                .current_adapter()
+                .and_then(|adapter| prompt_engine.render_channel_adapter_prompt(adapter)),
         };
 
         let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
@@ -2644,11 +2680,11 @@ impl Channel {
 
         let org_context = self.build_org_context(&prompt_engine);
 
-        let adapter_prompt = if self.state.cron_outcome.is_some() {
-            prompt_engine.render_channel_adapter_prompt("cron")
-        } else {
-            self.current_adapter()
-                .and_then(|adapter| prompt_engine.render_channel_adapter_prompt(adapter))
+        let adapter_prompt = match self.state.kind {
+            ChannelKind::Cron => prompt_engine.render_channel_adapter_prompt("cron"),
+            ChannelKind::User | ChannelKind::Autonomy => self
+                .current_adapter()
+                .and_then(|adapter| prompt_engine.render_channel_adapter_prompt(adapter)),
         };
 
         let project_context = self.build_project_context(&prompt_engine).await;
@@ -3490,9 +3526,7 @@ impl Channel {
         // Multiple branch/worker completions within the debounce window are
         // coalesced into a single retrigger to prevent message spam.
         if should_retrigger {
-            // Cron channels have no user to send a reset message, so the cap would
-            // permanently stall multi-worker jobs. The job timeout is the natural bound.
-            let cap_applies = self.state.cron_outcome.is_none();
+            let cap_applies = self.state.kind.caps_retriggers();
             if cap_applies && self.retrigger_count >= MAX_RETRIGGERS_PER_TURN {
                 tracing::warn!(
                     channel_id = %self.id,
@@ -3716,10 +3750,10 @@ impl Channel {
     /// Note that this conversation just did substantial work. The next
     /// persistence pass will also reflect on skills, cooldown permitting.
     ///
-    /// Cron conversations never reflect: scheduled runs repeat the same
-    /// procedure on a timer and would grind out noise skills.
+    /// System-initiated conversations (cron, autonomy) never reflect: they
+    /// repeat the same procedure on a schedule and would grind out noise skills.
     fn mark_reflection_signal(&self, source: &'static str) {
-        if self.id.starts_with("cron") {
+        if self.state.kind.suppresses_reflection() {
             return;
         }
         let was_set = self

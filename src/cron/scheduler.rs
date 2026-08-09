@@ -1329,6 +1329,7 @@ async fn run_cron_job(
 
     let (channel, channel_tx) = Channel::new(
         channel_id.clone(),
+        crate::agent::channel::ChannelKind::Cron,
         context.deps.clone(),
         response_tx,
         event_rx,
