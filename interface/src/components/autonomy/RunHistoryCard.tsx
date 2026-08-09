@@ -7,9 +7,24 @@ import {
 	PlusCircle,
 	Play,
 	MoonStars,
+	Clock,
+	Globe,
+	Lightning,
+	Gauge,
 } from "@phosphor-icons/react";
 import {Card, CardHeader, CardContent} from "@spacedrive/primitives";
-import {mockAutonomyApi, type AutonomyRunAction} from "./mock";
+import {
+	mockAutonomyApi,
+	type AutonomyRunAction,
+	type WakeTriggerKind,
+} from "./mock";
+
+const WAKE_ICON: Record<WakeTriggerKind, React.ElementType> = {
+	schedule: Clock,
+	webhook: Globe,
+	event: Lightning,
+	condition: Gauge,
+};
 
 const ACTION_CONFIG: Record<
 	AutonomyRunAction["kind"],
@@ -92,13 +107,28 @@ export function RunHistoryCard() {
 												<CaretRight className="size-3.5" weight="bold" />
 											)}
 										</span>
-										<p
-											className={`min-w-0 flex-1 truncate text-sm ${
-												idle ? "text-ink-faint" : "text-ink-dull"
-											}`}
-										>
-											{run.summary}
-										</p>
+										<span className="flex min-w-0 flex-1 items-center gap-2">
+											<p
+												className={`min-w-0 truncate text-sm ${
+													idle ? "text-ink-faint" : "text-ink-dull"
+												}`}
+											>
+												{run.summary}
+											</p>
+											{run.woken_by.map((w, i) => {
+												const WakeIcon = WAKE_ICON[w.kind];
+												return (
+													<span
+														key={i}
+														className="flex max-w-56 shrink-0 items-center gap-1 rounded-full bg-app-line/40 px-2 py-0.5 text-tiny text-ink-faint"
+														title={w.label}
+													>
+														<WakeIcon className="size-3 shrink-0" />
+														<span className="truncate">{w.label}</span>
+													</span>
+												);
+											})}
+										</span>
 										<span className="shrink-0 text-tiny tabular-nums text-ink-faint">
 											{formatDuration(run.duration_secs)}
 										</span>

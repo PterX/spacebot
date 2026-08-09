@@ -25,12 +25,32 @@ export interface AutonomyRunAction {
 	detail: string;
 }
 
+export type WakeTriggerKind = "schedule" | "webhook" | "event" | "condition";
+
+export interface WokenBy {
+	kind: WakeTriggerKind;
+	label: string;
+}
+
 export interface AutonomyRunSummary {
 	id: string;
 	started_at: string;
 	duration_secs: number;
 	summary: string;
+	woken_by: WokenBy[];
 	actions: AutonomyRunAction[];
+}
+
+export interface WakeDef {
+	id: string;
+	name: string;
+	trigger_kind: WakeTriggerKind;
+	trigger_label: string;
+	instructions: string;
+	min_level: Exclude<AutonomyLevel, "off">;
+	builtin: boolean;
+	enabled: boolean;
+	last_fired_at: string | null;
 }
 
 export interface PendingBrief {
@@ -77,6 +97,10 @@ const runs: AutonomyRunSummary[] = [
 		started_at: minutesAgo(23),
 		duration_secs: 372,
 		summary: "Enriched 2 tasks, proposed 1 new task",
+		woken_by: [
+			{kind: "schedule", label: "Idle survey"},
+			{kind: "event", label: "Comment on: Fix Telegram adapter reconnect loop"},
+		],
 		actions: [
 			{
 				kind: "enriched",
@@ -101,6 +125,7 @@ const runs: AutonomyRunSummary[] = [
 		started_at: minutesAgo(53),
 		duration_secs: 124,
 		summary: "Nothing needed attention",
+		woken_by: [{kind: "schedule", label: "Idle survey"}],
 		actions: [],
 	},
 	{
@@ -108,6 +133,9 @@ const runs: AutonomyRunSummary[] = [
 		started_at: minutesAgo(83),
 		duration_secs: 527,
 		summary: "Executed 1 approved task, proposed 1 new task",
+		woken_by: [
+			{kind: "event", label: "Approved: Rotate expiring webhook secrets"},
+		],
 		actions: [
 			{
 				kind: "executed",
@@ -126,6 +154,7 @@ const runs: AutonomyRunSummary[] = [
 		started_at: minutesAgo(113),
 		duration_secs: 240,
 		summary: "Enriched 1 task",
+		woken_by: [{kind: "condition", label: "Quiet hours (2h idle)"}],
 		actions: [
 			{
 				kind: "enriched",
@@ -139,7 +168,69 @@ const runs: AutonomyRunSummary[] = [
 		started_at: minutesAgo(143),
 		duration_secs: 98,
 		summary: "Nothing to do",
+		woken_by: [{kind: "schedule", label: "Idle survey"}],
 		actions: [],
+	},
+];
+
+const wakes: WakeDef[] = [
+	{
+		id: "wake-1",
+		name: "Idle survey",
+		trigger_kind: "schedule",
+		trigger_label: "every 30m",
+		instructions:
+			"Survey task state, enrich pending proposals, execute approved work.",
+		min_level: "observe",
+		builtin: true,
+		enabled: true,
+		last_fired_at: minutesAgo(23),
+	},
+	{
+		id: "wake-2",
+		name: "Task approved",
+		trigger_kind: "event",
+		trigger_label: "on approval",
+		instructions: "Start approved work immediately instead of waiting for the next survey.",
+		min_level: "act",
+		builtin: true,
+		enabled: true,
+		last_fired_at: minutesAgo(83),
+	},
+	{
+		id: "wake-3",
+		name: "Morning brief",
+		trigger_kind: "schedule",
+		trigger_label: "daily at 8:00",
+		instructions:
+			"Summarize overnight activity and what needs my attention today. Deliver to my DM.",
+		min_level: "observe",
+		builtin: false,
+		enabled: true,
+		last_fired_at: minutesAgo(457),
+	},
+	{
+		id: "wake-4",
+		name: "CI failed on main",
+		trigger_kind: "webhook",
+		trigger_label: "POST /hooks/ci",
+		instructions:
+			"Investigate the failing job in the payload and propose a fix task with findings.",
+		min_level: "suggest",
+		builtin: false,
+		enabled: true,
+		last_fired_at: minutesAgo(2880),
+	},
+	{
+		id: "wake-5",
+		name: "Quiet-hours enrichment",
+		trigger_kind: "condition",
+		trigger_label: "no activity for 2h",
+		instructions: "The humans are away. Use the time to research pending proposals.",
+		min_level: "suggest",
+		builtin: false,
+		enabled: false,
+		last_fired_at: minutesAgo(113),
 	},
 ];
 
@@ -211,4 +302,5 @@ export const mockAutonomyApi = {
 	runs: (): Promise<{runs: AutonomyRunSummary[]}> => Promise.resolve({runs}),
 	pending: (): Promise<{tasks: PendingBrief[]}> => Promise.resolve({tasks: pending}),
 	goals: (): Promise<{goals: AutonomyGoal[]}> => Promise.resolve({goals}),
+	wakes: (): Promise<{wakes: WakeDef[]}> => Promise.resolve({wakes}),
 };

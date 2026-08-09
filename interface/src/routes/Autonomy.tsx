@@ -2,6 +2,7 @@ import {useState} from "react";
 import {useQuery} from "@tanstack/react-query";
 import {
 	AutonomyDialCard,
+	WakesCard,
 	ApprovalQueueCard,
 	GoalsCard,
 	RunHistoryCard,
@@ -33,6 +34,10 @@ export function Autonomy() {
 							<ApprovalQueueCard />
 						</div>
 						<GoalsCard />
+					</div>
+
+					<div className="mt-5">
+						<WakesCard />
 					</div>
 
 					<div className="mt-5">
