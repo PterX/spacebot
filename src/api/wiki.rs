@@ -110,26 +110,26 @@ fn default_author_type() -> String {
     "user".to_string()
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct WikiListResponse {
-    pages: Vec<crate::wiki::WikiPageSummary>,
-    total: usize,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct WikiListResponse {
+    pub pages: Vec<crate::wiki::WikiPageSummary>,
+    pub total: usize,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct WikiPageResponse {
-    page: crate::wiki::WikiPage,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct WikiPageResponse {
+    pub page: crate::wiki::WikiPage,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct WikiHistoryResponse {
-    versions: Vec<crate::wiki::WikiPageVersion>,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct WikiHistoryResponse {
+    pub versions: Vec<crate::wiki::WikiPageVersion>,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct WikiActionResponse {
-    success: bool,
-    message: String,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct WikiActionResponse {
+    pub success: bool,
+    pub message: String,
 }
 
 // ---------------------------------------------------------------------------

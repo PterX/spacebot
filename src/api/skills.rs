@@ -446,6 +446,7 @@ pub(super) async fn pin_skill(
     responses(
         (status = 200, body = SkillLifecycleResponse),
         (status = 404, description = "Agent not found"),
+        (status = 500, description = "Skill store update failed"),
     ),
     tag = "skills",
 )]
@@ -475,6 +476,7 @@ pub(super) async fn adopt_skill(
         (status = 200, body = SkillLifecycleResponse),
         (status = 403, description = "Not a workspace skill"),
         (status = 404, description = "Agent or skill not found"),
+        (status = 500, description = "Archive operation failed"),
     ),
     tag = "skills",
 )]

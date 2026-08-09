@@ -11,67 +11,67 @@ use std::sync::Arc;
 
 // ── Response types ──
 
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub(super) struct UsageTotals {
-    input_tokens: i64,
-    output_tokens: i64,
-    cache_read_tokens: i64,
-    cache_write_tokens: i64,
-    reasoning_tokens: i64,
-    request_count: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    estimated_cost_usd: Option<f64>,
-    cost_status: String,
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct UsageTotals {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub request_count: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
+    pub cost_status: String,
 }
 
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub(super) struct UsageByModel {
-    model: String,
-    input_tokens: i64,
-    output_tokens: i64,
-    cache_read_tokens: i64,
-    cache_write_tokens: i64,
-    reasoning_tokens: i64,
-    request_count: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    estimated_cost_usd: Option<f64>,
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct UsageByModel {
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub request_count: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
 }
 
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub(super) struct UsageByDay {
-    date: String,
-    input_tokens: i64,
-    output_tokens: i64,
-    cache_read_tokens: i64,
-    cache_write_tokens: i64,
-    reasoning_tokens: i64,
-    request_count: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    estimated_cost_usd: Option<f64>,
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct UsageByDay {
+    pub date: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub request_count: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
 }
 
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub(super) struct UsageByAgent {
-    agent_id: String,
-    input_tokens: i64,
-    output_tokens: i64,
-    cache_read_tokens: i64,
-    cache_write_tokens: i64,
-    reasoning_tokens: i64,
-    request_count: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    estimated_cost_usd: Option<f64>,
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct UsageByAgent {
+    pub agent_id: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub request_count: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
 }
 
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub(super) struct UsageResponse {
-    total: UsageTotals,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    by_model: Vec<UsageByModel>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    by_day: Vec<UsageByDay>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    by_agent: Vec<UsageByAgent>,
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct UsageResponse {
+    pub total: UsageTotals,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub by_model: Vec<UsageByModel>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub by_day: Vec<UsageByDay>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub by_agent: Vec<UsageByAgent>,
 }
 
 // ── Query params ──

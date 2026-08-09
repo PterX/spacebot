@@ -4,38 +4,38 @@
 //! managing agents, viewing status, and interacting with the system.
 //! Includes an SSE endpoint for realtime event streaming.
 
-mod activity;
+pub mod activity;
 pub mod agents;
 mod attachments;
-mod bindings;
-mod channels;
-mod config;
+pub mod bindings;
+pub mod channels;
+pub mod config;
 mod cortex;
-mod cron;
+pub mod cron;
 mod factory;
-mod ingest;
+pub mod ingest;
 mod links;
-mod mcp;
-mod memories;
-mod messaging;
-mod models;
-mod notifications;
+pub mod mcp;
+pub mod memories;
+pub mod messaging;
+pub mod models;
+pub mod notifications;
 mod opencode_proxy;
-mod portal;
-mod projects;
-mod providers;
-mod secrets;
+pub mod portal;
+pub mod projects;
+pub mod providers;
+pub mod secrets;
 mod server;
-mod settings;
+pub mod settings;
 mod skills;
 pub(crate) mod ssh;
 mod state;
 mod system;
-mod tasks;
+pub mod tasks;
 mod tools;
-mod usage;
-mod wiki;
-mod workers;
+pub mod usage;
+pub mod wiki;
+pub mod workers;
 
 pub use server::{api_router, start_http_server};
 pub use state::{AgentInfo, ApiEvent, ApiState, ChannelToolCallEntry};

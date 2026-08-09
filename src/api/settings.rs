@@ -6,33 +6,33 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct GlobalSettingsResponse {
-    company_name: String,
-    brave_search_key: Option<String>,
-    api_enabled: bool,
-    api_port: u16,
-    api_bind: String,
-    worker_log_mode: String,
-    opencode: OpenCodeSettingsResponse,
-    ssh_enabled: bool,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct GlobalSettingsResponse {
+    pub company_name: String,
+    pub brave_search_key: Option<String>,
+    pub api_enabled: bool,
+    pub api_port: u16,
+    pub api_bind: String,
+    pub worker_log_mode: String,
+    pub opencode: OpenCodeSettingsResponse,
+    pub ssh_enabled: bool,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct OpenCodeSettingsResponse {
-    enabled: bool,
-    path: String,
-    max_servers: usize,
-    server_startup_timeout_secs: u64,
-    max_restart_retries: u32,
-    permissions: OpenCodePermissionsResponse,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct OpenCodeSettingsResponse {
+    pub enabled: bool,
+    pub path: String,
+    pub max_servers: usize,
+    pub server_startup_timeout_secs: u64,
+    pub max_restart_retries: u32,
+    pub permissions: OpenCodePermissionsResponse,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct OpenCodePermissionsResponse {
-    edit: String,
-    bash: String,
-    webfetch: String,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct OpenCodePermissionsResponse {
+    pub edit: String,
+    pub bash: String,
+    pub webfetch: String,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -64,16 +64,16 @@ pub(super) struct OpenCodePermissionsUpdate {
     webfetch: Option<String>,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct GlobalSettingsUpdateResponse {
-    success: bool,
-    message: String,
-    requires_restart: bool,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct GlobalSettingsUpdateResponse {
+    pub success: bool,
+    pub message: String,
+    pub requires_restart: bool,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct RawConfigResponse {
-    content: String,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RawConfigResponse {
+    pub content: String,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -81,10 +81,10 @@ pub(super) struct RawConfigUpdateRequest {
     content: String,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct RawConfigUpdateResponse {
-    success: bool,
-    message: String,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RawConfigUpdateResponse {
+    pub success: bool,
+    pub message: String,
 }
 
 #[utoipa::path(

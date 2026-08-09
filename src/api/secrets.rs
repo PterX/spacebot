@@ -67,20 +67,20 @@ pub async fn secrets_status(State(state): State<Arc<ApiState>>) -> impl IntoResp
     }
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-struct SecretListItem {
-    name: String,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SecretListItem {
+    pub name: String,
     /// Visibility scope. `InstanceShared` is the default for system /
     /// admin-managed secrets; `Agent` rows are per-agent tool credentials.
-    scope: SecretScope,
-    category: SecretCategory,
-    created_at: chrono::DateTime<chrono::Utc>,
-    updated_at: chrono::DateTime<chrono::Utc>,
+    pub scope: SecretScope,
+    pub category: SecretCategory,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-struct SecretListResponse {
-    secrets: Vec<SecretListItem>,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SecretListResponse {
+    pub secrets: Vec<SecretListItem>,
 }
 
 /// `GET /api/secrets` — List all secrets (name + category, no values).
@@ -134,12 +134,12 @@ pub struct PutSecretBody {
     pub category: Option<SecretCategory>,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-struct PutSecretResponse {
-    name: String,
-    category: SecretCategory,
-    reload_required: bool,
-    message: String,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PutSecretResponse {
+    pub name: String,
+    pub category: SecretCategory,
+    pub reload_required: bool,
+    pub message: String,
 }
 
 /// `PUT /api/secrets/:name` — Add or update a secret.
@@ -202,11 +202,11 @@ pub async fn put_secret(
     }
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-struct DeleteSecretResponse {
-    deleted: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    warning: Option<String>,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct DeleteSecretResponse {
+    pub deleted: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// `DELETE /api/secrets/:name` — Delete a secret.
@@ -254,12 +254,12 @@ pub async fn delete_secret(
     }
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-struct SecretInfoResponse {
-    name: String,
-    category: SecretCategory,
-    created_at: chrono::DateTime<chrono::Utc>,
-    updated_at: chrono::DateTime<chrono::Utc>,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SecretInfoResponse {
+    pub name: String,
+    pub category: SecretCategory,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// `GET /api/secrets/:name/info` — Secret metadata (no value).
@@ -301,10 +301,10 @@ pub async fn secret_info(
     }
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-struct EncryptResponse {
-    master_key: String,
-    message: String,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct EncryptResponse {
+    pub master_key: String,
+    pub message: String,
 }
 
 /// `POST /api/secrets/encrypt` — Enable encryption. Returns the master key (hex).
@@ -496,18 +496,18 @@ pub async fn rotate_key(State(state): State<Arc<ApiState>>) -> impl IntoResponse
     }
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-struct MigrationItem {
-    config_key: String,
-    secret_name: String,
-    category: SecretCategory,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct MigrationItem {
+    pub config_key: String,
+    pub secret_name: String,
+    pub category: SecretCategory,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-struct MigrateResponse {
-    migrated: Vec<MigrationItem>,
-    skipped: Vec<String>,
-    message: String,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct MigrateResponse {
+    pub migrated: Vec<MigrationItem>,
+    pub skipped: Vec<String>,
+    pub message: String,
 }
 
 /// `POST /api/secrets/migrate` — Auto-migrate literal keys from config.toml

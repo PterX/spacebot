@@ -89,20 +89,20 @@ pub(super) struct AssignRequest {
     assigned_agent_id: String,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct TaskListResponse {
-    tasks: Vec<crate::tasks::Task>,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct TaskListResponse {
+    pub tasks: Vec<crate::tasks::Task>,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct TaskResponse {
-    task: crate::tasks::Task,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct TaskResponse {
+    pub task: crate::tasks::Task,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct TaskActionResponse {
-    success: bool,
-    message: String,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct TaskActionResponse {
+    pub success: bool,
+    pub message: String,
 }
 
 // ---------------------------------------------------------------------------

@@ -32,13 +32,13 @@ fn default_limit() -> i64 {
     50
 }
 
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub(super) struct NotificationsResponse {
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct NotificationsResponse {
     pub notifications: Vec<Notification>,
 }
 
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub(super) struct UnreadCountResponse {
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct UnreadCountResponse {
     pub count: i64,
 }
 

@@ -7,126 +7,126 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-#[derive(Serialize, Debug, utoipa::ToSchema)]
-pub(super) struct RoutingSection {
-    channel: String,
-    branch: String,
-    worker: String,
-    compactor: String,
-    cortex: String,
-    voice: String,
-    rate_limit_cooldown_secs: u64,
+#[derive(Serialize, Deserialize, Debug, utoipa::ToSchema)]
+pub struct RoutingSection {
+    pub channel: String,
+    pub branch: String,
+    pub worker: String,
+    pub compactor: String,
+    pub cortex: String,
+    pub voice: String,
+    pub rate_limit_cooldown_secs: u64,
 }
 
-#[derive(Serialize, Debug, utoipa::ToSchema)]
-pub(super) struct TuningSection {
-    max_concurrent_branches: usize,
-    max_concurrent_workers: usize,
-    max_turns: usize,
-    branch_max_turns: usize,
-    context_window: usize,
-    history_backfill_count: usize,
+#[derive(Serialize, Deserialize, Debug, utoipa::ToSchema)]
+pub struct TuningSection {
+    pub max_concurrent_branches: usize,
+    pub max_concurrent_workers: usize,
+    pub max_turns: usize,
+    pub branch_max_turns: usize,
+    pub context_window: usize,
+    pub history_backfill_count: usize,
 }
 
-#[derive(Serialize, Debug, utoipa::ToSchema)]
-pub(super) struct CompactionSection {
-    background_threshold: f32,
-    aggressive_threshold: f32,
-    emergency_threshold: f32,
+#[derive(Serialize, Deserialize, Debug, utoipa::ToSchema)]
+pub struct CompactionSection {
+    pub background_threshold: f32,
+    pub aggressive_threshold: f32,
+    pub emergency_threshold: f32,
 }
 
-#[derive(Serialize, Debug, utoipa::ToSchema)]
-pub(super) struct CortexSection {
-    tick_interval_secs: u64,
-    maintenance_interval_secs: u64,
-    worker_timeout_secs: u64,
-    branch_timeout_secs: u64,
-    detached_worker_timeout_retry_limit: u8,
-    supervisor_kill_budget_per_tick: usize,
-    circuit_breaker_threshold: u8,
-    bulletin_interval_secs: u64,
-    bulletin_max_words: usize,
-    bulletin_max_turns: usize,
-    maintenance_decay_rate: f32,
-    maintenance_prune_threshold: f32,
-    maintenance_min_age_days: i64,
-    maintenance_merge_similarity_threshold: f32,
+#[derive(Serialize, Deserialize, Debug, utoipa::ToSchema)]
+pub struct CortexSection {
+    pub tick_interval_secs: u64,
+    pub maintenance_interval_secs: u64,
+    pub worker_timeout_secs: u64,
+    pub branch_timeout_secs: u64,
+    pub detached_worker_timeout_retry_limit: u8,
+    pub supervisor_kill_budget_per_tick: usize,
+    pub circuit_breaker_threshold: u8,
+    pub bulletin_interval_secs: u64,
+    pub bulletin_max_words: usize,
+    pub bulletin_max_turns: usize,
+    pub maintenance_decay_rate: f32,
+    pub maintenance_prune_threshold: f32,
+    pub maintenance_min_age_days: i64,
+    pub maintenance_merge_similarity_threshold: f32,
 }
 
-#[derive(Serialize, Debug, utoipa::ToSchema)]
-pub(super) struct WarmupSection {
-    enabled: bool,
-    eager_embedding_load: bool,
-    refresh_secs: u64,
-    startup_delay_secs: u64,
+#[derive(Serialize, Deserialize, Debug, utoipa::ToSchema)]
+pub struct WarmupSection {
+    pub enabled: bool,
+    pub eager_embedding_load: bool,
+    pub refresh_secs: u64,
+    pub startup_delay_secs: u64,
 }
 
-#[derive(Serialize, Debug, utoipa::ToSchema)]
-pub(super) struct CoalesceSection {
-    enabled: bool,
-    debounce_ms: u64,
-    max_wait_ms: u64,
-    min_messages: usize,
-    multi_user_only: bool,
+#[derive(Serialize, Deserialize, Debug, utoipa::ToSchema)]
+pub struct CoalesceSection {
+    pub enabled: bool,
+    pub debounce_ms: u64,
+    pub max_wait_ms: u64,
+    pub min_messages: usize,
+    pub multi_user_only: bool,
 }
 
-#[derive(Serialize, Debug, utoipa::ToSchema)]
-pub(super) struct MemoryPersistenceSection {
-    enabled: bool,
-    message_interval: usize,
+#[derive(Serialize, Deserialize, Debug, utoipa::ToSchema)]
+pub struct MemoryPersistenceSection {
+    pub enabled: bool,
+    pub message_interval: usize,
 }
 
-#[derive(Serialize, Debug, utoipa::ToSchema)]
-pub(super) struct BrowserSection {
-    enabled: bool,
-    headless: bool,
-    evaluate_enabled: bool,
-    persist_session: bool,
-    close_policy: String,
+#[derive(Serialize, Deserialize, Debug, utoipa::ToSchema)]
+pub struct BrowserSection {
+    pub enabled: bool,
+    pub headless: bool,
+    pub evaluate_enabled: bool,
+    pub persist_session: bool,
+    pub close_policy: String,
 }
 
-#[derive(Serialize, Debug, utoipa::ToSchema)]
-pub(super) struct ChannelSection {
-    listen_only_mode: bool,
+#[derive(Serialize, Deserialize, Debug, utoipa::ToSchema)]
+pub struct ChannelSection {
+    pub listen_only_mode: bool,
 }
 
-#[derive(Serialize, Debug, utoipa::ToSchema)]
-pub(super) struct SandboxSection {
-    mode: String,
-    writable_paths: Vec<String>,
-    passthrough_env: Vec<String>,
+#[derive(Serialize, Deserialize, Debug, utoipa::ToSchema)]
+pub struct SandboxSection {
+    pub mode: String,
+    pub writable_paths: Vec<String>,
+    pub passthrough_env: Vec<String>,
 }
 
-#[derive(Serialize, Debug, utoipa::ToSchema)]
-pub(super) struct ProjectsSection {
-    use_worktrees: bool,
-    worktree_name_template: String,
-    auto_create_worktrees: bool,
-    auto_discover_repos: bool,
-    auto_discover_worktrees: bool,
-    disk_usage_warning_threshold: u64,
+#[derive(Serialize, Deserialize, Debug, utoipa::ToSchema)]
+pub struct ProjectsSection {
+    pub use_worktrees: bool,
+    pub worktree_name_template: String,
+    pub auto_create_worktrees: bool,
+    pub auto_discover_repos: bool,
+    pub auto_discover_worktrees: bool,
+    pub disk_usage_warning_threshold: u64,
 }
 
-#[derive(Serialize, Debug, utoipa::ToSchema)]
-pub(super) struct DiscordSection {
-    enabled: bool,
-    allow_bot_messages: bool,
+#[derive(Serialize, Deserialize, Debug, utoipa::ToSchema)]
+pub struct DiscordSection {
+    pub enabled: bool,
+    pub allow_bot_messages: bool,
 }
 
-#[derive(Serialize, Debug, utoipa::ToSchema)]
-pub(super) struct AgentConfigResponse {
-    routing: RoutingSection,
-    tuning: TuningSection,
-    compaction: CompactionSection,
-    cortex: CortexSection,
-    warmup: WarmupSection,
-    coalesce: CoalesceSection,
-    memory_persistence: MemoryPersistenceSection,
-    browser: BrowserSection,
-    channel: ChannelSection,
-    sandbox: SandboxSection,
-    projects: ProjectsSection,
-    discord: DiscordSection,
+#[derive(Serialize, Deserialize, Debug, utoipa::ToSchema)]
+pub struct AgentConfigResponse {
+    pub routing: RoutingSection,
+    pub tuning: TuningSection,
+    pub compaction: CompactionSection,
+    pub cortex: CortexSection,
+    pub warmup: WarmupSection,
+    pub coalesce: CoalesceSection,
+    pub memory_persistence: MemoryPersistenceSection,
+    pub browser: BrowserSection,
+    pub channel: ChannelSection,
+    pub sandbox: SandboxSection,
+    pub projects: ProjectsSection,
+    pub discord: DiscordSection,
 }
 
 #[derive(Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
