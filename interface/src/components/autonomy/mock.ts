@@ -37,8 +37,18 @@ export interface AutonomyRunSummary {
 	started_at: string;
 	duration_secs: number;
 	summary: string;
+	agent_index: number;
 	woken_by: WokenBy[];
 	actions: AutonomyRunAction[];
+}
+
+export interface AgentAutonomyState {
+	level: AutonomyLevel;
+	last_run_at: string | null;
+	last_summary: string | null;
+	next_run_at: string | null;
+	current_run: CurrentRun | null;
+	pending_count: number;
 }
 
 export interface WakeDef {
@@ -61,6 +71,7 @@ export interface PendingBrief {
 	worker_count: number;
 	goal_title: string | null;
 	enriched_at: string | null;
+	agent_index: number;
 }
 
 export interface AutonomyGoal {
@@ -94,6 +105,7 @@ const status: AutonomyStatus = {
 const runs: AutonomyRunSummary[] = [
 	{
 		id: "run-1",
+		agent_index: 0,
 		started_at: minutesAgo(23),
 		duration_secs: 372,
 		summary: "Enriched 2 tasks, proposed 1 new task",
@@ -122,6 +134,7 @@ const runs: AutonomyRunSummary[] = [
 	},
 	{
 		id: "run-2",
+		agent_index: 1,
 		started_at: minutesAgo(53),
 		duration_secs: 124,
 		summary: "Nothing needed attention",
@@ -130,6 +143,7 @@ const runs: AutonomyRunSummary[] = [
 	},
 	{
 		id: "run-3",
+		agent_index: 0,
 		started_at: minutesAgo(83),
 		duration_secs: 527,
 		summary: "Executed 1 approved task, proposed 1 new task",
@@ -151,6 +165,7 @@ const runs: AutonomyRunSummary[] = [
 	},
 	{
 		id: "run-4",
+		agent_index: 1,
 		started_at: minutesAgo(113),
 		duration_secs: 240,
 		summary: "Enriched 1 task",
@@ -165,6 +180,7 @@ const runs: AutonomyRunSummary[] = [
 	},
 	{
 		id: "run-5",
+		agent_index: 0,
 		started_at: minutesAgo(143),
 		duration_secs: 98,
 		summary: "Nothing to do",
@@ -237,6 +253,7 @@ const wakes: WakeDef[] = [
 const pending: PendingBrief[] = [
 	{
 		id: "task-1",
+		agent_index: 0,
 		title: "Fix Telegram adapter reconnect loop",
 		finding:
 			"Reproduced: reconnect storms after a 429 from the Bot API. The retry path ignores retry_after and hammers the endpoint. Proposed fix is a ~30 line change to the adapter backoff; the Discord adapter has the same pattern.",
@@ -247,6 +264,7 @@ const pending: PendingBrief[] = [
 	},
 	{
 		id: "task-2",
+		agent_index: 1,
 		title: "Write weekly changelog draft",
 		finding:
 			"Collected 14 merged PRs since Monday, grouped into 4 themes with highlights. Draft is in the comments — needs your voice pass before it goes anywhere.",
@@ -257,6 +275,7 @@ const pending: PendingBrief[] = [
 	},
 	{
 		id: "task-3",
+		agent_index: 0,
 		title: "Prune stale memories (34 candidates)",
 		finding:
 			"Found 34 memories not recalled in 90+ days; 12 reference channels that no longer exist. Full list with per-memory reasons is in the comments. Deletion is reversible for 30 days.",
@@ -297,10 +316,34 @@ const goals: AutonomyGoal[] = [
 	},
 ];
 
+const fleet: AgentAutonomyState[] = [
+	{
+		level: "act",
+		last_run_at: minutesAgo(23),
+		last_summary: "Enriched 2 tasks · proposed 1",
+		next_run_at: minutesFromNow(7),
+		current_run: null,
+		pending_count: 2,
+	},
+	{
+		level: "suggest",
+		last_run_at: minutesAgo(41),
+		last_summary: "Proposed 1 task",
+		next_run_at: minutesFromNow(19),
+		current_run: {
+			started_at: minutesAgo(2),
+			activity: "Researching: Prune stale memories (34 candidates)",
+		},
+		pending_count: 1,
+	},
+];
+
 export const mockAutonomyApi = {
 	status: (): Promise<AutonomyStatus> => Promise.resolve(status),
 	runs: (): Promise<{runs: AutonomyRunSummary[]}> => Promise.resolve({runs}),
 	pending: (): Promise<{tasks: PendingBrief[]}> => Promise.resolve({tasks: pending}),
 	goals: (): Promise<{goals: AutonomyGoal[]}> => Promise.resolve({goals}),
 	wakes: (): Promise<{wakes: WakeDef[]}> => Promise.resolve({wakes}),
+	fleet: (): Promise<{states: AgentAutonomyState[]}> =>
+		Promise.resolve({states: fleet}),
 };

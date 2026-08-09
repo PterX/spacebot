@@ -11,6 +11,7 @@ import {Sidebar} from "@/components/Sidebar";
 import {Overview} from "@/routes/Overview";
 import {Dashboard} from "@/routes/Dashboard";
 import {Autonomy} from "@/routes/Autonomy";
+import {AgentAutonomy} from "@/routes/AgentAutonomy";
 import {AgentDetail} from "@/routes/AgentDetail";
 import {AgentChannels} from "@/routes/AgentChannels";
 import {AgentCortex} from "@/routes/AgentCortex";
@@ -204,6 +205,15 @@ const agentTasksRoute = createRoute({
 	},
 });
 
+const agentAutonomyRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/agents/$agentId/autonomy",
+	component: function AgentAutonomyPage() {
+		const {agentId} = agentAutonomyRoute.useParams();
+		return <AgentAutonomy agentId={agentId} />;
+	},
+});
+
 const agentCronRoute = createRoute({
 	getParentRoute: () => rootRoute,
 	path: "/agents/$agentId/cron",
@@ -283,6 +293,7 @@ const routeTree = rootRoute.addChildren([
 	agentTasksRoute,
 	agentCortexRoute,
 	agentSkillsRoute,
+	agentAutonomyRoute,
 	agentCronRoute,
 	agentConfigRoute,
 	channelRoute,

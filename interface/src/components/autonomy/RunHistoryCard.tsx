@@ -13,6 +13,7 @@ import {
 	Gauge,
 } from "@phosphor-icons/react";
 import {Card, CardHeader, CardContent} from "@spacedrive/primitives";
+import {api} from "@/api/client";
 import {
 	mockAutonomyApi,
 	type AutonomyRunAction,
@@ -54,7 +55,12 @@ function formatDuration(secs: number): string {
 	return `${m}m ${s}s`;
 }
 
-export function RunHistoryCard() {
+interface RunHistoryCardProps {
+	showAgent?: boolean;
+	agentIndex?: number;
+}
+
+export function RunHistoryCard({showAgent, agentIndex}: RunHistoryCardProps) {
 	const [expanded, setExpanded] = useState<Record<string, boolean>>({});
 
 	const {data} = useQuery({
@@ -63,7 +69,19 @@ export function RunHistoryCard() {
 		staleTime: 30_000,
 	});
 
-	const runs = data?.runs ?? [];
+	const {data: agentsData} = useQuery({
+		queryKey: ["agents"],
+		queryFn: api.agents,
+		staleTime: 30_000,
+		enabled: !!showAgent,
+	});
+	const agents = agentsData?.agents ?? [];
+	const agentName = (i: number) =>
+		agents[i]?.display_name ?? agents[i]?.id ?? `agent ${i + 1}`;
+
+	const runs = (data?.runs ?? []).filter(
+		(r) => agentIndex === undefined || r.agent_index === agentIndex,
+	);
 
 	return (
 		<Card variant="dark">
@@ -108,6 +126,11 @@ export function RunHistoryCard() {
 											)}
 										</span>
 										<span className="flex min-w-0 flex-1 items-center gap-2">
+											{showAgent && (
+												<span className="shrink-0 rounded-full bg-app-line/40 px-2 py-0.5 text-tiny text-ink-dull">
+													{agentName(run.agent_index)}
+												</span>
+											)}
 											<p
 												className={`min-w-0 truncate text-sm ${
 													idle ? "text-ink-faint" : "text-ink-dull"

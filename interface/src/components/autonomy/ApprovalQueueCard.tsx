@@ -1,7 +1,8 @@
 import {useState} from "react";
 import {useQuery} from "@tanstack/react-query";
-import {ChatCircleDots, Robot, Target} from "@phosphor-icons/react";
+import {ChatCircleDots, Robot, Target, UserCircle} from "@phosphor-icons/react";
 import {Card, CardHeader, CardContent, Button} from "@spacedrive/primitives";
+import {api} from "@/api/client";
 import {mockAutonomyApi} from "./mock";
 
 function formatTimeAgo(iso: string): string {
@@ -12,7 +13,12 @@ function formatTimeAgo(iso: string): string {
 	return `${Math.floor(seconds / 86400)}d ago`;
 }
 
-export function ApprovalQueueCard() {
+interface ApprovalQueueCardProps {
+	showAgent?: boolean;
+	agentIndex?: number;
+}
+
+export function ApprovalQueueCard({showAgent, agentIndex}: ApprovalQueueCardProps) {
 	const [resolved, setResolved] = useState<Record<string, "approved" | "dismissed">>(
 		{},
 	);
@@ -23,7 +29,19 @@ export function ApprovalQueueCard() {
 		staleTime: 30_000,
 	});
 
-	const tasks = (data?.tasks ?? []).filter((t) => !resolved[t.id]);
+	const {data: agentsData} = useQuery({
+		queryKey: ["agents"],
+		queryFn: api.agents,
+		staleTime: 30_000,
+		enabled: !!showAgent,
+	});
+	const agents = agentsData?.agents ?? [];
+	const agentName = (i: number) =>
+		agents[i]?.display_name ?? agents[i]?.id ?? `agent ${i + 1}`;
+
+	const tasks = (data?.tasks ?? [])
+		.filter((t) => !resolved[t.id])
+		.filter((t) => agentIndex === undefined || t.agent_index === agentIndex);
 
 	return (
 		<Card variant="dark" className="flex h-full flex-col">
@@ -60,6 +78,12 @@ export function ApprovalQueueCard() {
 											{task.finding}
 										</p>
 										<div className="mt-2 flex items-center gap-3 text-tiny text-ink-faint">
+											{showAgent && (
+												<span className="flex items-center gap-1 text-ink-dull">
+													<UserCircle className="size-3.5" />
+													{agentName(task.agent_index)}
+												</span>
+											)}
 											{task.enriched_at && (
 												<span>
 													researched {formatTimeAgo(task.enriched_at)}

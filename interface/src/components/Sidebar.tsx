@@ -69,6 +69,7 @@ const agentSubItems = [
 	{path: "chat", icon: ChatCircleDots, label: "Chat"},
 	{path: "channels", icon: Broadcast, label: "Channels"},
 	{path: "memories", icon: Brain, label: "Memory"},
+	{path: "autonomy", icon: Pulse, label: "Autonomy"},
 	{path: "skills", icon: Lightning, label: "Skills"},
 	{path: "cron", icon: CalendarDots, label: "Schedule"},
 	{path: "config", icon: SlidersHorizontal, label: "Config"},

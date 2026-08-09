@@ -1,49 +1,8 @@
 import {useEffect, useState} from "react";
-import {
-	Power,
-	Eye,
-	Lightbulb,
-	Lightning,
-	CaretDown,
-	CaretRight,
-} from "@phosphor-icons/react";
+import {CaretDown, CaretRight} from "@phosphor-icons/react";
 import {Card, CardContent, FilterButton} from "@spacedrive/primitives";
+import {LEVELS, LevelDial} from "./levels";
 import type {AutonomyLevel, AutonomyStatus} from "./mock";
-
-const LEVELS: {
-	key: AutonomyLevel;
-	label: string;
-	icon: React.ElementType;
-	tagline: string;
-}[] = [
-	{
-		key: "off",
-		label: "Off",
-		icon: Power,
-		tagline: "Responds only when you talk to it. No self-directed activity.",
-	},
-	{
-		key: "observe",
-		label: "Observe",
-		icon: Eye,
-		tagline:
-			"Wakes up periodically to review what's happening and keep its notes current. Doesn't create or run anything.",
-	},
-	{
-		key: "suggest",
-		label: "Suggest",
-		icon: Lightbulb,
-		tagline:
-			"Researches your goals and prepares proposed work for your review. Nothing runs without your approval.",
-	},
-	{
-		key: "act",
-		label: "Act",
-		icon: Lightning,
-		tagline:
-			"Executes work you've approved on its own schedule, and keeps proposing new work. You still decide what gets approved.",
-	},
-];
 
 const INTERVAL_OPTIONS: {label: string; secs: number}[] = [
 	{label: "15m", secs: 900},
@@ -88,12 +47,14 @@ interface AutonomyDialCardProps {
 	level: AutonomyLevel;
 	onLevelChange: (level: AutonomyLevel) => void;
 	status: AutonomyStatus | undefined;
+	agentName?: string;
 }
 
 export function AutonomyDialCard({
 	level,
 	onLevelChange,
 	status,
+	agentName,
 }: AutonomyDialCardProps) {
 	const [advancedOpen, setAdvancedOpen] = useState(false);
 	const [intervalSecs, setIntervalSecs] = useState(1800);
@@ -113,35 +74,14 @@ export function AutonomyDialCard({
 							Autonomy
 						</h1>
 						<p className="mt-0.5 text-sm text-ink-faint">
-							How active your agent is when you're not around.
+							{agentName
+								? `How active ${agentName} is when you're not around.`
+								: "How active your agent is when you're not around."}
 						</p>
 					</div>
 				</div>
 
-				{/* Level dial */}
-				<div className="grid grid-cols-4 gap-2">
-					{LEVELS.map(({key, label, icon: Icon}) => {
-						const active = key === level;
-						return (
-							<button
-								key={key}
-								type="button"
-								onClick={() => onLevelChange(key)}
-								className={`flex flex-col items-center gap-2 rounded-xl border px-3 py-4 transition-colors ${
-									active
-										? "border-accent bg-accent/10 text-ink"
-										: "border-app-line text-ink-dull hover:border-app-line hover:bg-app-box/50 hover:text-ink"
-								}`}
-							>
-								<Icon
-									className={`size-5 ${active ? "text-accent" : ""}`}
-									weight={active ? "fill" : "regular"}
-								/>
-								<span className="text-sm font-medium">{label}</span>
-							</button>
-						);
-					})}
-				</div>
+				<LevelDial value={level} onChange={onLevelChange} />
 
 				<p className="mt-3 min-h-[2.5rem] text-sm text-ink-dull">
 					{selected.tagline}
