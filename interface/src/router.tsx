@@ -10,6 +10,7 @@ import {ConnectionBanner} from "@/components/ConnectionBanner";
 import {Sidebar} from "@/components/Sidebar";
 import {Overview} from "@/routes/Overview";
 import {Dashboard} from "@/routes/Dashboard";
+import {Autonomy} from "@/routes/Autonomy";
 import {AgentDetail} from "@/routes/AgentDetail";
 import {AgentChannels} from "@/routes/AgentChannels";
 import {AgentCortex} from "@/routes/AgentCortex";
@@ -34,7 +35,7 @@ import {useLiveContext} from "@/hooks/useLiveContext";
 function RootLayout() {
 	const {liveStates, connectionState, hasData} = useLiveContext();
 	const location = useLocation();
-	const bare = location.pathname.startsWith("/workbench") || location.pathname.startsWith("/dashboard");
+	const bare = location.pathname.startsWith("/workbench") || location.pathname.startsWith("/dashboard") || location.pathname.startsWith("/autonomy");
 
 	return (
 		<div className="flex h-screen flex-col overflow-hidden bg-sidebar">
@@ -74,6 +75,12 @@ const dashboardRoute = createRoute({
 	getParentRoute: () => rootRoute,
 	path: "/dashboard",
 	component: Dashboard,
+});
+
+const autonomyRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/autonomy",
+	component: Autonomy,
 });
 
 const settingsRoute = createRoute({
@@ -260,6 +267,7 @@ const channelRoute = createRoute({
 const routeTree = rootRoute.addChildren([
 	indexRoute,
 	dashboardRoute,
+	autonomyRoute,
 	settingsRoute,
 	logsRoute,
 	workbenchRoute,

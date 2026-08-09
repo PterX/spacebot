@@ -28,6 +28,7 @@ import type {ChannelLiveState} from "@/hooks/useChannelLiveState";
 import {useAgentOrder} from "@/hooks/useAgentOrder";
 import {
 	House,
+	Pulse,
 	TreeStructure,
 	Wrench,
 	CheckSquare,
@@ -171,6 +172,7 @@ function SortableAgentItem({
 
 const navItems = [
 	{to: "/dashboard", icon: House, label: "Dashboard", exact: true},
+	{to: "/autonomy", icon: Pulse, label: "Autonomy", exact: true},
 	{to: "/", icon: TreeStructure, label: "Org Chart", exact: true},
 	{to: "/workbench", icon: Wrench, label: "Workbench", exact: true},
 	{to: "/tasks", icon: CheckSquare, label: "Tasks", exact: true},
