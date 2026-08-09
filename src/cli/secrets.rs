@@ -156,7 +156,9 @@ pub async fn run(ctx: &super::Context, secrets_cmd: SecretsCommand) -> anyhow::R
                 body["category"] = serde_json::json!(cat);
             }
 
-            let value = client.put(&format!("secrets/{name}"), &body).await?;
+            let value = client
+                .put(&format!("secrets/{}", client::encode_path(&name)), &body)
+                .await?;
             if ctx.json {
                 output::json(&value);
                 return Ok(());
@@ -173,7 +175,9 @@ pub async fn run(ctx: &super::Context, secrets_cmd: SecretsCommand) -> anyhow::R
             Ok(())
         }
         SecretsCommand::Delete { name } => {
-            let value = client.delete(&format!("secrets/{name}")).await?;
+            let value = client
+                .delete(&format!("secrets/{}", client::encode_path(&name)))
+                .await?;
             if ctx.json {
                 output::json(&value);
                 return Ok(());
@@ -186,7 +190,9 @@ pub async fn run(ctx: &super::Context, secrets_cmd: SecretsCommand) -> anyhow::R
             Ok(())
         }
         SecretsCommand::Info { name } => {
-            let value = client.get(&format!("secrets/{name}/info")).await?;
+            let value = client
+                .get(&format!("secrets/{}/info", client::encode_path(&name)))
+                .await?;
             if ctx.json {
                 output::json(&value);
                 return Ok(());
@@ -304,15 +310,19 @@ pub async fn run(ctx: &super::Context, secrets_cmd: SecretsCommand) -> anyhow::R
             let value = client
                 .post("secrets/export", &serde_json::json!({}))
                 .await?;
+            if ctx.json {
+                output::json(&value);
+            }
             let count = value["count"].as_u64().unwrap_or(0);
             let content =
                 serde_json::to_string_pretty(&value).context("failed to serialize export data")?;
             // Write with restrictive permissions — this file contains
-            // plaintext secrets.
+            // plaintext secrets. mode() only applies on creation, so an
+            // existing file is re-chmodded before the secrets are written.
             #[cfg(unix)]
             {
                 use std::io::Write as _;
-                use std::os::unix::fs::OpenOptionsExt as _;
+                use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
                 let mut file = std::fs::OpenOptions::new()
                     .write(true)
                     .create(true)
@@ -320,6 +330,8 @@ pub async fn run(ctx: &super::Context, secrets_cmd: SecretsCommand) -> anyhow::R
                     .mode(0o600)
                     .open(&output_path)
                     .with_context(|| format!("failed to create {}", output_path.display()))?;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .with_context(|| format!("failed to restrict {}", output_path.display()))?;
                 file.write_all(content.as_bytes())
                     .with_context(|| format!("failed to write {}", output_path.display()))?;
             }

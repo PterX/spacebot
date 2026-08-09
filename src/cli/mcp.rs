@@ -36,7 +36,9 @@ pub enum McpCommand {
         #[arg(long)]
         disabled: bool,
     },
-    /// Replace an existing MCP server definition
+    /// Replace an existing MCP server definition. The definition is written
+    /// exactly as the flags specify — env vars and headers omitted here are
+    /// removed from the stored entry.
     Update {
         /// Server name
         name: String,
@@ -49,9 +51,15 @@ pub enum McpCommand {
         /// Command argument, repeatable
         #[arg(long = "arg", value_name = "ARG")]
         args: Vec<String>,
+        /// Environment variable as KEY=VALUE; pass KEY alone to be prompted
+        #[arg(short, long = "env", value_name = "KEY[=VALUE]")]
+        env: Vec<String>,
         /// Server URL (http transport)
         #[arg(short, long)]
         url: Option<String>,
+        /// HTTP header as NAME=VALUE; pass NAME alone to be prompted for the value
+        #[arg(short = 'H', long = "header", value_name = "NAME[=VALUE]")]
+        headers: Vec<String>,
         /// Leave the server disabled
         #[arg(long)]
         disabled: bool,
@@ -140,7 +148,9 @@ pub async fn run(ctx: &super::Context, cmd: McpCommand) -> anyhow::Result<()> {
             transport,
             command,
             args,
+            env,
             url,
+            headers,
             disabled,
         } => {
             let mut body = serde_json::json!({
@@ -157,18 +167,28 @@ pub async fn run(ctx: &super::Context, cmd: McpCommand) -> anyhow::Result<()> {
             if let Some(url) = &url {
                 body["url"] = serde_json::json!(url);
             }
+            let env = parse_kv_pairs(&env, "env var")?;
+            if !env.is_empty() {
+                body["env"] = serde_json::Value::Object(env);
+            }
+            let headers = parse_kv_pairs(&headers, "header")?;
+            if !headers.is_empty() {
+                body["headers"] = serde_json::Value::Object(headers);
+            }
 
             let value = client.put("mcp/servers", &body).await?;
             finish_mutation(ctx, value)
         }
         McpCommand::Remove { name } => {
-            let value = client.delete(&format!("mcp/servers/{name}")).await?;
+            let value = client
+                .delete(&format!("mcp/servers/{}", client::encode_path(&name)))
+                .await?;
             finish_mutation(ctx, value)
         }
         McpCommand::Reconnect { name } => {
             let value = client
                 .post(
-                    &format!("mcp/servers/{name}/reconnect"),
+                    &format!("mcp/servers/{}/reconnect", client::encode_path(&name)),
                     &serde_json::json!({}),
                 )
                 .await?;

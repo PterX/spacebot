@@ -57,8 +57,13 @@ pub fn short_timestamp(value: &str) -> String {
         return timestamp.format("%Y-%m-%d %H:%M").to_string();
     }
     let bytes = value.as_bytes();
-    if bytes.len() >= 16 && bytes[4] == b'-' && bytes[7] == b'-' && bytes[10] == b' ' {
-        return value[..16].to_string();
+    if bytes.len() >= 16
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b' '
+        && let Some(trimmed) = value.get(..16)
+    {
+        return trimmed.to_string();
     }
     value.to_string()
 }

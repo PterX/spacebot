@@ -6220,6 +6220,13 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description Skill store update failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     archive_skill: {
@@ -6252,6 +6259,13 @@ export interface operations {
             };
             /** @description Agent or skill not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Archive operation failed */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -6778,6 +6792,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["WakeAgentResponse"];
                 };
+            };
+            /** @description Agent not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Wake manager not running */
             503: {

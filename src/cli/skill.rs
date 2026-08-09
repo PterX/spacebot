@@ -234,14 +234,12 @@ pub async fn run(ctx: &super::Context, skill_cmd: SkillCommand) -> anyhow::Resul
             }
 
             // Show a preview of the content
-            let preview_len = skill.content.chars().take(500).count();
-            if preview_len < skill.content.len() {
+            let total_chars = skill.content.chars().count();
+            if total_chars > 500 {
+                let preview: String = skill.content.chars().take(500).collect();
                 println!("\nContent preview (first 500 chars):\n");
-                println!("{}", &skill.content[..preview_len]);
-                println!(
-                    "\n... ({} more characters)",
-                    skill.content.len() - preview_len
-                );
+                println!("{preview}");
+                println!("\n... ({} more characters)", total_chars - 500);
             } else {
                 println!("\nContent:\n");
                 println!("{}", skill.content);

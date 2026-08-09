@@ -137,7 +137,10 @@ pub async fn run(ctx: &super::Context, cmd: NotificationCommand) -> anyhow::Resu
                 }
                 (Some(id), false) => {
                     client
-                        .post(&format!("notifications/{id}/read"), &serde_json::json!({}))
+                        .post(
+                            &format!("notifications/{}/read", client::encode_path(id)),
+                            &serde_json::json!({}),
+                        )
                         .await?
                 }
                 (None, false) => unreachable!("clap requires id unless --all"),
@@ -163,7 +166,7 @@ pub async fn run(ctx: &super::Context, cmd: NotificationCommand) -> anyhow::Resu
                 (Some(id), false) => {
                     client
                         .post(
-                            &format!("notifications/{id}/dismiss"),
+                            &format!("notifications/{}/dismiss", client::encode_path(id)),
                             &serde_json::json!({}),
                         )
                         .await?

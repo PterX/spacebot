@@ -28,7 +28,10 @@ pub async fn run(ctx: &super::Context, args: UsageArgs) -> anyhow::Result<()> {
     let client = ApiClient::from_context(ctx)?;
 
     if let Some(conversation_id) = &args.conversation {
-        let mut path = format!("usage/conversation/{conversation_id}");
+        let mut path = format!(
+            "usage/conversation/{}",
+            client::encode_path(conversation_id)
+        );
         if let Some(agent) = &args.agent {
             path.push_str(&format!("?agent_id={}", urlencoding::encode(agent)));
         }

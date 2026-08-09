@@ -223,3 +223,15 @@ pub fn load_config(
         spacebot::config::Config::load().with_context(|| "failed to load configuration")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory as _;
+
+    /// clap only validates the command tree when it's built, so conflicts
+    /// like duplicate short flags panic at runtime. Catch them here instead.
+    #[test]
+    fn cli_tree_is_valid() {
+        super::Cli::command().debug_assert();
+    }
+}

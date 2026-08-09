@@ -119,9 +119,10 @@ pub async fn run(ctx: &super::Context, ingest_cmd: IngestCommand) -> anyhow::Res
                 return Ok(());
             }
             let result: IngestDeleteResponse = client::parse(value)?;
-            if result.success {
-                eprintln!("Deleted ingestion record {content_hash}.");
+            if !result.success {
+                anyhow::bail!("ingestion record {content_hash} was not deleted");
             }
+            eprintln!("Deleted ingestion record {content_hash}.");
             Ok(())
         }
     }
