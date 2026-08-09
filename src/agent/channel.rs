@@ -2897,20 +2897,35 @@ impl Channel {
                 .await;
         }
 
-        let (applied_history, turn_tool_calls) = {
+        // Count tool iterations from the pre-sanitization turn history.
+        // apply_history_after_turn strips tool-call messages on
+        // PromptCancelled (the normal reply-tool ending), so counting the
+        // applied guard would report zero for exactly the tool-heavy turns
+        // reflection exists to catch. PromptCancelled and MaxTurnsError carry
+        // the authoritative messages in the error; Ok turns carry them in
+        // `history`.
+        let turn_tool_calls = {
+            let source: &[rig::message::Message] = match &result {
+                Err(rig::completion::PromptError::PromptCancelled { chat_history, .. })
+                | Err(rig::completion::PromptError::MaxTurnsError { chat_history, .. }) => {
+                    chat_history
+                }
+                _ => &history,
+            };
+            let appended_from = history_len_before.min(source.len());
+            crate::agent::channel_history::count_tool_call_messages(&source[appended_from..])
+        };
+
+        let applied_history = {
             let mut guard = self.state.history.write().await;
-            let applied = apply_history_after_turn(
+            apply_history_after_turn(
                 &result,
                 &mut guard,
                 history,
                 history_len_before,
                 &self.id,
                 is_retrigger,
-            );
-            let appended_from = history_len_before.min(guard.len());
-            let tool_calls =
-                crate::agent::channel_history::count_tool_call_messages(&guard[appended_from..]);
-            (applied, tool_calls)
+            )
         };
 
         {
@@ -3391,6 +3406,10 @@ impl Channel {
                     let reflection = self.deps.runtime_config.skills_config.load().reflection;
                     if reflection.enabled {
                         self.mark_reflection_signal("worker_completed");
+                        // A worker can finish after the last user turn; check
+                        // now so reflection doesn't sit pending until the next
+                        // inbound message.
+                        self.check_memory_persistence().await;
                     }
                 }
 
@@ -3733,18 +3752,19 @@ impl Channel {
     ///
     /// Three memory triggers (any one fires): message count, time since last
     /// persistence, and working-memory event density. A pending skill
-    /// reflection signal is a fourth trigger and can spawn the pass on its
-    /// own; the branch it spawns also reflects on skills.
+    /// reflection signal is a fourth trigger; the branch it spawns also
+    /// reflects on skills. Reflection rides the persistence pass, so every
+    /// trigger — reflection included — obeys the conversation's memory
+    /// persistence controls.
     async fn check_memory_persistence(&mut self) {
         let config = **self.deps.runtime_config.memory_persistence.load();
         let persistence_enabled = config.enabled
             && config.message_interval != 0
             && self.resolved_settings.memory.persistence_enabled();
-        let reflection_due = self.reflection_due();
-
-        if !persistence_enabled && !reflection_due {
+        if !persistence_enabled {
             return;
         }
+        let reflection_due = self.reflection_due();
 
         let wm_config = **self.deps.runtime_config.working_memory.load();
         let elapsed = self.last_persistence_at.elapsed();
@@ -3795,14 +3815,17 @@ impl Channel {
         // Reset counters before spawning so subsequent messages don't pile up.
         self.message_count = 0;
         self.last_persistence_at = std::time::Instant::now();
-        if reflection_due {
-            self.last_reflection_at = Some(std::time::Instant::now());
-            self.reflection_signal
-                .store(false, std::sync::atomic::Ordering::Relaxed);
-        }
 
         match spawn_memory_persistence_branch(&self.state, &self.deps, reflection_due).await {
             Ok(branch_id) => {
+                // Consume the reflection request only once the branch exists;
+                // a failed spawn leaves the signal set so the next check
+                // retries instead of losing the reflection for a cooldown.
+                if reflection_due {
+                    self.last_reflection_at = Some(std::time::Instant::now());
+                    self.reflection_signal
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                }
                 self.memory_persistence_branches.insert(branch_id);
                 tracing::info!(
                     channel_id = %self.id,

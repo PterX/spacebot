@@ -80,7 +80,7 @@ If something is worth keeping, follow this order strictly:
 
 1. **Patch the skill that governed this task**, if one was used this session. Call `skills_list` to see what exists, `read_skill` before any modification.
 2. **Patch a related existing skill** whose task class covers the lesson.
-3. **Add a `references/` file** to an existing skill via `write_file` when the material is supporting detail, not procedure.
+3. **Add a `references/` file** to an existing skill via `skill_manage`'s `write_file` action when the material is supporting detail, not procedure.
 4. **Only then create a new skill** — named for the task class (`discord-formatting`), never the incident. Keep the description within its budget; it's loaded into every system prompt.
 
 Never persist:
