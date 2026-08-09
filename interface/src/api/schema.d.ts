@@ -540,6 +540,43 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/agents/skills/adopt": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Adopt a skill into curation: flips `created_by` to 'agent'.
+         * @description The explicit act of handing a user or installed skill to the curator.
+         */
+        post: operations["adopt_skill"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/skills/archive": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Archive a workspace skill: move it to `.archive/` and mark it archived. */
+        post: operations["archive_skill"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/agents/skills/content": {
         parameters: {
             query?: never;
@@ -574,6 +611,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/agents/skills/pin": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Pin or unpin a skill.
+         * @description A pinned skill can't be deleted by the user without unpinning, and is
+         *     fully read-only for autonomous writers.
+         */
+        post: operations["pin_skill"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/agents/skills/remove": {
         parameters: {
             query?: never;
@@ -586,6 +644,23 @@ export interface paths {
         post?: never;
         /** Remove an installed skill. */
         delete: operations["remove_skill"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/skills/restore": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Restore the most recently archived copy of a skill. */
+        post: operations["restore_skill"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -685,7 +760,7 @@ export interface paths {
         };
         /**
          * Serve a saved attachment file.
-         * @description Streams the file from disk with the correct Content-Type.
+         * @description Reads the file from disk with the correct Content-Type.
          *     Use `?download=true` to force a download prompt.
          *     Use `?thumbnail=true` to request a thumbnail (currently serves full file).
          */
@@ -730,6 +805,28 @@ export interface paths {
          *     Returns an attachment ID to include in the subsequent message send request.
          */
         post: operations["upload_attachment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/wake": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Manually wake a (typically dormant) agent.
+         * @description Fires the same wake path that `send_agent_message`, cron, and other
+         *     trigger sources use. Useful for debugging dormant deployments and
+         *     recovering an agent stuck on a missed trigger.
+         */
+        post: operations["wake_agent"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3160,6 +3257,11 @@ export interface components {
             /** Format: date-time */
             created_at: string;
             name: string;
+            /**
+             * @description Scope this secret belongs to. Older exports without a `scope` field
+             *     import as `InstanceShared` so existing backups continue to load.
+             */
+            scope?: components["schemas"]["SecretScope"];
             /** Format: date-time */
             updated_at: string;
             value: string;
@@ -3518,6 +3620,11 @@ export interface components {
             permissions?: null | components["schemas"]["OpenCodePermissionsUpdate"];
             /** Format: int64 */
             server_startup_timeout_secs?: number | null;
+        };
+        PinSkillRequest: {
+            agent_id: string;
+            name: string;
+            pinned: boolean;
         };
         PlatformCredentials: {
             discord_token?: string | null;
@@ -3923,11 +4030,35 @@ export interface components {
             /** Format: date-time */
             created_at: string;
             name: string;
+            /**
+             * @description Visibility scope. `InstanceShared` is the default for system /
+             *     admin-managed secrets; `Agent` rows are per-agent tool credentials.
+             */
+            scope: components["schemas"]["SecretScope"];
             /** Format: date-time */
             updated_at: string;
         };
         SecretListResponse: {
             secrets: components["schemas"]["SecretListItem"][];
+        };
+        /**
+         * @description Secret scope determines visibility across agents on a shared instance.
+         *
+         *     Orthogonal to `SecretCategory` — `System` secrets are always
+         *     `InstanceShared` (singleton consumers like `LlmManager` /
+         *     `MessagingManager`); `Tool` secrets default to `Agent(...)` for
+         *     agentic-backend deployments where each tenant's worker subprocess must
+         *     not see another tenant's credentials, but can also be `InstanceShared`
+         *     when a single-tenant deployment legitimately wants every agent to share
+         *     the same `Tool` secret (e.g. one repo-wide `GH_TOKEN`).
+         */
+        SecretScope: {
+            /** @enum {string} */
+            kind: "instance_shared";
+        } | {
+            agent_id: string;
+            /** @enum {string} */
+            kind: "agent";
         };
         SetChannelArchiveRequest: {
             agent_id: string;
@@ -3950,6 +4081,14 @@ export interface components {
             name: string;
             source: string;
             source_repo?: string | null;
+        };
+        SkillLifecycleRequest: {
+            agent_id: string;
+            name: string;
+        };
+        SkillLifecycleResponse: {
+            path?: string | null;
+            success: boolean;
         };
         SkillsListResponse: {
             skills: components["schemas"]["SkillInfo"][];
@@ -4079,6 +4218,8 @@ export interface components {
             /** Format: int64 */
             reasoning: number;
         };
+        /** @enum {string} */
+        ToolResultStatus: "pending" | "final" | "waiting_for_input";
         ToolsResponse: {
             binaries: components["schemas"]["BinaryEntry"][];
             tools_bin: string;
@@ -4133,7 +4274,10 @@ export interface components {
             type: "system_text";
         } | {
             call_id: string;
+            /** @description Accumulated streaming output for live display. Cleared when tool completes. */
+            live_output?: string | null;
             name: string;
+            status?: components["schemas"]["ToolResultStatus"];
             text: string;
             /** @enum {string} */
             type: "tool_result";
@@ -4339,6 +4483,11 @@ export interface components {
             reasoning_tokens: number;
             /** Format: int64 */
             request_count: number;
+        };
+        WakeAgentResponse: {
+            agent_id: string;
+            fired: boolean;
+            message: string;
         };
         WarmupSection: {
             eager_embedding_load: boolean;
@@ -6043,6 +6192,73 @@ export interface operations {
             };
         };
     };
+    adopt_skill: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SkillLifecycleRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SkillLifecycleResponse"];
+                };
+            };
+            /** @description Agent not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    archive_skill: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SkillLifecycleRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SkillLifecycleResponse"];
+                };
+            };
+            /** @description Not a workspace skill */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Agent or skill not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     get_skill_content: {
         parameters: {
             query: {
@@ -6111,6 +6327,36 @@ export interface operations {
             };
         };
     };
+    pin_skill: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PinSkillRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SkillLifecycleResponse"];
+                };
+            };
+            /** @description Agent not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     remove_skill: {
         parameters: {
             query?: never;
@@ -6148,6 +6394,36 @@ export interface operations {
             };
             /** @description Internal server error */
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    restore_skill: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SkillLifecycleRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SkillLifecycleResponse"];
+                };
+            };
+            /** @description Agent not found or no archived copy */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -6476,6 +6752,35 @@ export interface operations {
             };
             /** @description Internal server error */
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    wake_agent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Agent ID */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WakeAgentResponse"];
+                };
+            };
+            /** @description Wake manager not running */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
