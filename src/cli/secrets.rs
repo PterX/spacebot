@@ -20,7 +20,7 @@ pub enum SecretsCommand {
         /// Secret name (e.g. GH_TOKEN)
         name: String,
         /// Secret category (system or tool)
-        #[arg(short, long)]
+        #[arg(long)]
         category: Option<String>,
         /// Read value from stdin instead of interactive prompt
         #[arg(long)]
