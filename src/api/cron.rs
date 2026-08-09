@@ -74,29 +74,29 @@ pub(super) struct ToggleCronRequest {
     enabled: bool,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-struct CronJobWithStats {
-    id: String,
-    prompt: String,
-    cron_expr: Option<String>,
-    interval_secs: u64,
-    delivery_target: String,
-    enabled: bool,
-    run_once: bool,
-    active_hours: Option<(u8, u8)>,
-    timeout_secs: Option<u64>,
-    execution_success_count: u64,
-    execution_failure_count: u64,
-    delivery_success_count: u64,
-    delivery_failure_count: u64,
-    delivery_skipped_count: u64,
-    last_executed_at: Option<String>,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CronJobWithStats {
+    pub id: String,
+    pub prompt: String,
+    pub cron_expr: Option<String>,
+    pub interval_secs: u64,
+    pub delivery_target: String,
+    pub enabled: bool,
+    pub run_once: bool,
+    pub active_hours: Option<(u8, u8)>,
+    pub timeout_secs: Option<u64>,
+    pub execution_success_count: u64,
+    pub execution_failure_count: u64,
+    pub delivery_success_count: u64,
+    pub delivery_failure_count: u64,
+    pub delivery_skipped_count: u64,
+    pub last_executed_at: Option<String>,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct CronListResponse {
-    jobs: Vec<CronJobWithStats>,
-    timezone: String,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CronListResponse {
+    pub jobs: Vec<CronJobWithStats>,
+    pub timezone: String,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -104,10 +104,10 @@ pub(super) struct CronExecutionsResponse {
     executions: Vec<crate::cron::CronExecutionEntry>,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct CronActionResponse {
-    success: bool,
-    message: String,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CronActionResponse {
+    pub success: bool,
+    pub message: String,
 }
 
 /// List all cron jobs for an agent with execution statistics.

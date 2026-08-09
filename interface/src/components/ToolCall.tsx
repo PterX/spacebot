@@ -3,16 +3,10 @@ import {cx} from "class-variance-authority";
 import type {OpenCodePart} from "@/api/client";
 import type { TranscriptStep as SchemaTranscriptStep } from "@/api/types";
 
-// Extended TranscriptStep with live_output for streaming shell output
 type ToolResultStatus = "pending" | "final" | "waiting_for_input";
 
-type ExtendedTranscriptStep = SchemaTranscriptStep & {
-	live_output?: string;
-	status?: ToolResultStatus;
-};
-
-// Use the extended type for pairing
-type TranscriptStep = ExtendedTranscriptStep;
+// The generated tool_result variant carries live_output and status directly.
+type TranscriptStep = SchemaTranscriptStep;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -64,7 +58,7 @@ export function pairTranscriptSteps(steps: TranscriptStep[]): TranscriptItem[] {
 	// First pass: index all tool_result steps by call_id
 	for (const step of steps) {
 		if (step.type === "tool_result") {
-			const liveOutput = step.live_output;
+			const liveOutput = step.live_output ?? undefined;
 			resultsById.set(step.call_id, {
 				name: step.name,
 				text: step.text,

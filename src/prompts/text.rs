@@ -80,6 +80,11 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         ("en", "adapters/cron") => include_str!("../../prompts/en/adapters/cron.md.j2"),
         ("en", "adapters/signal") => include_str!("../../prompts/en/adapters/signal.md.j2"),
 
+        // Slash-command agent-turn instructions
+        ("en", "commands/tasks") => include_str!("../../prompts/en/commands/tasks.md.j2"),
+        ("en", "commands/today") => include_str!("../../prompts/en/commands/today.md.j2"),
+        ("en", "commands/digest") => include_str!("../../prompts/en/commands/digest.md.j2"),
+
         // Fragment Templates
         ("en", "fragments/worker_capabilities") => {
             include_str!("../../prompts/en/fragments/worker_capabilities.md.j2")

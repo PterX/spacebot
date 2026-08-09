@@ -122,44 +122,44 @@ pub(super) struct CreateWorktreeRequest {
 // Response types
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct ProjectListResponse {
-    projects: Vec<crate::projects::Project>,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ProjectListResponse {
+    pub projects: Vec<crate::projects::Project>,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct ProjectResponse {
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ProjectResponse {
     #[serde(flatten)]
-    project: ProjectWithRelations,
+    pub project: ProjectWithRelations,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct RepoResponse {
-    repo: crate::projects::ProjectRepo,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RepoResponse {
+    pub repo: crate::projects::ProjectRepo,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct WorktreeResponse {
-    worktree: crate::projects::ProjectWorktree,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct WorktreeResponse {
+    pub worktree: crate::projects::ProjectWorktree,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct ActionResponse {
-    success: bool,
-    message: String,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ActionResponse {
+    pub success: bool,
+    pub message: String,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct DiskUsageResponse {
-    total_bytes: u64,
-    entries: Vec<DiskUsageEntry>,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct DiskUsageResponse {
+    pub total_bytes: u64,
+    pub entries: Vec<DiskUsageEntry>,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct DiskUsageEntry {
-    name: String,
-    bytes: u64,
-    is_dir: bool,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct DiskUsageEntry {
+    pub name: String,
+    pub bytes: u64,
+    pub is_dir: bool,
 }
 
 fn default_true() -> bool {

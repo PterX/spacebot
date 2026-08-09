@@ -93,6 +93,20 @@ impl PromptEngine {
             crate::prompts::text::get("adapters/signal"),
         )?;
 
+        // Slash-command agent-turn instructions
+        env.add_template(
+            "commands/tasks",
+            crate::prompts::text::get("commands/tasks"),
+        )?;
+        env.add_template(
+            "commands/today",
+            crate::prompts::text::get("commands/today"),
+        )?;
+        env.add_template(
+            "commands/digest",
+            crate::prompts::text::get("commands/digest"),
+        )?;
+
         // Fragment templates
         env.add_template(
             "fragments/worker_capabilities",

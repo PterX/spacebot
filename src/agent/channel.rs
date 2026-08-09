@@ -1108,37 +1108,6 @@ impl Channel {
         self.control_handle.clone()
     }
 
-    fn rewrite_tool_routed_command_prompt(&self, raw_text: &str) -> Option<String> {
-        match raw_text.trim() {
-            "/tasks" => Some(
-                "use channel tools to fetch my ready tasks (limit 10) and reply exactly with:\n\
-                 - header: tasks (ready):\n\
-                 - each line: - #<task_number> [<priority>] <title>\n\
-                 if no tasks are ready, reply exactly: tasks (ready): none"
-                    .to_string(),
-            ),
-            "/today" => Some(
-                "use channel tools to build a local tasks snapshot and reply exactly in this format:\n\
-                 - first line: today (local tasks snapshot):\n\
-                 - section 1: in-progress tasks (up to 5), each line:   #<task_number> [<priority>] <title>\n\
-                 - section 2: up next ready tasks (up to 5), each line:   #<task_number> [<priority>] <title>\n\
-                 if a section is empty use:\n\
-                 - in progress: none\n\
-                 - up next (ready): none"
-                    .to_string(),
-            ),
-            "/digest" => Some(
-                "using available tools and channel context, generate a concise day digest from local 00:00 to now with exactly this order:\n\
-                 1) top decisions\n\
-                 2) key convo themes\n\
-                 3) open loops\n\
-                 keep it practical and concise; if there are no meaningful updates, reply exactly: no material updates today."
-                    .to_string(),
-            ),
-            _ => None,
-        }
-    }
-
     fn compute_listen_mode_invocation(
         &self,
         message: &InboundMessage,
@@ -1220,32 +1189,20 @@ impl Channel {
         }
     }
 
-    async fn try_handle_builtin_ops_commands(
+    /// Execute a control-plane command. These run deterministically against
+    /// channel state and never consume an agent turn.
+    async fn handle_control_command(
         &mut self,
-        raw_text: &str,
-        message: &InboundMessage,
-    ) -> Result<bool> {
-        if message.source == "system" {
-            return Ok(false);
-        }
-        let supported_source = matches!(
-            message.source.as_str(),
-            "telegram" | "discord" | "slack" | "twitch" | "signal"
-        );
-        if !supported_source {
-            return Ok(false);
-        }
+        def: &'static crate::commands::CommandDef,
+        action: crate::commands::ControlAction,
+    ) {
+        use crate::commands::ControlAction;
 
-        let text = raw_text.trim();
-        if !text.starts_with('/') {
-            return Ok(false);
-        }
-
-        let temporal_context = TemporalContext::from_runtime(self.deps.runtime_config.as_ref());
-        let now_line = temporal_context.current_time_line();
-
-        match text {
-            "/status" => {
+        match action {
+            ControlAction::Status => {
+                let temporal_context =
+                    TemporalContext::from_runtime(self.deps.runtime_config.as_ref());
+                let now_line = temporal_context.current_time_line();
                 let routing = self.deps.runtime_config.routing.load();
                 let channel_model = self
                     .resolved_settings
@@ -1278,59 +1235,33 @@ impl Channel {
                     branch_model,
                     now_line
                 );
-                self.send_builtin_text(body, "status").await;
-                return Ok(true);
+                self.send_builtin_text(body, def.name).await;
             }
-            "/quiet" | "/observe" => {
-                self.set_response_mode(ResponseMode::Observe).await;
-                self.send_builtin_text(
-                    "observe mode enabled. i'll learn from this conversation but won't respond."
-                        .to_string(),
-                    "observe",
-                )
-                .await;
-                return Ok(true);
+            ControlAction::SetResponseMode(mode) => {
+                self.set_response_mode(mode).await;
+                let confirmation = match mode {
+                    ResponseMode::Active => {
+                        "active mode enabled. i'll respond normally in this chat."
+                    }
+                    ResponseMode::Observe => {
+                        "observe mode enabled. i'll learn from this conversation but won't respond."
+                    }
+                    ResponseMode::MentionOnly => {
+                        "mention-only mode enabled. i'll only respond when @mentioned or replied to."
+                    }
+                };
+                self.send_builtin_text(confirmation.to_string(), def.name)
+                    .await;
             }
-            "/active" => {
-                self.set_response_mode(ResponseMode::Active).await;
-                self.send_builtin_text(
-                    "active mode enabled. i'll respond normally in this chat.".to_string(),
-                    "active",
-                )
-                .await;
-                return Ok(true);
+            ControlAction::Help => {
+                self.send_builtin_text(crate::commands::REGISTRY.help_text(), def.name)
+                    .await;
             }
-            "/mention-only" => {
-                self.set_response_mode(ResponseMode::MentionOnly).await;
-                self.send_builtin_text(
-                    "mention-only mode enabled. i'll only respond when @mentioned or replied to."
-                        .to_string(),
-                    "mention-only",
-                )
-                .await;
-                return Ok(true);
+            ControlAction::AgentId => {
+                self.send_builtin_text(self.deps.agent_id.to_string(), def.name)
+                    .await;
             }
-            "/help" => {
-                let lines = [
-                    "commands:".to_string(),
-                    "- /status: current mode, models, binding snapshot".to_string(),
-                    "- /today: in-progress + ready task snapshot".to_string(),
-                    "- /tasks: ready task list".to_string(),
-                    "- /digest: one-shot day digest (00:00 -> now)".to_string(),
-                    "- /observe: learn from conversation, never respond".to_string(),
-                    "- /mention-only: only respond when @mentioned, replied to, or given a command"
-                        .to_string(),
-                    "- /active: normal reply mode".to_string(),
-                    "- /agent-id: runtime agent id".to_string(),
-                ];
-                let body = lines.join("\n");
-                self.send_builtin_text(body, "help").await;
-                return Ok(true);
-            }
-            _ => {}
         }
-
-        Ok(false)
     }
 
     /// Run the channel event loop.
@@ -1491,6 +1422,7 @@ impl Channel {
                 .as_deref()
                 .is_some_and(|value| value.trim_start().starts_with('/')),
             crate::MessageContent::Interaction { .. } => false,
+            crate::MessageContent::Command { .. } => true,
         };
         if looks_like_command {
             return false;
@@ -1692,8 +1624,10 @@ impl Channel {
                     crate::MessageContent::Media { text, attachments } => {
                         (text.clone().unwrap_or_default(), attachments.clone())
                     }
-                    // Render interactions as their Display form so the LLM sees plain text.
-                    crate::MessageContent::Interaction { .. } => {
+                    // Render interactions and commands as their Display form
+                    // so the LLM sees plain text.
+                    crate::MessageContent::Interaction { .. }
+                    | crate::MessageContent::Command { .. } => {
                         (message.content.to_string(), Vec::new())
                     }
                 };
@@ -2081,8 +2015,12 @@ impl Channel {
             crate::MessageContent::Media { text, attachments } => {
                 (text.clone().unwrap_or_default(), attachments.clone())
             }
-            // Render interactions as their Display form so the LLM sees plain text.
-            crate::MessageContent::Interaction { .. } => (message.content.to_string(), Vec::new()),
+            // Render interactions and commands as their Display form so the
+            // LLM sees plain text; a Command renders as "/name args" and is
+            // dispatched by the same parse below.
+            crate::MessageContent::Interaction { .. } | crate::MessageContent::Command { .. } => {
+                (message.content.to_string(), Vec::new())
+            }
         };
 
         // Save attachments to disk when enabled, capturing bytes for LLM reuse
@@ -2115,11 +2053,27 @@ impl Channel {
         self.persist_inbound_user_message(&message, &raw_text, saved_metas.as_deref());
         self.track_participant_from_message(&message).await;
 
-        // Deterministic built-in command: bypass model output drift for agent identity checks.
-        if message.source != "system" && raw_text.trim() == "/agent-id" {
-            self.send_builtin_text(self.deps.agent_id.to_string(), "agent-id")
-                .await;
-            return Ok(());
+        // Slash-command dispatch. Control commands execute deterministically
+        // on the spot and never consume an agent turn; agent commands are
+        // rewritten into their instruction below. System messages are never
+        // commands, and unrecognized "/words" flow to the model as text.
+        let parsed_command = if message.source == "system" {
+            crate::commands::ParseResult::NotACommand
+        } else {
+            crate::commands::REGISTRY.parse(&raw_text)
+        };
+        match &parsed_command {
+            crate::commands::ParseResult::Command(cmd) => {
+                if let crate::commands::CommandHandler::Control(action) = cmd.def.handler {
+                    self.handle_control_command(cmd.def, action).await;
+                    return Ok(());
+                }
+            }
+            crate::commands::ParseResult::Usage(_, usage) => {
+                self.send_builtin_text(usage.clone(), "command-usage").await;
+                return Ok(());
+            }
+            crate::commands::ParseResult::NotACommand => {}
         }
 
         // Deterministic liveness ping for Telegram mentions.
@@ -2163,18 +2117,30 @@ impl Channel {
             )?);
         }
 
-        if self
-            .try_handle_builtin_ops_commands(&raw_text, &message)
-            .await?
-        {
-            return Ok(());
-        }
-
-        let rewritten_text = if message.source == "system" {
-            raw_text.clone()
-        } else {
-            self.rewrite_tool_routed_command_prompt(&raw_text)
-                .unwrap_or_else(|| raw_text.clone())
+        let rewritten_text = match &parsed_command {
+            crate::commands::ParseResult::Command(cmd) => match cmd.def.handler {
+                crate::commands::CommandHandler::Agent(
+                    crate::commands::AgentAction::PromptTemplate(template),
+                ) => {
+                    let prompt_engine = self.deps.runtime_config.prompts.load();
+                    match prompt_engine.render_static(template) {
+                        Ok(instruction) => instruction,
+                        Err(error) => {
+                            tracing::error!(
+                                channel_id = %self.id,
+                                command = cmd.def.name,
+                                %template,
+                                %error,
+                                "failed to render command prompt template; using raw text"
+                            );
+                            raw_text.clone()
+                        }
+                    }
+                }
+                // Control commands returned above.
+                crate::commands::CommandHandler::Control(_) => raw_text.clone(),
+            },
+            _ => raw_text.clone(),
         };
 
         let temporal_context = TemporalContext::from_runtime(self.deps.runtime_config.as_ref());

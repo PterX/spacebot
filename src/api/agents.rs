@@ -100,11 +100,11 @@ pub(super) struct AgentProfileResponse {
     profile: Option<crate::agent::cortex::AgentProfile>,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct IdentityResponse {
-    soul: Option<String>,
-    identity: Option<String>,
-    role: Option<String>,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct IdentityResponse {
+    pub soul: Option<String>,
+    pub identity: Option<String>,
+    pub role: Option<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -396,8 +396,8 @@ pub(super) async fn get_warmup_status(
     Ok(Json(WarmupStatusResponse { statuses }))
 }
 
-#[derive(serde::Serialize, utoipa::ToSchema)]
-pub(super) struct WakeAgentResponse {
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct WakeAgentResponse {
     pub agent_id: String,
     pub fired: bool,
     pub message: String,
@@ -414,6 +414,7 @@ pub(super) struct WakeAgentResponse {
     params(("agent_id" = String, Path, description = "Agent ID")),
     responses(
         (status = 202, body = WakeAgentResponse),
+        (status = 404, description = "Agent not found"),
         (status = 503, description = "Wake manager not running"),
     ),
     tag = "agents",

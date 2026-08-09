@@ -84,10 +84,10 @@ pub(super) struct ProviderUpdateRequest {
     deployment: Option<String>,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct ProviderUpdateResponse {
-    success: bool,
-    message: String,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ProviderUpdateResponse {
+    pub success: bool,
+    pub message: String,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -104,13 +104,13 @@ pub(super) struct ProviderModelTestRequest {
     deployment: Option<String>,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct ProviderModelTestResponse {
-    success: bool,
-    message: String,
-    provider: String,
-    model: String,
-    sample: Option<String>,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ProviderModelTestResponse {
+    pub success: bool,
+    pub message: String,
+    pub provider: String,
+    pub model: String,
+    pub sample: Option<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -1109,16 +1109,16 @@ async fn update_azure_provider(
     }))
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct ProviderConfigResponse {
-    success: bool,
-    message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    base_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    api_version: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    deployment: Option<String>,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ProviderConfigResponse {
+    pub success: bool,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment: Option<String>,
     // Note: api_key is intentionally excluded for security.
     // Credentials should never be returned to the client.
 }

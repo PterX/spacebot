@@ -7,31 +7,31 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct IngestFileInfo {
-    content_hash: String,
-    filename: String,
-    file_size: i64,
-    total_chunks: i64,
-    chunks_completed: i64,
-    status: String,
-    started_at: String,
-    completed_at: Option<String>,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct IngestFileInfo {
+    pub content_hash: String,
+    pub filename: String,
+    pub file_size: i64,
+    pub total_chunks: i64,
+    pub chunks_completed: i64,
+    pub status: String,
+    pub started_at: String,
+    pub completed_at: Option<String>,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct IngestFilesResponse {
-    files: Vec<IngestFileInfo>,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct IngestFilesResponse {
+    pub files: Vec<IngestFileInfo>,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct IngestUploadResponse {
-    uploaded: Vec<String>,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct IngestUploadResponse {
+    pub uploaded: Vec<String>,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct IngestDeleteResponse {
-    success: bool,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct IngestDeleteResponse {
+    pub success: bool,
 }
 
 #[derive(Deserialize, utoipa::ToSchema, utoipa::IntoParams)]

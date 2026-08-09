@@ -7,27 +7,27 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[derive(Serialize, Clone, utoipa::ToSchema)]
-pub(super) struct ModelInfo {
+#[derive(Serialize, Deserialize, Clone, utoipa::ToSchema)]
+pub struct ModelInfo {
     /// Full routing string (e.g. "openrouter/anthropic/claude-sonnet-4")
-    pub(super) id: String,
+    pub id: String,
     /// Human-readable name
-    pub(super) name: String,
+    pub name: String,
     /// Provider ID for routing ("anthropic", "openrouter", "openai", etc.)
-    pub(super) provider: String,
+    pub provider: String,
     /// Context window size in tokens, if known
-    pub(super) context_window: Option<u64>,
+    pub context_window: Option<u64>,
     /// Whether this model supports tool/function calling
-    pub(super) tool_call: bool,
+    pub tool_call: bool,
     /// Whether this model has reasoning/thinking capability
-    pub(super) reasoning: bool,
+    pub reasoning: bool,
     /// Whether this model accepts audio input.
-    pub(super) input_audio: bool,
+    pub input_audio: bool,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct ModelsResponse {
-    models: Vec<ModelInfo>,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ModelsResponse {
+    pub models: Vec<ModelInfo>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
