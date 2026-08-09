@@ -509,6 +509,10 @@ pub(super) async fn trigger_warmup(
             );
             continue;
         };
+        let Some(goal_store) = state.goal_store.load().as_ref().clone() else {
+            tracing::warn!(agent_id, "goal store not initialized, skipping warmup");
+            continue;
+        };
         let Some(project_store) = state.project_store.load().as_ref().clone() else {
             tracing::warn!(
                 agent_id,
@@ -551,6 +555,7 @@ pub(super) async fn trigger_warmup(
                 messaging_manager: None,
                 sandbox,
                 task_store,
+                goal_store,
                 project_store,
                 links: Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
                 agent_names: Arc::new(std::collections::HashMap::new()),
@@ -855,6 +860,12 @@ pub async fn create_agent_internal(
         .as_ref()
         .clone()
         .ok_or_else(|| "global task store not initialized".to_string())?;
+    let goal_store = state
+        .goal_store
+        .load()
+        .as_ref()
+        .clone()
+        .ok_or_else(|| "goal store not initialized".to_string())?;
 
     let process_event_buses = crate::create_process_event_buses();
     let event_tx = process_event_buses.control;
@@ -963,6 +974,7 @@ pub async fn create_agent_internal(
         llm_manager,
         mcp_manager: mcp_manager.clone(),
         task_store: task_store.clone(),
+        goal_store: goal_store.clone(),
         project_store: project_store.clone(),
         cron_tool: None,
         runtime_config: runtime_config.clone(),

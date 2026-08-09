@@ -2,9 +2,10 @@
 
 use super::state::ApiState;
 use super::{
-    activity, agents, attachments, bindings, channels, config, cortex, cron, factory, ingest,
-    links, mcp, memories, messaging, models, notifications, opencode_proxy, portal, projects,
-    providers, secrets, settings, skills, ssh, system, tasks, tools, usage, wiki, workers,
+    activity, agents, attachments, bindings, channels, config, cortex, cron, factory, goals,
+    ingest, links, mcp, memories, messaging, models, notifications, opencode_proxy, portal,
+    projects, providers, secrets, settings, skills, ssh, system, tasks, tools, usage, wiki,
+    workers,
 };
 
 use axum::Json;
@@ -132,6 +133,9 @@ pub fn api_router() -> OpenApiRouter<Arc<ApiState>> {
         .routes(routes!(notifications::dismiss_notification))
         .routes(routes!(notifications::mark_all_read))
         .routes(routes!(notifications::dismiss_read))
+        // Goal routes
+        .routes(routes!(goals::list_goals, goals::create_goal))
+        .routes(routes!(goals::get_goal, goals::update_goal))
         // Task routes
         .routes(routes!(tasks::list_tasks, tasks::create_task))
         .routes(routes!(

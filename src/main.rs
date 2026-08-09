@@ -723,6 +723,9 @@ async fn run(
 
     let global_task_store = Arc::new(spacebot::tasks::TaskStore::new(instance_pool.clone()));
 
+    // Instance-level goal store. Goals are instance-scoped like tasks.
+    let global_goal_store = Arc::new(spacebot::goals::GoalStore::new(instance_pool.clone()));
+
     // Instance-wide wiki knowledge base.
     let global_wiki_store = Arc::new(spacebot::wiki::WikiStore::new(instance_pool.clone()));
 
@@ -749,6 +752,7 @@ async fn run(
     );
     api_state.auth_token = config.api.auth_token.clone();
     api_state.set_task_store(global_task_store.clone());
+    api_state.set_goal_store(global_goal_store.clone());
     api_state.set_wiki_store(global_wiki_store.clone());
     api_state.set_notification_store(global_notification_store.clone());
     let api_state = Arc::new(api_state);
@@ -917,6 +921,7 @@ async fn run(
             agent_humans.clone(),
             injection_tx.clone(),
             global_task_store.clone(),
+            global_goal_store.clone(),
             global_wiki_store.clone(),
             global_project_store.clone(),
             global_notification_store.clone(),
@@ -1713,6 +1718,7 @@ async fn run(
                                     agent_humans.clone(),
                                     injection_tx.clone(),
                                     global_task_store.clone(),
+                                    global_goal_store.clone(),
                                     global_wiki_store.clone(),
                                     global_project_store.clone(),
                                     global_notification_store.clone(),
@@ -1860,6 +1866,7 @@ async fn initialize_agents(
     agent_humans: Arc<ArcSwap<Vec<spacebot::config::HumanDef>>>,
     injection_tx: tokio::sync::mpsc::Sender<spacebot::ChannelInjection>,
     global_task_store: Arc<spacebot::tasks::TaskStore>,
+    global_goal_store: Arc<spacebot::goals::GoalStore>,
     global_wiki_store: Arc<spacebot::wiki::WikiStore>,
     global_project_store: Arc<spacebot::projects::ProjectStore>,
     global_notification_store: Arc<spacebot::notifications::NotificationStore>,
@@ -2120,6 +2127,7 @@ async fn initialize_agents(
             llm_manager: llm_manager.clone(),
             mcp_manager,
             task_store: global_task_store.clone(),
+            goal_store: global_goal_store.clone(),
             project_store: project_store.clone(),
             cron_tool: None,
             runtime_config,

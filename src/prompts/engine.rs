@@ -614,6 +614,7 @@ impl PromptEngine {
             None,
             None,
             None,
+            None,
             false,
         )
     }
@@ -726,6 +727,7 @@ impl PromptEngine {
         working_memory: Option<String>,
         channel_activity_map: Option<String>,
         participant_context: Option<String>,
+        active_goals: Option<String>,
         direct_mode: bool,
     ) -> Result<String> {
         self.render(
@@ -747,6 +749,7 @@ impl PromptEngine {
                 working_memory => working_memory,
                 channel_activity_map => channel_activity_map,
                 participant_context => participant_context,
+                active_goals => active_goals,
                 knowledge_synthesis => knowledge_synthesis,
                 direct_mode => direct_mode,
             },
@@ -882,6 +885,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
                 None,
                 None,
                 None,

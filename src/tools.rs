@@ -38,6 +38,9 @@ pub mod config_inspect;
 pub mod cron;
 pub mod email_search;
 pub mod file;
+pub mod goal_create;
+pub mod goal_list;
+pub mod goal_update;
 pub mod install_skill;
 pub mod mcp;
 pub mod memory_delete;
@@ -103,6 +106,9 @@ pub use file::{
     FileOutput, FileReadArgs, FileReadTool, FileType, FileWriteArgs, FileWriteTool,
     register_file_tools,
 };
+pub use goal_create::{GoalCreateArgs, GoalCreateError, GoalCreateOutput, GoalCreateTool};
+pub use goal_list::{GoalListArgs, GoalListEntry, GoalListError, GoalListOutput, GoalListTool};
+pub use goal_update::{GoalUpdateArgs, GoalUpdateError, GoalUpdateOutput, GoalUpdateTool};
 pub use install_skill::{
     InstallSkillArgs, InstallSkillError, InstallSkillOutput, InstallSkillTool,
 };
@@ -197,6 +203,7 @@ pub use factory_update_identity::{
 use crate::agent::channel::ChannelState;
 use crate::config::{BrowserConfig, RuntimeConfig};
 use crate::conversation::settings::WorkerMemoryMode;
+use crate::goals::GoalStore;
 use crate::memory::MemorySearch;
 use crate::sandbox::Sandbox;
 use crate::tasks::TaskStore;
@@ -512,6 +519,11 @@ pub async fn add_channel_tools(
     handle
         .add_tool(ProjectManageTool::new(state.deps.project_store.clone()))
         .await?;
+    // Channels are read-only for goals: they can reference goals in
+    // conversation, but mutations go through branches.
+    handle
+        .add_tool(GoalListTool::new(state.deps.goal_store.clone()))
+        .await?;
     // Add attachment recall tool when save_attachments is enabled
     if state
         .deps
@@ -785,6 +797,7 @@ pub async fn remove_channel_tools(
     handle.remove_tool(SendFileTool::NAME).await?;
     handle.remove_tool(ReactTool::NAME).await?;
     handle.remove_tool(ProjectManageTool::NAME).await?;
+    handle.remove_tool(GoalListTool::NAME).await?;
     // Cron, send_message, send_agent_message, and attachment_recall removal is
     // best-effort since not all channels have them
     let _ = handle.remove_tool(CronTool::NAME).await;
@@ -870,6 +883,7 @@ pub fn create_branch_tool_server(
     state: Option<ChannelState>,
     agent_id: AgentId,
     task_store: Arc<TaskStore>,
+    goal_store: Arc<GoalStore>,
     memory_search: Arc<MemorySearch>,
     runtime_config: Arc<RuntimeConfig>,
     memory_event_tx: broadcast::Sender<ProcessEvent>,
@@ -907,6 +921,9 @@ pub fn create_branch_tool_server(
         .tool(task_create)
         .tool(TaskListTool::new(task_store.clone(), agent_id.to_string()))
         .tool(TaskUpdateTool::for_branch(task_store, agent_id.clone()))
+        .tool(GoalCreateTool::new(goal_store.clone()))
+        .tool(GoalListTool::new(goal_store.clone()))
+        .tool(GoalUpdateTool::new(goal_store))
         .tool(FileReadTool::new(
             runtime_config.workspace_dir.clone(),
             sandbox,
@@ -1149,6 +1166,7 @@ pub fn create_cortex_chat_tool_server(
     cortex_ctx: Option<crate::tools::spawn_worker::CortexChatContext>,
 ) -> ToolServerHandle {
     let logs_dir = workspace.join(".spacebot").join("logs");
+    let goal_store = deps.goal_store.clone();
 
     let spawn_tool = {
         let tool = DetachedSpawnWorkerTool::new(deps, screenshot_dir.clone(), logs_dir);
@@ -1186,6 +1204,9 @@ pub fn create_cortex_chat_tool_server(
         )
         .tool(TaskListTool::new(task_store.clone(), agent_id.to_string()))
         .tool(TaskUpdateTool::for_branch(task_store, agent_id.clone()))
+        .tool(GoalCreateTool::new(goal_store.clone()))
+        .tool(GoalListTool::new(goal_store.clone()))
+        .tool(GoalUpdateTool::new(goal_store))
         .tool(ShellTool::new(workspace.clone(), sandbox.clone()));
 
     server = register_file_tools(server, workspace, sandbox);

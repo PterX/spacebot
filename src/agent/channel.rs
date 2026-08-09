@@ -1953,6 +1953,8 @@ impl Channel {
             knowledge_synthesis_text,
         ) = self.render_memory_layers().await;
 
+        let active_goals = self.render_active_goals().await;
+
         let routing = rc.routing.load();
         let model_name = routing.resolve(ProcessType::Channel, None).to_string();
         let tool_use_enforcement = rc.tool_use_enforcement.load();
@@ -1977,6 +1979,7 @@ impl Channel {
             empty_to_none(working_memory),
             empty_to_none(channel_activity_map),
             empty_to_none(participant_context),
+            active_goals,
             direct_mode,
         )?;
 
@@ -2618,6 +2621,21 @@ impl Channel {
         )
     }
 
+    /// Render the compact active-goals list for the system prompt.
+    ///
+    /// Returns `None` when there are no active goals so injection is skipped
+    /// entirely — goals should cost nothing when unused.
+    async fn render_active_goals(&self) -> Option<String> {
+        match crate::goals::render_active_goals(&self.deps.goal_store).await {
+            Ok(text) if !text.is_empty() => Some(text),
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(channel_id = %self.id, %error, "active goals render failed");
+                None
+            }
+        }
+    }
+
     /// Build pre-rendered project context for prompt injection.
     ///
     /// Delegates to the standalone `build_project_context` function shared
@@ -2697,6 +2715,8 @@ impl Channel {
             knowledge_synthesis_text,
         ) = self.render_memory_layers().await;
 
+        let active_goals = self.render_active_goals().await;
+
         let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
         let routing = rc.routing.load();
         let model_name = routing.resolve(ProcessType::Channel, None).to_string();
@@ -2721,6 +2741,7 @@ impl Channel {
             empty_to_none(working_memory),
             empty_to_none(channel_activity_map),
             empty_to_none(participant_context),
+            active_goals,
             direct_mode,
         )?;
 

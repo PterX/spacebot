@@ -13,6 +13,7 @@ pub mod config;
 mod cortex;
 pub mod cron;
 mod factory;
+pub mod goals;
 pub mod ingest;
 mod links;
 pub mod mcp;

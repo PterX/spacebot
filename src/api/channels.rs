@@ -780,6 +780,11 @@ pub(super) async fn inspect_prompt(
         }
     };
 
+    // ── Active goals ──
+    let active_goals = crate::goals::render_active_goals(&channel_state.deps.goal_store)
+        .await
+        .unwrap_or_default();
+
     // ── Render the full system prompt ──
     let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
     let system_prompt = prompt_engine
@@ -801,6 +806,7 @@ pub(super) async fn inspect_prompt(
             empty_to_none(working_memory),
             empty_to_none(channel_activity_map),
             empty_to_none(participant_context),
+            empty_to_none(active_goals),
             false, // direct_mode — resolved at runtime by the channel, not available here
         )
         .unwrap_or_default();

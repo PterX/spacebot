@@ -12,6 +12,7 @@ pub mod db;
 pub mod error;
 pub mod factory;
 pub mod github_copilot_auth;
+pub mod goals;
 pub mod hooks;
 pub mod identity;
 pub mod links;
@@ -439,6 +440,7 @@ pub struct AgentDeps {
     pub llm_manager: Arc<llm::LlmManager>,
     pub mcp_manager: Arc<mcp::McpManager>,
     pub task_store: Arc<tasks::TaskStore>,
+    pub goal_store: Arc<goals::GoalStore>,
     pub project_store: Arc<projects::ProjectStore>,
     pub cron_tool: Option<tools::CronTool>,
     pub runtime_config: Arc<config::RuntimeConfig>,

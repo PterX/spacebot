@@ -696,7 +696,9 @@ pub fn can_transition(current: TaskStatus, next: TaskStatus) -> bool {
     )
 }
 
-fn merge_json_object(current: Value, patch: Option<Value>) -> Value {
+/// Deep-merge an optional object patch into a JSON value. Shared with the
+/// goals store so metadata patch semantics stay identical across both.
+pub(crate) fn merge_json_object(current: Value, patch: Option<Value>) -> Value {
     let Some(patch) = patch else {
         return current;
     };
