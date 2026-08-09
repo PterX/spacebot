@@ -140,6 +140,8 @@ ALTER TABLE tasks ADD COLUMN last_enriched_at TEXT;
 
 Tasks have an `assigned_agent_id` field. Once an agent claims a task, no other agent can work on it. Ownership is enforced at the query level and set atomically when a task is first enriched or executed.
 
+The global tasks table currently declares `assigned_agent_id TEXT NOT NULL` with assignment at creation time, so the unowned-task model requires making the column nullable. That migration touches the global database and every task consumer; it ships as its own change ahead of this system, not inside it.
+
 ```sql
 -- Atomic claim: only succeeds if still unassigned or already assigned to this agent
 UPDATE tasks SET assigned_agent_id = ?1
@@ -183,7 +185,7 @@ Do not start a new task.
 
 The channel wraps up gracefully and exits cleanly. The hard `timeout_secs` remains as a safety net but should almost never fire.
 
-This uses the existing addendum context delivery mechanism (same path as worker context injection).
+Delivery mechanism: a synthetic system message between turns, the same pattern the cron scheduler uses for its timeout wrap-up injection. The worker-style mid-turn injection hook (`inject_rx` on `SpacebotHook`) is wired only for workers today; giving `Channel` the same pair would let the warning land inside a live turn, but that is an enhancement, not a prerequisite.
 
 ---
 
@@ -225,7 +227,7 @@ Calls set_outcome → summary recorded
 Channel exits → cortex records last_run_at, cleans up
 ```
 
-If the channel crashes mid-execution, the task returns to `ready`. If a task fails 3 consecutive times, it moves to `failed` and emits a working memory `Error` event. Enrichment runs (comments only) do not count as failures.
+If the channel crashes mid-execution, the task returns to `ready`. If a task fails 3 consecutive times, it moves to `failed` and emits a working memory `Error` event. Enrichment runs (comments only) do not count as failures. `failed` is a new `TaskStatus` variant — the current set is pending_approval, backlog, ready, in_progress, done — so adding it includes the transition table, API, and UI sweep.
 
 ---
 
@@ -262,7 +264,7 @@ Enforced at startup and on config reload — autonomy does not start if any rule
 - `autonomy_channel.md.j2` system prompt (enrichment-first, `autonomy_complete` on exit, never execute `pending_approval`)
 - Goals table migration + `goal_create`, `goal_update`, `goal_list` tools (see `goals.md`)
 - Cortex: interval trigger, `last_run_at` tracking, context assembly, channel lifecycle, soft timeout addendum at `warn_secs`
-- `autonomy_complete` tool + run summary storage + retrieval for run history (note: `set_outcome` already exists for cron delivery — `autonomy_complete` is intentionally distinct)
+- `autonomy_complete` tool + run summary storage + retrieval for run history. Intentionally distinct from `set_outcome`, which is an unpersisted last-write-wins delivery buffer with no completion contract. Model it on `memory_persistence_complete` instead, which already enforces call-the-terminal-tool-before-exit through the hook retry machinery.
 - `last_enriched_at` column on tasks; atomic claim via `assigned_agent_id`; selection query with priority ordering
 - Task retry/failure handling (3 strikes → `failed`, working memory error event)
 - All config fields + validation
