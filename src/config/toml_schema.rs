@@ -531,6 +531,8 @@ pub(super) struct TomlAgentConfig {
     pub(super) projects: Option<TomlProjectsConfig>,
     #[serde(default)]
     pub(super) cron: Vec<TomlCronDef>,
+    #[serde(default)]
+    pub(super) wakes: Vec<crate::wakes::WakeConfig>,
 }
 
 #[derive(Deserialize)]

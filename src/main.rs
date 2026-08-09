@@ -2131,6 +2131,7 @@ async fn initialize_agents(
             task_store: global_task_store.clone(),
             goal_store: global_goal_store.clone(),
             wake_event_store: Arc::new(spacebot::wakes::WakeEventStore::new(db.sqlite.clone())),
+            wake_def_store: Arc::new(spacebot::wakes::WakeDefStore::new(db.sqlite.clone())),
             autonomy_run_store: Arc::new(spacebot::wakes::AutonomyRunStore::new(db.sqlite.clone())),
             project_store: project_store.clone(),
             cron_tool: None,
@@ -2781,6 +2782,18 @@ async fn initialize_agents(
     for (agent_id, agent) in agents.iter_mut() {
         let store = Arc::new(spacebot::cron::CronStore::new(agent.db.sqlite.clone()));
         agent.deps.messaging_manager = Some(messaging_manager.clone());
+
+        // Seed built-in wakes, then reconcile config-owned wake definitions.
+        // Builtins go first so a config id colliding with one is detected.
+        if let Err(error) = spacebot::wakes::seed_builtin_wakes(&agent.deps.wake_def_store).await {
+            tracing::warn!(agent_id = %agent_id, %error, "failed to seed builtin wakes");
+        }
+        if let Err(error) =
+            spacebot::wakes::reconcile_config_wakes(&agent.deps.wake_def_store, &agent.config.wakes)
+                .await
+        {
+            tracing::warn!(agent_id = %agent_id, %error, "failed to reconcile config wakes");
+        }
 
         // Seed cron jobs from config into the database
         for cron_def in &agent.config.cron {

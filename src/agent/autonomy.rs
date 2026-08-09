@@ -449,13 +449,38 @@ async fn build_run_briefing(
         .cloned()
         .unwrap_or_else(|| deps.agent_id.to_string());
 
+    // Wake definitions supply each event's name and instructions.
+    // Instructions apply only within the wake's min_level; events from a wake
+    // above the current level are rendered as observations. An event whose
+    // definition is gone falls back to its wake id.
+    let wake_defs: HashMap<String, crate::wakes::WakeDef> = if wake_events.is_empty() {
+        HashMap::new()
+    } else {
+        deps.wake_def_store
+            .list()
+            .await?
+            .into_iter()
+            .map(|def| (def.id.clone(), def))
+            .collect()
+    };
+
     let wake_event_views: Vec<AutonomyWakeEventView> = wake_events
         .iter()
-        .map(|event| AutonomyWakeEventView {
-            wake_id: event.wake_id.clone(),
-            fired_at: event.fired_at.clone(),
-            delivery_count: event.delivery_count,
-            payload: compact_payload(&event.payload),
+        .map(|event| {
+            let def = wake_defs.get(&event.wake_id);
+            AutonomyWakeEventView {
+                wake_id: event.wake_id.clone(),
+                name: def
+                    .map(|def| def.name.clone())
+                    .unwrap_or_else(|| event.wake_id.clone()),
+                instructions: def
+                    .filter(|def| def.min_level <= config.level)
+                    .map(|def| def.instructions.clone()),
+                gated: def.is_some_and(|def| def.min_level > config.level),
+                fired_at: event.fired_at.clone(),
+                delivery_count: event.delivery_count,
+                payload: compact_payload(&event.payload),
+            }
         })
         .collect();
 

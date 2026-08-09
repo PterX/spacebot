@@ -5,10 +5,14 @@
 //! typed event vocabulary and the persisted wake-event queue; producers and
 //! the consuming autonomy channel plug in around them.
 
+mod config;
+mod defs;
 mod events;
 mod runs;
 mod store;
 
+pub use config::{WakeConfig, reconcile_config_wakes};
+pub use defs::{TASK_APPROVED_WAKE_ID, WakeDef, WakeDefStore, WakeTrigger, seed_builtin_wakes};
 pub use events::SystemEvent;
 pub(crate) use runs::parse_run_timestamp;
 pub use runs::{AutonomyAction, AutonomyRun, AutonomyRunStatus, AutonomyRunStore};

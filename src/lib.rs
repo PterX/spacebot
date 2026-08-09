@@ -443,6 +443,8 @@ pub struct AgentDeps {
     pub goal_store: Arc<goals::GoalStore>,
     /// Per-agent persisted wake-event queue, consumed by the autonomy channel.
     pub wake_event_store: Arc<wakes::WakeEventStore>,
+    /// Per-agent wake definition registry (builtin, config, and user wakes).
+    pub wake_def_store: Arc<wakes::WakeDefStore>,
     /// Per-agent autonomy run history (begin/complete + recent summaries).
     pub autonomy_run_store: Arc<wakes::AutonomyRunStore>,
     pub project_store: Arc<projects::ProjectStore>,

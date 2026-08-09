@@ -995,6 +995,7 @@ impl Config {
             sandbox: None,
             projects: None,
             cron: Vec::new(),
+            wakes: Vec::new(),
         }];
 
         let mut api = ApiConfig::default();
@@ -1887,6 +1888,11 @@ impl Config {
                     })
                     .transpose()?;
 
+                let wakes = a.wakes;
+                for wake in &wakes {
+                    wake.validated(&format!("agents.{}.wakes.{}", a.id, wake.id))?;
+                }
+
                 Ok(AgentConfig {
                     id: a.id,
                     default: a.default,
@@ -2026,6 +2032,7 @@ impl Config {
                         }
                     }),
                     cron,
+                    wakes,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2063,6 +2070,7 @@ impl Config {
                 sandbox: None,
                 projects: None,
                 cron: Vec::new(),
+                wakes: Vec::new(),
             });
         }
 
@@ -2827,5 +2835,70 @@ mod autonomy_config_tests {
     #[test]
     fn resolve_rejects_unknown_level() {
         assert!(toml::from_str::<TomlAutonomyConfig>("level = \"yolo\"").is_err());
+    }
+}
+
+#[cfg(test)]
+mod wake_config_tests {
+    use super::*;
+
+    #[test]
+    fn agent_wakes_parse_with_defaults() {
+        let agent: TomlAgentConfig = toml::from_str(
+            r#"
+            id = "main"
+
+            [[wakes]]
+            id = "morning-brief"
+            name = "Morning brief"
+            schedule = "0 8 * * *"
+            instructions = "Summarize overnight activity."
+            delivery_target = "discord:123456789"
+
+            [[wakes]]
+            id = "on-approve"
+            name = "Task approved"
+            event = "task.approved"
+            instructions = "Pick up the approved task."
+            min_level = "act"
+            enabled = false
+            "#,
+        )
+        .expect("agent wakes must parse");
+
+        assert_eq!(agent.wakes.len(), 2);
+        let brief = &agent.wakes[0];
+        assert_eq!(brief.min_level, crate::config::AutonomyLevel::Observe);
+        assert!(brief.enabled);
+        assert_eq!(
+            brief.validated("agents.main.wakes.morning-brief").unwrap(),
+            crate::wakes::WakeTrigger::Schedule {
+                cron_expr: Some("0 8 * * *".to_string()),
+                interval_secs: None,
+            }
+        );
+
+        let approve = &agent.wakes[1];
+        assert_eq!(approve.min_level, crate::config::AutonomyLevel::Act);
+        assert!(!approve.enabled);
+    }
+
+    #[test]
+    fn agent_wakes_reject_unknown_min_level() {
+        assert!(
+            toml::from_str::<TomlAgentConfig>(
+                r#"
+                id = "main"
+
+                [[wakes]]
+                id = "w"
+                name = "w"
+                event = "task.approved"
+                instructions = "x"
+                min_level = "yolo"
+                "#,
+            )
+            .is_err()
+        );
     }
 }

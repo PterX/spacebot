@@ -830,6 +830,15 @@ pub struct LinkedAgent {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AutonomyWakeEventView {
     pub wake_id: String,
+    /// Wake definition name; falls back to the wake id when the definition
+    /// no longer exists.
+    pub name: String,
+    /// Wake instructions, included only when the wake's min_level is within
+    /// the current autonomy level.
+    pub instructions: Option<String>,
+    /// The wake exists but its min_level is above the current level: the
+    /// event is surfaced as an observation only.
+    pub gated: bool,
     pub fired_at: String,
     pub delivery_count: i64,
     /// Compact JSON payload preview; empty when the payload is empty.
@@ -984,12 +993,26 @@ mod tests {
     fn autonomy_channel_prompt_renders_per_level() {
         let engine = PromptEngine::new("en").expect("prompt engine should build");
 
-        let wake_events = vec![super::AutonomyWakeEventView {
-            wake_id: "ci-failed".to_string(),
-            fired_at: "2026-08-09T02:00:00Z".to_string(),
-            delivery_count: 3,
-            payload: "{\"job\":\"clippy\"}".to_string(),
-        }];
+        let wake_events = vec![
+            super::AutonomyWakeEventView {
+                wake_id: "ci-failed".to_string(),
+                name: "CI failed on main".to_string(),
+                instructions: Some("Investigate the failing job.".to_string()),
+                gated: false,
+                fired_at: "2026-08-09T02:00:00Z".to_string(),
+                delivery_count: 3,
+                payload: "{\"job\":\"clippy\"}".to_string(),
+            },
+            super::AutonomyWakeEventView {
+                wake_id: "task-approved".to_string(),
+                name: "Task approved".to_string(),
+                instructions: None,
+                gated: true,
+                fired_at: "2026-08-09T02:05:00Z".to_string(),
+                delivery_count: 1,
+                payload: String::new(),
+            },
+        ];
         let run_history = vec![super::AutonomyRunHistoryView {
             started_at: "2026-08-09T00:00:00Z".to_string(),
             status: "completed".to_string(),
@@ -1012,7 +1035,9 @@ mod tests {
             )
             .expect("observe prompt should render");
         assert!(observe.contains("You are Iris."));
-        assert!(observe.contains("ci-failed"));
+        assert!(observe.contains("CI failed on main"));
+        assert!(observe.contains("Instructions: Investigate the failing job."));
+        assert!(observe.contains("observed only, below your current autonomy level"));
         assert!(observe.contains("3 coalesced firings"));
         assert!(observe.contains("Enriched task #4."));
         assert!(observe.contains("survey and summarize only"));

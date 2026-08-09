@@ -557,6 +557,7 @@ pub(super) async fn trigger_warmup(
                 task_store,
                 goal_store,
                 wake_event_store: Arc::new(crate::wakes::WakeEventStore::new(sqlite_pool.clone())),
+                wake_def_store: Arc::new(crate::wakes::WakeDefStore::new(sqlite_pool.clone())),
                 autonomy_run_store: Arc::new(crate::wakes::AutonomyRunStore::new(
                     sqlite_pool.clone(),
                 )),
@@ -800,6 +801,7 @@ pub async fn create_agent_internal(
         sandbox: None,
         projects: None,
         cron: Vec::new(),
+        wakes: Vec::new(),
     };
     let agent_config = raw_config.resolve(&instance_dir, defaults);
 
@@ -981,6 +983,7 @@ pub async fn create_agent_internal(
         task_store: task_store.clone(),
         goal_store: goal_store.clone(),
         wake_event_store: Arc::new(crate::wakes::WakeEventStore::new(db.sqlite.clone())),
+        wake_def_store: Arc::new(crate::wakes::WakeDefStore::new(db.sqlite.clone())),
         autonomy_run_store: Arc::new(crate::wakes::AutonomyRunStore::new(db.sqlite.clone())),
         project_store: project_store.clone(),
         cron_tool: None,
@@ -1048,6 +1051,11 @@ pub async fn create_agent_internal(
         .write()
         .await
         .insert(arc_agent_id.clone(), deps.clone());
+
+    // Runtime-created agents have no config wakes; seed the builtins only.
+    if let Err(error) = crate::wakes::seed_builtin_wakes(&deps.wake_def_store).await {
+        tracing::warn!(agent_id = %agent_id, %error, "failed to seed builtin wakes");
+    }
 
     let cron_store = std::sync::Arc::new(crate::cron::CronStore::new(db.sqlite.clone()));
     let cron_context = crate::cron::CronContext {

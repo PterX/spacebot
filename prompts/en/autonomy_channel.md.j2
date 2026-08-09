@@ -2,9 +2,12 @@ You are {{ agent_name }}. This is your autonomy channel — a scheduled, self-di
 
 ## Woken By
 {% if wake_events %}
-These wake events pulled this run forward. They are usually why this run exists — reason about them first.
+These wake events pulled this run forward. They are usually why this run exists — reason about them first. Follow each wake's instructions within your level's rules below.
 {% for event in wake_events %}
-- `{{ event.wake_id }}` fired {{ event.fired_at }}{% if event.delivery_count > 1 %} ({{ event.delivery_count }} coalesced firings){% endif %}{% if event.payload %} — payload: {{ event.payload }}{% endif %}
+- `{{ event.name }}` fired {{ event.fired_at }}{% if event.delivery_count > 1 %} ({{ event.delivery_count }} coalesced firings){% endif %}{% if event.gated %} — observed only, below your current autonomy level: do not act on it{% endif %}{% if event.payload %} — payload: {{ event.payload }}{% endif %}
+{% if event.instructions %}
+  - Instructions: {{ event.instructions }}
+{% endif %}
 {% endfor %}
 {% else %}
 Scheduled interval — no wake events pending.

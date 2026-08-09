@@ -118,6 +118,7 @@ async fn bootstrap_deps() -> anyhow::Result<spacebot::AgentDeps> {
         task_store,
         goal_store: Arc::new(spacebot::goals::GoalStore::new(db.sqlite.clone())),
         wake_event_store: Arc::new(spacebot::wakes::WakeEventStore::new(db.sqlite.clone())),
+        wake_def_store: Arc::new(spacebot::wakes::WakeDefStore::new(db.sqlite.clone())),
         autonomy_run_store: Arc::new(spacebot::wakes::AutonomyRunStore::new(db.sqlite.clone())),
         project_store: Arc::new(spacebot::projects::ProjectStore::new(db.sqlite.clone())),
         cron_tool: None,

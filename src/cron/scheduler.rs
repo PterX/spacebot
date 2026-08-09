@@ -957,7 +957,9 @@ fn normalize_active_hours(active_hours: Option<(u8, u8)>) -> Option<(u8, u8)> {
     active_hours.filter(|(start, end)| start != end)
 }
 
-fn normalize_cron_expr(cron_expr: Option<String>) -> Result<Option<String>> {
+/// Validate and normalize an optional 5-field cron expression, returning the
+/// original 5-field form. Shared with wake config validation.
+pub(crate) fn normalize_cron_expr(cron_expr: Option<String>) -> Result<Option<String>> {
     let Some(expr) = cron_expr else {
         return Ok(None);
     };

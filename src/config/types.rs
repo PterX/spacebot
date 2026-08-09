@@ -1240,7 +1240,19 @@ impl CortexConfig {
 /// The dial is cumulative: each level includes everything below it.
 /// `Off` disables the autonomy channel entirely; `Act` additionally allows
 /// executing user-approved `ready` tasks.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum AutonomyLevel {
     #[default]
@@ -1592,6 +1604,8 @@ pub struct AgentConfig {
     pub projects: Option<ProjectsConfig>,
     /// Cron job definitions for this agent.
     pub cron: Vec<CronDef>,
+    /// Wake definitions for this agent, reconciled into the wake store.
+    pub wakes: Vec<crate::wakes::WakeConfig>,
 }
 
 /// A cron job definition from config.
@@ -1655,6 +1669,8 @@ pub struct ResolvedAgentConfig {
     /// Number of messages to fetch from the platform when a new channel is created.
     pub history_backfill_count: usize,
     pub cron: Vec<CronDef>,
+    /// Wake definitions for this agent, reconciled into the wake store.
+    pub wakes: Vec<crate::wakes::WakeConfig>,
     /// Tool-use enforcement for preventing models from describing actions instead of calling tools.
     pub tool_use_enforcement: ToolUseEnforcement,
 }
@@ -1764,6 +1780,7 @@ impl AgentConfig {
                 .unwrap_or_else(|| defaults.projects.clone()),
             history_backfill_count: defaults.history_backfill_count,
             cron: self.cron.clone(),
+            wakes: self.wakes.clone(),
             tool_use_enforcement: self
                 .tool_use_enforcement
                 .clone()
@@ -3420,6 +3437,13 @@ mod autonomy_config_validation_tests {
         }
         assert_eq!(AutonomyLevel::parse("aggressive"), None);
         assert_eq!(AutonomyLevel::default(), AutonomyLevel::Off);
+    }
+
+    #[test]
+    fn autonomy_levels_order_by_capability() {
+        assert!(AutonomyLevel::Off < AutonomyLevel::Observe);
+        assert!(AutonomyLevel::Observe < AutonomyLevel::Suggest);
+        assert!(AutonomyLevel::Suggest < AutonomyLevel::Act);
     }
 
     #[test]
