@@ -2714,6 +2714,7 @@ export interface components {
         BindingResponse: {
             adapter?: string | null;
             agent_id: string;
+            authority: string[];
             channel: string;
             channel_ids: string[];
             chat_id?: string | null;
@@ -2973,6 +2974,7 @@ export interface components {
         CreateBindingRequest: {
             adapter?: string | null;
             agent_id: string;
+            authority?: string[];
             channel: string;
             channel_ids?: string[];
             chat_id?: string | null;
@@ -4319,6 +4321,7 @@ export interface components {
         UpdateBindingRequest: {
             adapter?: string | null;
             agent_id: string;
+            authority?: string[];
             channel: string;
             channel_ids?: string[];
             chat_id?: string | null;

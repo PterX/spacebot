@@ -18,6 +18,7 @@ pub struct BindingResponse {
     pub channel_ids: Vec<String>,
     pub require_mention: bool,
     pub dm_allowed_users: Vec<String>,
+    pub authority: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]
@@ -51,6 +52,8 @@ pub(super) struct CreateBindingRequest {
     require_mention: bool,
     #[serde(default)]
     dm_allowed_users: Vec<String>,
+    #[serde(default)]
+    authority: Vec<String>,
     /// Optional: set platform credentials if not yet configured.
     #[serde(default)]
     platform_credentials: Option<PlatformCredentials>,
@@ -161,6 +164,8 @@ pub(super) struct UpdateBindingRequest {
     require_mention: bool,
     #[serde(default)]
     dm_allowed_users: Vec<String>,
+    #[serde(default)]
+    authority: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]
@@ -210,6 +215,7 @@ pub(super) async fn list_bindings(
             channel_ids: b.channel_ids,
             require_mention: b.require_mention,
             dm_allowed_users: b.dm_allowed_users,
+            authority: b.authority,
         })
         .collect();
 
@@ -491,6 +497,13 @@ pub(super) async fn create_binding(
         }
         binding_table["dm_allowed_users"] = toml_edit::value(arr);
     }
+    if !request.authority.is_empty() {
+        let mut arr = toml_edit::Array::new();
+        for id in &request.authority {
+            arr.push(id.as_str());
+        }
+        binding_table["authority"] = toml_edit::value(arr);
+    }
     bindings_array.push(binding_table);
 
     tokio::fs::write(&config_path, doc.to_string())
@@ -593,18 +606,11 @@ pub(super) async fn create_binding(
                         }
                     }
                 };
-                let slack_commands = new_config
-                    .messaging
-                    .slack
-                    .as_ref()
-                    .map(|s| s.commands.clone())
-                    .unwrap_or_default();
                 match crate::messaging::slack::SlackAdapter::new(
                     "slack",
                     &bot_token,
                     &app_token,
                     slack_perms,
-                    slack_commands,
                 ) {
                     Ok(adapter) => {
                         if let Err(error) = manager.register_and_start(adapter).await {
@@ -875,6 +881,16 @@ pub(super) async fn update_binding(
         binding["dm_allowed_users"] = toml_edit::value(arr);
     } else {
         binding.remove("dm_allowed_users");
+    }
+
+    if !request.authority.is_empty() {
+        let mut arr = toml_edit::Array::new();
+        for id in &request.authority {
+            arr.push(id.as_str());
+        }
+        binding["authority"] = toml_edit::value(arr);
+    } else {
+        binding.remove("authority");
     }
 
     tokio::fs::write(&config_path, doc.to_string())

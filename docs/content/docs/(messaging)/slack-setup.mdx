@@ -59,6 +59,20 @@ In your Slack app settings, go to **Event Subscriptions** and make sure it's tog
 
 These tell Slack which message events to send to Spacebot. Without them, the bot won't see messages in the corresponding channel types.
 
+## Step 4b: Add the Slash Command (optional)
+
+Spacebot exposes its whole command set through one umbrella command: `/spacebot status`, `/spacebot quiet`, `/spacebot help`, and so on. Typing `/spacebot` alone (or an unknown subcommand) replies with the available subcommands.
+
+In your Slack app settings, go to **Slash Commands** → **Create New Command**:
+
+- Command: `/spacebot`
+- Short description: `Spacebot commands`
+- Usage hint: `[command] [args]`
+
+Socket Mode carries the command over the existing WebSocket, so no Request URL is needed. Slash commands are declared per app in the Slack UI — repeat this step for each app instance.
+
+Typed commands (`/status` as a plain message) work in every channel without this step; the native command only adds Slack's autocomplete UI.
+
 ## Step 5: Install to Workspace
 
 In your Slack app settings, go to **Install App** → **Install to Workspace** → Authorize.

@@ -110,6 +110,27 @@ fn should_process_event_for_channel(event: &ProcessEvent, channel_id: &ChannelId
     event_is_for_channel(event, channel_id)
 }
 
+/// Whether an inbound message is a recognized Control command. Control
+/// dispatch never runs a turn, so it skips the coalesce flush instead of
+/// waiting behind a buffered batch's LLM turn.
+fn is_control_command(message: &InboundMessage) -> bool {
+    if message.source == "system" {
+        return false;
+    }
+    let text = match &message.content {
+        crate::MessageContent::Text(text) => text.clone(),
+        crate::MessageContent::Command { .. } => message.content.to_string(),
+        _ => return false,
+    };
+    match crate::commands::REGISTRY.parse(&text) {
+        crate::commands::ParseResult::Command(command) => matches!(
+            command.def.handler,
+            crate::commands::CommandHandler::Control(_)
+        ),
+        _ => false,
+    }
+}
+
 fn should_flush_coalesce_buffer_for_event(event: &ProcessEvent) -> bool {
     matches!(
         event,
@@ -369,6 +390,13 @@ pub struct ChannelState {
     /// When set, the `set_outcome` tool is registered for this channel,
     /// allowing the LLM to explicitly store a delivery payload.
     pub cron_outcome: Option<crate::cron::CronOutcome>,
+    /// Whether a turn is currently in flight. Read by the inbound router's
+    /// busy policy without entering the channel's message queue.
+    pub turn_active: Arc<std::sync::atomic::AtomicBool>,
+    /// Live response mode, encoded via `ResponseMode::to_u8`. Shared so the
+    /// router-side control plane can apply a mode change mid-turn; the
+    /// channel reads it at every gate instead of its startup snapshot.
+    pub response_mode: Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl ChannelState {
@@ -625,6 +653,35 @@ impl ChannelControlHandle {
         }
     }
 
+    /// Whether the channel currently has a turn in flight. Read by the
+    /// inbound router's busy policy.
+    pub fn turn_active(&self) -> bool {
+        self.inner
+            .state
+            .turn_active
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Live response mode for this channel.
+    pub fn response_mode(&self) -> crate::conversation::settings::ResponseMode {
+        crate::conversation::settings::ResponseMode::from_u8(
+            self.inner
+                .state
+                .response_mode
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    /// Apply a response-mode change to the running channel. Persistence is
+    /// the caller's job (the control plane writes the settings store); this
+    /// updates the live cell every gate reads.
+    pub fn set_response_mode_live(&self, mode: crate::conversation::settings::ResponseMode) {
+        self.inner
+            .state
+            .response_mode
+            .store(mode.to_u8(), std::sync::atomic::Ordering::Release);
+    }
+
     /// Cancel all active workers and branches, emitting WorkerComplete/BranchResult
     /// for each so the channel can retrigger and synthesize partial results.
     pub async fn cancel_all_workers_and_branches(&self, reason: &str) {
@@ -660,6 +717,24 @@ impl ChannelControlHandle {
                 .cancel_branch_with_reason(branch_id, reason)
                 .await;
         }
+    }
+}
+
+/// RAII flag for the shared turn-active cell: set on entry to message
+/// handling, cleared when the turn ends by any path (early return, error,
+/// panic unwind).
+struct TurnActiveGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl TurnActiveGuard {
+    fn engage(flag: &Arc<std::sync::atomic::AtomicBool>) -> Self {
+        flag.store(true, std::sync::atomic::Ordering::Release);
+        Self(flag.clone())
+    }
+}
+
+impl Drop for TurnActiveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -865,6 +940,10 @@ impl Channel {
             model_overrides: Arc::new(resolved_settings.clone()),
             active_participants: Arc::new(RwLock::new(HashMap::new())),
             cron_outcome,
+            turn_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            response_mode: Arc::new(std::sync::atomic::AtomicU8::new(
+                resolved_settings.response_mode.to_u8(),
+            )),
         };
 
         // Each channel gets its own isolated tool server to avoid races between
@@ -1010,17 +1089,34 @@ impl Channel {
         // Update shared state for branches/workers
         *self.state.worker_context_settings.write().await = resolved.worker_context.clone();
         self.state.model_overrides = std::sync::Arc::new(resolved.clone());
+        self.state.response_mode.store(
+            resolved.response_mode.to_u8(),
+            std::sync::atomic::Ordering::Release,
+        );
         self.resolved_settings = resolved;
     }
 
     /// Whether the channel is in a non-active response mode (Observe or MentionOnly).
     fn is_suppressed(&self) -> bool {
-        !matches!(self.resolved_settings.response_mode, ResponseMode::Active)
+        !matches!(self.response_mode(), ResponseMode::Active)
+    }
+
+    /// Live response mode. Reads the shared cell rather than the startup
+    /// snapshot so router-side `/quiet` (and friends) apply mid-turn.
+    fn response_mode(&self) -> ResponseMode {
+        ResponseMode::from_u8(
+            self.state
+                .response_mode
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
     }
 
     /// Update the response mode and persist to the channel_settings table.
     async fn set_response_mode(&mut self, mode: ResponseMode) {
         self.resolved_settings.response_mode = mode;
+        self.state
+            .response_mode
+            .store(mode.to_u8(), std::sync::atomic::Ordering::Release);
 
         // Persist to channel_settings table — load existing settings first so we
         // don't overwrite other fields, then spawn the DB write to avoid blocking.
@@ -1202,7 +1298,6 @@ impl Channel {
             ControlAction::Status => {
                 let temporal_context =
                     TemporalContext::from_runtime(self.deps.runtime_config.as_ref());
-                let now_line = temporal_context.current_time_line();
                 let routing = self.deps.runtime_config.routing.load();
                 let channel_model = self
                     .resolved_settings
@@ -1212,46 +1307,24 @@ impl Channel {
                     .resolved_settings
                     .resolve_model("branch")
                     .unwrap_or_else(|| routing.resolve(ProcessType::Branch, None));
-                let mode = match self.resolved_settings.response_mode {
-                    ResponseMode::Active => "active",
-                    ResponseMode::Observe => "observe (learning, never responds)",
-                    ResponseMode::MentionOnly => "mention-only (@mention/reply only)",
-                };
-                let adapter = self.current_adapter().unwrap_or("unknown");
-                let body = format!(
-                    "status\n\
-                     - agent: {}\n\
-                     - channel: {}\n\
-                     - adapter: {}\n\
-                     - mode: {}\n\
-                     - channel model: {}\n\
-                     - branch model: {}\n\
-                     - time: {}",
-                    self.deps.agent_id,
-                    self.id,
-                    adapter,
-                    mode,
+                let body = crate::commands::control::status_text(
+                    &self.deps.agent_id,
+                    &self.id,
+                    self.current_adapter().unwrap_or("unknown"),
+                    self.response_mode(),
                     channel_model,
                     branch_model,
-                    now_line
+                    &temporal_context.current_time_line(),
                 );
                 self.send_builtin_text(body, def.name).await;
             }
             ControlAction::SetResponseMode(mode) => {
                 self.set_response_mode(mode).await;
-                let confirmation = match mode {
-                    ResponseMode::Active => {
-                        "active mode enabled. i'll respond normally in this chat."
-                    }
-                    ResponseMode::Observe => {
-                        "observe mode enabled. i'll learn from this conversation but won't respond."
-                    }
-                    ResponseMode::MentionOnly => {
-                        "mention-only mode enabled. i'll only respond when @mentioned or replied to."
-                    }
-                };
-                self.send_builtin_text(confirmation.to_string(), def.name)
-                    .await;
+                self.send_builtin_text(
+                    crate::commands::control::mode_confirmation(mode).to_string(),
+                    def.name,
+                )
+                .await;
             }
             ControlAction::Help => {
                 self.send_builtin_text(crate::commands::REGISTRY.help_text(), def.name)
@@ -1312,8 +1385,14 @@ impl Channel {
                         self.coalesce_buffer.push(message);
                         self.update_coalesce_deadline(&config).await;
                     } else {
-                        // Flush any pending buffer before handling this message
-                        if let Err(error) = self.flush_coalesce_buffer().await {
+                        // Control commands dispatch immediately without
+                        // flushing — the buffer keeps its own debounce clock.
+                        // Everything else (including Agent commands, which
+                        // are joining the conversation) flushes first so
+                        // order is preserved.
+                        if !is_control_command(&message)
+                            && let Err(error) = self.flush_coalesce_buffer().await
+                        {
                             tracing::error!(%error, channel_id = %self.id, "error flushing coalesce buffer");
                         }
                         if let Err(error) = self.handle_message(message).await {
@@ -1506,6 +1585,7 @@ impl Channel {
     #[tracing::instrument(skip(self, messages), fields(channel_id = %self.id, agent_id = %self.deps.agent_id, message_count = messages.len()))]
     async fn handle_message_batch(&mut self, messages: Vec<InboundMessage>) -> Result<()> {
         // Apply runtime-config updates immediately without requiring a restart.
+        let _turn_guard = TurnActiveGuard::engage(&self.state.turn_active);
 
         let message_count = messages.len();
         let batch_start_timestamp = messages
@@ -1711,7 +1791,7 @@ impl Channel {
         // Observe mode: always suppress (even with mentions in batch).
         // MentionOnly mode: suppress only when no invocations in the batch.
         let should_suppress_batch = !self.is_dm()
-            && match self.resolved_settings.response_mode {
+            && match self.response_mode() {
                 ResponseMode::Active => false,
                 ResponseMode::Observe => true,
                 ResponseMode::MentionOnly => !batch_has_invoke,
@@ -1721,7 +1801,7 @@ impl Channel {
             tracing::debug!(
                 channel_id = %self.id,
                 message_count,
-                response_mode = ?self.resolved_settings.response_mode,
+                response_mode = ?self.response_mode(),
                 "suppressing unsolicited coalesced batch"
             );
             // Inject batch messages into in-memory history so the agent
@@ -1959,6 +2039,7 @@ impl Channel {
     #[tracing::instrument(skip(self, message), fields(channel_id = %self.id, agent_id = %self.deps.agent_id, message_id = %message.id))]
     async fn handle_message(&mut self, message: InboundMessage) -> Result<()> {
         // Apply runtime-config updates immediately without requiring a restart.
+        let _turn_guard = TurnActiveGuard::engage(&self.state.turn_active);
 
         // Track the inbound message that triggered this turn so outbound
         // responses carry the correct routing metadata (e.g. Slack thread_ts).
@@ -2090,7 +2171,7 @@ impl Channel {
         // Deterministic ping ack for Discord mention-only mentions/replies to avoid
         // flaky model behavior (e.g. skipping or over-formatting simple liveness checks).
         // Skipped in Observe mode — the agent never responds in Observe.
-        if !matches!(self.resolved_settings.response_mode, ResponseMode::Observe)
+        if !matches!(self.response_mode(), ResponseMode::Observe)
             && should_send_discord_quiet_mode_ping_ack(&message, &raw_text, self.is_suppressed())
         {
             self.send_builtin_text("yeah i'm here".to_string(), "discord-ping")
@@ -2154,25 +2235,24 @@ impl Channel {
         // Response mode guardrail:
         // Observe mode: always suppress — agent learns but never responds.
         // MentionOnly mode: suppress unless explicitly invoked.
-        if !matches!(self.resolved_settings.response_mode, ResponseMode::Active)
+        if !matches!(self.response_mode(), ResponseMode::Active)
             && message.source != "system"
             && !self.is_dm()
         {
             // Observe mode always suppresses; MentionOnly checks for invocation.
-            let should_suppress =
-                if matches!(self.resolved_settings.response_mode, ResponseMode::Observe) {
-                    true
-                } else {
-                    (invoked_by_command, invoked_by_mention, invoked_by_reply) =
-                        self.compute_listen_mode_invocation(&message, &raw_text);
-                    !invoked_by_command && !invoked_by_mention && !invoked_by_reply
-                };
+            let should_suppress = if matches!(self.response_mode(), ResponseMode::Observe) {
+                true
+            } else {
+                (invoked_by_command, invoked_by_mention, invoked_by_reply) =
+                    self.compute_listen_mode_invocation(&message, &raw_text);
+                !invoked_by_command && !invoked_by_mention && !invoked_by_reply
+            };
 
             if should_suppress {
                 tracing::debug!(
                     channel_id = %self.id,
                     source = %message.source,
-                    response_mode = ?self.resolved_settings.response_mode,
+                    response_mode = ?self.response_mode(),
                     "suppressing unsolicited reply"
                 );
                 // In Observe and MentionOnly modes, inject the message into

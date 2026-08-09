@@ -560,6 +560,8 @@ pub(super) struct TomlDiscordConfig {
     #[serde(default)]
     pub(super) dm_allowed_users: Vec<String>,
     #[serde(default)]
+    pub(super) authority: Vec<String>,
+    #[serde(default)]
     pub(super) allow_bot_messages: bool,
 }
 
@@ -571,6 +573,8 @@ pub(super) struct TomlDiscordInstanceConfig {
     pub(super) token: Option<String>,
     #[serde(default)]
     pub(super) dm_allowed_users: Vec<String>,
+    #[serde(default)]
+    pub(super) authority: Vec<String>,
     #[serde(default)]
     pub(super) allow_bot_messages: bool,
 }
@@ -586,7 +590,7 @@ pub(super) struct TomlSlackConfig {
     #[serde(default)]
     pub(super) dm_allowed_users: Vec<String>,
     #[serde(default)]
-    pub(super) commands: Vec<TomlSlackCommandConfig>,
+    pub(super) authority: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -599,14 +603,7 @@ pub(super) struct TomlSlackInstanceConfig {
     #[serde(default)]
     pub(super) dm_allowed_users: Vec<String>,
     #[serde(default)]
-    pub(super) commands: Vec<TomlSlackCommandConfig>,
-}
-
-#[derive(Deserialize)]
-pub(super) struct TomlSlackCommandConfig {
-    pub(super) command: String,
-    pub(super) agent_id: String,
-    pub(super) description: Option<String>,
+    pub(super) authority: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -618,6 +615,8 @@ pub(super) struct TomlTelegramConfig {
     pub(super) instances: Vec<TomlTelegramInstanceConfig>,
     #[serde(default)]
     pub(super) dm_allowed_users: Vec<String>,
+    #[serde(default)]
+    pub(super) authority: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -628,6 +627,8 @@ pub(super) struct TomlTelegramInstanceConfig {
     pub(super) token: Option<String>,
     #[serde(default)]
     pub(super) dm_allowed_users: Vec<String>,
+    #[serde(default)]
+    pub(super) authority: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -656,6 +657,8 @@ pub(super) struct TomlEmailConfig {
     pub(super) folders: Vec<String>,
     #[serde(default)]
     pub(super) allowed_senders: Vec<String>,
+    #[serde(default)]
+    pub(super) authority: Vec<String>,
     #[serde(default = "default_email_max_body_bytes")]
     pub(super) max_body_bytes: usize,
     #[serde(default = "default_email_max_attachment_bytes")]
@@ -691,6 +694,8 @@ pub(super) struct TomlEmailInstanceConfig {
     pub(super) folders: Vec<String>,
     #[serde(default)]
     pub(super) allowed_senders: Vec<String>,
+    #[serde(default)]
+    pub(super) authority: Vec<String>,
     #[serde(default = "default_email_max_body_bytes")]
     pub(super) max_body_bytes: usize,
     #[serde(default = "default_email_max_attachment_bytes")]
@@ -721,6 +726,8 @@ pub(super) struct TomlTwitchConfig {
     pub(super) instances: Vec<TomlTwitchInstanceConfig>,
     #[serde(default)]
     pub(super) channels: Vec<String>,
+    #[serde(default)]
+    pub(super) authority: Vec<String>,
     pub(super) trigger_prefix: Option<String>,
 }
 
@@ -736,6 +743,8 @@ pub(super) struct TomlTwitchInstanceConfig {
     pub(super) refresh_token: Option<String>,
     #[serde(default)]
     pub(super) channels: Vec<String>,
+    #[serde(default)]
+    pub(super) authority: Vec<String>,
     pub(super) trigger_prefix: Option<String>,
 }
 
@@ -749,6 +758,8 @@ pub(super) struct TomlSignalConfig {
     pub(super) instances: Vec<TomlSignalInstanceConfig>,
     #[serde(default)]
     pub(super) dm_allowed_users: Vec<String>,
+    #[serde(default)]
+    pub(super) authority: Vec<String>,
     #[serde(default)]
     pub(super) group_ids: Vec<String>,
     #[serde(default)]
@@ -766,6 +777,8 @@ pub(super) struct TomlSignalInstanceConfig {
     pub(super) account: Option<String>,
     #[serde(default)]
     pub(super) dm_allowed_users: Vec<String>,
+    #[serde(default)]
+    pub(super) authority: Vec<String>,
     #[serde(default)]
     pub(super) group_ids: Vec<String>,
     #[serde(default)]
@@ -845,6 +858,8 @@ pub(super) struct TomlBinding {
     #[serde(default)]
     pub(super) dm_allowed_users: Vec<String>,
     #[serde(default)]
+    pub(super) authority: Vec<String>,
+    #[serde(default)]
     pub(super) settings: Option<TomlConversationSettings>,
 }
 
@@ -859,6 +874,8 @@ pub(super) struct TomlMattermostConfig {
     pub(super) instances: Vec<TomlMattermostInstanceConfig>,
     #[serde(default)]
     pub(super) dm_allowed_users: Vec<String>,
+    #[serde(default)]
+    pub(super) authority: Vec<String>,
     #[serde(default = "default_mattermost_max_attachment_bytes")]
     pub(super) max_attachment_bytes: usize,
 }
@@ -873,6 +890,8 @@ pub(super) struct TomlMattermostInstanceConfig {
     pub(super) team_id: Option<String>,
     #[serde(default)]
     pub(super) dm_allowed_users: Vec<String>,
+    #[serde(default)]
+    pub(super) authority: Vec<String>,
     #[serde(default = "default_mattermost_max_attachment_bytes")]
     pub(super) max_attachment_bytes: usize,
 }

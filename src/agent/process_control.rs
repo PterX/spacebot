@@ -149,6 +149,23 @@ impl ProcessControlRegistry {
             .collect()
     }
 
+    /// Live control handle for a channel, when one is running. Prunes a
+    /// stale registration on the way.
+    pub async fn channel_handle(
+        &self,
+        channel_id: &ChannelId,
+    ) -> Option<crate::agent::channel::ChannelControlHandle> {
+        match self.lookup_channel_handle(channel_id).await {
+            ChannelLookupResult::Found(handle) => Some(handle),
+            ChannelLookupResult::Stale(registration_id) => {
+                self.remove_stale_channel_if_matches(channel_id, registration_id)
+                    .await;
+                None
+            }
+            ChannelLookupResult::Missing => None,
+        }
+    }
+
     async fn lookup_channel_handle(&self, channel_id: &ChannelId) -> ChannelLookupResult {
         let handle_entry = {
             let channels = self.channels.read().await;

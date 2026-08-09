@@ -138,6 +138,26 @@ pub enum ResponseMode {
     MentionOnly,
 }
 
+impl ResponseMode {
+    /// Atomic-cell encoding, for sharing the live mode across tasks. Values
+    /// must round-trip with [`from_u8`](Self::from_u8).
+    pub fn to_u8(self) -> u8 {
+        match self {
+            ResponseMode::Active => 0,
+            ResponseMode::Observe => 1,
+            ResponseMode::MentionOnly => 2,
+        }
+    }
+
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            1 => ResponseMode::Observe,
+            2 => ResponseMode::MentionOnly,
+            _ => ResponseMode::Active,
+        }
+    }
+}
+
 /// Worker context settings control what context workers receive when spawned.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct WorkerContextMode {

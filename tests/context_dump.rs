@@ -239,6 +239,8 @@ async fn dump_channel_context() {
 
     let state = spacebot::agent::channel::ChannelState {
         channel_id,
+        turn_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        response_mode: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
         active_branches: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         worker_handles: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
@@ -496,6 +498,8 @@ async fn dump_all_contexts() {
     let response_tx = spacebot::RoutedSender::new(raw_tx, spacebot::InboundMessage::empty());
     let state = spacebot::agent::channel::ChannelState {
         channel_id,
+        turn_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        response_mode: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
         active_branches: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         worker_handles: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),

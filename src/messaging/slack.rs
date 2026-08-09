@@ -21,7 +21,7 @@
 //! - Typing indicator via `assistant.threads.setStatus`
 //! - DM broadcast via `conversations.open`
 
-use crate::config::{SlackCommandConfig, SlackPermissions};
+use crate::config::SlackPermissions;
 use crate::messaging::apply_runtime_adapter_to_conversation_id;
 use crate::messaging::traits::{HistoryMessage, InboundStream, Messaging};
 use crate::{InboundMessage, MessageContent, OutboundResponse, StatusUpdate};
@@ -41,9 +41,6 @@ struct SlackAdapterState {
     permissions: Arc<ArcSwap<SlackPermissions>>,
     bot_token: String,
     bot_user_id: String,
-    /// Maps slash command string (e.g. `"/ask"`) → agent_id.
-    /// Built once at start() from the config; read-only afterwards.
-    commands: Arc<HashMap<String, String>>,
     /// Cache of resolved user identities to avoid repeated `users.info` API calls.
     user_identity_cache: Arc<RwLock<HashMap<String, SlackUserIdentity>>>,
     /// Cache of resolved channel names to avoid repeated `conversations.info` API calls.
@@ -71,8 +68,6 @@ pub struct SlackAdapter {
     /// Maps InboundMessage.id → Slack ts for streaming edits.
     active_messages: Arc<RwLock<HashMap<String, String>>>,
     shutdown_tx: Arc<RwLock<Option<mpsc::Sender<()>>>>,
-    /// Slash command routing: command string → agent_id.
-    commands: Arc<HashMap<String, String>>,
 }
 
 impl SlackAdapter {
@@ -81,7 +76,6 @@ impl SlackAdapter {
         bot_token: impl Into<String>,
         app_token: impl Into<String>,
         permissions: Arc<ArcSwap<SlackPermissions>>,
-        commands: Vec<SlackCommandConfig>,
     ) -> anyhow::Result<Self> {
         let runtime_key = runtime_key.into();
         let bot_token = bot_token.into();
@@ -89,10 +83,6 @@ impl SlackAdapter {
             SlackClientHyperConnector::new().context("failed to create slack HTTP connector")?,
         ));
         let token = SlackApiToken::new(SlackApiTokenValue(bot_token.clone()));
-        let commands_map: HashMap<String, String> = commands
-            .into_iter()
-            .map(|c| (c.command, c.agent_id))
-            .collect();
         Ok(Self {
             runtime_key,
             bot_token,
@@ -102,7 +92,6 @@ impl SlackAdapter {
             token,
             active_messages: Arc::new(RwLock::new(HashMap::new())),
             shutdown_tx: Arc::new(RwLock::new(None)),
-            commands: Arc::new(commands_map),
         })
     }
 
@@ -495,22 +484,37 @@ async fn handle_command_event(
         }
     }
 
-    if !adapter_state.commands.contains_key(&command_str) {
-        tracing::warn!(
-            command = %command_str,
-            user_id = %user_id,
-            "slash command not configured — ignoring"
-        );
+    // One `/spacebot` umbrella command covers the whole registry:
+    // `/spacebot status`, `/spacebot quiet`, ... . An empty or unknown
+    // subcommand answers with the generated listing instead of dispatching.
+    let (subcommand, args) = match text.trim().split_once(char::is_whitespace) {
+        Some((subcommand, rest)) => (subcommand.to_string(), rest.trim().to_string()),
+        None => (text.trim().to_string(), String::new()),
+    };
+    let resolved = if subcommand.is_empty() {
+        None
+    } else {
+        crate::commands::REGISTRY.resolve(&subcommand)
+    };
+    let Some(def) = resolved else {
+        let listing = crate::commands::native::slack_subcommands()
+            .into_iter()
+            .map(|spec| match spec.arg {
+                Some(_) => format!("`{} {} <args>`", command_str, spec.name),
+                None => format!("`{} {}`", command_str, spec.name),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let heading = if subcommand.is_empty() {
+            "usage:".to_string()
+        } else {
+            format!("`{subcommand}` is not a spacebot command. usage:")
+        };
         return Ok(SlackCommandEventResponse {
-            content: SlackMessageContent::new().with_text(format!(
-                "`{}` is not configured on this Spacebot instance.",
-                command_str
-            )),
+            content: SlackMessageContent::new().with_text(format!("{heading} {listing}")),
             response_type: Some(SlackMessageResponseType::Ephemeral),
         });
-    }
-
-    let agent_id = adapter_state.commands[&command_str].clone();
+    };
 
     let base_conversation_id = format!("slack:{}:{}", team_id, channel_id);
     let conversation_id =
@@ -541,14 +545,11 @@ async fn handle_command_event(
         "slack_user_mention".into(),
         serde_json::Value::String(format!("<@{}>", user_id)),
     );
-    // Embed the agent_id hint so the router can honour command-specific routing
-    // without requiring a separate binding entry per command.
-    metadata.insert(
-        "slack_command_agent_id".into(),
-        serde_json::Value::String(agent_id),
-    );
 
-    let content = MessageContent::Text(format!("{} {}", command_str, text).trim().to_string());
+    let content = MessageContent::Command {
+        name: def.name.to_string(),
+        args,
+    };
 
     let inbound = InboundMessage {
         id: msg_id,
@@ -780,7 +781,6 @@ impl Messaging for SlackAdapter {
             permissions: self.permissions.clone(),
             bot_token: self.bot_token.clone(),
             bot_user_id,
-            commands: self.commands.clone(),
             user_identity_cache: Arc::new(RwLock::new(HashMap::new())),
             channel_name_cache: Arc::new(RwLock::new(HashMap::new())),
         });
@@ -789,14 +789,6 @@ impl Messaging for SlackAdapter {
             .with_push_events(handle_push_event)
             .with_command_events(handle_command_event)
             .with_interaction_events(handle_interaction_event);
-
-        // The socket mode listener needs its own client instance — it manages
-        // a persistent WebSocket connection internally and owns that client for
-        // the lifetime of the connection. The shared `self.client` is for REST calls.
-        let _listener_client = Arc::new(SlackClient::new(
-            SlackClientHyperConnector::new()
-                .context("failed to create slack socket mode connector")?,
-        ));
 
         // The socket mode listener needs its own client — it owns a persistent
         // WebSocket connection. The shared self.client is for REST calls only.
