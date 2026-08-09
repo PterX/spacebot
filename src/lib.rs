@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod api;
 pub mod auth;
+pub mod commands;
 pub mod config;
 pub mod conversation;
 pub mod cron;
@@ -606,6 +607,15 @@ pub enum MessageContent {
         /// Platform-specific message reference (`ts` on Slack, message ID on Discord).
         message_ts: Option<String>,
     },
+    /// A structured slash command: name without the slash, plus raw args.
+    ///
+    /// The wire form for surfaces that parse commands client-side (Portal)
+    /// or receive them natively (platform command menus). Renders as
+    /// "/name args", so text-path parsing handles it identically.
+    Command {
+        name: String,
+        args: String,
+    },
 }
 
 impl std::fmt::Display for MessageContent {
@@ -631,6 +641,13 @@ impl std::fmt::Display for MessageContent {
                     write!(f, "[interaction: {} → {:?}]", action_id, values)
                 } else {
                     write!(f, "[interaction: {}]", action_id)
+                }
+            }
+            MessageContent::Command { name, args } => {
+                if args.is_empty() {
+                    write!(f, "/{}", name)
+                } else {
+                    write!(f, "/{} {}", name, args)
                 }
             }
         }
