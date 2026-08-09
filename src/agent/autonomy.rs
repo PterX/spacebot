@@ -740,6 +740,7 @@ mod tests {
             assigned_agent_id: assigned.map(str::to_string),
             subtasks: Vec::new(),
             metadata: serde_json::json!({}),
+            goal_id: None,
             source_memory_id: None,
             worker_id: None,
             created_by: "user".to_string(),

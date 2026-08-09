@@ -2,8 +2,8 @@
 
 use super::state::ApiState;
 use super::{
-    activity, agents, attachments, bindings, channels, config, cortex, cron, factory, goals,
-    ingest, links, mcp, memories, messaging, models, notifications, opencode_proxy, portal,
+    activity, agents, attachments, autonomy, bindings, channels, config, cortex, cron, factory,
+    goals, ingest, links, mcp, memories, messaging, models, notifications, opencode_proxy, portal,
     projects, providers, secrets, settings, skills, ssh, system, tasks, tools, usage, wiki,
     workers,
 };
@@ -126,6 +126,10 @@ pub fn api_router() -> OpenApiRouter<Arc<ApiState>> {
         .routes(routes!(cron::cron_executions))
         .routes(routes!(cron::trigger_cron))
         .routes(routes!(cron::toggle_cron))
+        // Autonomy routes
+        .routes(routes!(autonomy::autonomy_status))
+        .routes(routes!(autonomy::autonomy_fleet))
+        .routes(routes!(autonomy::autonomy_runs))
         // Notification routes
         .routes(routes!(notifications::list_notifications))
         .routes(routes!(notifications::unread_count))

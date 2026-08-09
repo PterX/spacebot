@@ -1,8 +1,8 @@
 import {useEffect, useState} from "react";
 import {CaretDown, CaretRight} from "@phosphor-icons/react";
 import {Card, CardContent, FilterButton} from "@spacedrive/primitives";
+import type {AutonomyStatus, AutonomyUpdate} from "@/api/client";
 import {LEVELS, LevelDial} from "./levels";
-import type {AutonomyLevel, AutonomyStatus} from "./mock";
 
 const INTERVAL_OPTIONS: {label: string; secs: number}[] = [
 	{label: "15m", secs: 900},
@@ -43,24 +43,25 @@ function formatCountdown(iso: string, now: number): string {
 	return `${m}:${String(s).padStart(2, "0")}`;
 }
 
+function formatInterval(secs: number): string {
+	if (secs < 3600) return `${Math.round(secs / 60)}m`;
+	return `${Math.round(secs / 3600)}h`;
+}
+
 interface AutonomyDialCardProps {
-	level: AutonomyLevel;
-	onLevelChange: (level: AutonomyLevel) => void;
 	status: AutonomyStatus | undefined;
+	onUpdate: (update: AutonomyUpdate) => void;
 	agentName?: string;
 }
 
-export function AutonomyDialCard({
-	level,
-	onLevelChange,
-	status,
-	agentName,
-}: AutonomyDialCardProps) {
+export function AutonomyDialCard({status, onUpdate, agentName}: AutonomyDialCardProps) {
 	const [advancedOpen, setAdvancedOpen] = useState(false);
-	const [intervalSecs, setIntervalSecs] = useState(1800);
-	const [maxTasks, setMaxTasks] = useState(2);
-	const [activeHours, setActiveHours] = useState<[number, number] | null>([8, 22]);
 	const now = useNow(1000);
+
+	const level = status?.level ?? "off";
+	const intervalSecs = status?.interval_secs ?? 1800;
+	const maxTasks = status?.max_tasks_per_run ?? 2;
+	const activeHours = status?.active_hours ?? null;
 
 	const selected = LEVELS.find((l) => l.key === level) ?? LEVELS[0];
 	const isOff = level === "off";
@@ -81,7 +82,7 @@ export function AutonomyDialCard({
 					</div>
 				</div>
 
-				<LevelDial value={level} onChange={onLevelChange} />
+				<LevelDial value={level} onChange={(next) => onUpdate({level: next})} />
 
 				<p className="mt-3 min-h-[2.5rem] text-sm text-ink-dull">
 					{selected.tagline}
@@ -99,7 +100,7 @@ export function AutonomyDialCard({
 									{formatTimeAgo(status.last_run_at, now)}
 								</p>
 								<p className="mt-0.5 truncate text-tiny text-ink-faint">
-									Enriched 2 tasks · proposed 1
+									{status.last_run_summary ?? "no summary recorded"}
 								</p>
 							</>
 						) : (
@@ -119,9 +120,7 @@ export function AutonomyDialCard({
 									{formatCountdown(status.next_run_at, now)}
 								</p>
 								<p className="mt-0.5 truncate text-tiny text-ink-faint">
-									every{" "}
-									{INTERVAL_OPTIONS.find((o) => o.secs === intervalSecs)
-										?.label ?? "30m"}
+									every {formatInterval(intervalSecs)}
 									{activeHours
 										? ` · active ${activeHours[0]}:00–${activeHours[1]}:00`
 										: ""}
@@ -162,7 +161,7 @@ export function AutonomyDialCard({
 									Working
 								</p>
 								<p className="mt-0.5 truncate text-tiny text-ink-faint">
-									{status.current_run.activity}
+									started {formatTimeAgo(status.current_run.started_at, now)}
 								</p>
 							</>
 						) : (
@@ -207,7 +206,7 @@ export function AutonomyDialCard({
 										key={label}
 										label={label}
 										active={intervalSecs === secs}
-										onClick={() => setIntervalSecs(secs)}
+										onClick={() => onUpdate({interval_secs: secs})}
 									/>
 								))}
 							</div>
@@ -232,7 +231,9 @@ export function AutonomyDialCard({
 													activeHours[0] === value[0] &&
 													activeHours[1] === value[1]
 										}
-										onClick={() => setActiveHours(value)}
+										onClick={() =>
+											onUpdate({active_hours: value ?? []})
+										}
 									/>
 								))}
 							</div>
@@ -251,7 +252,7 @@ export function AutonomyDialCard({
 										key={n}
 										label={String(n)}
 										active={maxTasks === n}
-										onClick={() => setMaxTasks(n)}
+										onClick={() => onUpdate({max_tasks_per_run: n})}
 									/>
 								))}
 							</div>

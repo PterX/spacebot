@@ -1,6 +1,6 @@
 import {Card, CardContent} from "@spacedrive/primitives";
 import {LevelDial} from "./levels";
-import type {AutonomyLevel} from "./mock";
+import type {AutonomyLevel} from "@/api/client";
 
 const CEILING_TAGLINES: Record<AutonomyLevel, string> = {
 	off: "Fleet paused. No agent acts on its own, no matter its own setting.",
@@ -37,6 +37,10 @@ export function CeilingCard({ceiling, onCeilingChange}: CeilingCardProps) {
 					This is a ceiling, not a switch — each agent keeps its own dial below.
 					Lower it to pause the fleet; raise it and every agent resumes at its
 					own setting.
+				</p>
+
+				<p className="mt-1 text-tiny text-ink-faint">
+					ceiling is design-preview — it doesn't change agent behavior yet
 				</p>
 			</CardContent>
 		</Card>

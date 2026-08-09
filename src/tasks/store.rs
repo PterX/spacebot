@@ -125,6 +125,8 @@ pub struct Task {
     pub assigned_agent_id: Option<String>,
     pub subtasks: Vec<TaskSubtask>,
     pub metadata: Value,
+    /// Goal this task contributes to, when linked.
+    pub goal_id: Option<String>,
     pub source_memory_id: Option<String>,
     pub worker_id: Option<String>,
     pub created_by: String,
@@ -671,7 +673,7 @@ impl TaskStore {
 
 /// Column list used by all SELECT queries. Kept in sync with `task_from_row`.
 const SELECT_COLUMNS: &str = "SELECT id, task_number, title, description, status, priority, \
-     owner_agent_id, assigned_agent_id, subtasks, metadata, source_memory_id, worker_id, \
+     owner_agent_id, assigned_agent_id, subtasks, metadata, goal_id, source_memory_id, worker_id, \
      created_by, approved_at, approved_by, created_at, updated_at, completed_at";
 
 pub fn can_transition(current: TaskStatus, next: TaskStatus) -> bool {
@@ -780,6 +782,7 @@ fn task_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Task> {
             .context("failed to read assigned_agent_id")?,
         subtasks: parse_subtasks(&subtasks_value),
         metadata: parse_metadata(&metadata_value),
+        goal_id: row.try_get::<Option<String>, _>("goal_id").ok().flatten(),
         source_memory_id: row.try_get("source_memory_id").ok(),
         worker_id: row
             .try_get::<Option<String>, _>("worker_id")
@@ -843,6 +846,7 @@ pub(crate) async fn setup_test_store() -> TaskStore {
             assigned_agent_id TEXT NOT NULL,
             subtasks TEXT,
             metadata TEXT,
+            goal_id TEXT,
             source_memory_id TEXT,
             worker_id TEXT,
             created_by TEXT NOT NULL,

@@ -1,9 +1,7 @@
-import {useState} from "react";
-import {useQuery} from "@tanstack/react-query";
-import {ChatCircleDots, Robot, Target, UserCircle} from "@phosphor-icons/react";
+import {useMutation, useQuery, useQueryClient} from "@tanstack/react-query";
+import {Target, UserCircle} from "@phosphor-icons/react";
 import {Card, CardHeader, CardContent, Button} from "@spacedrive/primitives";
 import {api} from "@/api/client";
-import {mockAutonomyApi} from "./mock";
 
 function formatTimeAgo(iso: string): string {
 	const seconds = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
@@ -15,17 +13,21 @@ function formatTimeAgo(iso: string): string {
 
 interface ApprovalQueueCardProps {
 	showAgent?: boolean;
-	agentIndex?: number;
+	agentId?: string;
 }
 
-export function ApprovalQueueCard({showAgent, agentIndex}: ApprovalQueueCardProps) {
-	const [resolved, setResolved] = useState<Record<string, "approved" | "dismissed">>(
-		{},
-	);
+export function ApprovalQueueCard({showAgent, agentId}: ApprovalQueueCardProps) {
+	const queryClient = useQueryClient();
 
 	const {data} = useQuery({
-		queryKey: ["autonomy-pending"],
-		queryFn: mockAutonomyApi.pending,
+		queryKey: ["autonomy-pending-tasks", agentId ?? "all"],
+		queryFn: () => api.listTasks({status: "pending_approval", agent_id: agentId}),
+		staleTime: 30_000,
+	});
+
+	const {data: goalsData} = useQuery({
+		queryKey: ["goals"],
+		queryFn: () => api.listGoals(),
 		staleTime: 30_000,
 	});
 
@@ -36,12 +38,43 @@ export function ApprovalQueueCard({showAgent, agentIndex}: ApprovalQueueCardProp
 		enabled: !!showAgent,
 	});
 	const agents = agentsData?.agents ?? [];
-	const agentName = (i: number) =>
-		agents[i]?.display_name ?? agents[i]?.id ?? `agent ${i + 1}`;
+	const agentName = (id: string) =>
+		agents.find((a) => a.id === id)?.display_name ?? id;
+	const goalTitle = (goalId: string | undefined) =>
+		goalId
+			? (goalsData?.goals.find((g) => g.id === goalId)?.title ?? null)
+			: null;
 
-	const tasks = (data?.tasks ?? [])
-		.filter((t) => !resolved[t.id])
-		.filter((t) => agentIndex === undefined || t.agent_index === agentIndex);
+	const invalidate = () => {
+		queryClient.invalidateQueries({queryKey: ["autonomy-pending-tasks"]});
+		queryClient.invalidateQueries({queryKey: ["tasks"]});
+	};
+
+	const approveMutation = useMutation({
+		mutationFn: (taskNumber: number) => api.approveTask(taskNumber),
+		onSuccess: invalidate,
+	});
+
+	// Dismiss moves the proposal back to the backlog instead of deleting it —
+	// the enrichment survives and the agent can resurface it later.
+	const dismissMutation = useMutation({
+		mutationFn: (taskNumber: number) =>
+			api.updateTask(taskNumber, {status: "backlog"}),
+		onSuccess: invalidate,
+	});
+
+	// Hide rows with an in-flight approve/dismiss so the action feels instant.
+	const pendingResolutions = new Set<number>();
+	if (approveMutation.isPending && approveMutation.variables !== undefined) {
+		pendingResolutions.add(approveMutation.variables);
+	}
+	if (dismissMutation.isPending && dismissMutation.variables !== undefined) {
+		pendingResolutions.add(dismissMutation.variables);
+	}
+
+	const tasks = (data?.tasks ?? []).filter(
+		(t) => !pendingResolutions.has(t.task_number),
+	);
 
 	return (
 		<Card variant="dark" className="flex h-full flex-col">
@@ -67,67 +100,65 @@ export function ApprovalQueueCard({showAgent, agentIndex}: ApprovalQueueCardProp
 					</div>
 				) : (
 					<div className="flex flex-col divide-y divide-app-line/40">
-						{tasks.map((task) => (
-							<div key={task.id} className="py-4 first:pt-0 last:pb-0">
-								<div className="flex items-start justify-between gap-4">
-									<div className="min-w-0 flex-1">
-										<p className="text-sm font-medium text-ink">
-											{task.title}
-										</p>
-										<p className="mt-1 line-clamp-2 text-sm text-ink-dull">
-											{task.finding}
-										</p>
-										<div className="mt-2 flex items-center gap-3 text-tiny text-ink-faint">
-											{showAgent && (
-												<span className="flex items-center gap-1 text-ink-dull">
-													<UserCircle className="size-3.5" />
-													{agentName(task.agent_index)}
-												</span>
+						{tasks.map((task) => {
+							const goal = goalTitle(task.goal_id);
+							return (
+								<div key={task.id} className="py-4 first:pt-0 last:pb-0">
+									<div className="flex items-start justify-between gap-4">
+										<div className="min-w-0 flex-1">
+											<p className="text-sm font-medium text-ink">
+												{task.title}
+											</p>
+											{task.description && (
+												<p className="mt-1 line-clamp-2 text-sm text-ink-dull">
+													{task.description}
+												</p>
 											)}
-											{task.enriched_at && (
+											<div className="mt-2 flex items-center gap-3 text-tiny text-ink-faint">
+												{showAgent && (
+													<span className="flex items-center gap-1 text-ink-dull">
+														<UserCircle className="size-3.5" />
+														{agentName(
+															task.assigned_agent_id ??
+																task.owner_agent_id,
+														)}
+													</span>
+												)}
 												<span>
-													researched {formatTimeAgo(task.enriched_at)}
+													proposed {formatTimeAgo(task.created_at)}
 												</span>
-											)}
-											<span className="flex items-center gap-1">
-												<ChatCircleDots className="size-3.5" />
-												{task.comment_count}
-											</span>
-											<span className="flex items-center gap-1">
-												<Robot className="size-3.5" />
-												{task.worker_count}
-											</span>
-											{task.goal_title && (
-												<span className="flex items-center gap-1 text-accent/80">
-													<Target className="size-3.5" />
-													{task.goal_title}
-												</span>
-											)}
+												{goal && (
+													<span className="flex items-center gap-1 text-accent/80">
+														<Target className="size-3.5" />
+														{goal}
+													</span>
+												)}
+											</div>
+										</div>
+										<div className="flex shrink-0 items-center gap-1.5">
+											<Button
+												size="xs"
+												variant="accent"
+												onClick={() =>
+													approveMutation.mutate(task.task_number)
+												}
+											>
+												Approve
+											</Button>
+											<Button
+												size="xs"
+												variant="subtle"
+												onClick={() =>
+													dismissMutation.mutate(task.task_number)
+												}
+											>
+												Dismiss
+											</Button>
 										</div>
 									</div>
-									<div className="flex shrink-0 items-center gap-1.5">
-										<Button
-											size="xs"
-											variant="accent"
-											onClick={() =>
-												setResolved((r) => ({...r, [task.id]: "approved"}))
-											}
-										>
-											Approve
-										</Button>
-										<Button
-											size="xs"
-											variant="subtle"
-											onClick={() =>
-												setResolved((r) => ({...r, [task.id]: "dismissed"}))
-											}
-										>
-											Dismiss
-										</Button>
-									</div>
 								</div>
-							</div>
-						))}
+							);
+						})}
 					</div>
 				)}
 			</CardContent>

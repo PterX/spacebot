@@ -7,25 +7,10 @@ import {
 	PlusCircle,
 	Play,
 	MoonStars,
-	Clock,
-	Globe,
 	Lightning,
-	Gauge,
 } from "@phosphor-icons/react";
 import {Card, CardHeader, CardContent} from "@spacedrive/primitives";
-import {api} from "@/api/client";
-import {
-	mockAutonomyApi,
-	type AutonomyRunAction,
-	type WakeTriggerKind,
-} from "./mock";
-
-const WAKE_ICON: Record<WakeTriggerKind, React.ElementType> = {
-	schedule: Clock,
-	webhook: Globe,
-	event: Lightning,
-	condition: Gauge,
-};
+import {api, type AutonomyRunAction} from "@/api/client";
 
 const ACTION_CONFIG: Record<
 	AutonomyRunAction["kind"],
@@ -57,15 +42,15 @@ function formatDuration(secs: number): string {
 
 interface RunHistoryCardProps {
 	showAgent?: boolean;
-	agentIndex?: number;
+	agentId?: string;
 }
 
-export function RunHistoryCard({showAgent, agentIndex}: RunHistoryCardProps) {
+export function RunHistoryCard({showAgent, agentId}: RunHistoryCardProps) {
 	const [expanded, setExpanded] = useState<Record<string, boolean>>({});
 
 	const {data} = useQuery({
-		queryKey: ["autonomy-runs"],
-		queryFn: mockAutonomyApi.runs,
+		queryKey: ["autonomy-runs", agentId ?? "all"],
+		queryFn: () => api.autonomyRuns(agentId, 30),
 		staleTime: 30_000,
 	});
 
@@ -76,12 +61,10 @@ export function RunHistoryCard({showAgent, agentIndex}: RunHistoryCardProps) {
 		enabled: !!showAgent,
 	});
 	const agents = agentsData?.agents ?? [];
-	const agentName = (i: number) =>
-		agents[i]?.display_name ?? agents[i]?.id ?? `agent ${i + 1}`;
+	const agentName = (id: string) =>
+		agents.find((a) => a.id === id)?.display_name ?? id;
 
-	const runs = (data?.runs ?? []).filter(
-		(r) => agentIndex === undefined || r.agent_index === agentIndex,
-	);
+	const runs = data?.runs ?? [];
 
 	return (
 		<Card variant="dark">
@@ -104,6 +87,8 @@ export function RunHistoryCard({showAgent, agentIndex}: RunHistoryCardProps) {
 						{runs.map((run) => {
 							const isOpen = !!expanded[run.id];
 							const idle = run.actions.length === 0;
+							const summary = run.summary ?? "no summary recorded";
+							const wokenBy = run.wake_event_ids.length;
 							return (
 								<div key={run.id} className="py-2.5 first:pt-0 last:pb-0">
 									<button
@@ -128,7 +113,7 @@ export function RunHistoryCard({showAgent, agentIndex}: RunHistoryCardProps) {
 										<span className="flex min-w-0 flex-1 items-center gap-2">
 											{showAgent && (
 												<span className="shrink-0 rounded-full bg-app-line/40 px-2 py-0.5 text-tiny text-ink-dull">
-													{agentName(run.agent_index)}
+													{agentName(run.agent_id)}
 												</span>
 											)}
 											<p
@@ -136,24 +121,32 @@ export function RunHistoryCard({showAgent, agentIndex}: RunHistoryCardProps) {
 													idle ? "text-ink-faint" : "text-ink-dull"
 												}`}
 											>
-												{run.summary}
+												{summary}
 											</p>
-											{run.woken_by.map((w, i) => {
-												const WakeIcon = WAKE_ICON[w.kind];
-												return (
-													<span
-														key={i}
-														className="flex max-w-56 shrink-0 items-center gap-1 rounded-full bg-app-line/40 px-2 py-0.5 text-tiny text-ink-faint"
-														title={w.label}
-													>
-														<WakeIcon className="size-3 shrink-0" />
-														<span className="truncate">{w.label}</span>
+											{run.status === "running" && (
+												<span className="shrink-0 rounded-full bg-status-success/15 px-2 py-0.5 text-tiny text-status-success">
+													running
+												</span>
+											)}
+											{(run.status === "timeout" ||
+												run.status === "failed") && (
+												<span className="shrink-0 rounded-full bg-status-error/15 px-2 py-0.5 text-tiny text-status-error">
+													{run.status}
+												</span>
+											)}
+											{wokenBy > 0 && (
+												<span className="flex max-w-56 shrink-0 items-center gap-1 rounded-full bg-app-line/40 px-2 py-0.5 text-tiny text-ink-faint">
+													<Lightning className="size-3 shrink-0" />
+													<span className="truncate">
+														{wokenBy} wake event{wokenBy === 1 ? "" : "s"}
 													</span>
-												);
-											})}
+												</span>
+											)}
 										</span>
 										<span className="shrink-0 text-tiny tabular-nums text-ink-faint">
-											{formatDuration(run.duration_secs)}
+											{run.duration_secs != null
+												? formatDuration(run.duration_secs)
+												: "—"}
 										</span>
 										<span className="w-16 shrink-0 text-right text-tiny tabular-nums text-ink-faint">
 											{formatTimeAgo(run.started_at)}
@@ -176,9 +169,11 @@ export function RunHistoryCard({showAgent, agentIndex}: RunHistoryCardProps) {
 														<div className="min-w-0">
 															<p className="text-sm text-ink-dull">
 																<span className="text-ink-faint">
-																	{label}:
-																</span>{" "}
-																{action.task_title}
+																	{label}
+																	{action.task_number != null
+																		? `: task #${action.task_number}`
+																		: ""}
+																</span>
 															</p>
 															<p className="text-tiny text-ink-faint">
 																{action.detail}

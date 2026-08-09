@@ -1,8 +1,8 @@
 import {useQuery} from "@tanstack/react-query";
 import {Card, CardHeader, CardContent} from "@spacedrive/primitives";
-import {mockAutonomyApi, type AutonomyGoal} from "./mock";
+import {api, type TaskPriority} from "@/api/client";
 
-const PRIORITY_DOT: Record<AutonomyGoal["priority"], string> = {
+const PRIORITY_DOT: Record<TaskPriority, string> = {
 	critical: "bg-status-error",
 	high: "bg-status-warning",
 	medium: "bg-blue-400",
@@ -11,8 +11,8 @@ const PRIORITY_DOT: Record<AutonomyGoal["priority"], string> = {
 
 export function GoalsCard() {
 	const {data} = useQuery({
-		queryKey: ["autonomy-goals"],
-		queryFn: mockAutonomyApi.goals,
+		queryKey: ["goals", "active"],
+		queryFn: () => api.listGoals({status: "active"}),
 		staleTime: 30_000,
 	});
 
@@ -37,8 +37,16 @@ export function GoalsCard() {
 				) : (
 					<div className="flex flex-col divide-y divide-app-line/40">
 						{goals.map((goal) => {
-							const progress =
-								goal.tasks_total > 0 ? goal.tasks_done / goal.tasks_total : 0;
+							const counts = goal.task_counts;
+							const total =
+								counts.pending_approval +
+								counts.backlog +
+								counts.ready +
+								counts.in_progress +
+								counts.done +
+								counts.failed;
+							const progress = total > 0 ? counts.done / total : 0;
+							const notes = goal.notes ?? goal.description ?? "";
 							return (
 								<div key={goal.id} className="py-3.5 first:pt-0 last:pb-0">
 									<div className="flex items-center gap-2.5">
@@ -50,7 +58,7 @@ export function GoalsCard() {
 											{goal.title}
 										</p>
 										<span className="shrink-0 text-tiny tabular-nums text-ink-faint">
-											{goal.tasks_done}/{goal.tasks_total}
+											{counts.done}/{total}
 											{goal.due_date ? ` · due ${goal.due_date}` : ""}
 										</span>
 									</div>
@@ -60,9 +68,11 @@ export function GoalsCard() {
 											style={{width: `${Math.round(progress * 100)}%`}}
 										/>
 									</div>
-									<p className="mt-1.5 line-clamp-1 text-tiny text-ink-faint">
-										{goal.notes}
-									</p>
+									{notes && (
+										<p className="mt-1.5 line-clamp-1 text-tiny text-ink-faint">
+											{notes}
+										</p>
+									)}
 								</div>
 							);
 						})}

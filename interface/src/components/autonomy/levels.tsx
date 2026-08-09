@@ -1,5 +1,5 @@
 import {Power, Eye, Lightbulb, Lightning} from "@phosphor-icons/react";
-import type {AutonomyLevel} from "./mock";
+import type {AutonomyLevel} from "@/api/client";
 
 export const LEVELS: {
 	key: AutonomyLevel;

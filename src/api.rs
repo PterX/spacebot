@@ -7,6 +7,7 @@
 pub mod activity;
 pub mod agents;
 mod attachments;
+pub mod autonomy;
 pub mod bindings;
 pub mod channels;
 pub mod config;

@@ -2,10 +2,9 @@ import {useQuery} from "@tanstack/react-query";
 import {Link} from "@tanstack/react-router";
 import {CaretRight, ArrowBendDownRight} from "@phosphor-icons/react";
 import {Card, CardHeader, CardContent} from "@spacedrive/primitives";
-import {api} from "@/api/client";
+import {api, type AutonomyLevel} from "@/api/client";
 import {ProfileAvatar} from "@/components/ProfileAvatar";
 import {LEVELS, effectiveLevel} from "./levels";
-import {mockAutonomyApi, type AutonomyLevel} from "./mock";
 
 function formatTimeAgo(iso: string): string {
 	const seconds = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
@@ -28,12 +27,12 @@ export function FleetCard({ceiling}: FleetCardProps) {
 
 	const {data: fleetData} = useQuery({
 		queryKey: ["autonomy-fleet"],
-		queryFn: mockAutonomyApi.fleet,
+		queryFn: api.autonomyFleet,
 		staleTime: 30_000,
 	});
 
 	const agents = agentsData?.agents ?? [];
-	const states = fleetData?.states ?? [];
+	const states = new Map((fleetData?.agents ?? []).map((s) => [s.agent_id, s]));
 
 	return (
 		<Card variant="dark">
@@ -51,8 +50,8 @@ export function FleetCard({ceiling}: FleetCardProps) {
 					</div>
 				) : (
 					<div className="flex flex-col divide-y divide-app-line/40">
-						{agents.map((agent, i) => {
-							const state = states[i % Math.max(states.length, 1)];
+						{agents.map((agent) => {
+							const state = states.get(agent.id);
 							if (!state) return null;
 							const name = agent.display_name ?? agent.id;
 							const effective = effectiveLevel(ceiling, state.level);
@@ -95,7 +94,9 @@ export function FleetCard({ceiling}: FleetCardProps) {
 										</div>
 										<p className="mt-0.5 truncate text-tiny text-ink-faint">
 											{state.last_run_at
-												? `Last run ${formatTimeAgo(state.last_run_at)} · ${state.last_summary}`
+												? `Last run ${formatTimeAgo(state.last_run_at)} · ${
+														state.last_run_summary ?? "no summary recorded"
+													}`
 												: "No runs yet"}
 										</p>
 									</div>
@@ -126,8 +127,8 @@ export function FleetCard({ceiling}: FleetCardProps) {
 									</span>
 
 									<span className="w-20 shrink-0 text-right text-tiny tabular-nums text-ink-faint">
-										{state.pending_count > 0
-											? `${state.pending_count} pending`
+										{state.pending_wake_events > 0
+											? `${state.pending_wake_events} pending`
 											: "—"}
 									</span>
 

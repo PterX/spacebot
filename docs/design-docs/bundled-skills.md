@@ -145,6 +145,40 @@ Ready answers for "why doesn't spacebot ship X":
 The long tail belongs to skills.sh plus `install_skill`. Bundling is for what
 most instances will actually use.
 
+## The index is grouped by category
+
+Skill discovery already scans `skills/{category}/{name}/SKILL.md`, but the
+category dies there — the `Skill` struct doesn't carry it, and all three index
+fragments render a flat name+description list. That flat list is fine at five
+skills and structurally hostile at a hundred: a model scanning for relevance
+does materially better when the index is organized by domain first, entry
+second, and a mature instance accumulates enough self-authored skills that
+flat scanning degrades exactly when the corpus becomes most valuable.
+
+Changes:
+
+1. **Category on the index entry**, derived from the directory path at load
+   (top-level skills get `general`). No frontmatter field — the filesystem is
+   already the taxonomy, and installers/creators choose placement by path.
+2. **Grouped rendering** in all three fragments: category line, then its
+   skills, categories and names sorted. Same information, hierarchical shape.
+3. **Category descriptions.** A category directory may carry an `index.md`
+   with a one-line `description` in frontmatter, rendered on the category
+   line. The bundled catalog ships one per category; user categories work
+   without them.
+4. **A firmer load directive.** The current fragment preamble suggests
+   scanning for relevant skills. It should instruct: scan before acting, read
+   any skill that is even partially relevant, and prefer reading an
+   unnecessary skill over missing an established procedure — the skill defines
+   how the task is done here, even when the task looks familiar. The index
+   only pays for itself if reading it reliably converts to `read_skill` calls;
+   a polite preamble undersells the corpus.
+
+The bundled catalog lands pre-categorized (`craft/`, `documents/`,
+`development/`, `research/`, `chat-media/`, `integrations/`), so a fresh
+instance starts with a structured index and self-authored skills grow into
+the same shape instead of piling into a flat root.
+
 ## Secrets integration
 
 The secret store already does the hard half: `auto_categorize` defaults
@@ -256,25 +290,30 @@ One flag. Everything else is expressed through the existing skill lifecycle
 
 ## Phases
 
-**Phase 1 — secrets wiring.** `secrets` frontmatter field; lint against the
+**Phase 1 — index shape.** Category on the index entry; grouped rendering in
+the three fragments; `index.md` category descriptions; the firmer load
+directive. Small, self-contained, and improves existing installs before any
+catalog work.
+
+**Phase 2 — secrets wiring.** `secrets` frontmatter field; lint against the
 system secret registry; index annotation at prompt render; secret status in
 `install_skill` results, `read_skill`, `skill info`, and `SkillInspector`.
 Ships independently — installed registry skills benefit before the catalog
 exists.
 
-**Phase 2 — seeding.** Embedded catalog payload, manifest, sync rules, prune
+**Phase 3 — seeding.** Embedded catalog payload, manifest, sync rules, prune
 list, `skill restore`; retire the `Builtin` tier and migrate `wiki-writing`;
 `created_by = 'bundled'` provenance; `[skills.bundled]` config.
 
-**Phase 3 — craft and documents.** Author `skill-authoring`; adapt the five
+**Phase 4 — craft and documents.** Author `skill-authoring`; adapt the five
 document skills from `anthropics/skills`; validate script execution through
 the sandboxed shell on both platforms.
 
-**Phase 4 — the working catalog.** Development, research, and chat/media
+**Phase 5 — the working catalog.** Development, research, and chat/media
 groups. Each skill lands with its secrets declared and a smoke test that
 exercises the underlying CLI path.
 
-**Phase 5 — integrations and surfaces.** Keyed integration skills; bundled
+**Phase 6 — integrations and surfaces.** Keyed integration skills; bundled
 grouping and secret status in the interface; user docs for the catalog and
 the disable/restore/customize flows.
 

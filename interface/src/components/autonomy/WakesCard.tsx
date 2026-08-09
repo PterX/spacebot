@@ -46,7 +46,8 @@ export function WakesCard() {
 				<div className="flex items-center gap-2">
 					<h2 className="font-plex text-sm font-medium text-ink-dull">Wakes</h2>
 					<span className="text-tiny text-ink-faint">
-						what stirs your agent, and what it does when stirred
+						what stirs your agent, and what it does when stirred · design
+						preview
 					</span>
 				</div>
 				<Button size="xs" variant="subtle">

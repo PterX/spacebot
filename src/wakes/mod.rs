@@ -10,5 +10,6 @@ mod runs;
 mod store;
 
 pub use events::SystemEvent;
+pub(crate) use runs::parse_run_timestamp;
 pub use runs::{AutonomyAction, AutonomyRun, AutonomyRunStatus, AutonomyRunStore};
 pub use store::{EnqueueOutcome, WakeEvent, WakeEventStore};

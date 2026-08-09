@@ -6,7 +6,7 @@ import {
 	GoalsCard,
 	RunHistoryCard,
 } from "@/components/autonomy";
-import type {AutonomyLevel} from "@/components/autonomy/mock";
+import type {AutonomyLevel} from "@/api/client";
 
 export function Autonomy() {
 	const [ceiling, setCeiling] = useState<AutonomyLevel>("act");
