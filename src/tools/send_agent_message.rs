@@ -238,7 +238,7 @@ impl Tool for SendAgentMessageTool {
             .task_store
             .create(crate::tasks::CreateTaskInput {
                 owner_agent_id: sending_agent_id.to_string(),
-                assigned_agent_id: receiving_agent_id.to_string(),
+                assigned_agent_id: Some(receiving_agent_id.to_string()),
                 title: title.clone(),
                 description: Some(args.message.clone()),
                 status: crate::tasks::TaskStatus::Ready,

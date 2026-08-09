@@ -21,15 +21,17 @@ pub enum TaskStatus {
     Ready,
     InProgress,
     Done,
+    Failed,
 }
 
 impl TaskStatus {
-    pub const ALL: [TaskStatus; 5] = [
+    pub const ALL: [TaskStatus; 6] = [
         TaskStatus::PendingApproval,
         TaskStatus::Backlog,
         TaskStatus::Ready,
         TaskStatus::InProgress,
         TaskStatus::Done,
+        TaskStatus::Failed,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -39,6 +41,7 @@ impl TaskStatus {
             TaskStatus::Ready => "ready",
             TaskStatus::InProgress => "in_progress",
             TaskStatus::Done => "done",
+            TaskStatus::Failed => "failed",
         }
     }
 
@@ -49,6 +52,7 @@ impl TaskStatus {
             "ready" => Some(TaskStatus::Ready),
             "in_progress" => Some(TaskStatus::InProgress),
             "done" => Some(TaskStatus::Done),
+            "failed" => Some(TaskStatus::Failed),
             _ => None,
         }
     }
@@ -118,7 +122,7 @@ pub struct Task {
     pub status: TaskStatus,
     pub priority: TaskPriority,
     pub owner_agent_id: String,
-    pub assigned_agent_id: String,
+    pub assigned_agent_id: Option<String>,
     pub subtasks: Vec<TaskSubtask>,
     pub metadata: Value,
     pub source_memory_id: Option<String>,
@@ -131,10 +135,20 @@ pub struct Task {
     pub completed_at: Option<String>,
 }
 
+impl Task {
+    /// The agent responsible for this task: the assignee when claimed,
+    /// falling back to the owner for unassigned tasks.
+    pub fn effective_agent_id(&self) -> &str {
+        self.assigned_agent_id
+            .as_deref()
+            .unwrap_or(&self.owner_agent_id)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CreateTaskInput {
     pub owner_agent_id: String,
-    pub assigned_agent_id: String,
+    pub assigned_agent_id: Option<String>,
     pub title: String,
     pub description: Option<String>,
     pub status: TaskStatus,
@@ -499,9 +513,10 @@ impl TaskStore {
         let next_status = input.status.unwrap_or(current.status);
         let next_priority = input.priority.unwrap_or(current.priority);
         let next_metadata = merge_json_object(current.metadata, input.metadata);
-        let next_assigned = input
-            .assigned_agent_id
-            .unwrap_or(current.assigned_agent_id.clone());
+        let next_assigned = match input.assigned_agent_id {
+            Some(agent_id) => Some(agent_id),
+            None => current.assigned_agent_id.clone(),
+        };
         let reassigned = next_assigned != current.assigned_agent_id;
 
         // If the task is being reassigned to a different agent, clear the worker
@@ -674,8 +689,10 @@ pub fn can_transition(current: TaskStatus, next: TaskStatus) -> bool {
             | (TaskStatus::Ready, TaskStatus::InProgress)
             | (TaskStatus::InProgress, TaskStatus::Done)
             | (TaskStatus::InProgress, TaskStatus::Ready)
+            | (TaskStatus::InProgress, TaskStatus::Failed)
             | (TaskStatus::Backlog, TaskStatus::Ready)
             | (TaskStatus::Done, TaskStatus::Ready)
+            | (TaskStatus::Failed, TaskStatus::Ready)
     )
 }
 
@@ -868,7 +885,7 @@ mod tests {
     fn self_assigned_input(title: &str, status: TaskStatus) -> CreateTaskInput {
         CreateTaskInput {
             owner_agent_id: "agent-test".to_string(),
-            assigned_agent_id: "agent-test".to_string(),
+            assigned_agent_id: Some("agent-test".to_string()),
             title: title.to_string(),
             description: None,
             status,
@@ -1098,7 +1115,7 @@ mod tests {
         let task_b = store
             .create(CreateTaskInput {
                 owner_agent_id: "agent-other".to_string(),
-                assigned_agent_id: "agent-other".to_string(),
+                assigned_agent_id: Some("agent-other".to_string()),
                 ..self_assigned_input("task for agent B", TaskStatus::Backlog)
             })
             .await
@@ -1135,7 +1152,7 @@ mod tests {
         store
             .create(CreateTaskInput {
                 owner_agent_id: "agent-test".to_string(),
-                assigned_agent_id: "agent-other".to_string(),
+                assigned_agent_id: Some("agent-other".to_string()),
                 ..self_assigned_input("delegated task", TaskStatus::Ready)
             })
             .await
@@ -1177,7 +1194,7 @@ mod tests {
         store
             .create(CreateTaskInput {
                 owner_agent_id: "agent-test".to_string(),
-                assigned_agent_id: "agent-other".to_string(),
+                assigned_agent_id: Some("agent-other".to_string()),
                 title: "not mine".to_string(),
                 description: None,
                 status: TaskStatus::Ready,
@@ -1217,7 +1234,7 @@ mod tests {
             .await
             .expect("should create");
 
-        assert_eq!(created.assigned_agent_id, "agent-test");
+        assert_eq!(created.assigned_agent_id.as_deref(), Some("agent-test"));
 
         let updated = store
             .update(
@@ -1231,7 +1248,7 @@ mod tests {
             .expect("update should succeed")
             .expect("task should exist");
 
-        assert_eq!(updated.assigned_agent_id, "agent-other");
+        assert_eq!(updated.assigned_agent_id.as_deref(), Some("agent-other"));
         assert_eq!(updated.owner_agent_id, "agent-test");
     }
 }

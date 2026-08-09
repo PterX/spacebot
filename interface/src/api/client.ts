@@ -988,7 +988,7 @@ export interface UploadSkillResponse {
 
 // -- Task Types --
 
-export type TaskStatus = "pending_approval" | "backlog" | "ready" | "in_progress" | "done";
+export type TaskStatus = "pending_approval" | "backlog" | "ready" | "in_progress" | "done" | "failed";
 export type TaskPriority = "critical" | "high" | "medium" | "low";
 
 export interface TaskSubtask {
@@ -1004,7 +1004,7 @@ export interface TaskItem {
 	status: TaskStatus;
 	priority: TaskPriority;
 	owner_agent_id: string;
-	assigned_agent_id: string;
+	assigned_agent_id?: string;
 	subtasks: TaskSubtask[];
 	metadata: Record<string, unknown>;
 	source_memory_id?: string;

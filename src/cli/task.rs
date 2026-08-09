@@ -167,7 +167,9 @@ pub async fn run(ctx: &super::Context, task_cmd: TaskCommand) -> anyhow::Result<
                         output::truncate(&task.title, 50),
                         output::enum_label(&task.status),
                         output::enum_label(&task.priority),
-                        task.assigned_agent_id.clone(),
+                        task.assigned_agent_id
+                            .clone()
+                            .unwrap_or_else(|| "-".to_string()),
                         output::short_timestamp(&task.updated_at),
                     ]
                 })
@@ -191,7 +193,10 @@ pub async fn run(ctx: &super::Context, task_cmd: TaskCommand) -> anyhow::Result<
             println!("Status:      {}", output::enum_label(&task.status));
             println!("Priority:    {}", output::enum_label(&task.priority));
             println!("Owner:       {}", task.owner_agent_id);
-            println!("Assigned:    {}", task.assigned_agent_id);
+            println!(
+                "Assigned:    {}",
+                task.assigned_agent_id.as_deref().unwrap_or("-")
+            );
             println!("Created by:  {}", task.created_by);
             println!("Created:     {}", output::short_timestamp(&task.created_at));
             println!("Updated:     {}", output::short_timestamp(&task.updated_at));
@@ -371,7 +376,8 @@ pub async fn run(ctx: &super::Context, task_cmd: TaskCommand) -> anyhow::Result<
             let response: TaskResponse = client::parse(value)?;
             eprintln!(
                 "Task #{} assigned to {}.",
-                response.task.task_number, response.task.assigned_agent_id
+                response.task.task_number,
+                response.task.assigned_agent_id.as_deref().unwrap_or("-")
             );
             Ok(())
         }

@@ -145,7 +145,7 @@ fn emit_task_event(state: &ApiState, task: &crate::tasks::Task, action: &str) {
     state
         .event_tx
         .send(super::state::ApiEvent::TaskUpdated {
-            agent_id: task.assigned_agent_id.clone(),
+            agent_id: task.effective_agent_id().to_string(),
             task_number: task.task_number,
             status: task.status.to_string(),
             action: action.to_string(),
@@ -163,7 +163,7 @@ fn maybe_emit_approval_notification(state: &ApiState, task: &crate::tasks::Task)
         severity: NotificationSeverity::Info,
         title: task.title.clone(),
         body: task.description.clone(),
-        agent_id: Some(task.assigned_agent_id.clone()),
+        agent_id: Some(task.effective_agent_id().to_string()),
         related_entity_type: Some("task".to_string()),
         related_entity_id: Some(task.task_number.to_string()),
         action_url: Some(format!("/tasks/{}", task.task_number)),
@@ -275,7 +275,7 @@ pub(super) async fn create_task(
     let task = store
         .create(crate::tasks::CreateTaskInput {
             owner_agent_id: request.owner_agent_id,
-            assigned_agent_id: assigned,
+            assigned_agent_id: Some(assigned),
             title: request.title,
             description: request.description,
             status,
@@ -393,7 +393,7 @@ pub(super) async fn delete_task(
     state
         .event_tx
         .send(super::state::ApiEvent::TaskUpdated {
-            agent_id: task.assigned_agent_id,
+            agent_id: task.effective_agent_id().to_string(),
             task_number: number,
             status: "deleted".to_string(),
             action: "deleted".to_string(),
