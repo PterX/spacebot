@@ -295,6 +295,8 @@ pub struct ApiState {
     pub provider_setup_tx: mpsc::Sender<crate::ProviderSetupEvent>,
     /// Shared update status, populated by the background update checker.
     pub update_status: SharedUpdateStatus,
+    /// Handle for requesting daemon shutdown or restart from API handlers and tools.
+    pub lifecycle: ArcSwap<Option<crate::lifecycle::LifecycleHandle>>,
     /// Instance directory path for accessing instance-level skills.
     pub instance_dir: ArcSwap<PathBuf>,
     /// Shared LLM manager for agent creation.
@@ -555,6 +557,7 @@ impl ApiState {
             messaging_manager: RwLock::new(None),
             provider_setup_tx,
             update_status: crate::update::new_shared_status(),
+            lifecycle: ArcSwap::from_pointee(None),
             instance_dir: ArcSwap::from_pointee(PathBuf::new()),
             llm_manager: RwLock::new(None),
             embedding_model: RwLock::new(None),
@@ -1236,6 +1239,11 @@ impl ApiState {
     /// Set the instance directory path.
     pub fn set_instance_dir(&self, dir: PathBuf) {
         self.instance_dir.store(Arc::new(dir));
+    }
+
+    /// Set the lifecycle handle for daemon shutdown/restart requests.
+    pub fn set_lifecycle(&self, handle: crate::lifecycle::LifecycleHandle) {
+        self.lifecycle.store(Arc::new(Some(handle)));
     }
 
     /// Set the shared LLM manager for runtime agent creation.

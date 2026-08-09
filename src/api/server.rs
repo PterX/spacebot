@@ -51,6 +51,7 @@ pub fn api_router() -> OpenApiRouter<Arc<ApiState>> {
         .routes(routes!(system::health))
         .routes(routes!(system::idle))
         .routes(routes!(system::status))
+        .routes(routes!(system::restart))
         .routes(routes!(system::storage_status))
         .routes(routes!(system::backup_export))
         .routes(routes!(system::backup_restore))
@@ -278,7 +279,7 @@ pub fn api_router() -> OpenApiRouter<Arc<ApiState>> {
 pub async fn start_http_server(
     bind: SocketAddr,
     state: Arc<ApiState>,
-    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    shutdown_rx: tokio::sync::watch::Receiver<crate::lifecycle::LifecycleState>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     // Note: credentials are intentionally disabled. The API uses Bearer
     // token auth (Authorization header), not cookies. Enabling credentials
@@ -337,7 +338,9 @@ pub async fn start_http_server(
         let mut shutdown = shutdown_rx;
         if let Err(error) = axum::serve(listener, app)
             .with_graceful_shutdown(async move {
-                let _ = shutdown.wait_for(|v| *v).await;
+                let _ = shutdown
+                    .wait_for(|state| *state != crate::lifecycle::LifecycleState::Running)
+                    .await;
             })
             .await
         {

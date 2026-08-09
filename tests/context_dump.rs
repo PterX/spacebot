@@ -428,6 +428,7 @@ async fn dump_worker_context() {
         false,
         None,
         None,
+        None,
     );
 
     let tool_defs = worker_tool_server
@@ -625,6 +626,7 @@ async fn dump_all_contexts() {
         Default::default(),
         deps.memory_search.clone(),
         false,
+        None,
         None,
         None,
     );

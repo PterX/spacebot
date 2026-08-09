@@ -75,6 +75,36 @@ export function UpdatesSection() {
 		},
 	});
 
+	const restartMutation = useMutation({
+		mutationFn: api.restart,
+		onSuccess: (result) => {
+			if (result.status === "restarting") {
+				setMessage({
+					text: "Restarting. The UI should reconnect in a few seconds.",
+					type: "success",
+				});
+				setTimeout(() => {
+					queryClient.invalidateQueries();
+				}, 5000);
+				return;
+			}
+			if (result.status === "already_pending") {
+				setMessage({
+					text: "A restart is already pending.",
+					type: "success",
+				});
+				return;
+			}
+			setMessage({text: "Restart is not available yet.", type: "error"});
+		},
+		onError: (error) => {
+			setMessage({
+				text: `Failed to restart: ${error.message}`,
+				type: "error",
+			});
+		},
+	});
+
 	const handleCopy = async (label: string, content: string) => {
 		try {
 			if (navigator.clipboard?.writeText) {
@@ -208,6 +238,32 @@ export function UpdatesSection() {
 								View release notes
 							</a>
 						)}
+					</div>
+
+					<div className="rounded-lg border border-app-line bg-app-box p-4">
+						<div className="flex items-center justify-between gap-3">
+							<div>
+								<p className="text-sm font-medium text-ink">Restart Instance</p>
+								<p className="mt-0.5 text-sm text-ink-dull">
+									Reboot the daemon in place with the same configuration.
+								</p>
+							</div>
+							<Button
+								onClick={() => {
+									setMessage(null);
+									restartMutation.mutate();
+								}}
+								loading={restartMutation.isPending}
+								size="md"
+								variant="outline"
+							>
+								Restart
+							</Button>
+						</div>
+						<p className="mt-3 text-xs text-ink-faint">
+							In-flight workers are interrupted. The UI should reconnect within
+							10-30 seconds.
+						</p>
 					</div>
 
 					{deployment === "docker" && (

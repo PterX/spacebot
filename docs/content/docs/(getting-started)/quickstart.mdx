@@ -140,11 +140,13 @@ On first launch, Spacebot automatically creates:
 ```bash
 spacebot status    # show pid and uptime
 spacebot stop      # graceful shutdown
-spacebot restart   # stop + start
+spacebot restart   # in-place restart (falls back to stop + start)
 spacebot restart -f -d  # restart in foreground with debug
 ```
 
 Logs go to `~/.spacebot/agents/{id}/data/logs/` in daemon mode, or stderr in foreground mode.
+
+Restarts re-exec the daemon with its original environment — they don't pick up new environment variables or a rebuilt service definition. Use a full stop + start (or `systemctl restart` under systemd) for that. Agents can also restart the daemon themselves via the `restart` tool, and the dashboard has a Restart button under Settings → Updates.
 
 ## Identity files
 

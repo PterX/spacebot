@@ -647,6 +647,44 @@ impl BrowserState {
     fn invalidate_snapshot(&mut self) {
         self.snapshot = None;
     }
+
+    /// Close the browser process inline, awaited to completion. Used at daemon
+    /// teardown, where the Drop-spawned cleanup task would race process exit —
+    /// or never run at all before a restart re-exec — and orphan Chromium.
+    /// Persistent profile directories are preserved; temp profiles are removed.
+    pub async fn shutdown(&mut self) {
+        let Some(mut browser) = self.browser.take() else {
+            return;
+        };
+        let handler_task = self._handler_task.take();
+        let user_data_dir = self.user_data_dir.take();
+        self.pages.clear();
+        self.active_target = None;
+        self.invalidate_snapshot();
+
+        // Close gracefully before aborting the handler so chromiumoxide does
+        // not fall back to force-killing the child.
+        match tokio::time::timeout(std::time::Duration::from_secs(5), browser.close()).await {
+            Ok(Ok(_)) => tracing::debug!("browser closed for daemon shutdown"),
+            Ok(Err(error)) => tracing::debug!(%error, "failed to close browser at shutdown"),
+            Err(_) => tracing::debug!("browser close timed out after 5s at shutdown"),
+        }
+
+        if let Some(task) = handler_task {
+            task.abort();
+        }
+
+        if !self.persistent_profile
+            && let Some(dir) = user_data_dir
+            && let Err(error) = tokio::fs::remove_dir_all(&dir).await
+        {
+            tracing::debug!(
+                path = %dir.display(),
+                %error,
+                "failed to clean up browser user data dir at shutdown"
+            );
+        }
+    }
 }
 
 impl Drop for BrowserState {

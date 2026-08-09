@@ -15,10 +15,10 @@ use std::net::SocketAddr;
 /// Spawn the metrics HTTP server as a background tokio task.
 ///
 /// Returns the `JoinHandle` so the caller can hold it for lifetime management.
-/// The server shuts down when `shutdown_rx` signals true.
+/// The server shuts down when `shutdown_rx` leaves the `Running` state.
 pub async fn start_metrics_server(
     config: &MetricsConfig,
-    shutdown_rx: watch::Receiver<bool>,
+    shutdown_rx: watch::Receiver<crate::lifecycle::LifecycleState>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let raw_bind = config.bind.trim_start_matches('[').trim_end_matches(']');
     let bind_str = if raw_bind.contains(':') {
@@ -43,7 +43,9 @@ pub async fn start_metrics_server(
     let handle = tokio::spawn(async move {
         let mut shutdown_rx = shutdown_rx;
         let shutdown_signal = async move {
-            let _ = shutdown_rx.wait_for(|shutdown| *shutdown).await;
+            let _ = shutdown_rx
+                .wait_for(|state| *state != crate::lifecycle::LifecycleState::Running)
+                .await;
         };
 
         if let Err(error) = axum::serve(listener, app)

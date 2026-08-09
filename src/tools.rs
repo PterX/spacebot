@@ -6,7 +6,7 @@
 //! ## ToolServer Topology
 //!
 //! **Channel ToolServer** (one per channel):
-//! - `reply`, `branch`, `spawn_worker`, `route`, `cancel`, `skip`, `react` — added
+//! - `reply`, `branch`, `spawn_worker`, `route`, `cancel`, `skip`, `react`, `restart` — added
 //!   dynamically per conversation turn via `add_channel_tools()` /
 //!   `remove_channel_tools()` because they hold per-channel state.
 //! - No memory tools — the channel delegates memory work to branches.
@@ -16,17 +16,20 @@
 //! - `spacebot_docs` for embedded self-documentation lookup
 //! - `task_create` + `task_list` + `task_update`
 //! - `spawn_worker` is included for channel-originated branches only
+//! - `restart` when the daemon lifecycle handle is available
 //!
 //! **Worker ToolServer** (one per worker, created at spawn time):
 //! - `shell`, `file_read`/`file_write`/`file_edit`/`file_list` — stateless, registered at creation
 //! - `task_update` — scoped to the worker's assigned task
 //! - `set_status` — per-worker instance, registered at creation
+//! - `restart` when the daemon lifecycle handle is available
 //!
 //! **Cortex ToolServer** (one per agent):
 //! - `memory_save` — registered at startup
 //!
 //! **Cortex Chat ToolServer** (interactive admin chat):
-//! - branch + worker tool superset plus `spacebot_docs`, `config_inspect`, and `spawn_worker`
+//! - branch + worker tool superset plus `spacebot_docs`, `config_inspect`, `spawn_worker`,
+//!   and `restart`
 
 pub mod attachment_recall;
 pub mod branch_tool;
@@ -48,6 +51,7 @@ pub mod project_manage;
 pub mod react;
 pub mod read_skill;
 pub mod reply;
+pub mod restart;
 pub mod route;
 pub mod secret_set;
 pub mod send_agent_message;
@@ -129,6 +133,7 @@ pub use read_skill::{ReadSkillArgs, ReadSkillError, ReadSkillOutput, ReadSkillTo
 pub use reply::{
     RepliedFlag, ReplyArgs, ReplyError, ReplyOutput, ReplyTarget, ReplyTool, new_replied_flag,
 };
+pub use restart::{RestartArgs, RestartError, RestartOutput, RestartTool};
 pub use route::{RouteArgs, RouteError, RouteOutput, RouteTool};
 pub use secret_set::{SecretSetArgs, SecretSetError, SecretSetOutput, SecretSetTool};
 pub use send_agent_message::{
@@ -537,6 +542,21 @@ pub async fn add_channel_tools(
             ))
             .await?;
     }
+    if let Some(lifecycle) = state.deps.lifecycle() {
+        let delivery = default_delivery_target_for_conversation(&conversation_id, slack_thread_ts)
+            .and_then(|raw| crate::messaging::target::parse_delivery_target(&raw));
+        handle
+            .add_tool(
+                RestartTool::new(
+                    lifecycle,
+                    state.deps.runtime_config.instance_dir.clone(),
+                    state.deps.agent_id.to_string(),
+                    "channel",
+                )
+                .with_channel_context(conversation_id.clone(), delivery),
+            )
+            .await?;
+    }
     handle.add_tool(CancelTool::new(state)).await?;
     handle
         .add_tool(SkipTool::new(skip_flag.clone(), response_tx.clone()))
@@ -791,6 +811,7 @@ pub async fn remove_channel_tools(
     let _ = handle.remove_tool(SetOutcomeTool::NAME).await;
     let _ = handle.remove_tool(SkillsSearchTool::NAME).await;
     let _ = handle.remove_tool(InstallSkillTool::NAME).await;
+    let _ = handle.remove_tool(RestartTool::NAME).await;
     Ok(())
 }
 
@@ -972,6 +993,18 @@ pub fn create_branch_tool_server(
         server = server.tool(SpawnWorkerTool::new(state));
     }
 
+    if let Some(lifecycle) = api_state
+        .as_ref()
+        .and_then(|api| api.lifecycle.load().as_ref().clone())
+    {
+        server = server.tool(RestartTool::new(
+            lifecycle,
+            runtime_config.instance_dir.clone(),
+            agent_id.to_string(),
+            "branch",
+        ));
+    }
+
     server.run()
 }
 
@@ -1004,6 +1037,7 @@ pub fn create_worker_tool_server(
     wiki_write: bool,
     wiki_store: Option<Arc<crate::wiki::WikiStore>>,
     blocked_signal: Option<crate::agent::worker::BlockSignal>,
+    lifecycle: Option<crate::lifecycle::LifecycleHandle>,
 ) -> ToolServerHandle {
     let mut server = ToolServer::new()
         .tool(
@@ -1085,6 +1119,15 @@ pub fn create_worker_tool_server(
             .tool(WikiHistoryTool::new(store));
     }
 
+    if let Some(lifecycle) = lifecycle {
+        server = server.tool(RestartTool::new(
+            lifecycle,
+            runtime_config.instance_dir.clone(),
+            agent_id.to_string(),
+            "worker",
+        ));
+    }
+
     for mcp_tool in mcp_tools {
         server = server.tool(mcp_tool);
     }
@@ -1146,6 +1189,7 @@ pub fn create_cortex_chat_tool_server(
     cortex_ctx: Option<crate::tools::spawn_worker::CortexChatContext>,
 ) -> ToolServerHandle {
     let logs_dir = workspace.join(".spacebot").join("logs");
+    let lifecycle = api_state.lifecycle.load().as_ref().clone();
 
     let spawn_tool = {
         let tool = DetachedSpawnWorkerTool::new(deps, screenshot_dir.clone(), logs_dir);
@@ -1202,6 +1246,15 @@ pub fn create_cortex_chat_tool_server(
         server = server.tool(WebSearchTool::new(key));
     }
 
+    if let Some(lifecycle) = lifecycle {
+        server = server.tool(RestartTool::new(
+            lifecycle,
+            runtime_config.instance_dir.clone(),
+            agent_id.to_string(),
+            "cortex_chat",
+        ));
+    }
+
     server.run()
 }
 
@@ -1215,14 +1268,27 @@ pub fn create_factory_tool_server(
     state: Arc<crate::api::ApiState>,
     memory_search: Arc<MemorySearch>,
 ) -> ToolServerHandle {
-    ToolServer::new()
+    let lifecycle = state.lifecycle.load().as_ref().clone();
+    let instance_dir = state.instance_dir.load().as_ref().clone();
+
+    let mut server = ToolServer::new()
         .tool(FactoryListPresetsTool::new())
         .tool(FactoryLoadPresetTool::new())
         .tool(FactorySearchContextTool::new(memory_search))
         .tool(FactoryCreateAgentTool::new(state.clone()))
         .tool(FactoryUpdateIdentityTool::new(state.clone()))
-        .tool(FactoryUpdateConfigTool::new(state))
-        .run()
+        .tool(FactoryUpdateConfigTool::new(state));
+
+    if let Some(lifecycle) = lifecycle {
+        server = server.tool(RestartTool::new(
+            lifecycle,
+            instance_dir,
+            "factory",
+            "factory",
+        ));
+    }
+
+    server.run()
 }
 
 /// Add factory tools (agent creation/refinement) to an existing tool server handle.
