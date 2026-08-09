@@ -260,6 +260,9 @@ pub async fn run(ctx: &super::Context, channel_cmd: ChannelCommand) -> anyhow::R
                 output::json(&value);
                 return Ok(());
             }
+            if value.get("success").is_some_and(|s| s == false) {
+                anyhow::bail!("channel {channel_id} was not deleted");
+            }
             eprintln!("Channel {channel_id} deleted.");
             Ok(())
         }
@@ -280,6 +283,9 @@ pub async fn run(ctx: &super::Context, channel_cmd: ChannelCommand) -> anyhow::R
                 return Ok(());
             }
             let result: CancelProcessResponse = client::parse(value)?;
+            if !result.success {
+                anyhow::bail!("{}", result.message);
+            }
             eprintln!("{}", result.message);
             Ok(())
         }

@@ -186,3 +186,10 @@ impl ApiClient {
 pub fn parse<T: DeserializeOwned>(value: serde_json::Value) -> anyhow::Result<T> {
     serde_json::from_value(value).context("unexpected API response shape")
 }
+
+/// Encode a user-supplied identifier for use as a URL path segment, so
+/// values containing `/`, `?`, `#`, or spaces cannot change the request
+/// target. Query-string values use `urlencoding::encode` directly.
+pub fn encode_path(segment: &str) -> String {
+    urlencoding::encode(segment).into_owned()
+}

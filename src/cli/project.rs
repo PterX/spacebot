@@ -177,7 +177,9 @@ pub async fn run(ctx: &super::Context, project_cmd: ProjectCommand) -> anyhow::R
             Ok(())
         }
         ProjectCommand::Get { id } => {
-            let value = client.get(&format!("agents/projects/{id}")).await?;
+            let value = client
+                .get(&format!("agents/projects/{}", client::encode_path(&id)))
+                .await?;
             if ctx.json {
                 output::json(&value);
                 return Ok(());
@@ -302,7 +304,12 @@ pub async fn run(ctx: &super::Context, project_cmd: ProjectCommand) -> anyhow::R
                 anyhow::bail!("nothing to update — pass at least one field flag");
             }
 
-            let value = client.put(&format!("agents/projects/{id}"), &body).await?;
+            let value = client
+                .put(
+                    &format!("agents/projects/{}", client::encode_path(&id)),
+                    &body,
+                )
+                .await?;
             if ctx.json {
                 output::json(&value);
                 return Ok(());
@@ -312,7 +319,9 @@ pub async fn run(ctx: &super::Context, project_cmd: ProjectCommand) -> anyhow::R
             Ok(())
         }
         ProjectCommand::Delete { id } => {
-            let value = client.delete(&format!("agents/projects/{id}")).await?;
+            let value = client
+                .delete(&format!("agents/projects/{}", client::encode_path(&id)))
+                .await?;
             if ctx.json {
                 output::json(&value);
                 return Ok(());
@@ -324,7 +333,7 @@ pub async fn run(ctx: &super::Context, project_cmd: ProjectCommand) -> anyhow::R
         ProjectCommand::Scan { id } => {
             let value = client
                 .post(
-                    &format!("agents/projects/{id}/scan"),
+                    &format!("agents/projects/{}/scan", client::encode_path(&id)),
                     &serde_json::json!({}),
                 )
                 .await?;
@@ -342,7 +351,10 @@ pub async fn run(ctx: &super::Context, project_cmd: ProjectCommand) -> anyhow::R
         }
         ProjectCommand::DiskUsage { id } => {
             let value = client
-                .get(&format!("agents/projects/{id}/disk-usage"))
+                .get(&format!(
+                    "agents/projects/{}/disk-usage",
+                    client::encode_path(&id)
+                ))
                 .await?;
             if ctx.json {
                 output::json(&value);
@@ -393,7 +405,10 @@ pub async fn run(ctx: &super::Context, project_cmd: ProjectCommand) -> anyhow::R
                 }
 
                 let value = client
-                    .post(&format!("agents/projects/{project_id}/repos"), &body)
+                    .post(
+                        &format!("agents/projects/{}/repos", client::encode_path(&project_id)),
+                        &body,
+                    )
                     .await?;
                 if ctx.json {
                     output::json(&value);
@@ -408,7 +423,11 @@ pub async fn run(ctx: &super::Context, project_cmd: ProjectCommand) -> anyhow::R
                 repo_id,
             } => {
                 let value = client
-                    .delete(&format!("agents/projects/{project_id}/repos/{repo_id}"))
+                    .delete(&format!(
+                        "agents/projects/{}/repos/{}",
+                        client::encode_path(&project_id),
+                        client::encode_path(&repo_id)
+                    ))
                     .await?;
                 if ctx.json {
                     output::json(&value);
@@ -439,7 +458,13 @@ pub async fn run(ctx: &super::Context, project_cmd: ProjectCommand) -> anyhow::R
                 }
 
                 let value = client
-                    .post(&format!("agents/projects/{project_id}/worktrees"), &body)
+                    .post(
+                        &format!(
+                            "agents/projects/{}/worktrees",
+                            client::encode_path(&project_id)
+                        ),
+                        &body,
+                    )
                     .await?;
                 if ctx.json {
                     output::json(&value);
@@ -458,7 +483,9 @@ pub async fn run(ctx: &super::Context, project_cmd: ProjectCommand) -> anyhow::R
             } => {
                 let value = client
                     .delete(&format!(
-                        "agents/projects/{project_id}/worktrees/{worktree_id}"
+                        "agents/projects/{}/worktrees/{}",
+                        client::encode_path(&project_id),
+                        client::encode_path(&worktree_id)
                     ))
                     .await?;
                 if ctx.json {

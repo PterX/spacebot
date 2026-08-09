@@ -414,6 +414,7 @@ pub struct WakeAgentResponse {
     params(("agent_id" = String, Path, description = "Agent ID")),
     responses(
         (status = 202, body = WakeAgentResponse),
+        (status = 404, description = "Agent not found"),
         (status = 503, description = "Wake manager not running"),
     ),
     tag = "agents",

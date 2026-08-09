@@ -48,15 +48,21 @@ pub async fn run(ctx: &super::Context, args: DashboardArgs) -> anyhow::Result<()
 }
 
 /// Wildcard binds aren't connectable addresses — browsers need localhost.
-fn display_host(bind: &str) -> &str {
+/// IPv6 literals need brackets to form a valid URL host.
+fn display_host(bind: &str) -> String {
     match bind {
-        "0.0.0.0" | "::" | "[::]" => "localhost",
-        host => host,
+        "0.0.0.0" | "::" | "[::]" => "localhost".to_string(),
+        host if host.contains(':') && !host.starts_with('[') => format!("[{host}]"),
+        host => host.to_string(),
     }
 }
 
 async fn wait_for_api(bind: &str, port: u16) -> bool {
-    let host = display_host(bind);
+    // Bare address for the socket connect — brackets are URL syntax only.
+    let host = match bind {
+        "0.0.0.0" | "::" | "[::]" => "localhost",
+        host => host.trim_start_matches('[').trim_end_matches(']'),
+    };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         if tokio::net::TcpStream::connect((host, port)).await.is_ok() {

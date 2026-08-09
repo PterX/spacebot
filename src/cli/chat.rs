@@ -72,7 +72,13 @@ pub async fn run(ctx: &super::Context, args: ChatArgs) -> anyhow::Result<()> {
         let mut stream = events.bytes_stream();
         let mut buffer = String::new();
         while let Some(chunk) = stream.next().await {
-            let Ok(chunk) = chunk else { break };
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    eprintln!("event stream error: {error}");
+                    break;
+                }
+            };
             buffer.push_str(&String::from_utf8_lossy(&chunk));
             while let Some(newline) = buffer.find('\n') {
                 let line = buffer[..newline].trim_end_matches('\r').to_string();

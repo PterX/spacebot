@@ -20,13 +20,17 @@ pub enum AuthCommand {
 }
 
 pub async fn run(ctx: &super::Context, auth_cmd: AuthCommand) -> anyhow::Result<()> {
-    // We need the instance_dir for credential storage. Try loading config,
-    // but fall back to the default instance dir if config doesn't exist yet
-    // (auth login may be the first thing a user runs).
-    let instance_dir = if let Ok(config) = super::load_config(&ctx.config_path) {
-        config.instance_dir
+    // We need the instance_dir for credential storage. An explicitly passed
+    // config must load — falling back silently could point credential
+    // operations at a different instance. Without --config, fall back to the
+    // default instance dir (auth login may be the first thing a user runs).
+    let instance_dir = if ctx.config_path.is_some() {
+        super::load_config(&ctx.config_path)?.instance_dir
     } else {
-        spacebot::config::Config::default_instance_dir()
+        match super::load_config(&ctx.config_path) {
+            Ok(config) => config.instance_dir,
+            Err(_) => spacebot::config::Config::default_instance_dir(),
+        }
     };
 
     // Ensure instance dir exists

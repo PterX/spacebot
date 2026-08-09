@@ -121,7 +121,7 @@ pub async fn run(ctx: &super::Context, wiki_cmd: WikiCommand) -> anyhow::Result<
             Ok(())
         }
         WikiCommand::Get { slug, version } => {
-            let mut path = format!("wiki/{slug}");
+            let mut path = format!("wiki/{}", client::encode_path(&slug));
             if let Some(version) = version {
                 path.push_str(&format!("?version={version}"));
             }
@@ -189,7 +189,9 @@ pub async fn run(ctx: &super::Context, wiki_cmd: WikiCommand) -> anyhow::Result<
 
             // The API exposes string-replacement edits, so fetch the current
             // content and swap it wholesale for the provided source.
-            let current = client.get(&format!("wiki/{slug}")).await?;
+            let current = client
+                .get(&format!("wiki/{}", client::encode_path(&slug)))
+                .await?;
             let current: WikiPageResponse = client::parse(current)?;
             if current.page.content == new_content {
                 eprintln!("No changes to '{slug}'.");
@@ -204,7 +206,9 @@ pub async fn run(ctx: &super::Context, wiki_cmd: WikiCommand) -> anyhow::Result<
                 body["edit_summary"] = serde_json::json!(summary);
             }
 
-            let value = client.post(&format!("wiki/{slug}/edit"), &body).await?;
+            let value = client
+                .post(&format!("wiki/{}/edit", client::encode_path(&slug)), &body)
+                .await?;
             if ctx.json {
                 output::json(&value);
                 return Ok(());
@@ -217,7 +221,9 @@ pub async fn run(ctx: &super::Context, wiki_cmd: WikiCommand) -> anyhow::Result<
             Ok(())
         }
         WikiCommand::Archive { slug } => {
-            let value = client.delete(&format!("wiki/{slug}")).await?;
+            let value = client
+                .delete(&format!("wiki/{}", client::encode_path(&slug)))
+                .await?;
             if ctx.json {
                 output::json(&value);
                 return Ok(());
@@ -227,7 +233,7 @@ pub async fn run(ctx: &super::Context, wiki_cmd: WikiCommand) -> anyhow::Result<
             Ok(())
         }
         WikiCommand::History { slug, limit } => {
-            let mut path = format!("wiki/{slug}/history");
+            let mut path = format!("wiki/{}/history", client::encode_path(&slug));
             if let Some(limit) = limit {
                 path.push_str(&format!("?limit={limit}"));
             }
@@ -258,7 +264,12 @@ pub async fn run(ctx: &super::Context, wiki_cmd: WikiCommand) -> anyhow::Result<
         }
         WikiCommand::Restore { slug, version } => {
             let body = serde_json::json!({ "version": version });
-            let value = client.post(&format!("wiki/{slug}/restore"), &body).await?;
+            let value = client
+                .post(
+                    &format!("wiki/{}/restore", client::encode_path(&slug)),
+                    &body,
+                )
+                .await?;
             if ctx.json {
                 output::json(&value);
                 return Ok(());
