@@ -18,6 +18,8 @@ This has a well-known failure mode: the agent writes malformed JSON, overwrites 
 
 The autonomy channel is the agent's process for self-directed work. It is not per-task. It is one channel that wakes on a configured interval, surveys the task state, does as much enrichment and preparation as useful, executes ready tasks if any exist, and exits. On the next interval it wakes again.
 
+The interval is the default trigger, not the only one. Wake events — schedules, webhooks, internal events like a task approval or a user comment, and idle/staleness conditions — pull the next run forward and appear in its context with their payloads and instructions. The channel is the single consumer of all wake sources; see [`wakes.md`](wakes.md) for the trigger model, queue semantics, and authority rules.
+
 It is structurally similar to a cron channel — periodic, no user present, full agent context. The difference is that it is persistent across runs and has awareness of its own history.
 
 The autonomy channel is the only process that:
@@ -37,6 +39,7 @@ The cortex assembles the autonomy channel's context before each wake. It gets:
 - **Identity** — SOUL.md, IDENTITY.md, ROLE.md. The agent knows who it is.
 - **Memory bulletin** — the cortex's current knowledge synthesis.
 - **Working memory** — recent system events. What's been happening across all channels.
+- **Wake events** — what pulled this run forward, if anything: the wake's name, instructions, and payload for each pending event since the last run. Surfaced first, because they are usually why the run exists.
 - **Task state** — all active tasks: ready, in-progress, backlog, pending_approval. Full detail on each, including all comments.
 - **Goals** — all active goals with descriptions and notes. Background context and direction, not a work queue. See [`goals.md`](goals.md).
 - **Active workers** — what's currently running so it doesn't duplicate work.
@@ -188,7 +191,7 @@ This uses the existing addendum context delivery mechanism (same path as worker 
 
 **Task comments** — the primary record of what has been investigated and found. Persist indefinitely. The next run sees all prior comments when it reads task state on wake, so it does not duplicate completed investigation.
 
-**Run summaries** — on exit, `autonomy_complete` records what was enriched, what was executed, what was created. The next wake receives the last `run_history_count` summaries as part of its context.
+**Run summaries** — on exit, `autonomy_complete` records what was enriched, what was executed, what was created, and which wake events the run consumed. The next wake receives the last `run_history_count` summaries as part of its context, and the UI renders the consumed wakes as "woken by" provenance per run.
 
 Working memory provides broader system context. Run summaries provide the autonomy-specific thread.
 
@@ -199,6 +202,7 @@ Working memory provides broader system context. Run summaries provide the autono
 ```
 Cortex tick
   → elapsed since last autonomy run >= interval_secs
+    OR unconsumed wake events are pending
   → no autonomy channel currently running
   → autonomy.enabled = true
   ↓
