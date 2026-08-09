@@ -50,6 +50,10 @@ impl PromptEngine {
         // Register all templates from the central text registry
         // Process prompts
         env.add_template("channel", crate::prompts::text::get("channel"))?;
+        env.add_template(
+            "autonomy_channel",
+            crate::prompts::text::get("autonomy_channel"),
+        )?;
         env.add_template("branch", crate::prompts::text::get("branch"))?;
         env.add_template("worker", crate::prompts::text::get("worker"))?;
         env.add_template("cortex", crate::prompts::text::get("cortex"))?;
@@ -619,6 +623,42 @@ impl PromptEngine {
         )
     }
 
+    /// Render the autonomy channel run briefing.
+    ///
+    /// This becomes the run's initial synthetic message; the channel's normal
+    /// system prompt (identity, bulletin, working memory) is layered on top
+    /// by the channel machinery.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_autonomy_channel_prompt(
+        &self,
+        agent_name: &str,
+        level: &str,
+        wake_events: Vec<AutonomyWakeEventView>,
+        run_history: Vec<AutonomyRunHistoryView>,
+        task_state: &str,
+        active_goals: Option<&str>,
+        active_workers: Option<&str>,
+        max_tasks_per_run: u32,
+        warn_minutes: u64,
+        claim_unowned: bool,
+    ) -> Result<String> {
+        self.render(
+            "autonomy_channel",
+            context! {
+                agent_name => agent_name,
+                level => level,
+                wake_events => wake_events,
+                run_history => run_history,
+                task_state => task_state,
+                active_goals => active_goals,
+                active_workers => active_workers,
+                max_tasks_per_run => max_tasks_per_run,
+                warn_minutes => warn_minutes,
+                claim_unowned => claim_unowned,
+            },
+        )
+    }
+
     /// Render optional adapter-specific channel guidance.
     pub fn render_channel_adapter_prompt(&self, adapter: &str) -> Option<String> {
         let template_name = match adapter {
@@ -786,6 +826,26 @@ pub struct LinkedAgent {
     pub description: Option<String>,
 }
 
+/// A pending wake event rendered into the autonomy run briefing.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AutonomyWakeEventView {
+    pub wake_id: String,
+    pub fired_at: String,
+    pub delivery_count: i64,
+    /// Compact JSON payload preview; empty when the payload is empty.
+    pub payload: String,
+}
+
+/// A past autonomy run rendered into the run briefing.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AutonomyRunHistoryView {
+    pub started_at: String,
+    pub status: String,
+    pub summary: String,
+    /// How many wake events that run consumed.
+    pub woken_by: usize,
+}
+
 /// Information about a skill for template rendering.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SkillInfo {
@@ -918,6 +978,66 @@ mod tests {
         assert!(reflecting.contains("## Skill Reflection"));
         assert!(reflecting.contains("never the incident"));
         assert!(reflecting.contains("Never persist"));
+    }
+
+    #[test]
+    fn autonomy_channel_prompt_renders_per_level() {
+        let engine = PromptEngine::new("en").expect("prompt engine should build");
+
+        let wake_events = vec![super::AutonomyWakeEventView {
+            wake_id: "ci-failed".to_string(),
+            fired_at: "2026-08-09T02:00:00Z".to_string(),
+            delivery_count: 3,
+            payload: "{\"job\":\"clippy\"}".to_string(),
+        }];
+        let run_history = vec![super::AutonomyRunHistoryView {
+            started_at: "2026-08-09T00:00:00Z".to_string(),
+            status: "completed".to_string(),
+            summary: "Enriched task #4.".to_string(),
+            woken_by: 1,
+        }];
+
+        let observe = engine
+            .render_autonomy_channel_prompt(
+                "Iris",
+                "observe",
+                wake_events.clone(),
+                run_history.clone(),
+                "### Pending approval\n- #4 [high] Investigate flaky test\n",
+                Some("### [HIGH] Ship v2"),
+                None,
+                2,
+                8,
+                true,
+            )
+            .expect("observe prompt should render");
+        assert!(observe.contains("You are Iris."));
+        assert!(observe.contains("ci-failed"));
+        assert!(observe.contains("3 coalesced firings"));
+        assert!(observe.contains("Enriched task #4."));
+        assert!(observe.contains("survey and summarize only"));
+        assert!(observe.contains("up to 2 tasks this run"));
+        assert!(observe.contains("about 8 minutes"));
+        assert!(observe.contains("`pending_approval` are NEVER executed"));
+
+        let act = engine
+            .render_autonomy_channel_prompt(
+                "Iris",
+                "act",
+                Vec::new(),
+                Vec::new(),
+                "No active tasks.\n",
+                None,
+                None,
+                1,
+                1,
+                false,
+            )
+            .expect("act prompt should render");
+        assert!(act.contains("Scheduled interval — no wake events pending."));
+        assert!(act.contains("Execute ready tasks"));
+        assert!(act.contains("up to 1 task this run"));
+        assert!(!act.contains("claim unowned tasks"));
     }
 
     #[test]

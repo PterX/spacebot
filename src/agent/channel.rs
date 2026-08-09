@@ -403,6 +403,10 @@ pub struct ChannelState {
     /// When set, the `set_outcome` tool is registered for this channel,
     /// allowing the LLM to explicitly store a delivery payload.
     pub cron_outcome: Option<crate::cron::CronOutcome>,
+    /// Autonomy run state for the `autonomy_complete` tool. Set only on
+    /// `ChannelKind::Autonomy` channels; the run loop uses it to enforce the
+    /// completion contract before self-exit.
+    pub autonomy_run: Option<crate::agent::autonomy::AutonomyRunHandle>,
 }
 
 impl ChannelState {
@@ -780,6 +784,10 @@ pub struct Channel {
     /// Injected into the system prompt (not into chat history) so the LLM
     /// treats it as read-only context rather than actionable user messages.
     backfill_transcript: Option<String>,
+    /// Retry-prompts sent so far for the autonomy completion contract.
+    /// Autonomy channels must call `autonomy_complete` before self-exit;
+    /// this bounds how many times the run loop nudges them.
+    autonomy_contract_retries: usize,
     /// Handle exposed to the supervision control plane.
     control_handle: ChannelControlHandle,
     /// Per-conversation resolved settings (memory mode, delegation mode, model override).
@@ -846,6 +854,7 @@ impl Channel {
         live_worker_transcripts: Option<LiveWorkerTranscripts>,
         resolved_settings: ResolvedConversationSettings,
         cron_outcome: Option<crate::cron::CronOutcome>,
+        autonomy_run: Option<crate::agent::autonomy::AutonomyRunHandle>,
     ) -> (Self, mpsc::Sender<InboundMessage>) {
         let process_id = ProcessId::Channel(id.clone());
         let hook = SpacebotHook::new(
@@ -901,6 +910,7 @@ impl Channel {
             model_overrides: Arc::new(resolved_settings.clone()),
             active_participants: Arc::new(RwLock::new(HashMap::new())),
             cron_outcome,
+            autonomy_run,
         };
 
         // Each channel gets its own isolated tool server to avoid races between
@@ -961,6 +971,7 @@ impl Channel {
             pending_results: Vec::new(),
             send_agent_message_tool,
             backfill_transcript: None,
+            autonomy_contract_retries: 0,
             control_handle,
             resolved_settings,
         };
@@ -1319,6 +1330,48 @@ impl Channel {
                 && self.state.worker_handles.read().await.is_empty()
                 && self.state.active_branches.read().await.is_empty()
             {
+                // Autonomy runs must record their outcome via autonomy_complete
+                // before exiting. When the call is missing, nudge the LLM with
+                // a retry prompt (same budget as the memory-persistence
+                // contract) before giving up; the run driver records a
+                // fallback summary if the budget is exhausted.
+                if let Some(run) = self.state.autonomy_run.clone()
+                    && !run.completed()
+                    && self.autonomy_contract_retries
+                        < crate::agent::autonomy::AUTONOMY_CONTRACT_MAX_RETRIES
+                {
+                    self.autonomy_contract_retries += 1;
+                    tracing::warn!(
+                        channel_id = %self.id,
+                        attempt = self.autonomy_contract_retries,
+                        "autonomy run missing autonomy_complete call, retrying"
+                    );
+                    let retry = InboundMessage {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        source: "system".into(),
+                        adapter: None,
+                        conversation_id: self.conversation_id.clone().unwrap_or_else(|| {
+                            crate::agent::autonomy::AUTONOMY_CONVERSATION_ID.to_string()
+                        }),
+                        sender_id: "system".into(),
+                        agent_id: Some(self.deps.agent_id.clone()),
+                        content: crate::MessageContent::Text(
+                            crate::agent::autonomy::AUTONOMY_CONTRACT_RETRY_PROMPT.to_string(),
+                        ),
+                        timestamp: chrono::Utc::now(),
+                        metadata: HashMap::new(),
+                        formatted_author: None,
+                    };
+                    if let Err(error) = self.handle_message(retry).await {
+                        tracing::error!(
+                            %error,
+                            channel_id = %self.id,
+                            "autonomy completion-contract retry failed"
+                        );
+                        break;
+                    }
+                    continue;
+                }
                 tracing::info!(channel_id = %self.id, "self-exiting channel finished all work, exiting");
                 break;
             }
@@ -2767,7 +2820,10 @@ impl Channel {
     ) -> Result<AgentTurnResult> {
         let skip_flag = crate::tools::new_skip_flag();
         let replied_flag = crate::tools::new_replied_flag();
-        let allow_direct_reply = !self.suppress_plaintext_fallback();
+        // Autonomy runs never talk to users — no reply tool. Output goes to
+        // task state, working memory, and autonomy_complete.
+        let allow_direct_reply =
+            self.state.kind != ChannelKind::Autonomy && !self.suppress_plaintext_fallback();
 
         // Set the originating channel on the delegation tool so task completion
         // notifications route back to this conversation.
@@ -2844,7 +2900,11 @@ impl Channel {
 
         let rc = &self.deps.runtime_config;
         let routing = rc.routing.load();
-        let max_turns = if is_retrigger {
+        let max_turns = if self.state.kind == ChannelKind::Autonomy {
+            // Autonomy runs carry their own turn budget; on exhaustion the
+            // channel behaves like a soft timeout and wraps up.
+            (rc.autonomy.load().max_turns.max(1)) as usize
+        } else if is_retrigger {
             RETRIGGER_MAX_TURNS
         } else {
             **rc.max_turns.load()

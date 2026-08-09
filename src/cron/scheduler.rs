@@ -500,7 +500,8 @@ impl Scheduler {
 
                 // Check active hours window
                 if let Some((start, end)) = job.active_hours {
-                    let (current_hour, timezone) = current_hour_and_timezone(&context, &job_id);
+                    let (current_hour, timezone) =
+                        current_hour_and_timezone(&context.deps.runtime_config);
                     let in_window = hour_in_active_window(current_hour, start, end);
                     if !in_window {
                         tracing::debug!(
@@ -908,8 +909,13 @@ fn cron_timezone_label(context: &CronContext) -> String {
     }
 }
 
-fn current_hour_and_timezone(context: &CronContext, cron_id: &str) -> (u8, String) {
-    let timezone = context.deps.runtime_config.cron_timezone.load();
+/// Current hour in the agent's configured cron timezone, falling back to the
+/// system timezone, plus a label for logging. Shared by cron active-hours
+/// gating and the autonomy channel's active-hours check.
+pub(crate) fn current_hour_and_timezone(
+    runtime_config: &crate::config::RuntimeConfig,
+) -> (u8, String) {
+    let timezone = runtime_config.cron_timezone.load();
     match timezone.as_deref() {
         Some(name) => match name.parse::<Tz>() {
             Ok(timezone) => (
@@ -918,8 +924,6 @@ fn current_hour_and_timezone(context: &CronContext, cron_id: &str) -> (u8, Strin
             ),
             Err(error) => {
                 tracing::warn!(
-                    agent_id = %context.deps.agent_id,
-                    cron_id,
                     cron_timezone = %name,
                     %error,
                     "invalid cron timezone in runtime config, falling back to system timezone"
@@ -937,7 +941,7 @@ fn current_hour_and_timezone(context: &CronContext, cron_id: &str) -> (u8, Strin
     }
 }
 
-fn hour_in_active_window(current_hour: u8, start_hour: u8, end_hour: u8) -> bool {
+pub(crate) fn hour_in_active_window(current_hour: u8, start_hour: u8, end_hour: u8) -> bool {
     if start_hour == end_hour {
         return true;
     }
@@ -1339,6 +1343,7 @@ async fn run_cron_job(
         None, // cron channels don't share live transcript cache
         crate::conversation::settings::ResolvedConversationSettings::default(),
         Some(cron_outcome.clone()),
+        None, // no autonomy run for cron channels
     );
 
     // Hold a control handle so we can cancel outstanding workers on timeout,

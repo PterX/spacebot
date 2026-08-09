@@ -55,6 +55,7 @@ fn lookup(lang: &str, key: &str) -> &'static str {
     match (lang, key) {
         // Process Prompts
         ("en", "channel") => include_str!("../../prompts/en/channel.md.j2"),
+        ("en", "autonomy_channel") => include_str!("../../prompts/en/autonomy_channel.md.j2"),
         ("en", "branch") => include_str!("../../prompts/en/branch.md.j2"),
         ("en", "worker") => include_str!("../../prompts/en/worker.md.j2"),
         ("en", "cortex") => include_str!("../../prompts/en/cortex.md.j2"),
@@ -199,6 +200,9 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         }
         ("en", "tools/memory_persistence_complete") => {
             include_str!("../../prompts/en/tools/memory_persistence_complete_description.md.j2")
+        }
+        ("en", "tools/autonomy_complete") => {
+            include_str!("../../prompts/en/tools/autonomy_complete_description.md.j2")
         }
         ("en", "tools/memory_recall") => {
             include_str!("../../prompts/en/tools/memory_recall_description.md.j2")

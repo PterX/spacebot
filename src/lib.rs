@@ -441,6 +441,10 @@ pub struct AgentDeps {
     pub mcp_manager: Arc<mcp::McpManager>,
     pub task_store: Arc<tasks::TaskStore>,
     pub goal_store: Arc<goals::GoalStore>,
+    /// Per-agent persisted wake-event queue, consumed by the autonomy channel.
+    pub wake_event_store: Arc<wakes::WakeEventStore>,
+    /// Per-agent autonomy run history (begin/complete + recent summaries).
+    pub autonomy_run_store: Arc<wakes::AutonomyRunStore>,
     pub project_store: Arc<projects::ProjectStore>,
     pub cron_tool: Option<tools::CronTool>,
     pub runtime_config: Arc<config::RuntimeConfig>,

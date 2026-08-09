@@ -6,7 +6,9 @@
 //! the consuming autonomy channel plug in around them.
 
 mod events;
+mod runs;
 mod store;
 
 pub use events::SystemEvent;
+pub use runs::{AutonomyAction, AutonomyRun, AutonomyRunStatus, AutonomyRunStore};
 pub use store::{EnqueueOutcome, WakeEvent, WakeEventStore};

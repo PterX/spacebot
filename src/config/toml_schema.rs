@@ -298,6 +298,7 @@ pub(super) struct TomlDefaultsConfig {
     pub(super) coalesce: Option<TomlCoalesceConfig>,
     pub(super) ingestion: Option<TomlIngestionConfig>,
     pub(super) cortex: Option<TomlCortexConfig>,
+    pub(super) autonomy: Option<TomlAutonomyConfig>,
     pub(super) warmup: Option<TomlWarmupConfig>,
     pub(super) skills: Option<TomlSkillsConfig>,
     pub(super) participant_context: Option<TomlParticipantContextConfig>,
@@ -409,6 +410,20 @@ pub(super) struct TomlCortexConfig {
 }
 
 #[derive(Deserialize)]
+pub(super) struct TomlAutonomyConfig {
+    pub(super) level: Option<crate::config::AutonomyLevel>,
+    pub(super) interval_secs: Option<u64>,
+    /// [start_hour, end_hour] in the agent's cron timezone.
+    pub(super) active_hours: Option<(u8, u8)>,
+    pub(super) max_turns: Option<u32>,
+    pub(super) max_tasks_per_run: Option<u32>,
+    pub(super) timeout_secs: Option<u64>,
+    pub(super) warn_secs: Option<u64>,
+    pub(super) run_history_count: Option<u32>,
+    pub(super) claim_unowned: Option<bool>,
+}
+
+#[derive(Deserialize)]
 pub(super) struct TomlWarmupConfig {
     pub(super) enabled: Option<bool>,
     pub(super) eager_embedding_load: Option<bool>,
@@ -503,6 +518,7 @@ pub(super) struct TomlAgentConfig {
     pub(super) coalesce: Option<TomlCoalesceConfig>,
     pub(super) ingestion: Option<TomlIngestionConfig>,
     pub(super) cortex: Option<TomlCortexConfig>,
+    pub(super) autonomy: Option<TomlAutonomyConfig>,
     pub(super) warmup: Option<TomlWarmupConfig>,
     pub(super) skills: Option<TomlSkillsConfig>,
     pub(super) browser: Option<TomlBrowserConfig>,

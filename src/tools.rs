@@ -29,6 +29,7 @@
 //! - branch + worker tool superset plus `spacebot_docs`, `config_inspect`, and `spawn_worker`
 
 pub mod attachment_recall;
+pub mod autonomy_complete;
 pub mod branch_tool;
 pub mod browser;
 pub mod browser_detection;
@@ -86,6 +87,10 @@ pub mod factory_update_identity;
 
 pub use attachment_recall::{
     AttachmentRecallArgs, AttachmentRecallError, AttachmentRecallOutput, AttachmentRecallTool,
+};
+pub use autonomy_complete::{
+    AutonomyActionInput, AutonomyCompleteArgs, AutonomyCompleteError, AutonomyCompleteOutput,
+    AutonomyCompleteTool,
 };
 pub use branch_tool::{BranchArgs, BranchError, BranchOutput, BranchTool};
 pub use browser::{
@@ -469,6 +474,7 @@ pub async fn add_channel_tools(
 ) -> Result<(), rig::tool::server::ToolServerError> {
     let conversation_id = conversation_id.into();
     let channel_kind = state.kind;
+    let autonomy_run = state.autonomy_run.clone();
 
     if allow_direct_reply {
         let agent_display_name = state
@@ -574,6 +580,11 @@ pub async fn add_channel_tools(
         handle
             .add_tool(SetOutcomeTool::new(outcome, conversation_id.clone()))
             .await?;
+    }
+    if channel_kind == crate::agent::channel::ChannelKind::Autonomy
+        && let Some(run) = autonomy_run
+    {
+        handle.add_tool(AutonomyCompleteTool::new(run)).await?;
     }
     Ok(())
 }
@@ -805,6 +816,7 @@ pub async fn remove_channel_tools(
     let _ = handle.remove_tool(SendAgentMessageTool::NAME).await;
     let _ = handle.remove_tool(AttachmentRecallTool::NAME).await;
     let _ = handle.remove_tool(SetOutcomeTool::NAME).await;
+    let _ = handle.remove_tool(AutonomyCompleteTool::NAME).await;
     let _ = handle.remove_tool(SkillsSearchTool::NAME).await;
     let _ = handle.remove_tool(InstallSkillTool::NAME).await;
     Ok(())

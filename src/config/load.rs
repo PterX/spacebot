@@ -11,15 +11,16 @@ use super::providers::{
 };
 use super::toml_schema::*;
 use super::{
-    AgentConfig, ApiConfig, ApiType, Binding, BrowserConfig, ChannelConfig, ClosePolicy,
-    CoalesceConfig, CompactionConfig, Config, CortexConfig, CronDef, DefaultsConfig, DiscordConfig,
-    DiscordInstanceConfig, EmailConfig, EmailInstanceConfig, GroupDef, HumanDef, IngestionConfig,
-    LinkDef, LlmConfig, MattermostConfig, MattermostInstanceConfig, McpServerConfig, McpTransport,
-    MemoryJanitorConfig, MemoryPersistenceConfig, MessagingConfig, MetricsConfig, OpenCodeConfig,
-    ParticipantContextConfig, ProjectsConfig, ProviderConfig, ReflectionConfig, SignalConfig,
-    SignalInstanceConfig, SkillsConfig, SlackCommandConfig, SlackConfig, SlackInstanceConfig,
-    TelegramConfig, TelegramInstanceConfig, TelemetryConfig, TwitchConfig, TwitchInstanceConfig,
-    WarmupConfig, WebhookConfig, normalize_adapter, validate_named_messaging_adapters,
+    AgentConfig, ApiConfig, ApiType, AutonomyConfig, Binding, BrowserConfig, ChannelConfig,
+    ClosePolicy, CoalesceConfig, CompactionConfig, Config, CortexConfig, CronDef, DefaultsConfig,
+    DiscordConfig, DiscordInstanceConfig, EmailConfig, EmailInstanceConfig, GroupDef, HumanDef,
+    IngestionConfig, LinkDef, LlmConfig, MattermostConfig, MattermostInstanceConfig,
+    McpServerConfig, McpTransport, MemoryJanitorConfig, MemoryPersistenceConfig, MessagingConfig,
+    MetricsConfig, OpenCodeConfig, ParticipantContextConfig, ProjectsConfig, ProviderConfig,
+    ReflectionConfig, SignalConfig, SignalInstanceConfig, SkillsConfig, SlackCommandConfig,
+    SlackConfig, SlackInstanceConfig, TelegramConfig, TelegramInstanceConfig, TelemetryConfig,
+    TwitchConfig, TwitchInstanceConfig, WarmupConfig, WebhookConfig, normalize_adapter,
+    validate_named_messaging_adapters,
 };
 use crate::error::{ConfigError, Result};
 
@@ -282,6 +283,31 @@ impl CortexConfig {
         };
         config.validate_maintenance_bounds()?;
         Ok(config)
+    }
+}
+
+impl AutonomyConfig {
+    fn resolve(
+        overrides: TomlAutonomyConfig,
+        defaults: AutonomyConfig,
+        scope: &str,
+    ) -> Result<AutonomyConfig> {
+        AutonomyConfig {
+            level: overrides.level.unwrap_or(defaults.level),
+            interval_secs: overrides.interval_secs.unwrap_or(defaults.interval_secs),
+            active_hours: overrides.active_hours.or(defaults.active_hours),
+            max_turns: overrides.max_turns.unwrap_or(defaults.max_turns),
+            max_tasks_per_run: overrides
+                .max_tasks_per_run
+                .unwrap_or(defaults.max_tasks_per_run),
+            timeout_secs: overrides.timeout_secs.unwrap_or(defaults.timeout_secs),
+            warn_secs: overrides.warn_secs.unwrap_or(defaults.warn_secs),
+            run_history_count: overrides
+                .run_history_count
+                .unwrap_or(defaults.run_history_count),
+            claim_unowned: overrides.claim_unowned.unwrap_or(defaults.claim_unowned),
+        }
+        .validated(scope)
     }
 }
 
@@ -957,6 +983,7 @@ impl Config {
             coalesce: None,
             ingestion: None,
             cortex: None,
+            autonomy: None,
             warmup: None,
             skills: None,
             browser: None,
@@ -1638,6 +1665,12 @@ impl Config {
                 .map(|c| CortexConfig::resolve(c, base_defaults.cortex))
                 .transpose()?
                 .unwrap_or(base_defaults.cortex),
+            autonomy: toml
+                .defaults
+                .autonomy
+                .map(|a| AutonomyConfig::resolve(a, base_defaults.autonomy, "defaults.autonomy"))
+                .transpose()?
+                .unwrap_or(base_defaults.autonomy),
             warmup: toml
                 .defaults
                 .warmup
@@ -1843,6 +1876,17 @@ impl Config {
                     })
                     .collect();
 
+                let autonomy = a
+                    .autonomy
+                    .map(|c| {
+                        AutonomyConfig::resolve(
+                            c,
+                            defaults.autonomy,
+                            &format!("agents.{}.autonomy", a.id),
+                        )
+                    })
+                    .transpose()?;
+
                 Ok(AgentConfig {
                     id: a.id,
                     default: a.default,
@@ -1896,6 +1940,7 @@ impl Config {
                         .cortex
                         .map(|c| CortexConfig::resolve(c, defaults.cortex))
                         .transpose()?,
+                    autonomy,
                     warmup: a.warmup.map(|w| WarmupConfig {
                         enabled: w.enabled.unwrap_or(defaults.warmup.enabled),
                         eager_embedding_load: w
@@ -2006,6 +2051,7 @@ impl Config {
                 coalesce: None,
                 ingestion: None,
                 cortex: None,
+                autonomy: None,
                 warmup: None,
                 skills: None,
                 browser: None,
@@ -2735,5 +2781,51 @@ mod skills_config_tests {
         let merged = resolve_skills_config(toml, base);
         assert!(!merged.reflection.enabled);
         assert_eq!(merged.reflection.cooldown_secs, 60);
+    }
+}
+
+#[cfg(test)]
+mod autonomy_config_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_merges_partial_toml_over_defaults() {
+        let toml: TomlAutonomyConfig =
+            toml::from_str("level = \"suggest\"\ninterval_secs = 900\nactive_hours = [8, 22]")
+                .unwrap();
+        let resolved =
+            AutonomyConfig::resolve(toml, AutonomyConfig::default(), "defaults.autonomy")
+                .expect("valid overrides must resolve");
+
+        assert_eq!(resolved.level, crate::config::AutonomyLevel::Suggest);
+        assert_eq!(resolved.interval_secs, 900);
+        assert_eq!(resolved.active_hours, Some((8, 22)));
+        // Untouched fields inherit the defaults.
+        assert_eq!(
+            resolved.timeout_secs,
+            AutonomyConfig::default().timeout_secs
+        );
+        assert_eq!(
+            resolved.claim_unowned,
+            AutonomyConfig::default().claim_unowned
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_invalid_overrides_with_scoped_error() {
+        let toml: TomlAutonomyConfig = toml::from_str("interval_secs = 10").unwrap();
+        let error =
+            AutonomyConfig::resolve(toml, AutonomyConfig::default(), "agents.main.autonomy")
+                .expect_err("interval below the floor must reject the load");
+        assert!(
+            error
+                .to_string()
+                .contains("agents.main.autonomy.interval_secs")
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_unknown_level() {
+        assert!(toml::from_str::<TomlAutonomyConfig>("level = \"yolo\"").is_err());
     }
 }

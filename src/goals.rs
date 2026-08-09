@@ -59,3 +59,58 @@ pub async fn render_active_goals(store: &GoalStore) -> Result<String> {
 fn first_non_empty_line(text: &str) -> Option<&str> {
     text.lines().map(str::trim).find(|line| !line.is_empty())
 }
+
+/// Render the extended active-goals block for the autonomy channel briefing.
+///
+/// Unlike the short channel format, this includes each goal's full
+/// description, full progress notes, and linked-task counts — the autonomy
+/// channel reasons about which work serves which goal, so it gets the whole
+/// picture. Returns an empty string when there are no active goals.
+pub async fn render_active_goals_extended(store: &GoalStore) -> Result<String> {
+    let goals = store
+        .list(GoalListFilter {
+            status: Some(GoalStatus::Active),
+            limit: Some(ACTIVE_GOALS_PROMPT_LIMIT),
+        })
+        .await?;
+
+    if goals.is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut sections = Vec::with_capacity(goals.len());
+    for goal in goals {
+        let mut lines = vec![format!(
+            "### [{}] {}{}",
+            goal.priority.as_str().to_uppercase(),
+            goal.title,
+            goal.due_date
+                .as_deref()
+                .map(|due_date| format!(" (due: {due_date})"))
+                .unwrap_or_default()
+        )];
+        if let Some(description) = goal.description.as_deref().map(str::trim)
+            && !description.is_empty()
+        {
+            lines.push(description.to_string());
+        }
+        if let Some(notes) = goal.notes.as_deref().map(str::trim)
+            && !notes.is_empty()
+        {
+            lines.push(format!("Notes: {notes}"));
+        }
+        let counts = store.linked_task_counts(&goal.id).await?;
+        lines.push(format!(
+            "Tasks: {} ({} pending approval, {} ready, {} in progress, {} done, {} failed)",
+            counts.total(),
+            counts.pending_approval,
+            counts.ready,
+            counts.in_progress,
+            counts.done,
+            counts.failed
+        ));
+        sections.push(lines.join("\n"));
+    }
+
+    Ok(sections.join("\n\n"))
+}

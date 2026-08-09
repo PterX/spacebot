@@ -1143,6 +1143,7 @@ async fn run(
                         Some(api_state.live_worker_transcripts.clone()),
                         resolved_settings,
                         None, // no cron outcome for normal channels
+                        None, // no autonomy run for normal channels
                     );
                     let channel_registration_id = agent
                         .deps
@@ -1432,6 +1433,7 @@ async fn run(
                         Some(api_state.live_worker_transcripts.clone()),
                         resolved_settings,
                         None, // no cron outcome for normal channels
+                        None, // no autonomy run for normal channels
                     );
                     let channel_registration_id = agent
                         .deps
@@ -2128,6 +2130,8 @@ async fn initialize_agents(
             mcp_manager,
             task_store: global_task_store.clone(),
             goal_store: global_goal_store.clone(),
+            wake_event_store: Arc::new(spacebot::wakes::WakeEventStore::new(db.sqlite.clone())),
+            autonomy_run_store: Arc::new(spacebot::wakes::AutonomyRunStore::new(db.sqlite.clone())),
             project_store: project_store.clone(),
             cron_tool: None,
             runtime_config,

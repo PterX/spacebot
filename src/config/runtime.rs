@@ -4,10 +4,10 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 
 use super::{
-    BrowserConfig, ChannelConfig, CoalesceConfig, CompactionConfig, Config, CortexConfig,
-    DefaultsConfig, IngestionConfig, McpServerConfig, MemoryPersistenceConfig, OpenCodeConfig,
-    ResolvedAgentConfig, ToolUseEnforcement, WarmupConfig, WarmupStatus, WorkReadiness,
-    evaluate_work_readiness,
+    AutonomyConfig, BrowserConfig, ChannelConfig, CoalesceConfig, CompactionConfig, Config,
+    CortexConfig, DefaultsConfig, IngestionConfig, McpServerConfig, MemoryPersistenceConfig,
+    OpenCodeConfig, ResolvedAgentConfig, ToolUseEnforcement, WarmupConfig, WarmupStatus,
+    WorkReadiness, evaluate_work_readiness,
 };
 use crate::llm::routing::RoutingConfig;
 use crate::tools::browser::SharedBrowserHandle;
@@ -45,6 +45,7 @@ pub struct RuntimeConfig {
     pub cron_timezone: ArcSwap<Option<String>>,
     pub user_timezone: ArcSwap<Option<String>>,
     pub cortex: ArcSwap<CortexConfig>,
+    pub autonomy: ArcSwap<AutonomyConfig>,
     pub warmup: ArcSwap<WarmupConfig>,
     /// Current warmup lifecycle status for API and observability.
     pub warmup_status: ArcSwap<WarmupStatus>,
@@ -143,6 +144,7 @@ impl RuntimeConfig {
             cron_timezone: ArcSwap::from_pointee(agent_config.cron_timezone.clone()),
             user_timezone: ArcSwap::from_pointee(agent_config.user_timezone.clone()),
             cortex: ArcSwap::from_pointee(agent_config.cortex),
+            autonomy: ArcSwap::from_pointee(agent_config.autonomy),
             warmup: ArcSwap::from_pointee(agent_config.warmup),
             warmup_status: ArcSwap::from_pointee(WarmupStatus::default()),
             warmup_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -290,6 +292,7 @@ impl RuntimeConfig {
         self.cron_timezone.store(Arc::new(resolved.cron_timezone));
         self.user_timezone.store(Arc::new(resolved.user_timezone));
         self.cortex.store(Arc::new(resolved.cortex));
+        self.autonomy.store(Arc::new(resolved.autonomy));
         self.warmup.store(Arc::new(resolved.warmup));
         self.skills_config.store(Arc::new(resolved.skills));
         self.participant_context

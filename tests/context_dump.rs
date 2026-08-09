@@ -116,6 +116,8 @@ async fn bootstrap_deps() -> anyhow::Result<(spacebot::AgentDeps, spacebot::conf
         mcp_manager,
         task_store,
         goal_store: Arc::new(spacebot::goals::GoalStore::new(db.sqlite.clone())),
+        wake_event_store: Arc::new(spacebot::wakes::WakeEventStore::new(db.sqlite.clone())),
+        autonomy_run_store: Arc::new(spacebot::wakes::AutonomyRunStore::new(db.sqlite.clone())),
         project_store: Arc::new(spacebot::projects::ProjectStore::new(db.sqlite.clone())),
         cron_tool: None,
         runtime_config,
@@ -264,6 +266,7 @@ async fn dump_channel_context() {
         model_overrides: Arc::new(Default::default()),
         active_participants: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         cron_outcome: None,
+        autonomy_run: None,
     };
 
     let tool_server = rig::tool::server::ToolServer::new().run();
@@ -525,6 +528,7 @@ async fn dump_all_contexts() {
         model_overrides: Arc::new(Default::default()),
         active_participants: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         cron_outcome: None,
+        autonomy_run: None,
     };
     let channel_tool_server = rig::tool::server::ToolServer::new().run();
     let skip_flag = spacebot::tools::new_skip_flag();
