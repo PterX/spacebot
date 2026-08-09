@@ -2112,8 +2112,23 @@ impl Channel {
         let rewritten_text = match &parsed_command {
             crate::commands::ParseResult::Command(cmd) => match cmd.def.handler {
                 crate::commands::CommandHandler::Agent(
-                    crate::commands::AgentAction::PromptRewrite(instruction),
-                ) => instruction.to_string(),
+                    crate::commands::AgentAction::PromptTemplate(template),
+                ) => {
+                    let prompt_engine = self.deps.runtime_config.prompts.load();
+                    match prompt_engine.render_static(template) {
+                        Ok(instruction) => instruction,
+                        Err(error) => {
+                            tracing::error!(
+                                channel_id = %self.id,
+                                command = cmd.def.name,
+                                %template,
+                                %error,
+                                "failed to render command prompt template; using raw text"
+                            );
+                            raw_text.clone()
+                        }
+                    }
+                }
                 // Control commands returned above.
                 crate::commands::CommandHandler::Control(_) => raw_text.clone(),
             },

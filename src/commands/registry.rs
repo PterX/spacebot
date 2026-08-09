@@ -91,10 +91,10 @@ pub enum ControlAction {
 /// Agent-turn commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentAction {
-    /// Replace the raw text with a deterministic instruction rendered as a
-    /// normal agent turn. The instruction wording moves into the prompt
-    /// template system when commands arrive structured (design phase 4).
-    PromptRewrite(&'static str),
+    /// Replace the raw text with the named prompt template, rendered as a
+    /// normal agent turn. The value is a template key in the prompt engine
+    /// (e.g. "commands/tasks").
+    PromptTemplate(&'static str),
 }
 
 /// A successfully parsed command with validated, normalized arguments.
@@ -256,25 +256,6 @@ fn normalize_smart_dashes(args: &str) -> String {
         .replace('\u{2013}', "-")
 }
 
-const TASKS_PROMPT: &str = "use channel tools to fetch my ready tasks (limit 10) and reply exactly with:\n\
-     - header: tasks (ready):\n\
-     - each line: - #<task_number> [<priority>] <title>\n\
-     if no tasks are ready, reply exactly: tasks (ready): none";
-
-const TODAY_PROMPT: &str = "use channel tools to build a local tasks snapshot and reply exactly in this format:\n\
-     - first line: today (local tasks snapshot):\n\
-     - section 1: in-progress tasks (up to 5), each line:   #<task_number> [<priority>] <title>\n\
-     - section 2: up next ready tasks (up to 5), each line:   #<task_number> [<priority>] <title>\n\
-     if a section is empty use:\n\
-     - in progress: none\n\
-     - up next (ready): none";
-
-const DIGEST_PROMPT: &str = "using available tools and channel context, generate a concise day digest from local 00:00 to now with exactly this order:\n\
-     1) top decisions\n\
-     2) key convo themes\n\
-     3) open loops\n\
-     keep it practical and concise; if there are no meaningful updates, reply exactly: no material updates today.";
-
 /// The command table. Order within a category is display order in `/help`.
 pub static COMMANDS: &[CommandDef] = &[
     CommandDef {
@@ -307,7 +288,7 @@ pub static COMMANDS: &[CommandDef] = &[
         category: CommandCategory::Tasks,
         aliases: &[],
         args: ArgSpec::None,
-        handler: CommandHandler::Agent(AgentAction::PromptRewrite(TASKS_PROMPT)),
+        handler: CommandHandler::Agent(AgentAction::PromptTemplate("commands/tasks")),
     },
     CommandDef {
         name: "today",
@@ -315,7 +296,7 @@ pub static COMMANDS: &[CommandDef] = &[
         category: CommandCategory::Tasks,
         aliases: &[],
         args: ArgSpec::None,
-        handler: CommandHandler::Agent(AgentAction::PromptRewrite(TODAY_PROMPT)),
+        handler: CommandHandler::Agent(AgentAction::PromptTemplate("commands/today")),
     },
     CommandDef {
         name: "digest",
@@ -323,7 +304,7 @@ pub static COMMANDS: &[CommandDef] = &[
         category: CommandCategory::Tasks,
         aliases: &[],
         args: ArgSpec::None,
-        handler: CommandHandler::Agent(AgentAction::PromptRewrite(DIGEST_PROMPT)),
+        handler: CommandHandler::Agent(AgentAction::PromptTemplate("commands/digest")),
     },
     CommandDef {
         name: "status",
@@ -512,12 +493,36 @@ mod tests {
     }
 
     #[test]
+    fn prompt_template_keys_are_registered() {
+        // A PromptTemplate key that isn't in the prompt engine falls back to
+        // raw text at runtime; catch the drift here instead.
+        let engine = crate::prompts::engine::PromptEngine::new("en").expect("prompt engine");
+        for def in COMMANDS {
+            if let CommandHandler::Agent(AgentAction::PromptTemplate(template)) = def.handler {
+                engine.render_static(template).unwrap_or_else(|_| {
+                    panic!("/{} references unregistered template {template}", def.name)
+                });
+            }
+        }
+    }
+
+    #[test]
     fn names_and_aliases_are_globally_unique() {
+        // Resolution is case-insensitive, so uniqueness must be checked on
+        // normalized names or a future "STATUS" entry would collide with
+        // "status" at runtime while passing here.
         let mut seen = std::collections::HashSet::new();
         for def in COMMANDS {
-            assert!(seen.insert(def.name), "duplicate command name {}", def.name);
+            assert!(
+                seen.insert(def.name.to_ascii_lowercase()),
+                "duplicate command name {}",
+                def.name
+            );
             for alias in def.aliases {
-                assert!(seen.insert(alias), "duplicate alias {alias}");
+                assert!(
+                    seen.insert(alias.to_ascii_lowercase()),
+                    "duplicate alias {alias}"
+                );
             }
         }
     }

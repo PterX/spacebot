@@ -334,7 +334,7 @@ A registry test walks every command × platform and fails when a command is avai
 
 Generated from the registry, grouped by category, filtered by the caller's availability and access — a user never sees a command they can't run. Rich format for Portal/Discord, compact for Telegram/text:
 
-```
+```text
 /new — new conversation
 /status — conversation info
 /memory [query] — search memories
@@ -360,7 +360,7 @@ Generated from the registry, grouped by category, filtered by the caller's avail
 
 **API:**
 
-```
+```text
 GET  /api/commands                      registry projection for Portal palette
 POST /api/channels/:id/command          { name, args } → { text, data }
 ```

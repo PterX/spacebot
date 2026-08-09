@@ -2,7 +2,7 @@
 //!
 //! Design: `docs/design-docs/slash-commands.md`.
 
-mod registry;
+pub mod registry;
 
 pub use registry::{
     AgentAction, ArgSpec, COMMANDS, CommandCategory, CommandDef, CommandHandler, CommandRegistry,
