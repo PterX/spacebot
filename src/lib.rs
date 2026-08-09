@@ -34,6 +34,7 @@ pub mod tasks;
 pub mod telemetry;
 pub mod tools;
 pub mod update;
+pub mod wakes;
 pub mod wiki;
 
 pub use error::{Error, Result};
