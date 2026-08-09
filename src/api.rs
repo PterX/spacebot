@@ -24,7 +24,7 @@ mod opencode_proxy;
 mod portal;
 mod projects;
 mod providers;
-mod secrets;
+pub mod secrets;
 mod server;
 mod settings;
 mod skills;
