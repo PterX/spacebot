@@ -9,10 +9,10 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct MemoriesListResponse {
-    memories: Vec<Memory>,
-    total: usize,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct MemoriesListResponse {
+    pub memories: Vec<Memory>,
+    pub total: usize,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]

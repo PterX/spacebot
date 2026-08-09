@@ -5,11 +5,33 @@
 //! (start/stop/restart/status) talk to the daemon socket and stay in
 //! `main.rs` alongside the daemon entry point.
 
+mod activity;
+mod agent;
 mod auth;
+mod binding;
+mod channel;
+mod chat;
 mod client;
+mod completions;
+mod config;
+mod cron;
+mod dashboard;
+mod desktop;
+mod ingest;
+mod mcp;
+mod memory;
+mod messaging;
+mod model;
+mod notification;
 mod output;
+mod project;
+mod provider;
 mod secrets;
 mod skill;
+mod task;
+mod update;
+mod usage;
+mod wiki;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
@@ -60,6 +82,58 @@ pub enum Command {
     },
     /// Show status of the running daemon
     Status,
+    /// Manage agents
+    #[command(subcommand)]
+    Agent(agent::AgentCommand),
+    /// Inspect and manage conversation channels
+    #[command(subcommand)]
+    Channel(channel::ChannelCommand),
+    /// Manage tasks
+    #[command(subcommand)]
+    Task(task::TaskCommand),
+    /// Manage cron jobs
+    #[command(subcommand)]
+    Cron(cron::CronCommand),
+    /// Browse and search agent memories
+    #[command(subcommand)]
+    Memory(memory::MemoryCommand),
+    /// Manage wiki pages
+    #[command(subcommand)]
+    Wiki(wiki::WikiCommand),
+    /// Manage projects, repos, and worktrees
+    #[command(subcommand)]
+    Project(project::ProjectCommand),
+    /// Manage ingest files
+    #[command(subcommand)]
+    Ingest(ingest::IngestCommand),
+    /// Manage messaging platforms and adapter instances
+    #[command(subcommand)]
+    Messaging(messaging::MessagingCommand),
+    /// Manage agent-to-channel bindings
+    #[command(subcommand)]
+    Binding(Box<binding::BindingCommand>),
+    /// Manage LLM providers
+    #[command(subcommand)]
+    Provider(provider::ProviderCommand),
+    /// Browse the model catalog
+    #[command(subcommand)]
+    Model(model::ModelCommand),
+    /// Manage MCP servers
+    #[command(subcommand)]
+    Mcp(mcp::McpCommand),
+    /// Manage global settings and raw config
+    #[command(subcommand)]
+    Config(config::ConfigCommand),
+    /// Manage notifications
+    #[command(subcommand)]
+    Notification(notification::NotificationCommand),
+    /// Show token usage
+    Usage(usage::UsageArgs),
+    /// Show daily activity
+    Activity(activity::ActivityArgs),
+    /// Check for and apply updates
+    #[command(subcommand)]
+    Update(update::UpdateCommand),
     /// Manage skills
     #[command(subcommand)]
     Skill(skill::SkillCommand),
@@ -69,6 +143,17 @@ pub enum Command {
     /// Manage secrets stored in the running instance
     #[command(subcommand)]
     Secrets(secrets::SecretsCommand),
+    /// Chat with an agent from the terminal
+    Chat(chat::ChatArgs),
+    /// Open the web dashboard, starting the daemon if needed
+    Dashboard(dashboard::DashboardArgs),
+    /// Launch the installed desktop app
+    Desktop,
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
+    },
 }
 
 /// Global options shared by every resource command.
@@ -82,6 +167,10 @@ pub struct Context {
 /// Run a resource command. Lifecycle commands are dispatched in `main.rs`
 /// before this is reached.
 pub fn dispatch(command: Command, ctx: Context) -> anyhow::Result<()> {
+    if let Command::Completions { shell } = command {
+        return completions::run(shell);
+    }
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -89,10 +178,35 @@ pub fn dispatch(command: Command, ctx: Context) -> anyhow::Result<()> {
 
     runtime.block_on(async {
         match command {
+            Command::Agent(cmd) => agent::run(&ctx, cmd).await,
+            Command::Channel(cmd) => channel::run(&ctx, cmd).await,
+            Command::Task(cmd) => task::run(&ctx, cmd).await,
+            Command::Cron(cmd) => cron::run(&ctx, cmd).await,
+            Command::Memory(cmd) => memory::run(&ctx, cmd).await,
+            Command::Wiki(cmd) => wiki::run(&ctx, cmd).await,
+            Command::Project(cmd) => project::run(&ctx, cmd).await,
+            Command::Ingest(cmd) => ingest::run(&ctx, cmd).await,
+            Command::Messaging(cmd) => messaging::run(&ctx, cmd).await,
+            Command::Binding(cmd) => binding::run(&ctx, *cmd).await,
+            Command::Provider(cmd) => provider::run(&ctx, cmd).await,
+            Command::Model(cmd) => model::run(&ctx, cmd).await,
+            Command::Mcp(cmd) => mcp::run(&ctx, cmd).await,
+            Command::Config(cmd) => config::run(&ctx, cmd).await,
+            Command::Notification(cmd) => notification::run(&ctx, cmd).await,
+            Command::Usage(args) => usage::run(&ctx, args).await,
+            Command::Activity(args) => activity::run(&ctx, args).await,
+            Command::Update(cmd) => update::run(&ctx, cmd).await,
             Command::Skill(cmd) => skill::run(&ctx, cmd).await,
             Command::Auth(cmd) => auth::run(&ctx, cmd).await,
             Command::Secrets(cmd) => secrets::run(&ctx, cmd).await,
-            Command::Start { .. } | Command::Stop | Command::Restart { .. } | Command::Status => {
+            Command::Chat(args) => chat::run(&ctx, args).await,
+            Command::Dashboard(args) => dashboard::run(&ctx, args).await,
+            Command::Desktop => desktop::run(&ctx).await,
+            Command::Completions { .. }
+            | Command::Start { .. }
+            | Command::Stop
+            | Command::Restart { .. }
+            | Command::Status => {
                 unreachable!("lifecycle commands are dispatched in main")
             }
         }

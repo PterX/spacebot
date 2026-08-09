@@ -10,22 +10,22 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct ChannelResponse {
-    agent_id: String,
-    id: String,
-    platform: String,
-    display_name: Option<String>,
-    is_active: bool,
-    last_activity_at: String,
-    created_at: String,
-    response_mode: Option<String>,
-    model: Option<String>,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ChannelResponse {
+    pub agent_id: String,
+    pub id: String,
+    pub platform: String,
+    pub display_name: Option<String>,
+    pub is_active: bool,
+    pub last_activity_at: String,
+    pub created_at: String,
+    pub response_mode: Option<String>,
+    pub model: Option<String>,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct ChannelsResponse {
-    channels: Vec<ChannelResponse>,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ChannelsResponse {
+    pub channels: Vec<ChannelResponse>,
 }
 
 #[derive(Deserialize, Default, utoipa::ToSchema, utoipa::IntoParams)]
@@ -84,10 +84,10 @@ pub(super) struct CancelProcessRequest {
     process_id: String,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct CancelProcessResponse {
-    success: bool,
-    message: String,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CancelProcessResponse {
+    pub success: bool,
+    pub message: String,
 }
 
 /// List channels across agents, with optional activity and agent filters.

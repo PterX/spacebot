@@ -13,35 +13,35 @@ use std::sync::Arc;
 
 // ── Response types ──
 
-#[derive(Debug, Clone, Default, Serialize, utoipa::ToSchema)]
-pub(super) struct ProcessTokens {
-    input: i64,
-    output: i64,
-    cache_read: i64,
-    reasoning: i64,
-    cost_usd: f64,
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ProcessTokens {
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub reasoning: i64,
+    pub cost_usd: f64,
 }
 
-#[derive(Debug, Clone, Default, Serialize, utoipa::ToSchema)]
-pub(super) struct TokenSummary {
-    input: i64,
-    output: i64,
-    cache_read: i64,
-    reasoning: i64,
-    cost_usd: f64,
-    by_process: HashMap<String, ProcessTokens>,
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct TokenSummary {
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub reasoning: i64,
+    pub cost_usd: f64,
+    pub by_process: HashMap<String, ProcessTokens>,
 }
 
-#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
-pub(super) struct ActivityDay {
-    date: String,
-    messages: i64,
-    branches: i64,
-    workers: i64,
-    cortex: i64,
-    cron: i64,
-    active_channels: i64,
-    tokens: TokenSummary,
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ActivityDay {
+    pub date: String,
+    pub messages: i64,
+    pub branches: i64,
+    pub workers: i64,
+    pub cortex: i64,
+    pub cron: i64,
+    pub active_channels: i64,
+    pub tokens: TokenSummary,
 }
 
 impl ActivityDay {
@@ -59,21 +59,21 @@ impl ActivityDay {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, utoipa::ToSchema)]
-pub(super) struct ActivityTotals {
-    messages: i64,
-    branches: i64,
-    workers: i64,
-    cortex: i64,
-    cron: i64,
-    active_channels: i64,
-    tokens: TokenSummary,
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ActivityTotals {
+    pub messages: i64,
+    pub branches: i64,
+    pub workers: i64,
+    pub cortex: i64,
+    pub cron: i64,
+    pub active_channels: i64,
+    pub tokens: TokenSummary,
 }
 
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub(super) struct ActivityResponse {
-    daily: Vec<ActivityDay>,
-    totals: ActivityTotals,
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ActivityResponse {
+    pub daily: Vec<ActivityDay>,
+    pub totals: ActivityTotals,
 }
 
 // ── Query params ──

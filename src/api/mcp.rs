@@ -32,22 +32,22 @@ fn default_enabled() -> bool {
     true
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct McpServerInfo {
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct McpServerInfo {
     pub name: String,
     pub transport: String,
     pub enabled: bool,
     pub state: String,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct McpAgentStatus {
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct McpAgentStatus {
     pub agent_id: String,
     pub servers: Vec<McpServerInfo>,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct MutationResponse {
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct MutationResponse {
     pub success: bool,
     pub message: String,
 }

@@ -85,12 +85,25 @@ The `Control` plane is the important design move. The channel is a serial actor:
 
 ```rust
 pub enum ControlOutcome {
-    /// Reply text, nothing else
-    Reply(String),
+    /// Reply, nothing else
+    Reply(CommandReply),
     /// Cancel active work on this channel, then reply
-    CancelThenReply(String),
+    CancelThenReply(CommandReply),
+}
+
+pub struct CommandReply {
+    /// Canonical, adapter-independent core text
+    pub text: String,
+    /// Structured values behind the text, for surfaces that render
+    /// natively (Portal tables, Discord embeds) without recomputing
+    pub data: Option<serde_json::Value>,
 }
 ```
+
+Two contracts on Control output:
+
+- **Surface independence.** A Control handler's output depends only on its args and channel state — never on which adapter invoked it. The core text is identical everywhere; adapters apply only their own decoration (markdown flavor, ephemeral delivery, entity escaping). A registry test pins this by running each Control command against a fixed context across every adapter surface.
+- **Data beside text.** `/status`, `/workers`, and `/usage` derive structured values to build their text; `data` carries them so Portal renders a real table and the API returns machine-readable output, without a second code path computing the same numbers.
 
 ### `CommandAccess` — declarative access control
 
@@ -349,8 +362,10 @@ Generated from the registry, grouped by category, filtered by the caller's avail
 
 ```
 GET  /api/commands                      registry projection for Portal palette
-POST /api/channels/:id/command          { name, args }
+POST /api/channels/:id/command          { name, args } → { text, data }
 ```
+
+Control commands return their `CommandReply` directly in the response body; Portal renders `data` natively when present and falls back to `text`.
 
 ### Phase 1 — Registry and port
 

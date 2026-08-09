@@ -65,21 +65,69 @@ impl ApiClient {
         self.send(reqwest::Method::DELETE, path, None).await
     }
 
+    /// DELETE with a JSON body — the bindings and messaging-instance
+    /// delete endpoints match on the request body.
+    pub async fn delete_json(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.send(reqwest::Method::DELETE, path, Some(body)).await
+    }
+
+    pub async fn post_multipart(
+        &self,
+        path: &str,
+        form: reqwest::multipart::Form,
+    ) -> anyhow::Result<serde_json::Value> {
+        let mut request = self.http.post(self.url_for(path)).multipart(form);
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        self.execute(request).await
+    }
+
+    /// Open a streaming GET request (SSE endpoints). The caller consumes
+    /// the byte stream; connection errors get the same daemon-down hint.
+    pub async fn stream(&self, path: &str) -> anyhow::Result<reqwest::Response> {
+        let mut request = self.http.get(self.url_for(path));
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| self.connect_hint(error))?;
+        let status = response.status();
+        if !status.is_success() {
+            anyhow::bail!("API request failed ({status})");
+        }
+        Ok(response)
+    }
+
     async fn send(
         &self,
         method: reqwest::Method,
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> anyhow::Result<serde_json::Value> {
-        let url = format!("{}/api/{}", self.base, path.trim_start_matches('/'));
-        let mut request = self.http.request(method, &url);
+        let mut request = self.http.request(method, self.url_for(path));
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
         }
         if let Some(body) = body {
             request = request.json(body);
         }
+        self.execute(request).await
+    }
 
+    fn url_for(&self, path: &str) -> String {
+        format!("{}/api/{}", self.base, path.trim_start_matches('/'))
+    }
+
+    /// Send a prepared request and map the response to JSON with the shared
+    /// status/error-body handling.
+    async fn execute(&self, request: reqwest::RequestBuilder) -> anyhow::Result<serde_json::Value> {
         let response = request
             .send()
             .await

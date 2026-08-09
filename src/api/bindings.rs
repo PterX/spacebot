@@ -6,23 +6,23 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct BindingResponse {
-    agent_id: String,
-    channel: String,
-    adapter: Option<String>,
-    guild_id: Option<String>,
-    workspace_id: Option<String>,
-    chat_id: Option<String>,
-    team_id: Option<String>,
-    channel_ids: Vec<String>,
-    require_mention: bool,
-    dm_allowed_users: Vec<String>,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct BindingResponse {
+    pub agent_id: String,
+    pub channel: String,
+    pub adapter: Option<String>,
+    pub guild_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub chat_id: Option<String>,
+    pub team_id: Option<String>,
+    pub channel_ids: Vec<String>,
+    pub require_mention: bool,
+    pub dm_allowed_users: Vec<String>,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct BindingsListResponse {
-    bindings: Vec<BindingResponse>,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct BindingsListResponse {
+    pub bindings: Vec<BindingResponse>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
@@ -98,12 +98,12 @@ pub(super) struct PlatformCredentials {
     twitch_refresh_token: Option<String>,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct CreateBindingResponse {
-    success: bool,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CreateBindingResponse {
+    pub success: bool,
     /// True if platform credentials were added/changed (adapter needs restart).
-    restart_required: bool,
-    message: String,
+    pub restart_required: bool,
+    pub message: String,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -122,10 +122,10 @@ pub(super) struct DeleteBindingRequest {
     team_id: Option<String>,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct DeleteBindingResponse {
-    success: bool,
-    message: String,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct DeleteBindingResponse {
+    pub success: bool,
+    pub message: String,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -163,10 +163,10 @@ pub(super) struct UpdateBindingRequest {
     dm_allowed_users: Vec<String>,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct UpdateBindingResponse {
-    success: bool,
-    message: String,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct UpdateBindingResponse {
+    pub success: bool,
+    pub message: String,
 }
 
 /// List all bindings, optionally filtered by agent_id.

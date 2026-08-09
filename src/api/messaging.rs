@@ -9,34 +9,34 @@ use std::sync::Arc;
 // Re-export E.164 validation from messaging target module
 pub use crate::messaging::target::is_valid_e164;
 
-#[derive(Serialize, Clone, utoipa::ToSchema)]
-pub(super) struct PlatformStatus {
-    configured: bool,
-    enabled: bool,
+#[derive(Serialize, Deserialize, Clone, utoipa::ToSchema)]
+pub struct PlatformStatus {
+    pub configured: bool,
+    pub enabled: bool,
 }
 
-#[derive(Serialize, Clone, utoipa::ToSchema)]
-pub(super) struct AdapterInstanceStatus {
-    platform: String,
+#[derive(Serialize, Deserialize, Clone, utoipa::ToSchema)]
+pub struct AdapterInstanceStatus {
+    pub platform: String,
     /// `None` means the default instance for the platform.
-    name: Option<String>,
-    runtime_key: String,
-    configured: bool,
-    enabled: bool,
-    binding_count: usize,
+    pub name: Option<String>,
+    pub runtime_key: String,
+    pub configured: bool,
+    pub enabled: bool,
+    pub binding_count: usize,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct MessagingStatusResponse {
-    discord: PlatformStatus,
-    slack: PlatformStatus,
-    telegram: PlatformStatus,
-    email: PlatformStatus,
-    webhook: PlatformStatus,
-    twitch: PlatformStatus,
-    mattermost: PlatformStatus,
-    signal: PlatformStatus,
-    instances: Vec<AdapterInstanceStatus>,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct MessagingStatusResponse {
+    pub discord: PlatformStatus,
+    pub slack: PlatformStatus,
+    pub telegram: PlatformStatus,
+    pub email: PlatformStatus,
+    pub webhook: PlatformStatus,
+    pub twitch: PlatformStatus,
+    pub mattermost: PlatformStatus,
+    pub signal: PlatformStatus,
+    pub instances: Vec<AdapterInstanceStatus>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -132,10 +132,10 @@ pub(super) struct DeleteMessagingInstanceRequest {
     name: Option<String>,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct MessagingInstanceActionResponse {
-    success: bool,
-    message: String,
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct MessagingInstanceActionResponse {
+    pub success: bool,
+    pub message: String,
 }
 
 fn normalize_adapter_selector(value: Option<&str>) -> Option<String> {
