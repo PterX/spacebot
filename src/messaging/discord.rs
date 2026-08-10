@@ -9,16 +9,29 @@ use anyhow::Context as _;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use serenity::all::{
-    ButtonStyle, ChannelId, ChannelType, Context, CreateActionRow, CreateAttachment, CreateButton,
-    CreateEmbed, CreateEmbedAuthor, CreateEmbedFooter, CreateInteractionResponse,
-    CreateInteractionResponseMessage, CreateMessage, CreatePoll, CreatePollAnswer,
-    CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditMessage,
-    EventHandler, GatewayIntents, GetMessages, Http, Interaction, Message, MessageId, ReactionType,
-    Ready, ShardManager, Timestamp, User, UserId,
+    ButtonStyle, ChannelId, ChannelType, Command as ApplicationCommand, CommandDataOptionValue,
+    CommandInteraction, CommandOptionType, Context, CreateActionRow, CreateAttachment,
+    CreateButton, CreateCommand, CreateCommandOption, CreateEmbed, CreateEmbedAuthor,
+    CreateEmbedFooter, CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage,
+    CreatePoll, CreatePollAnswer, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption,
+    CreateThread, EditInteractionResponse, EditMessage, EventHandler, GatewayIntents, GetMessages,
+    GuildId, Http, Interaction, Message, MessageId, ReactionType, Ready, ShardManager, Timestamp,
+    User, UserId,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{RwLock, mpsc};
+
+/// Discord interaction tokens are valid for 15 minutes; stop trying to
+/// resolve deferred responses a minute early.
+const INTERACTION_TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(14 * 60);
+
+/// A deferred interaction awaiting its real response.
+struct InteractionToken {
+    token: String,
+    created: Instant,
+}
 
 /// Discord adapter state.
 pub struct DiscordAdapter {
@@ -32,6 +45,12 @@ pub struct DiscordAdapter {
     /// Typing handles per message. Typing stops when the handle is dropped.
     typing_tasks: Arc<RwLock<HashMap<String, serenity::http::Typing>>>,
     shard_manager: Arc<RwLock<Option<Arc<ShardManager>>>>,
+    /// Deferred slash-command interactions keyed by InboundMessage.id, so
+    /// replies can resolve the deferral within the token window.
+    interaction_tokens: Arc<RwLock<HashMap<String, InteractionToken>>>,
+    /// Guards against concurrent application-command syncs when `ready`
+    /// re-fires on reconnect.
+    command_sync_active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DiscordAdapter {
@@ -49,6 +68,30 @@ impl DiscordAdapter {
             active_messages: Arc::new(RwLock::new(HashMap::new())),
             typing_tasks: Arc::new(RwLock::new(HashMap::new())),
             shard_manager: Arc::new(RwLock::new(None)),
+            interaction_tokens: Arc::new(RwLock::new(HashMap::new())),
+            command_sync_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Take the deferred-interaction token for a message, if still within
+    /// the token window. Expired entries are pruned on the way.
+    async fn take_interaction_token(&self, message_id: &str) -> Option<String> {
+        let mut tokens = self.interaction_tokens.write().await;
+        tokens.retain(|_, entry| entry.created.elapsed() < INTERACTION_TOKEN_TTL);
+        tokens.remove(message_id).map(|entry| entry.token)
+    }
+
+    /// Clear a deferred interaction whose real response is going out through
+    /// a surface that can't resolve it (rich messages, streaming). Deleting
+    /// the deferral removes the dangling "thinking" state.
+    async fn clear_deferred_interaction(&self, http: &Arc<Http>, message_id: &str) {
+        if let Some(token) = self.take_interaction_token(message_id).await {
+            let http = http.clone();
+            tokio::spawn(async move {
+                if let Err(error) = http.delete_original_interaction_response(&token).await {
+                    tracing::debug!(%error, "failed to delete deferred interaction response");
+                }
+            });
         }
     }
 
@@ -113,6 +156,8 @@ impl Messaging for DiscordAdapter {
             permissions: self.permissions.clone(),
             http_slot: self.http.clone(),
             bot_user_id_slot: self.bot_user_id.clone(),
+            interaction_tokens: self.interaction_tokens.clone(),
+            command_sync_active: self.command_sync_active.clone(),
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES
@@ -150,8 +195,29 @@ impl Messaging for DiscordAdapter {
             OutboundResponse::Text(text) => {
                 self.stop_typing(message).await;
                 let reply_to = Self::extract_reply_message_id(message);
+                let deferred = self.take_interaction_token(&message.id).await;
 
                 for (index, chunk) in split_message(&text, 2000).into_iter().enumerate() {
+                    // The first chunk resolves a deferred slash-command
+                    // interaction in place; overflow chunks follow as
+                    // ordinary messages.
+                    if index == 0
+                        && let Some(token) = deferred.as_deref()
+                    {
+                        let edit = EditInteractionResponse::new().content(chunk.as_str());
+                        match http
+                            .edit_original_interaction_response(token, &edit, Vec::new())
+                            .await
+                        {
+                            Ok(_) => continue,
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    "failed to resolve deferred interaction, falling back to channel send"
+                                );
+                            }
+                        }
+                    }
                     let mut builder = CreateMessage::new().content(chunk);
                     if index == 0
                         && let Some(reply_message_id) = reply_to
@@ -172,6 +238,7 @@ impl Messaging for DiscordAdapter {
                 ..
             } => {
                 self.stop_typing(message).await;
+                self.clear_deferred_interaction(&http, &message.id).await;
                 let reply_to = Self::extract_reply_message_id(message);
                 let parts =
                     prepare_rich_message_parts(text, &cards, &interactive_elements, poll.as_ref());
@@ -316,6 +383,7 @@ impl Messaging for DiscordAdapter {
             }
             OutboundResponse::StreamStart => {
                 self.stop_typing(message).await;
+                self.clear_deferred_interaction(&http, &message.id).await;
 
                 let placeholder = channel_id
                     .say(&*http, "\u{200B}")
@@ -351,14 +419,23 @@ impl Messaging for DiscordAdapter {
             // Slack-specific variants — graceful fallbacks for Discord
             OutboundResponse::RemoveReaction(_) => {} // no-op
             OutboundResponse::Ephemeral { text, .. } => {
-                // Discord has no ephemeral equivalent here; send as regular text
-                if let Ok(channel_id) = self.extract_channel_id(message) {
-                    let http = self.get_http().await?;
-                    channel_id
-                        .say(&*http, &text)
+                // A deferred slash command resolves ephemerally in place;
+                // outside an interaction Discord has no ephemeral surface,
+                // so degrade to a regular message.
+                if let Some(token) = self.take_interaction_token(&message.id).await {
+                    let edit = EditInteractionResponse::new().content(&text);
+                    if http
+                        .edit_original_interaction_response(&token, &edit, Vec::new())
                         .await
-                        .context("failed to send ephemeral fallback on discord")?;
+                        .is_ok()
+                    {
+                        return Ok(());
+                    }
                 }
+                channel_id
+                    .say(&*http, &text)
+                    .await
+                    .context("failed to send ephemeral fallback on discord")?;
             }
             OutboundResponse::ScheduledMessage { text, .. } => {
                 // Discord has no native scheduled messages — send immediately
@@ -589,6 +666,128 @@ struct Handler {
     permissions: Arc<ArcSwap<DiscordPermissions>>,
     http_slot: Arc<RwLock<Option<Arc<Http>>>>,
     bot_user_id_slot: Arc<RwLock<Option<UserId>>>,
+    interaction_tokens: Arc<RwLock<HashMap<String, InteractionToken>>>,
+    command_sync_active: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Handler {
+    /// Handle a native slash-command interaction: admission checks, defer
+    /// (ephemeral for Control commands), then inject as structured
+    /// `MessageContent::Command` for the router's shared dispatch path.
+    async fn handle_command_interaction(&self, ctx: Context, command: CommandInteraction) {
+        let permissions = self.permissions.load();
+        let user = &command.user;
+
+        if command.guild_id.is_none()
+            && (permissions.dm_allowed_users.is_empty()
+                || !permissions.dm_allowed_users.contains(&user.id.get()))
+        {
+            return;
+        }
+        if let Some(filter) = &permissions.guild_filter
+            && let Some(guild_id) = command.guild_id
+            && !filter.contains(&guild_id.get())
+        {
+            return;
+        }
+
+        // Control replies resolve the deferral ephemerally; Agent commands
+        // defer publicly and the real response arrives through the normal
+        // message path.
+        let is_control = crate::commands::REGISTRY
+            .resolve(&command.data.name)
+            .is_some_and(|def| matches!(def.handler, crate::commands::CommandHandler::Control(_)));
+        let defer = if is_control {
+            CreateInteractionResponse::Defer(
+                CreateInteractionResponseMessage::new().ephemeral(true),
+            )
+        } else {
+            CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new())
+        };
+        if let Err(error) = command.create_response(&ctx.http, defer).await {
+            tracing::warn!(%error, command = %command.data.name, "failed to defer slash command");
+            return;
+        }
+
+        let interaction_id = command.id.to_string();
+        {
+            let mut tokens = self.interaction_tokens.write().await;
+            tokens.retain(|_, entry| entry.created.elapsed() < INTERACTION_TOKEN_TTL);
+            tokens.insert(
+                interaction_id.clone(),
+                InteractionToken {
+                    token: command.token.clone(),
+                    created: Instant::now(),
+                },
+            );
+        }
+
+        let args = command
+            .data
+            .options
+            .first()
+            .and_then(|option| match &option.value {
+                CommandDataOptionValue::String(value) => Some(value.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+
+        let base_conversation_id = match command.guild_id {
+            Some(guild_id) => format!("discord:{}:{}", guild_id, command.channel_id),
+            None => format!("discord:dm:{}", user.id),
+        };
+        let conversation_id =
+            apply_runtime_adapter_to_conversation_id(&self.runtime_key, base_conversation_id);
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "discord_channel_id".into(),
+            serde_json::Value::Number(command.channel_id.get().into()),
+        );
+        if let Some(guild_id) = command.guild_id {
+            metadata.insert(
+                "discord_guild_id".into(),
+                serde_json::Value::Number(guild_id.get().into()),
+            );
+        }
+        // A command invocation addresses the bot directly.
+        metadata.insert("discord_mentioned_bot".into(), true.into());
+        metadata.insert("discord_reply_to_bot".into(), false.into());
+        metadata.insert("discord_mentions_or_replies_to_bot".into(), true.into());
+
+        let formatted_author = format!("{} (<@{}>)", user.name, user.id);
+        metadata.insert(
+            "discord_user_id".into(),
+            serde_json::Value::Number(user.id.get().into()),
+        );
+        metadata.insert(
+            "sender_display_name".into(),
+            serde_json::Value::String(formatted_author.clone()),
+        );
+
+        let inbound = InboundMessage {
+            id: interaction_id,
+            source: "discord".into(),
+            adapter: Some(self.runtime_key.clone()),
+            conversation_id,
+            sender_id: user.id.to_string(),
+            agent_id: None,
+            content: MessageContent::Command {
+                name: command.data.name.clone(),
+                args,
+            },
+            timestamp: chrono::Utc::now(),
+            metadata,
+            formatted_author: Some(formatted_author),
+        };
+
+        if let Err(error) = self.inbound_tx.send(inbound).await {
+            tracing::warn!(
+                %error,
+                "failed to send inbound slash command from Discord (receiver dropped)"
+            );
+        }
+    }
 }
 
 #[async_trait]
@@ -599,6 +798,22 @@ impl EventHandler for Handler {
         *self.http_slot.write().await = Some(ctx.http.clone());
         *self.bot_user_id_slot.write().await = Some(ready.user.id);
         tracing::info!(guild_count = ready.guilds.len(), "discord guilds available");
+
+        // Register application commands from the registry. `ready` re-fires
+        // on reconnect; the sync is diff-only so re-runs are no-ops, and the
+        // guard just prevents overlapping syncs.
+        if !self
+            .command_sync_active
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let http = ctx.http.clone();
+            let permissions = self.permissions.clone();
+            let guard = self.command_sync_active.clone();
+            tokio::spawn(async move {
+                sync_application_commands(&http, &permissions).await;
+                guard.store(false, std::sync::atomic::Ordering::Release);
+            });
+        }
     }
 
     async fn message(&self, ctx: Context, message: Message) {
@@ -678,7 +893,11 @@ impl EventHandler for Handler {
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         let component = match interaction {
             Interaction::Component(c) => c,
-            _ => return, // Only handle component interactions
+            Interaction::Command(command) => {
+                self.handle_command_interaction(ctx, command).await;
+                return;
+            }
+            _ => return,
         };
 
         // Acknowledge the interaction immediately to prevent "This interaction failed" in the UI.
@@ -782,6 +1001,302 @@ impl EventHandler for Handler {
                 %error,
                 "failed to send inbound interaction from Discord (receiver dropped)"
             );
+        }
+    }
+}
+
+/// Discord application-command field limits (CHAT_INPUT).
+const DISCORD_NAME_MAX: usize = 32;
+const DISCORD_DESCRIPTION_MAX: usize = 100;
+const DISCORD_CHOICE_CAP: usize = 25;
+const DISCORD_CHOICE_VALUE_MAX: usize = 100;
+
+/// Why a spec can't be expressed as a Discord application command, if it
+/// can't. One invalid entry in a bulk `set_commands` call fails the whole
+/// batch, so specs are validated up front and invalid ones skipped.
+fn discord_spec_violation(spec: &crate::commands::native::NativeCommandSpec) -> Option<String> {
+    use crate::commands::native::NativeArg;
+
+    // Registry names are ASCII; Discord additionally allows lowercase
+    // unicode letters, which no command uses.
+    let name_valid = !spec.name.is_empty()
+        && spec.name.chars().count() <= DISCORD_NAME_MAX
+        && spec
+            .name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+    if !name_valid {
+        return Some(format!(
+            "name must be 1-{DISCORD_NAME_MAX} lowercase [a-z0-9_-] characters"
+        ));
+    }
+    if let Some(NativeArg::Choice { options }) = &spec.arg {
+        if options.len() > DISCORD_CHOICE_CAP {
+            return Some(format!(
+                "{} choices exceed discord's cap of {DISCORD_CHOICE_CAP}",
+                options.len()
+            ));
+        }
+        // A truncated choice value would dispatch different args than the
+        // user picked, so over-long choices invalidate the command instead.
+        if options
+            .iter()
+            .any(|option| option.is_empty() || option.chars().count() > DISCORD_CHOICE_VALUE_MAX)
+        {
+            return Some(format!(
+                "choice values must be 1-{DISCORD_CHOICE_VALUE_MAX} characters"
+            ));
+        }
+    }
+    None
+}
+
+/// Clamp a description to Discord's 1-100 character range, falling back to
+/// the command name when empty.
+fn normalize_discord_description(description: &str, command_name: &str) -> String {
+    let normalized: String = description.chars().take(DISCORD_DESCRIPTION_MAX).collect();
+    if normalized.is_empty() {
+        format!("/{command_name}")
+    } else {
+        normalized
+    }
+}
+
+/// Build serenity command definitions from the registry's native specs.
+/// Returned specs are normalized to Discord limits and match the built
+/// commands one-to-one, so the diff comparison sees exactly what was
+/// registered.
+fn build_discord_create_commands() -> (
+    Vec<CreateCommand>,
+    Vec<crate::commands::native::NativeCommandSpec>,
+    usize,
+) {
+    use crate::commands::native::discord_commands;
+
+    let (specs, dropped) = discord_commands();
+    let specs: Vec<_> = specs
+        .into_iter()
+        .filter(|spec| match discord_spec_violation(spec) {
+            Some(reason) => {
+                tracing::warn!(
+                    command = %spec.name,
+                    reason,
+                    "command cannot be registered as a discord application command, skipping"
+                );
+                false
+            }
+            None => true,
+        })
+        .map(|mut spec| {
+            spec.description = normalize_discord_description(&spec.description, &spec.name);
+            spec
+        })
+        .collect();
+    let commands = specs
+        .iter()
+        .map(|spec| {
+            let mut command = CreateCommand::new(&spec.name).description(&spec.description);
+            if let Some((name, description, required, choices)) = expected_option(spec) {
+                let mut option =
+                    CreateCommandOption::new(CommandOptionType::String, name, description)
+                        .required(required);
+                for choice in choices {
+                    option = option.add_string_choice(&choice, &choice);
+                }
+                command = command.add_option(option);
+            }
+            command
+        })
+        .collect();
+    (commands, specs, dropped)
+}
+
+/// The option a spec maps to: (name, description, required, choices).
+/// Shared between registration and the diff comparison so they can't drift.
+fn expected_option(
+    spec: &crate::commands::native::NativeCommandSpec,
+) -> Option<(String, String, bool, Vec<String>)> {
+    use crate::commands::native::NativeArg;
+    match &spec.arg {
+        None => None,
+        Some(NativeArg::Text { hint, required }) => Some((
+            "input".to_string(),
+            {
+                let description: String = hint.chars().take(DISCORD_DESCRIPTION_MAX).collect();
+                if description.is_empty() {
+                    "input".to_string()
+                } else {
+                    description
+                }
+            },
+            *required,
+            Vec::new(),
+        )),
+        Some(NativeArg::Choice { options }) => Some((
+            "value".to_string(),
+            {
+                let description: String = format!("one of: {}", options.join(", "))
+                    .chars()
+                    .take(DISCORD_DESCRIPTION_MAX)
+                    .collect();
+                description
+            },
+            false,
+            options.clone(),
+        )),
+    }
+}
+
+/// Whether the live command set already matches the registry specs.
+/// Comparing name, description, and option shape keeps re-registration a
+/// no-op on every reconnect.
+fn command_set_matches(
+    existing: &[ApplicationCommand],
+    specs: &[crate::commands::native::NativeCommandSpec],
+) -> bool {
+    type Normalized = (String, String, Option<(String, String, bool, Vec<String>)>);
+
+    let mut live: Vec<Normalized> = existing
+        .iter()
+        .map(|command| {
+            let option = command.options.first().map(|option| {
+                (
+                    option.name.clone(),
+                    option.description.clone(),
+                    option.required,
+                    option
+                        .choices
+                        .iter()
+                        .map(|choice| choice.name.clone())
+                        .collect::<Vec<_>>(),
+                )
+            });
+            (command.name.clone(), command.description.clone(), option)
+        })
+        .collect();
+    let mut wanted: Vec<Normalized> = specs
+        .iter()
+        .map(|spec| {
+            (
+                spec.name.clone(),
+                spec.description.clone(),
+                expected_option(spec),
+            )
+        })
+        .collect();
+    live.sort();
+    wanted.sort();
+    live == wanted
+}
+
+/// Diff-only application-command sync. Guild-scoped when bindings declare
+/// guilds (instant propagation, scoped to served guilds), global otherwise.
+async fn sync_application_commands(
+    http: &Arc<Http>,
+    permissions: &Arc<ArcSwap<DiscordPermissions>>,
+) {
+    let (commands, specs, dropped) = build_discord_create_commands();
+    if dropped > 0 {
+        tracing::warn!(
+            dropped,
+            cap = crate::commands::native::DISCORD_COMMAND_CAP,
+            "discord command cap exceeded; trailing registry commands were not registered"
+        );
+    }
+
+    let guild_filter = permissions.load().guild_filter.clone();
+    match guild_filter {
+        Some(guild_ids) => {
+            // Every configured guild is synced, not just the ones present
+            // in a READY payload — a served guild missing from one gateway
+            // session would otherwise get no commands until a reconnect
+            // happens to include it. Per-guild failures (the bot not being
+            // a member yet, transient API errors) are logged and the loop
+            // continues with the remaining guilds. The filter can repeat a
+            // guild (one binding per channel set), so duplicates are synced
+            // once.
+            let mut all_guilds_synced = true;
+            let mut seen_guilds = std::collections::HashSet::new();
+            for guild_id in guild_ids
+                .iter()
+                .copied()
+                .filter(|guild_id| seen_guilds.insert(*guild_id))
+                .map(GuildId::new)
+            {
+                let in_sync = match guild_id.get_commands(http).await {
+                    Ok(existing) => command_set_matches(&existing, &specs),
+                    Err(error) => {
+                        tracing::warn!(%error, guild_id = %guild_id, "failed to fetch guild commands");
+                        false
+                    }
+                };
+                if in_sync {
+                    tracing::debug!(guild_id = %guild_id, "discord commands already in sync");
+                    continue;
+                }
+                match guild_id.set_commands(http, commands.clone()).await {
+                    Ok(registered) => {
+                        tracing::info!(
+                            guild_id = %guild_id,
+                            count = registered.len(),
+                            "discord guild commands registered"
+                        );
+                    }
+                    Err(error) => {
+                        all_guilds_synced = false;
+                        tracing::warn!(%error, guild_id = %guild_id, "failed to register guild commands");
+                    }
+                }
+            }
+
+            // Stale globals are cleared only after every configured guild is
+            // confirmed in sync — clearing first would leave a guild whose
+            // registration then failed with no commands at all until a later
+            // reconnect. A guild that failed keeps the globals as a fallback;
+            // the next `ready` re-sync retries both.
+            if !all_guilds_synced {
+                tracing::warn!(
+                    "leaving global discord commands in place until every configured guild syncs"
+                );
+                return;
+            }
+            match ApplicationCommand::get_global_commands(http).await {
+                Ok(global) if !global.is_empty() => {
+                    if let Err(error) =
+                        ApplicationCommand::set_global_commands(http, Vec::new()).await
+                    {
+                        tracing::warn!(%error, "failed to clear stale global discord commands");
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "failed to fetch global discord commands");
+                }
+            }
+        }
+        None => {
+            match ApplicationCommand::get_global_commands(http).await {
+                Ok(existing) if command_set_matches(&existing, &specs) => {
+                    tracing::debug!("global discord commands already in sync");
+                    return;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "failed to fetch global discord commands");
+                    return;
+                }
+            }
+            match ApplicationCommand::set_global_commands(http, commands).await {
+                Ok(registered) => {
+                    tracing::info!(
+                        count = registered.len(),
+                        "global discord commands registered"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "failed to register global discord commands");
+                }
+            }
         }
     }
 }
@@ -1245,6 +1760,97 @@ fn build_poll(
 mod tests {
     use super::*;
     use crate::{Button, ButtonStyle, Card, CardField, InteractiveElements, Poll};
+
+    #[test]
+    fn discord_specs_satisfy_platform_limits() {
+        let (commands, specs, _) = build_discord_create_commands();
+        assert_eq!(commands.len(), specs.len());
+        for spec in &specs {
+            assert!(
+                discord_spec_violation(spec).is_none(),
+                "spec /{} violates discord limits",
+                spec.name
+            );
+            assert!(
+                (1..=DISCORD_DESCRIPTION_MAX).contains(&spec.description.chars().count()),
+                "discord description length for /{}",
+                spec.name
+            );
+            if let Some((_, description, _, choices)) = expected_option(spec) {
+                assert!(
+                    (1..=DISCORD_DESCRIPTION_MAX).contains(&description.chars().count()),
+                    "discord option description length for /{}",
+                    spec.name
+                );
+                assert!(
+                    choices.len() <= DISCORD_CHOICE_CAP,
+                    "discord choice cap for /{}",
+                    spec.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn discord_validation_drops_no_registry_command() {
+        // Every command the registry exposes on Discord must survive
+        // validation — a violation here means a registry entry silently
+        // disappears from Discord instead of failing the build.
+        let (specs, _) = crate::commands::native::discord_commands();
+        let (_, validated, _) = build_discord_create_commands();
+        let expected: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
+        let actual: Vec<&str> = validated.iter().map(|spec| spec.name.as_str()).collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn discord_spec_violation_flags_invalid_specs() {
+        use crate::commands::native::{NativeArg, NativeCommandSpec};
+
+        let valid = NativeCommandSpec {
+            name: "mention-only".into(),
+            description: "only respond when mentioned".into(),
+            arg: None,
+        };
+        assert!(discord_spec_violation(&valid).is_none());
+
+        let uppercase = NativeCommandSpec {
+            name: "Status".into(),
+            ..valid.clone()
+        };
+        assert!(discord_spec_violation(&uppercase).is_some());
+
+        let too_long = NativeCommandSpec {
+            name: "a".repeat(DISCORD_NAME_MAX + 1),
+            ..valid.clone()
+        };
+        assert!(discord_spec_violation(&too_long).is_some());
+
+        let too_many_choices = NativeCommandSpec {
+            arg: Some(NativeArg::Choice {
+                options: (0..DISCORD_CHOICE_CAP + 1)
+                    .map(|i| format!("option-{i}"))
+                    .collect(),
+            }),
+            ..valid.clone()
+        };
+        assert!(discord_spec_violation(&too_many_choices).is_some());
+
+        let oversized_choice = NativeCommandSpec {
+            arg: Some(NativeArg::Choice {
+                options: vec!["x".repeat(DISCORD_CHOICE_VALUE_MAX + 1)],
+            }),
+            ..valid
+        };
+        assert!(discord_spec_violation(&oversized_choice).is_some());
+    }
+
+    #[test]
+    fn discord_description_normalization_clamps_and_falls_back() {
+        let clamped = normalize_discord_description(&"d".repeat(300), "status");
+        assert_eq!(clamped.chars().count(), DISCORD_DESCRIPTION_MAX);
+        assert_eq!(normalize_discord_description("", "status"), "/status");
+    }
 
     #[test]
     fn test_build_embed_limits() {

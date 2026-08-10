@@ -11,8 +11,8 @@ use regex::Regex;
 use teloxide::payloads::setters::*;
 use teloxide::requests::{Request, Requester};
 use teloxide::types::{
-    ChatAction, ChatId, FileId, InputFile, InputPollOption, MediaKind, MessageId, MessageKind,
-    ParseMode, ReactionType, ReplyParameters, UpdateKind, UserId,
+    BotCommand, ChatAction, ChatId, FileId, InputFile, InputPollOption, MediaKind, MessageId,
+    MessageKind, ParseMode, ReactionType, ReplyParameters, UpdateKind, UserId,
 };
 use teloxide::{ApiError, Bot, RequestError};
 
@@ -38,6 +38,36 @@ pub struct TelegramAdapter {
     typing_tasks: Arc<RwLock<HashMap<String, JoinHandle<()>>>>,
     /// Shutdown signal for the polling loop.
     shutdown_tx: Arc<RwLock<Option<mpsc::Sender<()>>>>,
+    /// Whether the registry-generated command menu has been registered via
+    /// setMyCommands. `start()` re-runs on supervisor restarts; the menu
+    /// only needs to land once per adapter instance.
+    commands_registered: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TelegramAdapter {
+    /// Register the registry-generated command menu with Telegram. Runs at
+    /// most once per adapter instance; a failure clears the guard so the
+    /// next supervisor restart retries.
+    async fn register_command_menu(&self) {
+        use std::sync::atomic::Ordering;
+        if self.commands_registered.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let menu: Vec<BotCommand> = crate::commands::native::telegram_menu()
+            .into_iter()
+            .map(|entry| BotCommand::new(entry.command, entry.description))
+            .collect();
+        let count = menu.len();
+        match self.bot.set_my_commands(menu).send().await {
+            Ok(_) => {
+                tracing::info!(count, "telegram command menu registered");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to register telegram command menu");
+                self.commands_registered.store(false, Ordering::Release);
+            }
+        }
+    }
 }
 
 /// Tracks an in-progress streaming message edit.
@@ -73,6 +103,7 @@ impl TelegramAdapter {
             bot_username: Arc::new(RwLock::new(None)),
             active_messages: Arc::new(RwLock::new(HashMap::new())),
             typing_tasks: Arc::new(RwLock::new(HashMap::new())),
+            commands_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown_tx: Arc::new(RwLock::new(None)),
         }
     }
@@ -128,6 +159,8 @@ impl Messaging for TelegramAdapter {
             bot_username = ?me.username,
             "telegram connected"
         );
+
+        self.register_command_menu().await;
 
         let bot = self.bot.clone();
         let runtime_key = self.runtime_key.clone();

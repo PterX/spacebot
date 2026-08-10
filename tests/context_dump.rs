@@ -55,6 +55,12 @@ async fn bootstrap_deps() -> anyhow::Result<(spacebot::AgentDeps, spacebot::conf
         .await
         .context("failed to connect databases")?;
 
+    // Tasks, goals, and projects live in the instance database (global
+    // migrations), not the per-agent database — mirror main.rs.
+    let instance_pool = spacebot::db::connect_instance_db(&config.instance_dir.join("data"))
+        .await
+        .context("failed to connect instance database")?;
+
     let memory_store = spacebot::memory::MemoryStore::new(db.sqlite.clone());
 
     let embedding_table = spacebot::memory::EmbeddingTable::open_or_create(&db.lance)
@@ -70,7 +76,7 @@ async fn bootstrap_deps() -> anyhow::Result<(spacebot::AgentDeps, spacebot::conf
         embedding_table,
         embedding_model,
     ));
-    let task_store = Arc::new(spacebot::tasks::TaskStore::new(db.sqlite.clone()));
+    let task_store = Arc::new(spacebot::tasks::TaskStore::new(instance_pool.clone()));
 
     let identity = spacebot::identity::Identity::load(&agent_config.workspace).await;
     let prompts =
@@ -115,7 +121,14 @@ async fn bootstrap_deps() -> anyhow::Result<(spacebot::AgentDeps, spacebot::conf
         llm_manager,
         mcp_manager,
         task_store,
-        project_store: Arc::new(spacebot::projects::ProjectStore::new(db.sqlite.clone())),
+        goal_store: Arc::new(spacebot::goals::GoalStore::new(instance_pool.clone())),
+        wake_event_store: Arc::new(spacebot::wakes::WakeEventStore::new(db.sqlite.clone())),
+        autonomy_ceiling: Arc::new(arc_swap::ArcSwap::from_pointee(
+            spacebot::config::AutonomyLevel::Act,
+        )),
+        wake_def_store: Arc::new(spacebot::wakes::WakeDefStore::new(db.sqlite.clone())),
+        autonomy_run_store: Arc::new(spacebot::wakes::AutonomyRunStore::new(db.sqlite.clone())),
+        project_store: Arc::new(spacebot::projects::ProjectStore::new(instance_pool.clone())),
         cron_tool: None,
         runtime_config,
         event_tx,
@@ -239,6 +252,9 @@ async fn dump_channel_context() {
 
     let state = spacebot::agent::channel::ChannelState {
         channel_id,
+        kind: spacebot::agent::channel::ChannelKind::User,
+        turn_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        response_mode: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
         active_branches: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         worker_handles: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
@@ -262,6 +278,7 @@ async fn dump_channel_context() {
         model_overrides: Arc::new(Default::default()),
         active_participants: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         cron_outcome: None,
+        autonomy_run: None,
     };
 
     let tool_server = rig::tool::server::ToolServer::new().run();
@@ -338,6 +355,7 @@ async fn dump_branch_context() {
         None,
         deps.agent_id.clone(),
         deps.task_store.clone(),
+        deps.goal_store.clone(),
         deps.memory_search.clone(),
         deps.runtime_config.clone(),
         deps.memory_event_tx.clone(),
@@ -428,6 +446,7 @@ async fn dump_worker_context() {
         false,
         None,
         None,
+        None,
     );
 
     let tool_defs = worker_tool_server
@@ -496,6 +515,9 @@ async fn dump_all_contexts() {
     let response_tx = spacebot::RoutedSender::new(raw_tx, spacebot::InboundMessage::empty());
     let state = spacebot::agent::channel::ChannelState {
         channel_id,
+        kind: spacebot::agent::channel::ChannelKind::User,
+        turn_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        response_mode: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
         active_branches: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         worker_handles: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
@@ -521,6 +543,7 @@ async fn dump_all_contexts() {
         model_overrides: Arc::new(Default::default()),
         active_participants: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         cron_outcome: None,
+        autonomy_run: None,
     };
     let channel_tool_server = rig::tool::server::ToolServer::new().run();
     let skip_flag = spacebot::tools::new_skip_flag();
@@ -565,6 +588,7 @@ async fn dump_all_contexts() {
         None,
         deps.agent_id.clone(),
         deps.task_store.clone(),
+        deps.goal_store.clone(),
         deps.memory_search.clone(),
         deps.runtime_config.clone(),
         deps.memory_event_tx.clone(),
@@ -625,6 +649,7 @@ async fn dump_all_contexts() {
         Default::default(),
         deps.memory_search.clone(),
         false,
+        None,
         None,
         None,
     );

@@ -50,6 +50,10 @@ impl PromptEngine {
         // Register all templates from the central text registry
         // Process prompts
         env.add_template("channel", crate::prompts::text::get("channel"))?;
+        env.add_template(
+            "autonomy_channel",
+            crate::prompts::text::get("autonomy_channel"),
+        )?;
         env.add_template("branch", crate::prompts::text::get("branch"))?;
         env.add_template("worker", crate::prompts::text::get("worker"))?;
         env.add_template("cortex", crate::prompts::text::get("cortex"))?;
@@ -161,6 +165,22 @@ impl PromptEngine {
         env.add_template(
             "fragments/system/memory_persistence",
             crate::prompts::text::get("fragments/system/memory_persistence"),
+        )?;
+        env.add_template(
+            "fragments/system/memory_persistence_contract_retry",
+            crate::prompts::text::get("fragments/system/memory_persistence_contract_retry"),
+        )?;
+        env.add_template(
+            "fragments/system/autonomy_contract_retry",
+            crate::prompts::text::get("fragments/system/autonomy_contract_retry"),
+        )?;
+        env.add_template(
+            "fragments/system/autonomy_soft_warning",
+            crate::prompts::text::get("fragments/system/autonomy_soft_warning"),
+        )?;
+        env.add_template(
+            "fragments/system/autonomy_hard_timeout",
+            crate::prompts::text::get("fragments/system/autonomy_hard_timeout"),
         )?;
         env.add_template(
             "fragments/system/cortex_synthesis",
@@ -470,6 +490,26 @@ impl PromptEngine {
         self.render_static("fragments/system/memory_persistence_contract_retry")
     }
 
+    /// Retry nudge sent to an autonomy channel that missed its `autonomy_complete` call.
+    pub fn render_system_autonomy_contract_retry(&self) -> Result<String> {
+        self.render_static("fragments/system/autonomy_contract_retry")
+    }
+
+    /// Soft-timeout warning injected into an autonomy run at `warn_secs`.
+    pub fn render_system_autonomy_soft_warning(&self, remaining_minutes: u64) -> Result<String> {
+        self.render(
+            "fragments/system/autonomy_soft_warning",
+            context! {
+                remaining_minutes => remaining_minutes,
+            },
+        )
+    }
+
+    /// Hard-timeout wrap-up injected when an autonomy run's `timeout_secs` elapses.
+    pub fn render_system_autonomy_hard_timeout(&self) -> Result<String> {
+        self.render_static("fragments/system/autonomy_hard_timeout")
+    }
+
     /// Render the profile synthesis prompt with identity and bulletin context.
     pub fn render_system_profile_synthesis(
         &self,
@@ -614,7 +654,44 @@ impl PromptEngine {
             None,
             None,
             None,
+            None,
             false,
+        )
+    }
+
+    /// Render the autonomy channel run briefing.
+    ///
+    /// This becomes the run's initial synthetic message; the channel's normal
+    /// system prompt (identity, bulletin, working memory) is layered on top
+    /// by the channel machinery.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_autonomy_channel_prompt(
+        &self,
+        agent_name: &str,
+        level: &str,
+        wake_events: Vec<AutonomyWakeEventView>,
+        run_history: Vec<AutonomyRunHistoryView>,
+        task_state: &str,
+        active_goals: Option<&str>,
+        active_workers: Option<&str>,
+        max_tasks_per_run: u32,
+        warn_minutes: u64,
+        claim_unowned: bool,
+    ) -> Result<String> {
+        self.render(
+            "autonomy_channel",
+            context! {
+                agent_name => agent_name,
+                level => level,
+                wake_events => wake_events,
+                run_history => run_history,
+                task_state => task_state,
+                active_goals => active_goals,
+                active_workers => active_workers,
+                max_tasks_per_run => max_tasks_per_run,
+                warn_minutes => warn_minutes,
+                claim_unowned => claim_unowned,
+            },
         )
     }
 
@@ -726,6 +803,7 @@ impl PromptEngine {
         working_memory: Option<String>,
         channel_activity_map: Option<String>,
         participant_context: Option<String>,
+        active_goals: Option<String>,
         direct_mode: bool,
     ) -> Result<String> {
         self.render(
@@ -747,6 +825,7 @@ impl PromptEngine {
                 working_memory => working_memory,
                 channel_activity_map => channel_activity_map,
                 participant_context => participant_context,
+                active_goals => active_goals,
                 knowledge_synthesis => knowledge_synthesis,
                 direct_mode => direct_mode,
             },
@@ -781,6 +860,35 @@ pub struct LinkedAgent {
     /// style, etc. Loaded from `HUMAN.md` on disk. Only set for humans.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+}
+
+/// A pending wake event rendered into the autonomy run briefing.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AutonomyWakeEventView {
+    pub wake_id: String,
+    /// Wake definition name; falls back to the wake id when the definition
+    /// no longer exists.
+    pub name: String,
+    /// Wake instructions, included only when the wake's min_level is within
+    /// the current autonomy level.
+    pub instructions: Option<String>,
+    /// The wake exists but its min_level is above the current level: the
+    /// event is surfaced as an observation only.
+    pub gated: bool,
+    pub fired_at: String,
+    pub delivery_count: i64,
+    /// Compact JSON payload preview; empty when the payload is empty.
+    pub payload: String,
+}
+
+/// A past autonomy run rendered into the run briefing.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AutonomyRunHistoryView {
+    pub started_at: String,
+    pub status: String,
+    pub summary: String,
+    /// How many wake events that run consumed.
+    pub woken_by: usize,
 }
 
 /// Information about a skill for template rendering.
@@ -889,6 +997,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 false,
             )
             .expect("channel prompt should render");
@@ -914,6 +1023,145 @@ mod tests {
         assert!(reflecting.contains("## Skill Reflection"));
         assert!(reflecting.contains("never the incident"));
         assert!(reflecting.contains("Never persist"));
+    }
+
+    #[test]
+    fn autonomy_channel_prompt_renders_per_level() {
+        let engine = PromptEngine::new("en").expect("prompt engine should build");
+
+        let wake_events = vec![
+            super::AutonomyWakeEventView {
+                wake_id: "ci-failed".to_string(),
+                name: "CI failed on main".to_string(),
+                instructions: Some("Investigate the failing job.".to_string()),
+                gated: false,
+                fired_at: "2026-08-09T02:00:00Z".to_string(),
+                delivery_count: 3,
+                payload: "{\"job\":\"clippy\"}".to_string(),
+            },
+            super::AutonomyWakeEventView {
+                wake_id: "task-approved".to_string(),
+                name: "Task approved".to_string(),
+                instructions: None,
+                gated: true,
+                fired_at: "2026-08-09T02:05:00Z".to_string(),
+                delivery_count: 1,
+                payload: String::new(),
+            },
+        ];
+        let run_history = vec![super::AutonomyRunHistoryView {
+            started_at: "2026-08-09T00:00:00Z".to_string(),
+            status: "completed".to_string(),
+            summary: "Enriched task #4.".to_string(),
+            woken_by: 1,
+        }];
+
+        let observe = engine
+            .render_autonomy_channel_prompt(
+                "Iris",
+                "observe",
+                wake_events.clone(),
+                run_history.clone(),
+                "### Pending approval\n- #4 [high] Investigate flaky test\n",
+                Some("### [HIGH] Ship v2"),
+                None,
+                2,
+                8,
+                true,
+            )
+            .expect("observe prompt should render");
+        assert!(observe.contains("You are Iris."));
+        assert!(observe.contains("CI failed on main"));
+        assert!(observe.contains("Instructions: Investigate the failing job."));
+        assert!(observe.contains("observed only, below your current autonomy level"));
+        assert!(observe.contains("3 coalesced firings"));
+        assert!(observe.contains("Enriched task #4."));
+        assert!(observe.contains("survey and summarize only"));
+        assert!(observe.contains("up to 2 tasks this run"));
+        assert!(observe.contains("about 8 minutes"));
+        assert!(observe.contains("`pending_approval` are NEVER executed"));
+
+        let act = engine
+            .render_autonomy_channel_prompt(
+                "Iris",
+                "act",
+                Vec::new(),
+                Vec::new(),
+                "No active tasks.\n",
+                None,
+                None,
+                1,
+                1,
+                false,
+            )
+            .expect("act prompt should render");
+        assert!(act.contains("Scheduled interval — no wake events pending."));
+        assert!(act.contains("Execute ready tasks"));
+        assert!(act.contains("up to 1 task this run"));
+        assert!(!act.contains("claim unowned tasks"));
+
+        // An unrecognized level falls back to observe-only rules.
+        let unknown = engine
+            .render_autonomy_channel_prompt(
+                "Iris",
+                "unrecognized",
+                Vec::new(),
+                Vec::new(),
+                "No active tasks.\n",
+                None,
+                None,
+                1,
+                1,
+                false,
+            )
+            .expect("unknown level prompt should render");
+        assert!(unknown.contains("Treat this run as observe: survey and summarize only."));
+    }
+
+    #[test]
+    fn autonomy_run_fragments_render() {
+        let engine = PromptEngine::new("en").expect("prompt engine should build");
+
+        let retry = engine
+            .render_system_autonomy_contract_retry()
+            .expect("contract retry should render");
+        assert_eq!(
+            retry,
+            "You must finish this autonomy run by calling autonomy_complete. Provide a 2-5 \
+             line summary of what this run observed and did, plus an actions entry for every \
+             task you enriched, created, or executed. Do not start new work."
+        );
+
+        let singular = engine
+            .render_system_autonomy_soft_warning(1)
+            .expect("soft warning should render");
+        assert_eq!(
+            singular,
+            "You have approximately 1 minute remaining in this run. Finish your current task, \
+             add any final notes, and call autonomy_complete. Do not start a new task."
+        );
+        let plural = engine
+            .render_system_autonomy_soft_warning(5)
+            .expect("soft warning should render");
+        assert!(plural.contains("approximately 5 minutes remaining"));
+
+        let hard = engine
+            .render_system_autonomy_hard_timeout()
+            .expect("hard timeout should render");
+        assert_eq!(
+            hard,
+            "Time is up. Some work may not have finished. Call autonomy_complete NOW with a \
+             summary of whatever this run accomplished. Do not start any new work."
+        );
+    }
+
+    #[test]
+    fn memory_persistence_contract_retry_fragment_renders() {
+        let engine = PromptEngine::new("en").expect("prompt engine should build");
+        let retry = engine
+            .render_system_memory_persistence_contract_retry()
+            .expect("contract retry should render");
+        assert!(retry.contains("memory_persistence_complete"));
     }
 
     #[test]

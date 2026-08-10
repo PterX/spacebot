@@ -4,7 +4,8 @@ use crate::agent::channel::ChannelState;
 use crate::agent::cortex_chat::CortexChatSession;
 use crate::agent::status::StatusBlock;
 use crate::config::{
-    Binding, DefaultsConfig, DiscordPermissions, RuntimeConfig, SignalPermissions, SlackPermissions,
+    AutonomyLevel, Binding, DefaultsConfig, DiscordPermissions, RuntimeConfig, SignalPermissions,
+    SlackPermissions,
 };
 use crate::conversation::worker_transcript::{ActionContent, ToolResultStatus, TranscriptStep};
 use crate::cron::{CronStore, Scheduler};
@@ -251,12 +252,17 @@ pub struct ApiState {
     /// Guards read-modify-write cycles on config.toml to prevent concurrent
     /// modifications from clobbering each other.
     pub config_write_mutex: tokio::sync::Mutex<()>,
+    /// Instance-wide autonomy ceiling. The same Arc is cloned into every
+    /// AgentDeps, so API writes are visible to agents immediately.
+    pub autonomy_ceiling: Arc<ArcSwap<AutonomyLevel>>,
     /// Per-agent cron stores for cron job CRUD operations.
     pub cron_stores: arc_swap::ArcSwap<HashMap<String, Arc<CronStore>>>,
     /// Per-agent cron schedulers for job timer management.
     pub cron_schedulers: arc_swap::ArcSwap<HashMap<String, Arc<Scheduler>>>,
     /// Instance-level global task store shared across all agents.
     pub task_store: ArcSwap<Option<Arc<TaskStore>>>,
+    /// Instance-level goal store shared across all agents.
+    pub goal_store: ArcSwap<Option<Arc<crate::goals::GoalStore>>>,
     /// Instance-wide wiki knowledge base.
     pub wiki_store: ArcSwap<Option<Arc<crate::wiki::WikiStore>>>,
     /// Wake-dispatch sender for dormant-mode agent triggers. Set at startup
@@ -295,6 +301,8 @@ pub struct ApiState {
     pub provider_setup_tx: mpsc::Sender<crate::ProviderSetupEvent>,
     /// Shared update status, populated by the background update checker.
     pub update_status: SharedUpdateStatus,
+    /// Handle for requesting daemon shutdown or restart from API handlers and tools.
+    pub lifecycle: ArcSwap<Option<crate::lifecycle::LifecycleHandle>>,
     /// Instance directory path for accessing instance-level skills.
     pub instance_dir: ArcSwap<PathBuf>,
     /// Shared LLM manager for agent creation.
@@ -536,9 +544,11 @@ impl ApiState {
             agent_data_dirs: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             config_path: RwLock::new(PathBuf::new()),
             config_write_mutex: tokio::sync::Mutex::new(()),
+            autonomy_ceiling: Arc::new(ArcSwap::from_pointee(AutonomyLevel::Act)),
             cron_stores: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             cron_schedulers: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             task_store: ArcSwap::from_pointee(None),
+            goal_store: ArcSwap::from_pointee(None),
             wiki_store: ArcSwap::from_pointee(None),
             wake_tx: ArcSwap::from_pointee(None),
             wake_registry: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
@@ -555,6 +565,7 @@ impl ApiState {
             messaging_manager: RwLock::new(None),
             provider_setup_tx,
             update_status: crate::update::new_shared_status(),
+            lifecycle: ArcSwap::from_pointee(None),
             instance_dir: ArcSwap::from_pointee(PathBuf::new()),
             llm_manager: RwLock::new(None),
             embedding_model: RwLock::new(None),
@@ -1154,6 +1165,11 @@ impl ApiState {
         self.task_store.store(Arc::new(Some(store)));
     }
 
+    /// Set the instance-level goal store.
+    pub fn set_goal_store(&self, store: Arc<crate::goals::GoalStore>) {
+        self.goal_store.store(Arc::new(Some(store)));
+    }
+
     /// Set the instance-wide wiki store.
     pub fn set_wiki_store(&self, store: Arc<crate::wiki::WikiStore>) {
         self.wiki_store.store(Arc::new(Some(store)));
@@ -1236,6 +1252,11 @@ impl ApiState {
     /// Set the instance directory path.
     pub fn set_instance_dir(&self, dir: PathBuf) {
         self.instance_dir.store(Arc::new(dir));
+    }
+
+    /// Set the lifecycle handle for daemon shutdown/restart requests.
+    pub fn set_lifecycle(&self, handle: crate::lifecycle::LifecycleHandle) {
+        self.lifecycle.store(Arc::new(Some(handle)));
     }
 
     /// Set the shared LLM manager for runtime agent creation.

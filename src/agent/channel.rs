@@ -110,6 +110,27 @@ fn should_process_event_for_channel(event: &ProcessEvent, channel_id: &ChannelId
     event_is_for_channel(event, channel_id)
 }
 
+/// Whether an inbound message is a recognized Control command. Control
+/// dispatch never runs a turn, so it skips the coalesce flush instead of
+/// waiting behind a buffered batch's LLM turn.
+fn is_control_command(message: &InboundMessage) -> bool {
+    if message.source == "system" {
+        return false;
+    }
+    let text = match &message.content {
+        crate::MessageContent::Text(text) => text.clone(),
+        crate::MessageContent::Command { .. } => message.content.to_string(),
+        _ => return false,
+    };
+    match crate::commands::REGISTRY.parse(&text) {
+        crate::commands::ParseResult::Command(command) => matches!(
+            command.def.handler,
+            crate::commands::CommandHandler::Control(_)
+        ),
+        _ => false,
+    }
+}
+
 fn should_flush_coalesce_buffer_for_event(event: &ProcessEvent) -> bool {
     matches!(
         event,
@@ -312,6 +333,39 @@ struct AgentTurnResult {
     reply_text: Option<String>,
 }
 
+/// What kind of conversation a channel is serving.
+///
+/// Channels behave differently depending on who is on the other end: user
+/// channels are driven by incoming messages, while cron and autonomy channels
+/// are system-initiated runs that do their work and exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelKind {
+    User,
+    Cron,
+    Autonomy,
+}
+
+impl ChannelKind {
+    /// System-initiated channels receive no further user messages after the
+    /// initial prompt, so the event loop exits once all work settles.
+    pub fn self_exits(&self) -> bool {
+        matches!(self, ChannelKind::Cron | ChannelKind::Autonomy)
+    }
+
+    /// System-initiated runs repeat the same procedure on a schedule and
+    /// would grind out noise skills, so they never trigger skill reflection.
+    pub fn suppresses_reflection(&self) -> bool {
+        matches!(self, ChannelKind::Cron | ChannelKind::Autonomy)
+    }
+
+    /// System-initiated channels have no user to send a reset message, so the
+    /// retrigger cap would permanently stall multi-worker jobs. The job
+    /// timeout is the natural bound instead.
+    pub fn caps_retriggers(&self) -> bool {
+        matches!(self, ChannelKind::User)
+    }
+}
+
 /// Shared state that channel tools need to act on the channel.
 ///
 /// Wrapped in Arc and passed to tools (branch, spawn_worker, route, cancel)
@@ -319,6 +373,7 @@ struct AgentTurnResult {
 #[derive(Clone)]
 pub struct ChannelState {
     pub channel_id: ChannelId,
+    pub kind: ChannelKind,
     pub history: Arc<RwLock<Vec<rig::message::Message>>>,
     pub active_branches: Arc<RwLock<HashMap<BranchId, tokio::task::JoinHandle<()>>>>,
     pub active_workers: Arc<RwLock<HashMap<WorkerId, Worker>>>,
@@ -369,6 +424,17 @@ pub struct ChannelState {
     /// When set, the `set_outcome` tool is registered for this channel,
     /// allowing the LLM to explicitly store a delivery payload.
     pub cron_outcome: Option<crate::cron::CronOutcome>,
+    /// Whether a turn is currently in flight. Read by the inbound router's
+    /// busy policy without entering the channel's message queue.
+    pub turn_active: Arc<std::sync::atomic::AtomicBool>,
+    /// Live response mode, encoded via `ResponseMode::to_u8`. Shared so the
+    /// router-side control plane can apply a mode change mid-turn; the
+    /// channel reads it at every gate instead of its startup snapshot.
+    pub response_mode: Arc<std::sync::atomic::AtomicU8>,
+    /// Autonomy run state for the `autonomy_complete` tool. Set only on
+    /// `ChannelKind::Autonomy` channels; the run loop uses it to enforce the
+    /// completion contract before self-exit.
+    pub autonomy_run: Option<crate::agent::autonomy::AutonomyRunHandle>,
 }
 
 impl ChannelState {
@@ -625,6 +691,35 @@ impl ChannelControlHandle {
         }
     }
 
+    /// Whether the channel currently has a turn in flight. Read by the
+    /// inbound router's busy policy.
+    pub fn turn_active(&self) -> bool {
+        self.inner
+            .state
+            .turn_active
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Live response mode for this channel.
+    pub fn response_mode(&self) -> crate::conversation::settings::ResponseMode {
+        crate::conversation::settings::ResponseMode::from_u8(
+            self.inner
+                .state
+                .response_mode
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    /// Apply a response-mode change to the running channel. Persistence is
+    /// the caller's job (the control plane writes the settings store); this
+    /// updates the live cell every gate reads.
+    pub fn set_response_mode_live(&self, mode: crate::conversation::settings::ResponseMode) {
+        self.inner
+            .state
+            .response_mode
+            .store(mode.to_u8(), std::sync::atomic::Ordering::Release);
+    }
+
     /// Cancel all active workers and branches, emitting WorkerComplete/BranchResult
     /// for each so the channel can retrigger and synthesize partial results.
     pub async fn cancel_all_workers_and_branches(&self, reason: &str) {
@@ -660,6 +755,24 @@ impl ChannelControlHandle {
                 .cancel_branch_with_reason(branch_id, reason)
                 .await;
         }
+    }
+}
+
+/// RAII flag for the shared turn-active cell: set on entry to message
+/// handling, cleared when the turn ends by any path (early return, error,
+/// panic unwind).
+struct TurnActiveGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl TurnActiveGuard {
+    fn engage(flag: &Arc<std::sync::atomic::AtomicBool>) -> Self {
+        flag.store(true, std::sync::atomic::Ordering::Release);
+        Self(flag.clone())
+    }
+}
+
+impl Drop for TurnActiveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -746,6 +859,10 @@ pub struct Channel {
     /// Injected into the system prompt (not into chat history) so the LLM
     /// treats it as read-only context rather than actionable user messages.
     backfill_transcript: Option<String>,
+    /// Retry-prompts sent so far for the autonomy completion contract.
+    /// Autonomy channels must call `autonomy_complete` before self-exit;
+    /// this bounds how many times the run loop nudges them.
+    autonomy_contract_retries: usize,
     /// Handle exposed to the supervision control plane.
     control_handle: ChannelControlHandle,
     /// Per-conversation resolved settings (memory mode, delegation mode, model override).
@@ -802,6 +919,7 @@ impl Channel {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: ChannelId,
+        kind: ChannelKind,
         deps: AgentDeps,
         response_tx: mpsc::Sender<RoutedResponse>,
         event_rx: broadcast::Receiver<ProcessEvent>,
@@ -811,6 +929,7 @@ impl Channel {
         live_worker_transcripts: Option<LiveWorkerTranscripts>,
         resolved_settings: ResolvedConversationSettings,
         cron_outcome: Option<crate::cron::CronOutcome>,
+        autonomy_run: Option<crate::agent::autonomy::AutonomyRunHandle>,
     ) -> (Self, mpsc::Sender<InboundMessage>) {
         let process_id = ProcessId::Channel(id.clone());
         let hook = SpacebotHook::new(
@@ -841,6 +960,7 @@ impl Channel {
 
         let state = ChannelState {
             channel_id: id.clone(),
+            kind,
             history: history.clone(),
             active_branches: active_branches.clone(),
             active_workers: active_workers.clone(),
@@ -865,6 +985,11 @@ impl Channel {
             model_overrides: Arc::new(resolved_settings.clone()),
             active_participants: Arc::new(RwLock::new(HashMap::new())),
             cron_outcome,
+            turn_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            response_mode: Arc::new(std::sync::atomic::AtomicU8::new(
+                resolved_settings.response_mode.to_u8(),
+            )),
+            autonomy_run,
         };
 
         // Each channel gets its own isolated tool server to avoid races between
@@ -925,6 +1050,7 @@ impl Channel {
             pending_results: Vec::new(),
             send_agent_message_tool,
             backfill_transcript: None,
+            autonomy_contract_retries: 0,
             control_handle,
             resolved_settings,
         };
@@ -1010,40 +1136,45 @@ impl Channel {
         // Update shared state for branches/workers
         *self.state.worker_context_settings.write().await = resolved.worker_context.clone();
         self.state.model_overrides = std::sync::Arc::new(resolved.clone());
+        self.state.response_mode.store(
+            resolved.response_mode.to_u8(),
+            std::sync::atomic::Ordering::Release,
+        );
         self.resolved_settings = resolved;
     }
 
     /// Whether the channel is in a non-active response mode (Observe or MentionOnly).
     fn is_suppressed(&self) -> bool {
-        !matches!(self.resolved_settings.response_mode, ResponseMode::Active)
+        !matches!(self.response_mode(), ResponseMode::Active)
+    }
+
+    /// Live response mode. Reads the shared cell rather than the startup
+    /// snapshot so router-side `/quiet` (and friends) apply mid-turn.
+    fn response_mode(&self) -> ResponseMode {
+        ResponseMode::from_u8(
+            self.state
+                .response_mode
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
     }
 
     /// Update the response mode and persist to the channel_settings table.
     async fn set_response_mode(&mut self, mode: ResponseMode) {
         self.resolved_settings.response_mode = mode;
+        self.state
+            .response_mode
+            .store(mode.to_u8(), std::sync::atomic::Ordering::Release);
 
-        // Persist to channel_settings table — load existing settings first so we
-        // don't overwrite other fields, then spawn the DB write to avoid blocking.
+        // Persist on a spawned task to avoid blocking the channel. The
+        // store's atomic field update leaves the rest of the settings row
+        // untouched, so this write can't restore stale fields over a
+        // concurrent settings writer or a router-side mode change.
         let pool = self.deps.sqlite_pool.clone();
         let agent_id = self.deps.agent_id.clone();
         let channel_id: String = self.id.as_ref().to_owned();
         tokio::spawn(async move {
             let store = crate::conversation::ChannelSettingsStore::new(pool);
-            let mut settings = match store.get(&agent_id, &channel_id).await {
-                Ok(Some(existing)) => existing,
-                Ok(None) => crate::conversation::ConversationSettings::default(),
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        %channel_id,
-                        ?mode,
-                        "failed to load existing settings before persisting response_mode"
-                    );
-                    crate::conversation::ConversationSettings::default()
-                }
-            };
-            settings.response_mode = mode;
-            if let Err(error) = store.upsert(&agent_id, &channel_id, &settings).await {
+            if let Err(error) = store.set_response_mode(&agent_id, &channel_id, mode).await {
                 tracing::warn!(
                     %error,
                     %channel_id,
@@ -1202,7 +1333,6 @@ impl Channel {
             ControlAction::Status => {
                 let temporal_context =
                     TemporalContext::from_runtime(self.deps.runtime_config.as_ref());
-                let now_line = temporal_context.current_time_line();
                 let routing = self.deps.runtime_config.routing.load();
                 let channel_model = self
                     .resolved_settings
@@ -1212,46 +1342,24 @@ impl Channel {
                     .resolved_settings
                     .resolve_model("branch")
                     .unwrap_or_else(|| routing.resolve(ProcessType::Branch, None));
-                let mode = match self.resolved_settings.response_mode {
-                    ResponseMode::Active => "active",
-                    ResponseMode::Observe => "observe (learning, never responds)",
-                    ResponseMode::MentionOnly => "mention-only (@mention/reply only)",
-                };
-                let adapter = self.current_adapter().unwrap_or("unknown");
-                let body = format!(
-                    "status\n\
-                     - agent: {}\n\
-                     - channel: {}\n\
-                     - adapter: {}\n\
-                     - mode: {}\n\
-                     - channel model: {}\n\
-                     - branch model: {}\n\
-                     - time: {}",
-                    self.deps.agent_id,
-                    self.id,
-                    adapter,
-                    mode,
+                let body = crate::commands::control::status_text(
+                    &self.deps.agent_id,
+                    &self.id,
+                    self.current_adapter().unwrap_or("unknown"),
+                    self.response_mode(),
                     channel_model,
                     branch_model,
-                    now_line
+                    &temporal_context.current_time_line(),
                 );
                 self.send_builtin_text(body, def.name).await;
             }
             ControlAction::SetResponseMode(mode) => {
                 self.set_response_mode(mode).await;
-                let confirmation = match mode {
-                    ResponseMode::Active => {
-                        "active mode enabled. i'll respond normally in this chat."
-                    }
-                    ResponseMode::Observe => {
-                        "observe mode enabled. i'll learn from this conversation but won't respond."
-                    }
-                    ResponseMode::MentionOnly => {
-                        "mention-only mode enabled. i'll only respond when @mentioned or replied to."
-                    }
-                };
-                self.send_builtin_text(confirmation.to_string(), def.name)
-                    .await;
+                self.send_builtin_text(
+                    crate::commands::control::mode_confirmation(mode).to_string(),
+                    def.name,
+                )
+                .await;
             }
             ControlAction::Help => {
                 self.send_builtin_text(crate::commands::REGISTRY.help_text(), def.name)
@@ -1271,19 +1379,76 @@ impl Channel {
         let mut last_lag_warning: Option<std::time::Instant> = None;
 
         loop {
-            // Cron channels have no further user messages after the initial prompt.
-            // Once all workers/branches finish and no retrigger is pending, exit so
-            // the scheduler can flush the reply buffer. Without this the channel
-            // would wait on the broadcast event_rx (which never closes) until the
-            // job timeout kills it.
-            if self.state.cron_outcome.is_some()
+            // Self-exiting channels (cron, autonomy) have no further user messages
+            // after the initial prompt. Once all workers/branches finish and no
+            // retrigger is pending, exit so the caller can flush the reply buffer.
+            // Without this the channel would wait on the broadcast event_rx (which
+            // never closes) until the job timeout kills it.
+            if self.state.kind.self_exits()
                 && self.message_count > 0
                 && !self.pending_retrigger
                 && self.retrigger_deadline.is_none()
                 && self.state.worker_handles.read().await.is_empty()
                 && self.state.active_branches.read().await.is_empty()
             {
-                tracing::info!(channel_id = %self.id, "cron channel finished all work, exiting");
+                // Autonomy runs must record their outcome via autonomy_complete
+                // before exiting. When the call is missing, nudge the LLM with
+                // a retry prompt (same budget as the memory-persistence
+                // contract) before giving up; the run driver records a
+                // fallback summary if the budget is exhausted.
+                if let Some(run) = self.state.autonomy_run.clone()
+                    && !run.completed()
+                    && self.autonomy_contract_retries
+                        < crate::agent::autonomy::AUTONOMY_CONTRACT_MAX_RETRIES
+                {
+                    self.autonomy_contract_retries += 1;
+                    tracing::warn!(
+                        channel_id = %self.id,
+                        attempt = self.autonomy_contract_retries,
+                        "autonomy run missing autonomy_complete call, retrying"
+                    );
+                    let retry_prompt = match self
+                        .deps
+                        .runtime_config
+                        .prompts
+                        .load()
+                        .render_system_autonomy_contract_retry()
+                    {
+                        Ok(text) => text,
+                        Err(error) => {
+                            tracing::error!(
+                                %error,
+                                channel_id = %self.id,
+                                "failed to render autonomy contract retry prompt"
+                            );
+                            break;
+                        }
+                    };
+                    let retry = InboundMessage {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        source: "system".into(),
+                        adapter: None,
+                        conversation_id: self.conversation_id.clone().unwrap_or_else(|| {
+                            crate::agent::autonomy::AUTONOMY_CONVERSATION_ID.to_string()
+                        }),
+                        sender_id: "system".into(),
+                        agent_id: Some(self.deps.agent_id.clone()),
+                        content: crate::MessageContent::Text(retry_prompt),
+                        timestamp: chrono::Utc::now(),
+                        metadata: HashMap::new(),
+                        formatted_author: None,
+                    };
+                    if let Err(error) = self.handle_message(retry).await {
+                        tracing::error!(
+                            %error,
+                            channel_id = %self.id,
+                            "autonomy completion-contract retry failed"
+                        );
+                        break;
+                    }
+                    continue;
+                }
+                tracing::info!(channel_id = %self.id, "self-exiting channel finished all work, exiting");
                 break;
             }
 
@@ -1312,8 +1477,14 @@ impl Channel {
                         self.coalesce_buffer.push(message);
                         self.update_coalesce_deadline(&config).await;
                     } else {
-                        // Flush any pending buffer before handling this message
-                        if let Err(error) = self.flush_coalesce_buffer().await {
+                        // Control commands dispatch immediately without
+                        // flushing — the buffer keeps its own debounce clock.
+                        // Everything else (including Agent commands, which
+                        // are joining the conversation) flushes first so
+                        // order is preserved.
+                        if !is_control_command(&message)
+                            && let Err(error) = self.flush_coalesce_buffer().await
+                        {
                             tracing::error!(%error, channel_id = %self.id, "error flushing coalesce buffer");
                         }
                         if let Err(error) = self.handle_message(message).await {
@@ -1506,6 +1677,7 @@ impl Channel {
     #[tracing::instrument(skip(self, messages), fields(channel_id = %self.id, agent_id = %self.deps.agent_id, message_count = messages.len()))]
     async fn handle_message_batch(&mut self, messages: Vec<InboundMessage>) -> Result<()> {
         // Apply runtime-config updates immediately without requiring a restart.
+        let _turn_guard = TurnActiveGuard::engage(&self.state.turn_active);
 
         let message_count = messages.len();
         let batch_start_timestamp = messages
@@ -1711,7 +1883,7 @@ impl Channel {
         // Observe mode: always suppress (even with mentions in batch).
         // MentionOnly mode: suppress only when no invocations in the batch.
         let should_suppress_batch = !self.is_dm()
-            && match self.resolved_settings.response_mode {
+            && match self.response_mode() {
                 ResponseMode::Active => false,
                 ResponseMode::Observe => true,
                 ResponseMode::MentionOnly => !batch_has_invoke,
@@ -1721,7 +1893,7 @@ impl Channel {
             tracing::debug!(
                 channel_id = %self.id,
                 message_count,
-                response_mode = ?self.resolved_settings.response_mode,
+                response_mode = ?self.response_mode(),
                 "suppressing unsolicited coalesced batch"
             );
             // Inject batch messages into in-memory history so the agent
@@ -1897,11 +2069,11 @@ impl Channel {
 
         let org_context = self.build_org_context(&prompt_engine);
 
-        let adapter_prompt = if self.state.cron_outcome.is_some() {
-            prompt_engine.render_channel_adapter_prompt("cron")
-        } else {
-            self.current_adapter()
-                .and_then(|adapter| prompt_engine.render_channel_adapter_prompt(adapter))
+        let adapter_prompt = match self.state.kind {
+            ChannelKind::Cron => prompt_engine.render_channel_adapter_prompt("cron"),
+            ChannelKind::User | ChannelKind::Autonomy => self
+                .current_adapter()
+                .and_then(|adapter| prompt_engine.render_channel_adapter_prompt(adapter)),
         };
 
         let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
@@ -1916,6 +2088,8 @@ impl Channel {
             memory_bulletin_text,
             knowledge_synthesis_text,
         ) = self.render_memory_layers().await;
+
+        let active_goals = self.render_active_goals().await;
 
         let routing = rc.routing.load();
         let model_name = routing.resolve(ProcessType::Channel, None).to_string();
@@ -1941,6 +2115,7 @@ impl Channel {
             empty_to_none(working_memory),
             empty_to_none(channel_activity_map),
             empty_to_none(participant_context),
+            active_goals,
             direct_mode,
         )?;
 
@@ -1959,6 +2134,7 @@ impl Channel {
     #[tracing::instrument(skip(self, message), fields(channel_id = %self.id, agent_id = %self.deps.agent_id, message_id = %message.id))]
     async fn handle_message(&mut self, message: InboundMessage) -> Result<()> {
         // Apply runtime-config updates immediately without requiring a restart.
+        let _turn_guard = TurnActiveGuard::engage(&self.state.turn_active);
 
         // Track the inbound message that triggered this turn so outbound
         // responses carry the correct routing metadata (e.g. Slack thread_ts).
@@ -2090,7 +2266,7 @@ impl Channel {
         // Deterministic ping ack for Discord mention-only mentions/replies to avoid
         // flaky model behavior (e.g. skipping or over-formatting simple liveness checks).
         // Skipped in Observe mode — the agent never responds in Observe.
-        if !matches!(self.resolved_settings.response_mode, ResponseMode::Observe)
+        if !matches!(self.response_mode(), ResponseMode::Observe)
             && should_send_discord_quiet_mode_ping_ack(&message, &raw_text, self.is_suppressed())
         {
             self.send_builtin_text("yeah i'm here".to_string(), "discord-ping")
@@ -2154,25 +2330,24 @@ impl Channel {
         // Response mode guardrail:
         // Observe mode: always suppress — agent learns but never responds.
         // MentionOnly mode: suppress unless explicitly invoked.
-        if !matches!(self.resolved_settings.response_mode, ResponseMode::Active)
+        if !matches!(self.response_mode(), ResponseMode::Active)
             && message.source != "system"
             && !self.is_dm()
         {
             // Observe mode always suppresses; MentionOnly checks for invocation.
-            let should_suppress =
-                if matches!(self.resolved_settings.response_mode, ResponseMode::Observe) {
-                    true
-                } else {
-                    (invoked_by_command, invoked_by_mention, invoked_by_reply) =
-                        self.compute_listen_mode_invocation(&message, &raw_text);
-                    !invoked_by_command && !invoked_by_mention && !invoked_by_reply
-                };
+            let should_suppress = if matches!(self.response_mode(), ResponseMode::Observe) {
+                true
+            } else {
+                (invoked_by_command, invoked_by_mention, invoked_by_reply) =
+                    self.compute_listen_mode_invocation(&message, &raw_text);
+                !invoked_by_command && !invoked_by_mention && !invoked_by_reply
+            };
 
             if should_suppress {
                 tracing::debug!(
                     channel_id = %self.id,
                     source = %message.source,
-                    response_mode = ?self.resolved_settings.response_mode,
+                    response_mode = ?self.response_mode(),
                     "suppressing unsolicited reply"
                 );
                 // In Observe and MentionOnly modes, inject the message into
@@ -2582,6 +2757,21 @@ impl Channel {
         )
     }
 
+    /// Render the compact active-goals list for the system prompt.
+    ///
+    /// Returns `None` when there are no active goals so injection is skipped
+    /// entirely — goals should cost nothing when unused.
+    async fn render_active_goals(&self) -> Option<String> {
+        match crate::goals::render_active_goals(&self.deps.goal_store).await {
+            Ok(text) if !text.is_empty() => Some(text),
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(channel_id = %self.id, %error, "active goals render failed");
+                None
+            }
+        }
+    }
+
     /// Build pre-rendered project context for prompt injection.
     ///
     /// Delegates to the standalone `build_project_context` function shared
@@ -2644,11 +2834,11 @@ impl Channel {
 
         let org_context = self.build_org_context(&prompt_engine);
 
-        let adapter_prompt = if self.state.cron_outcome.is_some() {
-            prompt_engine.render_channel_adapter_prompt("cron")
-        } else {
-            self.current_adapter()
-                .and_then(|adapter| prompt_engine.render_channel_adapter_prompt(adapter))
+        let adapter_prompt = match self.state.kind {
+            ChannelKind::Cron => prompt_engine.render_channel_adapter_prompt("cron"),
+            ChannelKind::User | ChannelKind::Autonomy => self
+                .current_adapter()
+                .and_then(|adapter| prompt_engine.render_channel_adapter_prompt(adapter)),
         };
 
         let project_context = self.build_project_context(&prompt_engine).await;
@@ -2660,6 +2850,8 @@ impl Channel {
             memory_bulletin_text,
             knowledge_synthesis_text,
         ) = self.render_memory_layers().await;
+
+        let active_goals = self.render_active_goals().await;
 
         let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
         let routing = rc.routing.load();
@@ -2685,6 +2877,7 @@ impl Channel {
             empty_to_none(working_memory),
             empty_to_none(channel_activity_map),
             empty_to_none(participant_context),
+            active_goals,
             direct_mode,
         )?;
 
@@ -2710,7 +2903,10 @@ impl Channel {
     ) -> Result<AgentTurnResult> {
         let skip_flag = crate::tools::new_skip_flag();
         let replied_flag = crate::tools::new_replied_flag();
-        let allow_direct_reply = !self.suppress_plaintext_fallback();
+        // Autonomy runs never talk to users — no reply tool. Output goes to
+        // task state, working memory, and autonomy_complete.
+        let allow_direct_reply =
+            self.state.kind != ChannelKind::Autonomy && !self.suppress_plaintext_fallback();
 
         // Set the originating channel on the delegation tool so task completion
         // notifications route back to this conversation.
@@ -2787,7 +2983,11 @@ impl Channel {
 
         let rc = &self.deps.runtime_config;
         let routing = rc.routing.load();
-        let max_turns = if is_retrigger {
+        let max_turns = if self.state.kind == ChannelKind::Autonomy {
+            // Autonomy runs carry their own turn budget; on exhaustion the
+            // channel behaves like a soft timeout and wraps up.
+            (rc.autonomy.load().max_turns.max(1)) as usize
+        } else if is_retrigger {
             RETRIGGER_MAX_TURNS
         } else {
             **rc.max_turns.load()
@@ -3400,6 +3600,33 @@ impl Channel {
 
                 run_logger.log_worker_completed(*worker_id, result, *success);
 
+                let worker_event = if *success {
+                    crate::wakes::SystemEvent::WorkerCompleted
+                } else {
+                    crate::wakes::SystemEvent::WorkerFailed
+                };
+                // Wake emission writes to SQLite; run it off the event loop so
+                // a slow disk cannot stall channel event handling.
+                let emit_deps = self.deps.clone();
+                let dedupe_key = format!("worker:{worker_id}");
+                let payload = serde_json::json!({
+                    "worker_id": worker_id.to_string(),
+                    "success": *success,
+                    "summary": crate::summarize_first_non_empty_line(
+                        result,
+                        crate::EVENT_SUMMARY_MAX_CHARS,
+                    ),
+                });
+                tokio::spawn(async move {
+                    crate::wakes::emit_system_event(
+                        &emit_deps,
+                        worker_event,
+                        &dedupe_key,
+                        &payload,
+                    )
+                    .await;
+                });
+
                 // A worker finishing real work successfully is a reflection
                 // signal: the session likely produced a reusable lesson.
                 if *success {
@@ -3490,9 +3717,7 @@ impl Channel {
         // Multiple branch/worker completions within the debounce window are
         // coalesced into a single retrigger to prevent message spam.
         if should_retrigger {
-            // Cron channels have no user to send a reset message, so the cap would
-            // permanently stall multi-worker jobs. The job timeout is the natural bound.
-            let cap_applies = self.state.cron_outcome.is_none();
+            let cap_applies = self.state.kind.caps_retriggers();
             if cap_applies && self.retrigger_count >= MAX_RETRIGGERS_PER_TURN {
                 tracing::warn!(
                     channel_id = %self.id,
@@ -3716,10 +3941,10 @@ impl Channel {
     /// Note that this conversation just did substantial work. The next
     /// persistence pass will also reflect on skills, cooldown permitting.
     ///
-    /// Cron conversations never reflect: scheduled runs repeat the same
-    /// procedure on a timer and would grind out noise skills.
+    /// System-initiated conversations (cron, autonomy) never reflect: they
+    /// repeat the same procedure on a schedule and would grind out noise skills.
     fn mark_reflection_signal(&self, source: &'static str) {
-        if self.id.starts_with("cron") {
+        if self.state.kind.suppresses_reflection() {
             return;
         }
         let was_set = self

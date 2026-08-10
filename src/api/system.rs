@@ -36,6 +36,11 @@ pub(super) struct StatusResponse {
     uptime_seconds: u64,
 }
 
+#[derive(Serialize, utoipa::ToSchema)]
+pub(super) struct RestartResponse {
+    status: &'static str,
+}
+
 #[utoipa::path(
     get,
     path = "/health",
@@ -92,6 +97,36 @@ pub(super) async fn status(State(state): State<Arc<ApiState>>) -> Json<StatusRes
         pid: std::process::id(),
         uptime_seconds: uptime.as_secs(),
     })
+}
+
+/// Restart the daemon in place. The response is sent immediately; teardown
+/// and re-exec begin after the lifecycle grace delay so this response and any
+/// other in-flight requests can flush.
+#[utoipa::path(
+    post,
+    path = "/restart",
+    responses(
+        (status = 200, body = RestartResponse),
+        (status = 503, body = RestartResponse, description = "Daemon lifecycle control not available"),
+    ),
+    tag = "system",
+)]
+pub(super) async fn restart(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    let Some(lifecycle) = state.lifecycle.load().as_ref().clone() else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(RestartResponse {
+                status: "unavailable",
+            }),
+        );
+    };
+
+    let status = if lifecycle.request_restart("api") {
+        "restarting"
+    } else {
+        "already_pending"
+    };
+    (axum::http::StatusCode::OK, Json(RestartResponse { status }))
 }
 
 /// SSE endpoint streaming all agent events to connected clients.

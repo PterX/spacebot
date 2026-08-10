@@ -4,10 +4,10 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 
 use super::{
-    BrowserConfig, ChannelConfig, CoalesceConfig, CompactionConfig, Config, CortexConfig,
-    DefaultsConfig, IngestionConfig, McpServerConfig, MemoryPersistenceConfig, OpenCodeConfig,
-    ResolvedAgentConfig, ToolUseEnforcement, WarmupConfig, WarmupStatus, WorkReadiness,
-    evaluate_work_readiness,
+    AutonomyConfig, BrowserConfig, ChannelConfig, CoalesceConfig, CompactionConfig, Config,
+    CortexConfig, DefaultsConfig, IngestionConfig, McpServerConfig, MemoryPersistenceConfig,
+    OpenCodeConfig, ResolvedAgentConfig, ToolUseEnforcement, WarmupConfig, WarmupStatus,
+    WorkReadiness, evaluate_work_readiness,
 };
 use crate::llm::routing::RoutingConfig;
 use crate::tools::browser::SharedBrowserHandle;
@@ -45,6 +45,7 @@ pub struct RuntimeConfig {
     pub cron_timezone: ArcSwap<Option<String>>,
     pub user_timezone: ArcSwap<Option<String>>,
     pub cortex: ArcSwap<CortexConfig>,
+    pub autonomy: ArcSwap<AutonomyConfig>,
     pub warmup: ArcSwap<WarmupConfig>,
     /// Current warmup lifecycle status for API and observability.
     pub warmup_status: ArcSwap<WarmupStatus>,
@@ -143,6 +144,7 @@ impl RuntimeConfig {
             cron_timezone: ArcSwap::from_pointee(agent_config.cron_timezone.clone()),
             user_timezone: ArcSwap::from_pointee(agent_config.user_timezone.clone()),
             cortex: ArcSwap::from_pointee(agent_config.cortex),
+            autonomy: ArcSwap::from_pointee(agent_config.autonomy),
             warmup: ArcSwap::from_pointee(agent_config.warmup),
             warmup_status: ArcSwap::from_pointee(WarmupStatus::default()),
             warmup_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -290,6 +292,7 @@ impl RuntimeConfig {
         self.cron_timezone.store(Arc::new(resolved.cron_timezone));
         self.user_timezone.store(Arc::new(resolved.user_timezone));
         self.cortex.store(Arc::new(resolved.cortex));
+        self.autonomy.store(Arc::new(resolved.autonomy));
         self.warmup.store(Arc::new(resolved.warmup));
         self.skills_config.store(Arc::new(resolved.skills));
         self.participant_context
@@ -336,21 +339,19 @@ impl RuntimeConfig {
     /// Reload skills from disk.
     ///
     /// Seeds usage rows for skills seen for the first time, so their
-    /// staleness clock starts at discovery.
-    pub fn reload_skills(&self, skills: crate::skills::SkillSet) {
+    /// staleness clock starts at discovery. Seeding completes before this
+    /// returns so a seed from a stale snapshot can never land after a later
+    /// usage-row removal and resurrect a deleted skill.
+    pub async fn reload_skills(&self, skills: crate::skills::SkillSet) {
         let names: Vec<String> = skills.iter().map(|s| s.name.to_lowercase()).collect();
         self.skills.store(Arc::new(skills));
         tracing::info!("skills reloaded");
 
-        if let Some(store) = self.skill_usage.load().as_ref()
-            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        let store = self.skill_usage.load().as_ref().clone();
+        if let Some(store) = store
+            && let Err(error) = store.seed(&names).await
         {
-            let store = store.clone();
-            handle.spawn(async move {
-                if let Err(error) = store.seed(&names).await {
-                    tracing::warn!(%error, "failed to seed skill usage rows");
-                }
-            });
+            tracing::warn!(%error, "failed to seed skill usage rows");
         }
     }
 }

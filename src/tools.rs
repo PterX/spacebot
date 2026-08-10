@@ -6,7 +6,7 @@
 //! ## ToolServer Topology
 //!
 //! **Channel ToolServer** (one per channel):
-//! - `reply`, `branch`, `spawn_worker`, `route`, `cancel`, `skip`, `react` — added
+//! - `reply`, `branch`, `spawn_worker`, `route`, `cancel`, `skip`, `react`, `restart` — added
 //!   dynamically per conversation turn via `add_channel_tools()` /
 //!   `remove_channel_tools()` because they hold per-channel state.
 //! - No memory tools — the channel delegates memory work to branches.
@@ -16,19 +16,23 @@
 //! - `spacebot_docs` for embedded self-documentation lookup
 //! - `task_create` + `task_list` + `task_update`
 //! - `spawn_worker` is included for channel-originated branches only
+//! - `restart` when the daemon lifecycle handle is available
 //!
 //! **Worker ToolServer** (one per worker, created at spawn time):
 //! - `shell`, `file_read`/`file_write`/`file_edit`/`file_list` — stateless, registered at creation
 //! - `task_update` — scoped to the worker's assigned task
 //! - `set_status` — per-worker instance, registered at creation
+//! - `restart` when the daemon lifecycle handle is available
 //!
 //! **Cortex ToolServer** (one per agent):
 //! - `memory_save` — registered at startup
 //!
 //! **Cortex Chat ToolServer** (interactive admin chat):
-//! - branch + worker tool superset plus `spacebot_docs`, `config_inspect`, and `spawn_worker`
+//! - branch + worker tool superset plus `spacebot_docs`, `config_inspect`, `spawn_worker`,
+//!   and `restart`
 
 pub mod attachment_recall;
+pub mod autonomy_complete;
 pub mod branch_tool;
 pub mod browser;
 pub mod browser_detection;
@@ -38,6 +42,9 @@ pub mod config_inspect;
 pub mod cron;
 pub mod email_search;
 pub mod file;
+pub mod goal_create;
+pub mod goal_list;
+pub mod goal_update;
 pub mod install_skill;
 pub mod mcp;
 pub mod memory_delete;
@@ -48,6 +55,7 @@ pub mod project_manage;
 pub mod react;
 pub mod read_skill;
 pub mod reply;
+pub mod restart;
 pub mod route;
 pub mod secret_set;
 pub mod send_agent_message;
@@ -84,6 +92,10 @@ pub mod factory_update_identity;
 pub use attachment_recall::{
     AttachmentRecallArgs, AttachmentRecallError, AttachmentRecallOutput, AttachmentRecallTool,
 };
+pub use autonomy_complete::{
+    AutonomyActionInput, AutonomyCompleteArgs, AutonomyCompleteError, AutonomyCompleteOutput,
+    AutonomyCompleteTool,
+};
 pub use branch_tool::{BranchArgs, BranchError, BranchOutput, BranchTool};
 pub use browser::{
     BrowserError, BrowserOutput, SharedBrowserHandle, TabInfo, new_shared_browser_handle,
@@ -103,6 +115,9 @@ pub use file::{
     FileOutput, FileReadArgs, FileReadTool, FileType, FileWriteArgs, FileWriteTool,
     register_file_tools,
 };
+pub use goal_create::{GoalCreateArgs, GoalCreateError, GoalCreateOutput, GoalCreateTool};
+pub use goal_list::{GoalListArgs, GoalListEntry, GoalListError, GoalListOutput, GoalListTool};
+pub use goal_update::{GoalUpdateArgs, GoalUpdateError, GoalUpdateOutput, GoalUpdateTool};
 pub use install_skill::{
     InstallSkillArgs, InstallSkillError, InstallSkillOutput, InstallSkillTool,
 };
@@ -129,6 +144,7 @@ pub use read_skill::{ReadSkillArgs, ReadSkillError, ReadSkillOutput, ReadSkillTo
 pub use reply::{
     RepliedFlag, ReplyArgs, ReplyError, ReplyOutput, ReplyTarget, ReplyTool, new_replied_flag,
 };
+pub use restart::{RestartArgs, RestartError, RestartOutput, RestartTool};
 pub use route::{RouteArgs, RouteError, RouteOutput, RouteTool};
 pub use secret_set::{SecretSetArgs, SecretSetError, SecretSetOutput, SecretSetTool};
 pub use send_agent_message::{
@@ -197,6 +213,7 @@ pub use factory_update_identity::{
 use crate::agent::channel::ChannelState;
 use crate::config::{BrowserConfig, RuntimeConfig};
 use crate::conversation::settings::WorkerMemoryMode;
+use crate::goals::GoalStore;
 use crate::memory::MemorySearch;
 use crate::sandbox::Sandbox;
 use crate::tasks::TaskStore;
@@ -461,6 +478,8 @@ pub async fn add_channel_tools(
     cron_outcome: Option<crate::cron::CronOutcome>,
 ) -> Result<(), rig::tool::server::ToolServerError> {
     let conversation_id = conversation_id.into();
+    let channel_kind = state.kind;
+    let autonomy_run = state.autonomy_run.clone();
 
     if allow_direct_reply {
         let agent_display_name = state
@@ -511,6 +530,11 @@ pub async fn add_channel_tools(
     handle
         .add_tool(ProjectManageTool::new(state.deps.project_store.clone()))
         .await?;
+    // Channels are read-only for goals: they can reference goals in
+    // conversation, but mutations go through branches.
+    handle
+        .add_tool(GoalListTool::new(state.deps.goal_store.clone()))
+        .await?;
     // Add attachment recall tool when save_attachments is enabled
     if state
         .deps
@@ -537,6 +561,21 @@ pub async fn add_channel_tools(
             ))
             .await?;
     }
+    if let Some(lifecycle) = state.deps.lifecycle() {
+        let delivery = default_delivery_target_for_conversation(&conversation_id, slack_thread_ts)
+            .and_then(|raw| crate::messaging::target::parse_delivery_target(&raw));
+        handle
+            .add_tool(
+                RestartTool::new(
+                    lifecycle,
+                    state.deps.runtime_config.instance_dir.clone(),
+                    state.deps.agent_id.to_string(),
+                    "channel",
+                )
+                .with_channel_context(conversation_id.clone(), delivery),
+            )
+            .await?;
+    }
     handle.add_tool(CancelTool::new(state)).await?;
     handle
         .add_tool(SkipTool::new(skip_flag.clone(), response_tx.clone()))
@@ -555,10 +594,17 @@ pub async fn add_channel_tools(
         agent_msg = agent_msg.with_skip_flag(skip_flag.clone());
         handle.add_tool(agent_msg).await?;
     }
-    if let Some(outcome) = cron_outcome {
+    if channel_kind == crate::agent::channel::ChannelKind::Cron
+        && let Some(outcome) = cron_outcome
+    {
         handle
             .add_tool(SetOutcomeTool::new(outcome, conversation_id.clone()))
             .await?;
+    }
+    if channel_kind == crate::agent::channel::ChannelKind::Autonomy
+        && let Some(run) = autonomy_run
+    {
+        handle.add_tool(AutonomyCompleteTool::new(run)).await?;
     }
     Ok(())
 }
@@ -763,6 +809,17 @@ fn default_delivery_target_for_conversation(
     }
 }
 
+/// Remove a tool whose registration is profile-dependent.
+///
+/// The tool server treats removal of an unregistered tool as a no-op and
+/// only errors when the server itself is unreachable (dropped request or
+/// response channel), so any error here is a real failure worth surfacing.
+async fn remove_optional_tool(handle: &ToolServerHandle, tool_name: &str) {
+    if let Err(error) = handle.remove_tool(tool_name).await {
+        tracing::warn!(tool_name, %error, "failed to remove tool from tool server");
+    }
+}
+
 /// Remove per-channel tools from a running ToolServer.
 ///
 /// Called when a conversation turn ends or a channel is torn down. Prevents stale
@@ -782,15 +839,18 @@ pub async fn remove_channel_tools(
     handle.remove_tool(SendFileTool::NAME).await?;
     handle.remove_tool(ReactTool::NAME).await?;
     handle.remove_tool(ProjectManageTool::NAME).await?;
-    // Cron, send_message, send_agent_message, and attachment_recall removal is
-    // best-effort since not all channels have them
-    let _ = handle.remove_tool(CronTool::NAME).await;
-    let _ = handle.remove_tool(SendMessageTool::NAME).await;
-    let _ = handle.remove_tool(SendAgentMessageTool::NAME).await;
-    let _ = handle.remove_tool(AttachmentRecallTool::NAME).await;
-    let _ = handle.remove_tool(SetOutcomeTool::NAME).await;
-    let _ = handle.remove_tool(SkillsSearchTool::NAME).await;
-    let _ = handle.remove_tool(InstallSkillTool::NAME).await;
+    handle.remove_tool(GoalListTool::NAME).await?;
+    // These tools are registered per-profile, so not every channel has them;
+    // removal is idempotent and only surfaces server failures.
+    remove_optional_tool(handle, CronTool::NAME).await;
+    remove_optional_tool(handle, SendMessageTool::NAME).await;
+    remove_optional_tool(handle, SendAgentMessageTool::NAME).await;
+    remove_optional_tool(handle, AttachmentRecallTool::NAME).await;
+    remove_optional_tool(handle, SetOutcomeTool::NAME).await;
+    remove_optional_tool(handle, AutonomyCompleteTool::NAME).await;
+    remove_optional_tool(handle, SkillsSearchTool::NAME).await;
+    remove_optional_tool(handle, InstallSkillTool::NAME).await;
+    remove_optional_tool(handle, RestartTool::NAME).await;
     Ok(())
 }
 
@@ -803,43 +863,41 @@ pub async fn remove_direct_mode_tools(
     remove_channel_tools(handle, allow_direct_reply).await?;
 
     // Memory tools
-    let _ = handle.remove_tool(MemoryRecallTool::NAME).await;
-    let _ = handle.remove_tool(MemorySaveTool::NAME).await;
+    remove_optional_tool(handle, MemoryRecallTool::NAME).await;
+    remove_optional_tool(handle, MemorySaveTool::NAME).await;
 
     // Shell + file tools
-    let _ = handle.remove_tool(ShellTool::NAME).await;
-    let _ = handle.remove_tool(FileReadTool::NAME).await;
-    let _ = handle.remove_tool(FileWriteTool::NAME).await;
-    let _ = handle.remove_tool(FileEditTool::NAME).await;
-    let _ = handle.remove_tool(FileListTool::NAME).await;
+    remove_optional_tool(handle, ShellTool::NAME).await;
+    remove_optional_tool(handle, FileReadTool::NAME).await;
+    remove_optional_tool(handle, FileWriteTool::NAME).await;
+    remove_optional_tool(handle, FileEditTool::NAME).await;
+    remove_optional_tool(handle, FileListTool::NAME).await;
 
-    // Browser tools (best-effort, may not have been registered)
-    let _ = handle.remove_tool(browser::BrowserLaunchTool::NAME).await;
-    let _ = handle.remove_tool(browser::BrowserNavigateTool::NAME).await;
-    let _ = handle.remove_tool(browser::BrowserSnapshotTool::NAME).await;
-    let _ = handle.remove_tool(browser::BrowserClickTool::NAME).await;
-    let _ = handle.remove_tool(browser::BrowserTypeTool::NAME).await;
-    let _ = handle.remove_tool(browser::BrowserPressKeyTool::NAME).await;
-    let _ = handle
-        .remove_tool(browser::BrowserScreenshotTool::NAME)
-        .await;
-    let _ = handle.remove_tool(browser::BrowserEvaluateTool::NAME).await;
-    let _ = handle.remove_tool(browser::BrowserTabOpenTool::NAME).await;
-    let _ = handle.remove_tool(browser::BrowserTabListTool::NAME).await;
-    let _ = handle.remove_tool(browser::BrowserTabCloseTool::NAME).await;
-    let _ = handle.remove_tool(browser::BrowserCloseTool::NAME).await;
+    // Browser tools, registered only when browser automation is enabled
+    remove_optional_tool(handle, browser::BrowserLaunchTool::NAME).await;
+    remove_optional_tool(handle, browser::BrowserNavigateTool::NAME).await;
+    remove_optional_tool(handle, browser::BrowserSnapshotTool::NAME).await;
+    remove_optional_tool(handle, browser::BrowserClickTool::NAME).await;
+    remove_optional_tool(handle, browser::BrowserTypeTool::NAME).await;
+    remove_optional_tool(handle, browser::BrowserPressKeyTool::NAME).await;
+    remove_optional_tool(handle, browser::BrowserScreenshotTool::NAME).await;
+    remove_optional_tool(handle, browser::BrowserEvaluateTool::NAME).await;
+    remove_optional_tool(handle, browser::BrowserTabOpenTool::NAME).await;
+    remove_optional_tool(handle, browser::BrowserTabListTool::NAME).await;
+    remove_optional_tool(handle, browser::BrowserTabCloseTool::NAME).await;
+    remove_optional_tool(handle, browser::BrowserCloseTool::NAME).await;
 
-    // Web search + skill reader (best-effort)
-    let _ = handle.remove_tool(WebSearchTool::NAME).await;
-    let _ = handle.remove_tool(ReadSkillTool::NAME).await;
+    // Web search + skill reader
+    remove_optional_tool(handle, WebSearchTool::NAME).await;
+    remove_optional_tool(handle, ReadSkillTool::NAME).await;
 
-    // Wiki tools (best-effort)
-    let _ = handle.remove_tool(WikiCreateTool::NAME).await;
-    let _ = handle.remove_tool(WikiEditTool::NAME).await;
-    let _ = handle.remove_tool(WikiReadTool::NAME).await;
-    let _ = handle.remove_tool(WikiListTool::NAME).await;
-    let _ = handle.remove_tool(WikiSearchTool::NAME).await;
-    let _ = handle.remove_tool(WikiHistoryTool::NAME).await;
+    // Wiki tools, registered only when a wiki store is configured
+    remove_optional_tool(handle, WikiCreateTool::NAME).await;
+    remove_optional_tool(handle, WikiEditTool::NAME).await;
+    remove_optional_tool(handle, WikiReadTool::NAME).await;
+    remove_optional_tool(handle, WikiListTool::NAME).await;
+    remove_optional_tool(handle, WikiSearchTool::NAME).await;
+    remove_optional_tool(handle, WikiHistoryTool::NAME).await;
 
     Ok(())
 }
@@ -867,6 +925,7 @@ pub fn create_branch_tool_server(
     state: Option<ChannelState>,
     agent_id: AgentId,
     task_store: Arc<TaskStore>,
+    goal_store: Arc<GoalStore>,
     memory_search: Arc<MemorySearch>,
     runtime_config: Arc<RuntimeConfig>,
     memory_event_tx: broadcast::Sender<ProcessEvent>,
@@ -904,10 +963,25 @@ pub fn create_branch_tool_server(
         .tool(task_create)
         .tool(TaskListTool::new(task_store.clone(), agent_id.to_string()))
         .tool(TaskUpdateTool::for_branch(task_store, agent_id.clone()))
+        .tool(GoalListTool::new(goal_store.clone()))
         .tool(FileReadTool::new(
             runtime_config.workspace_dir.clone(),
             sandbox,
         ));
+
+    // Goal mutation follows user direction: conversation branches act on a
+    // live user turn, while persistence and ingestion passes process derived
+    // or untrusted content and must not alter durable goals. Those profiles
+    // keep read-only goal access via goal_list above.
+    if matches!(profile, BranchToolProfile::Default) {
+        let mut goal_create = GoalCreateTool::new(goal_store.clone());
+        let mut goal_update = GoalUpdateTool::new(goal_store);
+        if let Some(ref api) = api_state {
+            goal_create = goal_create.with_api_state(api.clone());
+            goal_update = goal_update.with_api_state(api.clone());
+        }
+        server = server.tool(goal_create).tool(goal_update);
+    }
 
     // Skill tools by profile. Conversation branches carry User origin — the
     // user is present and directing. A persistence pass with reflection on
@@ -972,6 +1046,18 @@ pub fn create_branch_tool_server(
         server = server.tool(SpawnWorkerTool::new(state));
     }
 
+    if let Some(lifecycle) = api_state
+        .as_ref()
+        .and_then(|api| api.lifecycle.load().as_ref().clone())
+    {
+        server = server.tool(RestartTool::new(
+            lifecycle,
+            runtime_config.instance_dir.clone(),
+            agent_id.to_string(),
+            "branch",
+        ));
+    }
+
     server.run()
 }
 
@@ -1004,6 +1090,7 @@ pub fn create_worker_tool_server(
     wiki_write: bool,
     wiki_store: Option<Arc<crate::wiki::WikiStore>>,
     blocked_signal: Option<crate::agent::worker::BlockSignal>,
+    lifecycle: Option<crate::lifecycle::LifecycleHandle>,
 ) -> ToolServerHandle {
     let mut server = ToolServer::new()
         .tool(
@@ -1085,6 +1172,15 @@ pub fn create_worker_tool_server(
             .tool(WikiHistoryTool::new(store));
     }
 
+    if let Some(lifecycle) = lifecycle {
+        server = server.tool(RestartTool::new(
+            lifecycle,
+            runtime_config.instance_dir.clone(),
+            agent_id.to_string(),
+            "worker",
+        ));
+    }
+
     for mcp_tool in mcp_tools {
         server = server.tool(mcp_tool);
     }
@@ -1146,6 +1242,8 @@ pub fn create_cortex_chat_tool_server(
     cortex_ctx: Option<crate::tools::spawn_worker::CortexChatContext>,
 ) -> ToolServerHandle {
     let logs_dir = workspace.join(".spacebot").join("logs");
+    let lifecycle = api_state.lifecycle.load().as_ref().clone();
+    let goal_store = deps.goal_store.clone();
 
     let spawn_tool = {
         let tool = DetachedSpawnWorkerTool::new(deps, screenshot_dir.clone(), logs_dir);
@@ -1179,10 +1277,13 @@ pub fn create_cortex_chat_tool_server(
         .tool(spawn_tool)
         .tool(
             TaskCreateTool::new(task_store.clone(), agent_id.to_string(), "cortex")
-                .with_api_state(api_state),
+                .with_api_state(api_state.clone()),
         )
         .tool(TaskListTool::new(task_store.clone(), agent_id.to_string()))
         .tool(TaskUpdateTool::for_branch(task_store, agent_id.clone()))
+        .tool(GoalCreateTool::new(goal_store.clone()).with_api_state(api_state.clone()))
+        .tool(GoalListTool::new(goal_store.clone()))
+        .tool(GoalUpdateTool::new(goal_store).with_api_state(api_state))
         .tool(ShellTool::new(workspace.clone(), sandbox.clone()));
 
     server = register_file_tools(server, workspace, sandbox);
@@ -1202,6 +1303,15 @@ pub fn create_cortex_chat_tool_server(
         server = server.tool(WebSearchTool::new(key));
     }
 
+    if let Some(lifecycle) = lifecycle {
+        server = server.tool(RestartTool::new(
+            lifecycle,
+            runtime_config.instance_dir.clone(),
+            agent_id.to_string(),
+            "cortex_chat",
+        ));
+    }
+
     server.run()
 }
 
@@ -1215,14 +1325,27 @@ pub fn create_factory_tool_server(
     state: Arc<crate::api::ApiState>,
     memory_search: Arc<MemorySearch>,
 ) -> ToolServerHandle {
-    ToolServer::new()
+    let lifecycle = state.lifecycle.load().as_ref().clone();
+    let instance_dir = state.instance_dir.load().as_ref().clone();
+
+    let mut server = ToolServer::new()
         .tool(FactoryListPresetsTool::new())
         .tool(FactoryLoadPresetTool::new())
         .tool(FactorySearchContextTool::new(memory_search))
         .tool(FactoryCreateAgentTool::new(state.clone()))
         .tool(FactoryUpdateIdentityTool::new(state.clone()))
-        .tool(FactoryUpdateConfigTool::new(state))
-        .run()
+        .tool(FactoryUpdateConfigTool::new(state));
+
+    if let Some(lifecycle) = lifecycle {
+        server = server.tool(RestartTool::new(
+            lifecycle,
+            instance_dir,
+            "factory",
+            "factory",
+        ));
+    }
+
+    server.run()
 }
 
 /// Add factory tools (agent creation/refinement) to an existing tool server handle.

@@ -675,11 +675,24 @@ export interface DiscordSection {
 	allow_bot_messages: boolean;
 }
 
+export interface AutonomySection {
+	level: AutonomyLevel;
+	interval_secs: number;
+	active_hours: [number, number] | null;
+	max_turns: number;
+	max_tasks_per_run: number;
+	timeout_secs: number;
+	warn_secs: number;
+	run_history_count: number;
+	claim_unowned: boolean;
+}
+
 export interface AgentConfigResponse {
 	routing: RoutingSection;
 	tuning: TuningSection;
 	compaction: CompactionSection;
 	cortex: CortexSection;
+	autonomy: AutonomySection;
 	coalesce: CoalesceSection;
 	memory_persistence: MemoryPersistenceSection;
 	browser: BrowserSection;
@@ -728,6 +741,19 @@ export interface CortexUpdate {
 	bulletin_interval_secs?: number;
 	bulletin_max_words?: number;
 	bulletin_max_turns?: number;
+}
+
+export interface AutonomyUpdate {
+	level?: AutonomyLevel;
+	interval_secs?: number;
+	/** `[start, end]` sets the window; an empty array clears it. */
+	active_hours?: number[];
+	max_turns?: number;
+	max_tasks_per_run?: number;
+	timeout_secs?: number;
+	warn_secs?: number;
+	run_history_count?: number;
+	claim_unowned?: boolean;
 }
 
 export interface CoalesceUpdate {
@@ -779,6 +805,7 @@ export interface AgentConfigUpdateRequest {
 	tuning?: TuningUpdate;
 	compaction?: CompactionUpdate;
 	cortex?: CortexUpdate;
+	autonomy?: AutonomyUpdate;
 	coalesce?: CoalesceUpdate;
 	memory_persistence?: MemoryPersistenceUpdate;
 	browser?: BrowserUpdate;
@@ -874,6 +901,10 @@ export interface UpdateStatus {
 export interface UpdateApplyResponse {
 	status: "updating" | "error";
 	error?: string;
+}
+
+export interface RestartResponse {
+	status: "restarting" | "already_pending" | "unavailable";
 }
 
 // -- Global Settings Types --
@@ -988,7 +1019,7 @@ export interface UploadSkillResponse {
 
 // -- Task Types --
 
-export type TaskStatus = "pending_approval" | "backlog" | "ready" | "in_progress" | "done";
+export type TaskStatus = "pending_approval" | "backlog" | "ready" | "in_progress" | "done" | "failed";
 export type TaskPriority = "critical" | "high" | "medium" | "low";
 
 export interface TaskSubtask {
@@ -1004,9 +1035,10 @@ export interface TaskItem {
 	status: TaskStatus;
 	priority: TaskPriority;
 	owner_agent_id: string;
-	assigned_agent_id: string;
+	assigned_agent_id?: string;
 	subtasks: TaskSubtask[];
 	metadata: Record<string, unknown>;
+	goal_id?: string;
 	source_memory_id?: string;
 	worker_id?: string;
 	created_by: string;
@@ -1054,6 +1086,117 @@ export interface UpdateTaskRequest {
 	complete_subtask?: number;
 	worker_id?: string;
 	approved_by?: string;
+}
+
+// -- Goal Types --
+
+export type GoalStatus = "active" | "paused" | "completed" | "abandoned";
+
+export interface GoalTaskCounts {
+	pending_approval: number;
+	backlog: number;
+	ready: number;
+	in_progress: number;
+	done: number;
+	failed: number;
+}
+
+export interface GoalItem {
+	id: string;
+	title: string;
+	description: string | null;
+	status: GoalStatus;
+	priority: TaskPriority;
+	due_date: string | null;
+	notes: string | null;
+	metadata: Record<string, unknown>;
+	created_at: string;
+	updated_at: string;
+	completed_at: string | null;
+	task_counts: GoalTaskCounts;
+}
+
+export interface GoalListResponse {
+	goals: GoalItem[];
+}
+
+// -- Autonomy Types --
+
+export type AutonomyLevel = "off" | "observe" | "suggest" | "act";
+export type AutonomyRunStatus = "running" | "completed" | "timeout" | "failed";
+
+export interface AutonomyCurrentRun {
+	started_at: string;
+}
+
+export interface AutonomyStatus {
+	agent_id: string;
+	level: AutonomyLevel;
+	/** The agent's dial capped by the instance ceiling — what it actually runs at. */
+	effective_level: AutonomyLevel;
+	interval_secs: number;
+	active_hours: [number, number] | null;
+	max_tasks_per_run: number;
+	last_run_at: string | null;
+	last_run_summary: string | null;
+	next_run_at: string | null;
+	current_run: AutonomyCurrentRun | null;
+	pending_wake_events: number;
+}
+
+export interface AutonomyFleetResponse {
+	/** Instance-wide autonomy ceiling applied to every agent. */
+	ceiling: AutonomyLevel;
+	agents: AutonomyStatus[];
+}
+
+export interface AutonomyRunAction {
+	kind: "enriched" | "created" | "executed";
+	task_number: number | null;
+	detail: string;
+}
+
+export interface AutonomyRunEntry {
+	agent_id: string;
+	id: string;
+	started_at: string;
+	finished_at: string | null;
+	duration_secs: number | null;
+	status: AutonomyRunStatus;
+	summary: string | null;
+	actions: AutonomyRunAction[];
+	wake_event_ids: string[];
+}
+
+export interface AutonomyRunsResponse {
+	runs: AutonomyRunEntry[];
+}
+
+export type WakeTriggerKind = "schedule" | "webhook" | "event";
+
+export interface WakeItem {
+	id: string;
+	name: string;
+	trigger_kind: WakeTriggerKind;
+	trigger_label: string;
+	instructions: string;
+	min_level: AutonomyLevel;
+	enabled: boolean;
+	builtin: boolean;
+	virtual: boolean;
+	last_fired_at: string | null;
+	webhook_url: string | null;
+}
+
+export interface WakesResponse {
+	wakes: WakeItem[];
+}
+
+export interface WakeUpdate {
+	enabled?: boolean;
+	name?: string;
+	instructions?: string;
+	min_level?: AutonomyLevel;
 }
 
 // -- Notification Types --
@@ -1688,6 +1831,62 @@ export const api = {
 		return response.json() as Promise<CronActionResponse>;
 	},
 
+	// Autonomy API
+	autonomyStatus: (agentId: string) =>
+		fetchJson<AutonomyStatus>(`/agents/autonomy?agent_id=${encodeURIComponent(agentId)}`),
+
+	autonomyFleet: () => fetchJson<AutonomyFleetResponse>("/agents/autonomy/fleet"),
+
+	updateAutonomyCeiling: async (ceiling: AutonomyLevel) => {
+		const response = await fetch(`${getApiBase()}/agents/autonomy/ceiling`, {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ ceiling }),
+		});
+		if (!response.ok) {
+			throw new Error(`API error: ${response.status}`);
+		}
+		return response.json() as Promise<AutonomyFleetResponse>;
+	},
+
+	autonomyRuns: (agentId?: string, limit?: number) => {
+		const search = new URLSearchParams();
+		if (agentId) search.set("agent_id", agentId);
+		if (limit) search.set("limit", String(limit));
+		const query = search.toString();
+		return fetchJson<AutonomyRunsResponse>(query ? `/agents/autonomy/runs?${query}` : "/agents/autonomy/runs");
+	},
+
+	// Wakes API
+	listWakes: (agentId: string) =>
+		fetchJson<WakesResponse>(`/agents/wakes?agent_id=${encodeURIComponent(agentId)}`),
+
+	updateWake: async (agentId: string, wakeId: string, patch: WakeUpdate) => {
+		const response = await fetch(
+			`${getApiBase()}/agents/wakes/${encodeURIComponent(wakeId)}?agent_id=${encodeURIComponent(agentId)}`,
+			{
+				method: "PUT",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(patch),
+			},
+		);
+		if (!response.ok) {
+			throw new Error(`API error: ${response.status}`);
+		}
+		return response.json() as Promise<WakeItem>;
+	},
+
+	fireWake: async (agentId: string, wakeId: string) => {
+		const response = await fetch(
+			`${getApiBase()}/agents/wakes/${encodeURIComponent(wakeId)}/fire?agent_id=${encodeURIComponent(agentId)}`,
+			{ method: "POST" },
+		);
+		if (!response.ok) {
+			throw new Error(`API error: ${response.status}`);
+		}
+		return response.json() as Promise<{ status: string }>;
+	},
+
 	cancelProcess: async (channelId: string, processType: "worker" | "branch", processId: string) => {
 		const response = await fetch(`${getApiBase()}/channels/cancel-process`, {
 			method: "POST",
@@ -1983,6 +2182,15 @@ export const api = {
 			throw new Error(`API error: ${response.status}`);
 		}
 		return response.json() as Promise<UpdateApplyResponse>;
+	},
+	restart: async () => {
+		const response = await fetch(`${getApiBase()}/restart`, { method: "POST" });
+		// 503 carries a typed RestartResponse ({ status: "unavailable" }) so the
+		// UI can show its unavailable-state message instead of a generic error.
+		if (!response.ok && response.status !== 503) {
+			throw new Error(`API error: ${response.status}`);
+		}
+		return response.json() as Promise<RestartResponse>;
 	},
 
 	// Skills API
@@ -2343,6 +2551,15 @@ export const api = {
 		});
 		if (!response.ok) throw new Error(`API error: ${response.status}`);
 		return response.json() as Promise<TaskResponse>;
+	},
+
+	// Goals API
+	listGoals: (params?: { status?: GoalStatus; limit?: number }) => {
+		const search = new URLSearchParams();
+		if (params?.status) search.set("status", params.status);
+		if (params?.limit) search.set("limit", String(params.limit));
+		const query = search.toString();
+		return fetchJson<GoalListResponse>(query ? `/goals?${query}` : "/goals");
 	},
 
 	// Secrets API

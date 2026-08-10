@@ -46,6 +46,7 @@ pub fn spawn_file_watcher(
     mattermost_permissions: Option<Arc<arc_swap::ArcSwap<MattermostPermissions>>>,
     signal_permissions: Option<Arc<arc_swap::ArcSwap<SignalPermissions>>>,
     bindings: Arc<arc_swap::ArcSwap<Vec<Binding>>>,
+    authority_defaults: Arc<arc_swap::ArcSwap<crate::commands::access::AdapterAuthorityDefaults>>,
     messaging_manager: Option<Arc<crate::messaging::MessagingManager>>,
     llm_manager: Arc<crate::llm::LlmManager>,
     agent_links: Arc<arc_swap::ArcSwap<Vec<crate::links::AgentLink>>>,
@@ -220,6 +221,10 @@ pub fn spawn_file_watcher(
                 bindings.store(Arc::new(config.bindings.clone()));
                 tracing::info!("bindings reloaded ({} entries)", config.bindings.len());
 
+                authority_defaults.store(Arc::new(
+                    crate::commands::access::AdapterAuthorityDefaults::from_config(config),
+                ));
+
                 match crate::links::AgentLink::from_config(&config.links) {
                     Ok(links) => {
                         agent_links.store(Arc::new(links));
@@ -337,11 +342,14 @@ pub fn spawn_file_watcher(
 
                 if skills_changed {
                     let rt = tokio::runtime::Handle::current();
-                    let skills = rt.block_on(crate::skills::SkillSet::load(
-                        &instance_dir.join("skills"),
-                        &workspace.join("skills"),
-                    ));
-                    runtime_config.reload_skills(skills);
+                    rt.block_on(async {
+                        let skills = crate::skills::SkillSet::load(
+                            &instance_dir.join("skills"),
+                            &workspace.join("skills"),
+                        )
+                        .await;
+                        runtime_config.reload_skills(skills).await;
+                    });
                 }
             }
         }
@@ -436,11 +444,10 @@ fn build_desired_configured_adapters(
                 ))
             });
             let fingerprint = format!(
-                "bot_token={}|app_token={}|dm={:?}|commands={:?}|permissions={}",
+                "bot_token={}|app_token={}|dm={:?}|permissions={}",
                 secret_fingerprint(&slack_config.bot_token),
                 secret_fingerprint(&slack_config.app_token),
                 sorted_strings(slack_config.dm_allowed_users.clone()),
-                sorted_slack_commands(slack_config.commands.clone()),
                 slack_permissions_fingerprint(&permissions_snapshot)
             );
             let adapter = crate::messaging::slack::SlackAdapter::new(
@@ -448,7 +455,6 @@ fn build_desired_configured_adapters(
                 &slack_config.bot_token,
                 &slack_config.app_token,
                 permissions,
-                slack_config.commands.clone(),
             )?;
             desired.push(crate::messaging::ConfiguredAdapter::new(
                 adapter,
@@ -467,11 +473,10 @@ fn build_desired_configured_adapters(
             let permissions_snapshot =
                 SlackPermissions::from_instance_config(instance, &config.bindings);
             let fingerprint = format!(
-                "bot_token={}|app_token={}|dm={:?}|commands={:?}|permissions={}",
+                "bot_token={}|app_token={}|dm={:?}|permissions={}",
                 secret_fingerprint(&instance.bot_token),
                 secret_fingerprint(&instance.app_token),
                 sorted_strings(instance.dm_allowed_users.clone()),
-                sorted_slack_commands(instance.commands.clone()),
                 slack_permissions_fingerprint(&permissions_snapshot)
             );
             let adapter = crate::messaging::slack::SlackAdapter::new(
@@ -479,7 +484,6 @@ fn build_desired_configured_adapters(
                 &instance.bot_token,
                 &instance.app_token,
                 Arc::new(arc_swap::ArcSwap::from_pointee(permissions_snapshot)),
-                instance.commands.clone(),
             )?;
             desired.push(crate::messaging::ConfiguredAdapter::new(
                 adapter,
@@ -959,15 +963,4 @@ fn signal_permissions_fingerprint(permissions: &SignalPermissions) -> String {
 fn secret_fingerprint(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
     hex::encode(&digest[..8])
-}
-
-fn sorted_slack_commands(
-    mut commands: Vec<crate::config::SlackCommandConfig>,
-) -> Vec<(String, String, Option<String>)> {
-    let mut normalized = commands
-        .drain(..)
-        .map(|command| (command.command, command.agent_id, command.description))
-        .collect::<Vec<_>>();
-    normalized.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
-    normalized
 }

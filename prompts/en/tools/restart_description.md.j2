@@ -1,0 +1,9 @@
+Restart the spacebot daemon in place. Use this when a change genuinely requires a full process restart — for example after config edits that report "restart required" (API bind/port, system secrets, platform credentials, backup restore) or to activate an updated binary.
+
+This reboots the entire harness, not just your conversation:
+
+- Every in-flight worker and branch across all agents is terminated. Interrupted workers are marked failed on the way back up.
+- The daemon tears down, re-executes itself, and comes back with the same configuration and environment a few seconds later.
+- If you were asked to restart from a channel, send your reply BEFORE calling this tool — nothing sent after it will be delivered. A short "back online" note is posted to the requesting channel once the restart completes.
+
+Do not use this for config changes that hot-reload (routing, tuning, identity — those apply live), or as a troubleshooting reflex. A required `reason` is audit-logged and included in the post-restart announcement.

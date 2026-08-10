@@ -7,12 +7,14 @@
 pub mod activity;
 pub mod agents;
 mod attachments;
+pub mod autonomy;
 pub mod bindings;
 pub mod channels;
 pub mod config;
 mod cortex;
 pub mod cron;
 mod factory;
+pub mod goals;
 pub mod ingest;
 mod links;
 pub mod mcp;
@@ -34,6 +36,7 @@ mod system;
 pub mod tasks;
 mod tools;
 pub mod usage;
+pub mod wakes;
 pub mod wiki;
 pub mod workers;
 
