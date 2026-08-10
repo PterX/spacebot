@@ -1,5 +1,6 @@
 //! Agent processes: channels, branches, workers, compactor, cortex.
 
+pub mod autonomy;
 pub mod branch;
 pub mod channel;
 pub mod channel_attachments;

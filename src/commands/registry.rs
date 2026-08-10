@@ -22,6 +22,91 @@ pub struct CommandDef {
     pub args: ArgSpec,
     /// How this command executes.
     pub handler: CommandHandler,
+    /// Who may run this command in a scope with an authority list configured.
+    pub access: CommandAccess,
+    /// What happens when an Agent command arrives while a turn is in flight.
+    /// Control commands are busy-immune by construction; this field is only
+    /// consulted for `CommandHandler::Agent`.
+    pub busy: BusyPolicy,
+    /// Which platform surfaces expose this command.
+    pub availability: CommandAvailability,
+}
+
+/// Who may run a command. Layered on top of admission (bindings and adapter
+/// permission snapshots): access never widens who may talk to the agent, it
+/// only restricts who may change state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandAccess {
+    Everyone,
+    /// Requires the sender to be in the authority list for this scope. With
+    /// no authority list configured the command is open to everyone the
+    /// binding already admits.
+    Authority,
+}
+
+/// What happens when an Agent command arrives while a turn is in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusyPolicy {
+    /// Wait for the current turn, then run as a normal turn.
+    Queue,
+    /// Refuse mid-turn with a pointer to /stop.
+    Reject,
+}
+
+/// Which platform surfaces expose a command. Used by native registration
+/// (Discord application commands, Telegram menu, Slack subcommands) and the
+/// parity test; the shared text parser accepts every command everywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandAvailability {
+    pub portal: bool,
+    pub discord: bool,
+    pub slack: bool,
+    pub telegram: bool,
+    /// Signal, Mattermost, Twitch, Email, Webhook.
+    pub text_adapters: bool,
+}
+
+impl CommandAvailability {
+    pub const ALL: CommandAvailability = CommandAvailability {
+        portal: true,
+        discord: true,
+        slack: true,
+        telegram: true,
+        text_adapters: true,
+    };
+
+    pub fn on(&self, surface: Surface) -> bool {
+        match surface {
+            Surface::Portal => self.portal,
+            Surface::Discord => self.discord,
+            Surface::Slack => self.slack,
+            Surface::Telegram => self.telegram,
+            Surface::TextAdapters => self.text_adapters,
+        }
+    }
+}
+
+/// A platform surface, for availability checks. Maps from
+/// `InboundMessage.source`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    Portal,
+    Discord,
+    Slack,
+    Telegram,
+    TextAdapters,
+}
+
+impl Surface {
+    pub fn from_source(source: &str) -> Surface {
+        match source {
+            "portal" => Surface::Portal,
+            "discord" => Surface::Discord,
+            "slack" => Surface::Slack,
+            "telegram" => Surface::Telegram,
+            _ => Surface::TextAdapters,
+        }
+    }
 }
 
 /// Grouping for `/help` display, rendered in [`CATEGORY_ORDER`].
@@ -138,15 +223,20 @@ impl CommandRegistry {
     }
 
     /// Resolve a bare command token (no slash) across names and aliases,
-    /// case-insensitively.
+    /// case-insensitively. Underscores fold to hyphens so Telegram's menu
+    /// form of a hyphenated name (`/mention_only` — Telegram rejects hyphens
+    /// in registered commands) resolves to the canonical def.
     pub fn resolve(&self, name: &str) -> Option<&'static CommandDef> {
-        self.defs.iter().find(|def| {
-            def.name.eq_ignore_ascii_case(name)
-                || def
-                    .aliases
-                    .iter()
-                    .any(|alias| alias.eq_ignore_ascii_case(name))
-        })
+        let folded = |candidate: &str| {
+            candidate.len() == name.len()
+                && candidate
+                    .chars()
+                    .zip(name.chars())
+                    .all(|(a, b)| a.eq_ignore_ascii_case(&b) || (a == '-' && b == '_'))
+        };
+        self.defs
+            .iter()
+            .find(|def| folded(def.name) || def.aliases.iter().any(|alias| folded(alias)))
     }
 
     /// Parse message text into a command.
@@ -156,6 +246,13 @@ impl CommandRegistry {
     /// never parse as commands, and un-mangles smart dashes in arguments
     /// (iOS autocorrects `--` to `—` and `-` to `–`).
     pub fn parse(&self, text: &str) -> ParseResult {
+        self.parse_addressed(text, None)
+    }
+
+    /// [`parse`](Self::parse) with the receiving bot's username, when the
+    /// surface knows it. A `/cmd@other_bot` addressed to a different bot in a
+    /// Telegram group is conversation, not a command for us.
+    pub fn parse_addressed(&self, text: &str, bot_username: Option<&str>) -> ParseResult {
         let trimmed = text.trim();
         let Some(body) = trimmed.strip_prefix('/') else {
             return ParseResult::NotACommand;
@@ -167,7 +264,17 @@ impl CommandRegistry {
         if token.is_empty() || token.contains('/') {
             return ParseResult::NotACommand;
         }
-        let token = token.split('@').next().unwrap_or(token);
+        let token = match token.split_once('@') {
+            Some((bare, addressed)) => {
+                if let Some(own_name) = bot_username
+                    && !addressed.eq_ignore_ascii_case(own_name)
+                {
+                    return ParseResult::NotACommand;
+                }
+                bare
+            }
+            None => token,
+        };
         let Some(def) = self.resolve(token) else {
             return ParseResult::NotACommand;
         };
@@ -206,12 +313,25 @@ impl CommandRegistry {
     /// aliases and argument hints. Generated so it cannot drift from the
     /// table.
     pub fn help_text(&self) -> String {
+        self.help_text_for(None, true)
+    }
+
+    /// [`help_text`](Self::help_text) filtered to what the caller can see and
+    /// run: commands available on `surface` (all surfaces when `None`), minus
+    /// Authority commands when the caller lacks authority. A user never sees
+    /// a command they can't run.
+    pub fn help_text_for(&self, surface: Option<Surface>, is_authority: bool) -> String {
+        let visible = |def: &&CommandDef| {
+            surface.is_none_or(|surface| def.availability.on(surface))
+                && (is_authority || def.access == CommandAccess::Everyone)
+        };
         let mut out = String::from("commands:");
         for (category, label) in CATEGORY_ORDER {
             let defs: Vec<&CommandDef> = self
                 .defs
                 .iter()
                 .filter(|def| def.category == *category)
+                .filter(visible)
                 .collect();
             if defs.is_empty() {
                 continue;
@@ -265,6 +385,9 @@ pub static COMMANDS: &[CommandDef] = &[
         aliases: &[],
         args: ArgSpec::None,
         handler: CommandHandler::Control(ControlAction::SetResponseMode(ResponseMode::Active)),
+        access: CommandAccess::Authority,
+        busy: BusyPolicy::Queue,
+        availability: CommandAvailability::ALL,
     },
     CommandDef {
         name: "mention-only",
@@ -273,6 +396,9 @@ pub static COMMANDS: &[CommandDef] = &[
         aliases: &[],
         args: ArgSpec::None,
         handler: CommandHandler::Control(ControlAction::SetResponseMode(ResponseMode::MentionOnly)),
+        access: CommandAccess::Authority,
+        busy: BusyPolicy::Queue,
+        availability: CommandAvailability::ALL,
     },
     CommandDef {
         name: "quiet",
@@ -281,6 +407,9 @@ pub static COMMANDS: &[CommandDef] = &[
         aliases: &["observe"],
         args: ArgSpec::None,
         handler: CommandHandler::Control(ControlAction::SetResponseMode(ResponseMode::Observe)),
+        access: CommandAccess::Authority,
+        busy: BusyPolicy::Queue,
+        availability: CommandAvailability::ALL,
     },
     CommandDef {
         name: "tasks",
@@ -289,6 +418,9 @@ pub static COMMANDS: &[CommandDef] = &[
         aliases: &[],
         args: ArgSpec::None,
         handler: CommandHandler::Agent(AgentAction::PromptTemplate("commands/tasks")),
+        access: CommandAccess::Everyone,
+        busy: BusyPolicy::Queue,
+        availability: CommandAvailability::ALL,
     },
     CommandDef {
         name: "today",
@@ -297,6 +429,9 @@ pub static COMMANDS: &[CommandDef] = &[
         aliases: &[],
         args: ArgSpec::None,
         handler: CommandHandler::Agent(AgentAction::PromptTemplate("commands/today")),
+        access: CommandAccess::Everyone,
+        busy: BusyPolicy::Queue,
+        availability: CommandAvailability::ALL,
     },
     CommandDef {
         name: "digest",
@@ -305,6 +440,9 @@ pub static COMMANDS: &[CommandDef] = &[
         aliases: &[],
         args: ArgSpec::None,
         handler: CommandHandler::Agent(AgentAction::PromptTemplate("commands/digest")),
+        access: CommandAccess::Everyone,
+        busy: BusyPolicy::Queue,
+        availability: CommandAvailability::ALL,
     },
     CommandDef {
         name: "status",
@@ -313,6 +451,9 @@ pub static COMMANDS: &[CommandDef] = &[
         aliases: &[],
         args: ArgSpec::None,
         handler: CommandHandler::Control(ControlAction::Status),
+        access: CommandAccess::Everyone,
+        busy: BusyPolicy::Queue,
+        availability: CommandAvailability::ALL,
     },
     CommandDef {
         name: "help",
@@ -321,6 +462,9 @@ pub static COMMANDS: &[CommandDef] = &[
         aliases: &["commands"],
         args: ArgSpec::None,
         handler: CommandHandler::Control(ControlAction::Help),
+        access: CommandAccess::Everyone,
+        busy: BusyPolicy::Queue,
+        availability: CommandAvailability::ALL,
     },
     CommandDef {
         name: "agent-id",
@@ -329,6 +473,9 @@ pub static COMMANDS: &[CommandDef] = &[
         aliases: &[],
         args: ArgSpec::None,
         handler: CommandHandler::Control(ControlAction::AgentId),
+        access: CommandAccess::Everyone,
+        busy: BusyPolicy::Queue,
+        availability: CommandAvailability::ALL,
     },
 ];
 
@@ -411,6 +558,9 @@ mod tests {
             aliases: &[],
             args: ArgSpec::Optional("[query]"),
             handler: CommandHandler::Control(ControlAction::Help),
+            access: CommandAccess::Everyone,
+            busy: BusyPolicy::Queue,
+            availability: CommandAvailability::ALL,
         },
         CommandDef {
             name: "background",
@@ -419,6 +569,9 @@ mod tests {
             aliases: &[],
             args: ArgSpec::Required("<prompt>"),
             handler: CommandHandler::Control(ControlAction::Help),
+            access: CommandAccess::Everyone,
+            busy: BusyPolicy::Queue,
+            availability: CommandAvailability::ALL,
         },
         CommandDef {
             name: "voice",
@@ -427,6 +580,9 @@ mod tests {
             aliases: &[],
             args: ArgSpec::Choice(&["on", "off", "status"]),
             handler: CommandHandler::Control(ControlAction::Help),
+            access: CommandAccess::Everyone,
+            busy: BusyPolicy::Queue,
+            availability: CommandAvailability::ALL,
         },
     ];
 

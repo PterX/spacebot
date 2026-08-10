@@ -64,6 +64,10 @@ pub struct Config {
     /// (their cortex tick never runs maintenance), additive on active-mode
     /// agents.
     pub memory_janitor: MemoryJanitorConfig,
+    /// Instance-wide autonomy ceiling. Every agent runs at
+    /// `min(ceiling, agent level)` — the ceiling caps the per-agent dial
+    /// without overwriting it. `Act` (the default) applies no cap.
+    pub autonomy_ceiling: AutonomyLevel,
 }
 
 /// Instance-wide memory maintenance scheduler.
@@ -642,6 +646,7 @@ pub struct DefaultsConfig {
     pub coalesce: CoalesceConfig,
     pub ingestion: IngestionConfig,
     pub cortex: CortexConfig,
+    pub autonomy: AutonomyConfig,
     pub warmup: WarmupConfig,
     pub skills: SkillsConfig,
     pub participant_context: ParticipantContextConfig,
@@ -680,6 +685,7 @@ impl std::fmt::Debug for DefaultsConfig {
             .field("coalesce", &self.coalesce)
             .field("ingestion", &self.ingestion)
             .field("cortex", &self.cortex)
+            .field("autonomy", &self.autonomy)
             .field("warmup", &self.warmup)
             .field("participant_context", &self.participant_context)
             .field("browser", &self.browser)
@@ -1233,6 +1239,156 @@ impl CortexConfig {
     }
 }
 
+/// How much the autonomy channel may do without a user present.
+///
+/// The dial is cumulative: each level includes everything below it.
+/// `Off` disables the autonomy channel entirely; `Act` additionally allows
+/// executing user-approved `ready` tasks.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AutonomyLevel {
+    #[default]
+    Off,
+    Observe,
+    Suggest,
+    Act,
+}
+
+impl AutonomyLevel {
+    pub const ALL: [AutonomyLevel; 4] = [
+        AutonomyLevel::Off,
+        AutonomyLevel::Observe,
+        AutonomyLevel::Suggest,
+        AutonomyLevel::Act,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AutonomyLevel::Off => "off",
+            AutonomyLevel::Observe => "observe",
+            AutonomyLevel::Suggest => "suggest",
+            AutonomyLevel::Act => "act",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(AutonomyLevel::Off),
+            "observe" => Some(AutonomyLevel::Observe),
+            "suggest" => Some(AutonomyLevel::Suggest),
+            "act" => Some(AutonomyLevel::Act),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for AutonomyLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Autonomy channel configuration. See `docs/design-docs/autonomy.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutonomyConfig {
+    /// What the autonomy channel may do. `Off` disables it.
+    pub level: AutonomyLevel,
+    /// How often the channel wakes without wake events, in seconds.
+    pub interval_secs: u64,
+    /// UTC-hour window (start, end) outside of which wakes are suppressed.
+    /// Evaluated in the agent's cron timezone, like cron active hours.
+    pub active_hours: Option<(u8, u8)>,
+    /// Turn budget per run.
+    pub max_turns: u32,
+    /// Maximum tasks to work on per wake.
+    pub max_tasks_per_run: u32,
+    /// Hard wall-clock timeout for a run. Should rarely fire — the soft
+    /// warning at `warn_secs` asks the channel to wrap up first.
+    pub timeout_secs: u64,
+    /// When to inject the soft "wrap up" warning into the run.
+    pub warn_secs: u64,
+    /// How many past run summaries to surface on wake.
+    pub run_history_count: u32,
+    /// Whether this agent picks up tasks with no assigned agent.
+    pub claim_unowned: bool,
+}
+
+impl Default for AutonomyConfig {
+    fn default() -> Self {
+        Self {
+            level: AutonomyLevel::Off,
+            interval_secs: 1800,
+            active_hours: None,
+            max_turns: 20,
+            max_tasks_per_run: 2,
+            timeout_secs: 600,
+            warn_secs: 480,
+            run_history_count: 5,
+            claim_unowned: true,
+        }
+    }
+}
+
+impl AutonomyConfig {
+    /// Validate the invariants from autonomy.md, clamping `warn_secs` to
+    /// `timeout_secs - 60` when it does not fire before the hard timeout.
+    /// `scope` names the config path (e.g. "defaults.autonomy") so load
+    /// errors point at the offending section.
+    pub fn validated(mut self, scope: &str) -> Result<Self> {
+        if self.interval_secs < 60 {
+            return Err(ConfigError::Invalid(format!(
+                "{scope}.interval_secs must be >= 60, got {}",
+                self.interval_secs
+            ))
+            .into());
+        }
+        if self.timeout_secs > self.interval_secs {
+            return Err(ConfigError::Invalid(format!(
+                "{scope}.timeout_secs ({}) must be <= interval_secs ({})",
+                self.timeout_secs, self.interval_secs
+            ))
+            .into());
+        }
+        if self.max_tasks_per_run < 1 {
+            return Err(
+                ConfigError::Invalid(format!("{scope}.max_tasks_per_run must be >= 1")).into(),
+            );
+        }
+        if let Some((start, end)) = self.active_hours
+            && (start > 23 || end > 23)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "{scope}.active_hours hours must be 0-23, got [{start}, {end}]"
+            ))
+            .into());
+        }
+        if self.warn_secs >= self.timeout_secs {
+            let clamped = self.timeout_secs.saturating_sub(60);
+            tracing::warn!(
+                scope,
+                warn_secs = self.warn_secs,
+                timeout_secs = self.timeout_secs,
+                clamped,
+                "autonomy warn_secs must be < timeout_secs, clamping"
+            );
+            self.warn_secs = clamped;
+        }
+        Ok(self)
+    }
+}
+
 fn validate_unit_interval_f32(name: &str, value: f32) -> Result<()> {
     if !value.is_finite() || !(0.0..=1.0).contains(&value) {
         return Err(ConfigError::Invalid(format!(
@@ -1434,6 +1590,7 @@ pub struct AgentConfig {
     pub coalesce: Option<CoalesceConfig>,
     pub ingestion: Option<IngestionConfig>,
     pub cortex: Option<CortexConfig>,
+    pub autonomy: Option<AutonomyConfig>,
     pub warmup: Option<WarmupConfig>,
     pub skills: Option<SkillsConfig>,
     pub browser: Option<BrowserConfig>,
@@ -1451,6 +1608,8 @@ pub struct AgentConfig {
     pub projects: Option<ProjectsConfig>,
     /// Cron job definitions for this agent.
     pub cron: Vec<CronDef>,
+    /// Wake definitions for this agent, reconciled into the wake store.
+    pub wakes: Vec<crate::wakes::WakeConfig>,
 }
 
 /// A cron job definition from config.
@@ -1498,6 +1657,7 @@ pub struct ResolvedAgentConfig {
     pub coalesce: CoalesceConfig,
     pub ingestion: IngestionConfig,
     pub cortex: CortexConfig,
+    pub autonomy: AutonomyConfig,
     pub warmup: WarmupConfig,
     pub skills: SkillsConfig,
     pub browser: BrowserConfig,
@@ -1513,6 +1673,8 @@ pub struct ResolvedAgentConfig {
     /// Number of messages to fetch from the platform when a new channel is created.
     pub history_backfill_count: usize,
     pub cron: Vec<CronDef>,
+    /// Wake definitions for this agent, reconciled into the wake store.
+    pub wakes: Vec<crate::wakes::WakeConfig>,
     /// Tool-use enforcement for preventing models from describing actions instead of calling tools.
     pub tool_use_enforcement: ToolUseEnforcement,
 }
@@ -1531,6 +1693,7 @@ impl Default for DefaultsConfig {
             coalesce: CoalesceConfig::default(),
             ingestion: IngestionConfig::default(),
             cortex: CortexConfig::default(),
+            autonomy: AutonomyConfig::default(),
             warmup: WarmupConfig::default(),
             skills: SkillsConfig::default(),
             participant_context: ParticipantContextConfig::default(),
@@ -1599,6 +1762,7 @@ impl AgentConfig {
             coalesce: self.coalesce.unwrap_or(defaults.coalesce),
             ingestion: self.ingestion.unwrap_or(defaults.ingestion),
             cortex: self.cortex.unwrap_or(defaults.cortex),
+            autonomy: self.autonomy.unwrap_or(defaults.autonomy),
             warmup: self.warmup.unwrap_or(defaults.warmup),
             skills: self.skills.unwrap_or(defaults.skills),
             browser: self
@@ -1620,6 +1784,7 @@ impl AgentConfig {
                 .unwrap_or_else(|| defaults.projects.clone()),
             history_backfill_count: defaults.history_backfill_count,
             cron: self.cron.clone(),
+            wakes: self.wakes.clone(),
             tool_use_enforcement: self
                 .tool_use_enforcement
                 .clone()
@@ -1807,6 +1972,12 @@ pub struct Binding {
     pub require_mention: bool,
     /// User IDs allowed to DM the bot through this binding.
     pub dm_allowed_users: Vec<String>,
+    /// User IDs allowed to run authority-gated slash commands in scopes
+    /// matched by this binding. `None` (key omitted) falls back to the
+    /// adapter-instance default; `Some(vec![])` (explicit `authority = []`)
+    /// opens commands to everyone this binding admits, even when the
+    /// adapter default is restricted.
+    pub authority: Option<Vec<String>>,
     /// Default conversation settings for channels matched by this binding.
     pub settings: Option<crate::conversation::ConversationSettings>,
 }
@@ -2511,6 +2682,28 @@ pub fn resolve_agent_for_message(
     Some((std::sync::Arc::from(default_agent_id), None))
 }
 
+/// The binding that routes `message`, matched on routing criteria only.
+/// Uses the same first-match-wins scan as [`resolve_agent_for_message`], so
+/// the result is always the binding that actually routed the message.
+pub fn matched_binding<'a>(
+    bindings: &'a [Binding],
+    message: &crate::InboundMessage,
+) -> Option<&'a Binding> {
+    bindings
+        .iter()
+        .find(|binding| binding.matches_route(message))
+}
+
+/// Authority list of the binding that routes `message`, for slash-command
+/// access checks. `None` when no binding matched or the matched binding
+/// omits `authority` — both fall back to the adapter default downstream.
+pub fn matched_binding_authority(
+    bindings: &[Binding],
+    message: &crate::InboundMessage,
+) -> Option<Vec<String>> {
+    matched_binding(bindings, message).and_then(|binding| binding.authority.clone())
+}
+
 // ---------------------------------------------------------------------------
 // Messaging platform configs
 // ---------------------------------------------------------------------------
@@ -2536,6 +2729,8 @@ pub struct DiscordConfig {
     pub instances: Vec<DiscordInstanceConfig>,
     /// User IDs allowed to DM the bot. If empty, DMs are ignored entirely.
     pub dm_allowed_users: Vec<String>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
     /// Whether to process messages from other bots (self-messages are always ignored).
     pub allow_bot_messages: bool,
 }
@@ -2547,6 +2742,8 @@ pub struct DiscordInstanceConfig {
     pub token: String,
     /// User IDs allowed to DM this bot instance.
     pub dm_allowed_users: Vec<String>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
     /// Whether this bot instance processes messages from other bots.
     pub allow_bot_messages: bool,
 }
@@ -2558,6 +2755,7 @@ impl std::fmt::Debug for DiscordInstanceConfig {
             .field("enabled", &self.enabled)
             .field("token", &"[REDACTED]")
             .field("dm_allowed_users", &self.dm_allowed_users)
+            .field("authority", &self.authority)
             .field("allow_bot_messages", &self.allow_bot_messages)
             .finish()
     }
@@ -2570,6 +2768,7 @@ impl std::fmt::Debug for DiscordConfig {
             .field("token", &"[REDACTED]")
             .field("instances", &self.instances)
             .field("dm_allowed_users", &self.dm_allowed_users)
+            .field("authority", &self.authority)
             .field("allow_bot_messages", &self.allow_bot_messages)
             .finish()
     }
@@ -2596,20 +2795,6 @@ impl SystemSecrets for DiscordConfig {
     }
 }
 
-/// A single slash command definition for the Slack adapter.
-///
-/// Maps a Slack slash command (e.g. `/ask`) to a target agent.
-/// Commands not listed here are acknowledged but produce a "not configured" reply.
-#[derive(Debug, Clone)]
-pub struct SlackCommandConfig {
-    /// The slash command string exactly as Slack sends it, e.g. `"/ask"`.
-    pub command: String,
-    /// ID of the agent that should handle this command.
-    pub agent_id: String,
-    /// Short description shown in Slack's command autocomplete hint (optional).
-    pub description: Option<String>,
-}
-
 #[derive(Clone)]
 pub struct SlackConfig {
     pub enabled: bool,
@@ -2619,8 +2804,8 @@ pub struct SlackConfig {
     pub instances: Vec<SlackInstanceConfig>,
     /// User IDs allowed to DM the bot. If empty, DMs are ignored entirely.
     pub dm_allowed_users: Vec<String>,
-    /// Slash command definitions. If empty, all slash commands are ignored.
-    pub commands: Vec<SlackCommandConfig>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -2631,8 +2816,8 @@ pub struct SlackInstanceConfig {
     pub app_token: String,
     /// User IDs allowed to DM this app instance.
     pub dm_allowed_users: Vec<String>,
-    /// Slash command definitions for this app instance.
-    pub commands: Vec<SlackCommandConfig>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
 }
 
 impl std::fmt::Debug for SlackInstanceConfig {
@@ -2643,7 +2828,7 @@ impl std::fmt::Debug for SlackInstanceConfig {
             .field("bot_token", &"[REDACTED]")
             .field("app_token", &"[REDACTED]")
             .field("dm_allowed_users", &self.dm_allowed_users)
-            .field("commands", &self.commands)
+            .field("authority", &self.authority)
             .finish()
     }
 }
@@ -2656,7 +2841,7 @@ impl std::fmt::Debug for SlackConfig {
             .field("app_token", &"[REDACTED]")
             .field("instances", &self.instances)
             .field("dm_allowed_users", &self.dm_allowed_users)
-            .field("commands", &self.commands)
+            .field("authority", &self.authority)
             .finish()
     }
 }
@@ -2700,6 +2885,8 @@ pub struct TelegramConfig {
     pub instances: Vec<TelegramInstanceConfig>,
     /// User IDs allowed to DM the bot. If empty, DMs are ignored entirely.
     pub dm_allowed_users: Vec<String>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -2709,6 +2896,8 @@ pub struct TelegramInstanceConfig {
     pub token: String,
     /// User IDs allowed to DM this bot instance.
     pub dm_allowed_users: Vec<String>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
 }
 
 impl std::fmt::Debug for TelegramInstanceConfig {
@@ -2718,6 +2907,7 @@ impl std::fmt::Debug for TelegramInstanceConfig {
             .field("enabled", &self.enabled)
             .field("token", &"[REDACTED]")
             .field("dm_allowed_users", &self.dm_allowed_users)
+            .field("authority", &self.authority)
             .finish()
     }
 }
@@ -2729,6 +2919,7 @@ impl std::fmt::Debug for TelegramConfig {
             .field("token", &"[REDACTED]")
             .field("instances", &self.instances)
             .field("dm_allowed_users", &self.dm_allowed_users)
+            .field("authority", &self.authority)
             .finish()
     }
 }
@@ -2772,6 +2963,8 @@ pub struct EmailConfig {
     pub poll_interval_secs: u64,
     pub folders: Vec<String>,
     pub allowed_senders: Vec<String>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
     pub max_body_bytes: usize,
     pub max_attachment_bytes: usize,
     pub instances: Vec<EmailInstanceConfig>,
@@ -2797,6 +2990,8 @@ pub struct EmailInstanceConfig {
     pub poll_interval_secs: u64,
     pub folders: Vec<String>,
     pub allowed_senders: Vec<String>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
     pub max_body_bytes: usize,
     pub max_attachment_bytes: usize,
 }
@@ -2821,6 +3016,7 @@ impl std::fmt::Debug for EmailInstanceConfig {
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("folders", &self.folders)
             .field("allowed_senders", &"[REDACTED]")
+            .field("authority", &self.authority)
             .field("max_body_bytes", &self.max_body_bytes)
             .field("max_attachment_bytes", &self.max_attachment_bytes)
             .finish()
@@ -2846,6 +3042,7 @@ impl std::fmt::Debug for EmailConfig {
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("folders", &self.folders)
             .field("allowed_senders", &"[REDACTED]")
+            .field("authority", &self.authority)
             .field("max_body_bytes", &self.max_body_bytes)
             .field("max_attachment_bytes", &self.max_attachment_bytes)
             .finish()
@@ -2911,6 +3108,8 @@ pub struct TwitchConfig {
     pub instances: Vec<TwitchInstanceConfig>,
     /// Channels to join (without the # prefix).
     pub channels: Vec<String>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
     /// Optional prefix that triggers the bot (e.g. "!ask"). If empty, all messages are processed.
     pub trigger_prefix: Option<String>,
 }
@@ -2926,6 +3125,8 @@ pub struct TwitchInstanceConfig {
     pub refresh_token: Option<String>,
     /// Channels to join (without the # prefix).
     pub channels: Vec<String>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
     /// Optional prefix that triggers the bot for this instance.
     pub trigger_prefix: Option<String>,
 }
@@ -2947,6 +3148,7 @@ impl std::fmt::Debug for TwitchInstanceConfig {
                 &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field("channels", &self.channels)
+            .field("authority", &self.authority)
             .field("trigger_prefix", &self.trigger_prefix)
             .finish()
     }
@@ -2960,6 +3162,7 @@ impl std::fmt::Debug for TwitchConfig {
             .field("oauth_token", &"[REDACTED]")
             .field("instances", &self.instances)
             .field("channels", &self.channels)
+            .field("authority", &self.authority)
             .field("trigger_prefix", &self.trigger_prefix)
             .finish()
     }
@@ -3036,6 +3239,8 @@ pub struct SignalConfig {
     pub instances: Vec<SignalInstanceConfig>,
     /// Phone numbers or UUIDs allowed to DM the bot. If empty, DMs are ignored.
     pub dm_allowed_users: Vec<String>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
     /// Group IDs allowed for this adapter. If empty, all groups are blocked
     /// (same as `None` in the permission filter — groups are opt-in only).
     pub group_ids: Vec<String>,
@@ -3056,6 +3261,8 @@ pub struct SignalInstanceConfig {
     pub account: String,
     /// Phone numbers or UUIDs allowed to DM this instance.
     pub dm_allowed_users: Vec<String>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
     /// Group IDs allowed for this instance.
     pub group_ids: Vec<String>,
     /// User IDs allowed to message in Signal groups for this instance.
@@ -3072,6 +3279,7 @@ impl std::fmt::Debug for SignalInstanceConfig {
             .field("http_url", &"[REDACTED]")
             .field("account", &"[REDACTED]")
             .field("dm_allowed_users", &"[REDACTED]")
+            .field("authority", &self.authority)
             .field("group_ids", &self.group_ids)
             .field("group_allowed_users", &"[REDACTED]")
             .field("ignore_stories", &self.ignore_stories)
@@ -3087,6 +3295,7 @@ impl std::fmt::Debug for SignalConfig {
             .field("account", &"[REDACTED]")
             .field("instances", &self.instances)
             .field("dm_allowed_users", &"[REDACTED]")
+            .field("authority", &self.authority)
             .field("group_ids", &self.group_ids)
             .field("group_allowed_users", &"[REDACTED]")
             .field("ignore_stories", &self.ignore_stories)
@@ -3127,6 +3336,8 @@ pub struct MattermostConfig {
     pub team_id: Option<String>,
     pub instances: Vec<MattermostInstanceConfig>,
     pub dm_allowed_users: Vec<String>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
     pub max_attachment_bytes: usize,
 }
 
@@ -3139,6 +3350,7 @@ impl std::fmt::Debug for MattermostConfig {
             .field("team_id", &self.team_id)
             .field("instances", &self.instances)
             .field("dm_allowed_users", &self.dm_allowed_users)
+            .field("authority", &self.authority)
             .field("max_attachment_bytes", &self.max_attachment_bytes)
             .finish()
     }
@@ -3152,6 +3364,8 @@ pub struct MattermostInstanceConfig {
     pub token: String,
     pub team_id: Option<String>,
     pub dm_allowed_users: Vec<String>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
     pub max_attachment_bytes: usize,
 }
 
@@ -3195,6 +3409,7 @@ impl std::fmt::Debug for MattermostInstanceConfig {
             .field("token", &"[REDACTED]")
             .field("team_id", &self.team_id)
             .field("dm_allowed_users", &self.dm_allowed_users)
+            .field("authority", &self.authority)
             .field("max_attachment_bytes", &self.max_attachment_bytes)
             .finish()
     }
@@ -3262,5 +3477,134 @@ mod mattermost_url_tests {
     #[test]
     fn rejects_fragment() {
         assert!(validate_mattermost_url("https://mattermost.example.com/#section").is_err());
+    }
+}
+
+#[cfg(test)]
+mod autonomy_config_validation_tests {
+    use super::{AutonomyConfig, AutonomyLevel};
+
+    #[test]
+    fn autonomy_level_round_trips() {
+        for level in AutonomyLevel::ALL {
+            assert_eq!(AutonomyLevel::parse(level.as_str()), Some(level));
+        }
+        assert_eq!(AutonomyLevel::parse("aggressive"), None);
+        assert_eq!(AutonomyLevel::default(), AutonomyLevel::Off);
+    }
+
+    #[test]
+    fn autonomy_levels_order_by_capability() {
+        assert!(AutonomyLevel::Off < AutonomyLevel::Observe);
+        assert!(AutonomyLevel::Observe < AutonomyLevel::Suggest);
+        assert!(AutonomyLevel::Suggest < AutonomyLevel::Act);
+    }
+
+    #[test]
+    fn autonomy_defaults_pass_validation() {
+        let config = AutonomyConfig::default()
+            .validated("defaults.autonomy")
+            .expect("defaults must validate");
+        assert_eq!(config, AutonomyConfig::default());
+    }
+
+    #[test]
+    fn autonomy_rejects_short_interval() {
+        let error = AutonomyConfig {
+            interval_secs: 59,
+            timeout_secs: 59,
+            warn_secs: 30,
+            ..AutonomyConfig::default()
+        }
+        .validated("defaults.autonomy")
+        .expect_err("interval < 60 must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("defaults.autonomy.interval_secs")
+        );
+    }
+
+    #[test]
+    fn autonomy_rejects_timeout_longer_than_interval() {
+        let error = AutonomyConfig {
+            interval_secs: 300,
+            timeout_secs: 301,
+            ..AutonomyConfig::default()
+        }
+        .validated("agents.main.autonomy")
+        .expect_err("timeout > interval must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("agents.main.autonomy.timeout_secs")
+        );
+    }
+
+    #[test]
+    fn autonomy_allows_timeout_equal_to_interval() {
+        // Back-to-back runs (continuous operation) are valid but intentional.
+        let config = AutonomyConfig {
+            interval_secs: 600,
+            timeout_secs: 600,
+            ..AutonomyConfig::default()
+        }
+        .validated("defaults.autonomy")
+        .expect("timeout == interval is valid");
+        assert_eq!(config.timeout_secs, 600);
+    }
+
+    #[test]
+    fn autonomy_clamps_warn_at_or_past_timeout() {
+        let config = AutonomyConfig {
+            timeout_secs: 600,
+            warn_secs: 600,
+            ..AutonomyConfig::default()
+        }
+        .validated("defaults.autonomy")
+        .expect("warn violation clamps, not errors");
+        assert_eq!(config.warn_secs, 540);
+
+        let config = AutonomyConfig {
+            timeout_secs: 600,
+            warn_secs: 9999,
+            ..AutonomyConfig::default()
+        }
+        .validated("defaults.autonomy")
+        .expect("warn violation clamps, not errors");
+        assert_eq!(config.warn_secs, 540);
+    }
+
+    #[test]
+    fn autonomy_rejects_zero_max_tasks() {
+        let error = AutonomyConfig {
+            max_tasks_per_run: 0,
+            ..AutonomyConfig::default()
+        }
+        .validated("defaults.autonomy")
+        .expect_err("max_tasks_per_run 0 must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("defaults.autonomy.max_tasks_per_run")
+        );
+    }
+
+    #[test]
+    fn autonomy_rejects_out_of_range_active_hours() {
+        let error = AutonomyConfig {
+            active_hours: Some((8, 24)),
+            ..AutonomyConfig::default()
+        }
+        .validated("defaults.autonomy")
+        .expect_err("hour 24 must fail");
+        assert!(error.to_string().contains("active_hours"));
+
+        AutonomyConfig {
+            active_hours: Some((22, 6)),
+            ..AutonomyConfig::default()
+        }
+        .validated("defaults.autonomy")
+        .expect("midnight-wrapping window is valid");
     }
 }

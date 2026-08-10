@@ -583,6 +583,7 @@ impl Worker {
             self.wiki_write,
             self.deps.wiki_store.clone(),
             Some(self.blocked_signal.clone()),
+            self.deps.lifecycle(),
         );
 
         let routing = self.deps.runtime_config.routing.load();

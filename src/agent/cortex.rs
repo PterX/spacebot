@@ -2512,6 +2512,13 @@ async fn run_cortex_loop(
                     tracing::warn!(%error, "working memory event pruning failed");
                 }
 
+                crate::wakes::fire_due_schedule_wakes(&cortex.deps).await;
+
+                // Autonomy: start a run when the interval has elapsed or wake
+                // events are pending. The check is a few cheap SQL queries;
+                // the run itself is spawned as a task so the tick never blocks.
+                crate::agent::autonomy::maybe_run_autonomy(&cortex.deps).await;
+
                 let updated_tick_interval_secs = cortex_config.tick_interval_secs.max(1);
                 if updated_tick_interval_secs != tick_interval_secs {
                     tick_interval_secs = updated_tick_interval_secs;
@@ -3902,6 +3909,25 @@ async fn run_ready_task_loop(deps: &AgentDeps, logger: &CortexLogger) -> anyhow:
 }
 
 async fn pickup_one_ready_task(deps: &AgentDeps, logger: &CortexLogger) -> anyhow::Result<()> {
+    // Ready-task execution is Act-only. Observe and Suggest agents survey and
+    // propose but never execute approved work without a user present, and Off
+    // disables autonomous pickup entirely. The instance ceiling caps the
+    // per-agent dial. See docs/design-docs/autonomy.md.
+    let autonomy_level = deps
+        .runtime_config
+        .autonomy
+        .load()
+        .level
+        .min(**deps.autonomy_ceiling.load());
+    if !crate::agent::autonomy::ready_pickup_allowed(autonomy_level) {
+        tracing::debug!(
+            agent_id = %deps.agent_id,
+            level = %autonomy_level,
+            "ready-task pickup skipped: autonomy level below act"
+        );
+        return Ok(());
+    }
+
     let Some(task) = deps.task_store.claim_next_ready(&deps.agent_id).await? else {
         return Ok(());
     };
@@ -5546,6 +5572,7 @@ mod tests {
                 assigned_agent_id TEXT NOT NULL,
                 subtasks TEXT,
                 metadata TEXT,
+                goal_id TEXT,
                 source_memory_id TEXT,
                 worker_id TEXT,
                 created_by TEXT NOT NULL,
@@ -5630,6 +5657,7 @@ mod tests {
                 assigned_agent_id TEXT NOT NULL,
                 subtasks TEXT,
                 metadata TEXT,
+                goal_id TEXT,
                 source_memory_id TEXT,
                 worker_id TEXT,
                 created_by TEXT NOT NULL,

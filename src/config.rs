@@ -560,18 +560,19 @@ bind = "127.0.0.1"
     /// Helper to build a minimal `SlackConfig` for permission tests.
     fn slack_config_with_dm_users(dm_allowed_users: Vec<String>) -> SlackConfig {
         SlackConfig {
+            authority: vec![],
             enabled: true,
             bot_token: "xoxb-test".into(),
             app_token: "xapp-test".into(),
             instances: vec![],
             dm_allowed_users,
-            commands: vec![],
         }
     }
 
     /// Helper to build a Slack binding with optional dm_allowed_users.
     fn slack_binding(workspace_id: Option<&str>, dm_allowed_users: Vec<String>) -> Binding {
         Binding {
+            authority: None,
             agent_id: "test-agent".into(),
             channel: "slack".into(),
             adapter: None,
@@ -1473,6 +1474,7 @@ id = "main"
     #[test]
     fn binding_runtime_adapter_key_method() {
         let binding = Binding {
+            authority: None,
             agent_id: "main".into(),
             channel: "telegram".into(),
             adapter: Some("sales".into()),
@@ -1491,6 +1493,7 @@ id = "main"
     #[test]
     fn binding_uses_default_adapter() {
         let binding = Binding {
+            authority: None,
             agent_id: "main".into(),
             channel: "discord".into(),
             adapter: None,
@@ -1524,6 +1527,7 @@ id = "main"
     #[test]
     fn adapter_matches_default_binding_default_message() {
         let binding = Binding {
+            authority: None,
             agent_id: "main".into(),
             channel: "telegram".into(),
             adapter: None,
@@ -1543,6 +1547,7 @@ id = "main"
     #[test]
     fn adapter_matches_named_binding_named_message() {
         let binding = Binding {
+            authority: None,
             agent_id: "main".into(),
             channel: "telegram".into(),
             adapter: Some("support".into()),
@@ -1562,6 +1567,7 @@ id = "main"
     #[test]
     fn adapter_mismatch_named_vs_default() {
         let binding = Binding {
+            authority: None,
             agent_id: "main".into(),
             channel: "telegram".into(),
             adapter: Some("support".into()),
@@ -1581,6 +1587,7 @@ id = "main"
     #[test]
     fn adapter_mismatch_default_vs_named() {
         let binding = Binding {
+            authority: None,
             agent_id: "main".into(),
             channel: "telegram".into(),
             adapter: None,
@@ -1600,6 +1607,7 @@ id = "main"
     #[test]
     fn adapter_mismatch_different_names() {
         let binding = Binding {
+            authority: None,
             agent_id: "main".into(),
             channel: "telegram".into(),
             adapter: Some("support".into()),
@@ -1617,14 +1625,51 @@ id = "main"
     }
 
     #[test]
+    fn matched_binding_resolves_preassigned_portal_messages() {
+        let bindings = vec![Binding {
+            authority: Some(vec!["42".into()]),
+            agent_id: "orion".into(),
+            channel: "portal".into(),
+            adapter: None,
+            guild_id: None,
+            workspace_id: None,
+            chat_id: None,
+            team_id: None,
+            channel_ids: vec![],
+            require_mention: false,
+            dm_allowed_users: vec![],
+            settings: None,
+        }];
+
+        // Portal sends preassign `agent_id`, so the router skips agent
+        // resolution — the binding scan must still find this binding.
+        let mut message = test_inbound_message("portal", Some("portal"));
+        message.agent_id = Some(std::sync::Arc::from("orion"));
+
+        let matched =
+            matched_binding(&bindings, &message).expect("portal binding should match on agent_id");
+        assert_eq!(matched.agent_id, "orion");
+        assert_eq!(
+            matched_binding_authority(&bindings, &message),
+            Some(vec!["42".to_string()])
+        );
+
+        let mut other_agent = test_inbound_message("portal", Some("portal"));
+        other_agent.agent_id = Some(std::sync::Arc::from("someone-else"));
+        assert!(matched_binding(&bindings, &other_agent).is_none());
+    }
+
+    #[test]
     fn validate_named_adapters_valid_config() {
         let messaging = MessagingConfig {
             discord: None,
             slack: None,
             telegram: Some(TelegramConfig {
+                authority: vec![],
                 enabled: true,
                 token: "tok".into(),
                 instances: vec![TelegramInstanceConfig {
+                    authority: vec![],
                     name: "support".into(),
                     enabled: true,
                     token: "tok2".into(),
@@ -1640,6 +1685,7 @@ id = "main"
         };
         let bindings = vec![
             Binding {
+                authority: None,
                 agent_id: "main".into(),
                 channel: "telegram".into(),
                 adapter: None,
@@ -1653,6 +1699,7 @@ id = "main"
                 settings: None,
             },
             Binding {
+                authority: None,
                 agent_id: "support-agent".into(),
                 channel: "telegram".into(),
                 adapter: Some("support".into()),
@@ -1677,6 +1724,7 @@ id = "main"
             discord: None,
             slack: None,
             telegram: Some(TelegramConfig {
+                authority: vec![],
                 enabled: true,
                 token: "tok".into(),
                 instances: vec![],
@@ -1689,6 +1737,7 @@ id = "main"
             mattermost: None,
         };
         let bindings = vec![Binding {
+            authority: None,
             agent_id: "main".into(),
             channel: "telegram".into(),
             adapter: Some("nonexistent".into()),
@@ -1731,6 +1780,7 @@ id = "main"
             slack: None,
             telegram: None,
             email: Some(EmailConfig {
+                authority: vec![],
                 enabled: true,
                 imap_host: "imap.test.com".into(),
                 imap_port: 993,
@@ -1757,6 +1807,7 @@ id = "main"
             mattermost: None,
         };
         let bindings = vec![Binding {
+            authority: None,
             agent_id: "main".into(),
             channel: "email".into(),
             adapter: Some("named".into()),
@@ -1783,9 +1834,11 @@ id = "main"
             discord: None,
             slack: None,
             telegram: Some(TelegramConfig {
+                authority: vec![],
                 enabled: true,
                 token: "".into(), // no default credential
                 instances: vec![TelegramInstanceConfig {
+                    authority: vec![],
                     name: "support".into(),
                     enabled: true,
                     token: "tok".into(),
@@ -1801,6 +1854,7 @@ id = "main"
         };
         // Binding targets default adapter, but no default credentials exist
         let bindings = vec![Binding {
+            authority: None,
             agent_id: "main".into(),
             channel: "telegram".into(),
             adapter: None,
@@ -1827,9 +1881,11 @@ id = "main"
             discord: None,
             slack: None,
             telegram: Some(TelegramConfig {
+                authority: vec![],
                 enabled: true,
                 token: "tok".into(),
                 instances: vec![TelegramInstanceConfig {
+                    authority: vec![],
                     name: "support".into(),
                     enabled: true,
                     token: "tok2".into(),
@@ -1846,6 +1902,7 @@ id = "main"
         let bindings = vec![
             // Valid: default adapter with credentials
             Binding {
+                authority: None,
                 agent_id: "agent-a".into(),
                 channel: "telegram".into(),
                 adapter: None,
@@ -1860,6 +1917,7 @@ id = "main"
             },
             // Invalid: references a non-existent named adapter
             Binding {
+                authority: None,
                 agent_id: "agent-b".into(),
                 channel: "telegram".into(),
                 adapter: Some("ghost".into()),
@@ -1874,6 +1932,7 @@ id = "main"
             },
             // Valid: references an existing named adapter
             Binding {
+                authority: None,
                 agent_id: "agent-c".into(),
                 channel: "telegram".into(),
                 adapter: Some("support".into()),
@@ -1888,6 +1947,7 @@ id = "main"
             },
             // Invalid: no discord config at all
             Binding {
+                authority: None,
                 agent_id: "agent-d".into(),
                 channel: "discord".into(),
                 adapter: None,
@@ -1925,6 +1985,7 @@ id = "main"
             mattermost: None,
         };
         let bindings = vec![Binding {
+            authority: None,
             agent_id: "main".into(),
             channel: "telegram".into(),
             adapter: None,
@@ -1958,6 +2019,7 @@ id = "main"
             mattermost: None,
         };
         let bindings = vec![Binding {
+            authority: None,
             agent_id: "main".into(),
             channel: "telegram".into(),
             adapter: None,
@@ -1983,9 +2045,11 @@ id = "main"
             discord: None,
             slack: None,
             telegram: Some(TelegramConfig {
+                authority: vec![],
                 enabled: true,
                 token: "tok".into(),
                 instances: vec![TelegramInstanceConfig {
+                    authority: vec![],
                     name: "support".into(),
                     enabled: false,
                     token: "tok2".into(),
@@ -2000,6 +2064,7 @@ id = "main"
             mattermost: None,
         };
         let bindings = vec![Binding {
+            authority: None,
             agent_id: "main".into(),
             channel: "telegram".into(),
             adapter: Some("support".into()),
@@ -2026,6 +2091,7 @@ id = "main"
             discord: None,
             slack: None,
             telegram: Some(TelegramConfig {
+                authority: vec![],
                 enabled: false,
                 token: "tok".into(),
                 instances: vec![],
@@ -2038,6 +2104,7 @@ id = "main"
             mattermost: None,
         };
         let bindings = vec![Binding {
+            authority: None,
             agent_id: "main".into(),
             channel: "telegram".into(),
             adapter: None,

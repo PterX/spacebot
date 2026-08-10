@@ -182,6 +182,7 @@ impl EmailAdapter {
         // Build a temporary EmailConfig to reuse build_smtp_transport and shared logic.
         let email_config = EmailConfig {
             enabled: config.enabled,
+            authority: config.authority.clone(),
             imap_host: config.imap_host.clone(),
             imap_port: config.imap_port,
             imap_username: config.imap_username.clone(),

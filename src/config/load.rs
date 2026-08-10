@@ -11,15 +11,16 @@ use super::providers::{
 };
 use super::toml_schema::*;
 use super::{
-    AgentConfig, ApiConfig, ApiType, Binding, BrowserConfig, ChannelConfig, ClosePolicy,
-    CoalesceConfig, CompactionConfig, Config, CortexConfig, CronDef, DefaultsConfig, DiscordConfig,
-    DiscordInstanceConfig, EmailConfig, EmailInstanceConfig, GroupDef, HumanDef, IngestionConfig,
-    LinkDef, LlmConfig, MattermostConfig, MattermostInstanceConfig, McpServerConfig, McpTransport,
-    MemoryJanitorConfig, MemoryPersistenceConfig, MessagingConfig, MetricsConfig, OpenCodeConfig,
+    AgentConfig, ApiConfig, ApiType, AutonomyConfig, AutonomyLevel, Binding, BrowserConfig,
+    ChannelConfig, ClosePolicy, CoalesceConfig, CompactionConfig, Config, CortexConfig, CronDef,
+    DefaultsConfig, DiscordConfig, DiscordInstanceConfig, EmailConfig, EmailInstanceConfig,
+    GroupDef, HumanDef, IngestionConfig, LinkDef, LlmConfig, MattermostConfig,
+    MattermostInstanceConfig, McpServerConfig, McpTransport, MemoryJanitorConfig,
+    MemoryPersistenceConfig, MessagingConfig, MetricsConfig, OpenCodeConfig,
     ParticipantContextConfig, ProjectsConfig, ProviderConfig, ReflectionConfig, SignalConfig,
-    SignalInstanceConfig, SkillsConfig, SlackCommandConfig, SlackConfig, SlackInstanceConfig,
-    TelegramConfig, TelegramInstanceConfig, TelemetryConfig, TwitchConfig, TwitchInstanceConfig,
-    WarmupConfig, WebhookConfig, normalize_adapter, validate_named_messaging_adapters,
+    SignalInstanceConfig, SkillsConfig, SlackConfig, SlackInstanceConfig, TelegramConfig,
+    TelegramInstanceConfig, TelemetryConfig, TwitchConfig, TwitchInstanceConfig, WarmupConfig,
+    WebhookConfig, normalize_adapter, validate_named_messaging_adapters,
 };
 use crate::error::{ConfigError, Result};
 
@@ -97,6 +98,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "metrics",
     "telemetry",
     "memory_janitor",
+    "autonomy",
 ];
 
 /// Pre-parse check that warns about unrecognised top-level keys in a config
@@ -282,6 +284,31 @@ impl CortexConfig {
         };
         config.validate_maintenance_bounds()?;
         Ok(config)
+    }
+}
+
+impl AutonomyConfig {
+    fn resolve(
+        overrides: TomlAutonomyConfig,
+        defaults: AutonomyConfig,
+        scope: &str,
+    ) -> Result<AutonomyConfig> {
+        AutonomyConfig {
+            level: overrides.level.unwrap_or(defaults.level),
+            interval_secs: overrides.interval_secs.unwrap_or(defaults.interval_secs),
+            active_hours: overrides.active_hours.or(defaults.active_hours),
+            max_turns: overrides.max_turns.unwrap_or(defaults.max_turns),
+            max_tasks_per_run: overrides
+                .max_tasks_per_run
+                .unwrap_or(defaults.max_tasks_per_run),
+            timeout_secs: overrides.timeout_secs.unwrap_or(defaults.timeout_secs),
+            warn_secs: overrides.warn_secs.unwrap_or(defaults.warn_secs),
+            run_history_count: overrides
+                .run_history_count
+                .unwrap_or(defaults.run_history_count),
+            claim_unowned: overrides.claim_unowned.unwrap_or(defaults.claim_unowned),
+        }
+        .validated(scope)
     }
 }
 
@@ -957,6 +984,7 @@ impl Config {
             coalesce: None,
             ingestion: None,
             cortex: None,
+            autonomy: None,
             warmup: None,
             skills: None,
             browser: None,
@@ -968,6 +996,7 @@ impl Config {
             sandbox: None,
             projects: None,
             cron: Vec::new(),
+            wakes: Vec::new(),
         }];
 
         let mut api = ApiConfig::default();
@@ -1011,6 +1040,7 @@ impl Config {
                 sample_rate: 1.0,
             },
             memory_janitor: MemoryJanitorConfig::default(),
+            autonomy_ceiling: AutonomyLevel::Act,
         })
     }
 
@@ -1638,6 +1668,12 @@ impl Config {
                 .map(|c| CortexConfig::resolve(c, base_defaults.cortex))
                 .transpose()?
                 .unwrap_or(base_defaults.cortex),
+            autonomy: toml
+                .defaults
+                .autonomy
+                .map(|a| AutonomyConfig::resolve(a, base_defaults.autonomy, "defaults.autonomy"))
+                .transpose()?
+                .unwrap_or(base_defaults.autonomy),
             warmup: toml
                 .defaults
                 .warmup
@@ -1843,6 +1879,22 @@ impl Config {
                     })
                     .collect();
 
+                let autonomy = a
+                    .autonomy
+                    .map(|c| {
+                        AutonomyConfig::resolve(
+                            c,
+                            defaults.autonomy,
+                            &format!("agents.{}.autonomy", a.id),
+                        )
+                    })
+                    .transpose()?;
+
+                let wakes = a.wakes;
+                for wake in &wakes {
+                    wake.validated(&format!("agents.{}.wakes.{}", a.id, wake.id))?;
+                }
+
                 Ok(AgentConfig {
                     id: a.id,
                     default: a.default,
@@ -1896,6 +1948,7 @@ impl Config {
                         .cortex
                         .map(|c| CortexConfig::resolve(c, defaults.cortex))
                         .transpose()?,
+                    autonomy,
                     warmup: a.warmup.map(|w| WarmupConfig {
                         enabled: w.enabled.unwrap_or(defaults.warmup.enabled),
                         eager_embedding_load: w
@@ -1981,6 +2034,7 @@ impl Config {
                         }
                     }),
                     cron,
+                    wakes,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2006,6 +2060,7 @@ impl Config {
                 coalesce: None,
                 ingestion: None,
                 cortex: None,
+                autonomy: None,
                 warmup: None,
                 skills: None,
                 browser: None,
@@ -2017,6 +2072,7 @@ impl Config {
                 sandbox: None,
                 projects: None,
                 cron: Vec::new(),
+                wakes: Vec::new(),
             });
         }
 
@@ -2040,6 +2096,7 @@ impl Config {
                             );
                         }
                         DiscordInstanceConfig {
+                            authority: instance.authority,
                             name: instance.name,
                             enabled: instance.enabled && token.is_some(),
                             token: token.unwrap_or_default(),
@@ -2058,6 +2115,7 @@ impl Config {
                 }
 
                 Some(DiscordConfig {
+                    authority: d.authority,
                     enabled: d.enabled,
                     token: token.unwrap_or_default(),
                     instances,
@@ -2082,20 +2140,12 @@ impl Config {
                         }
                         let has_credentials = bot_token.is_some() && app_token.is_some();
                         SlackInstanceConfig {
+                            authority: instance.authority,
                             name: instance.name,
                             enabled: instance.enabled && has_credentials,
                             bot_token: bot_token.unwrap_or_default(),
                             app_token: app_token.unwrap_or_default(),
                             dm_allowed_users: instance.dm_allowed_users,
-                            commands: instance
-                                .commands
-                                .into_iter()
-                                .map(|command| SlackCommandConfig {
-                                    command: command.command,
-                                    agent_id: command.agent_id,
-                                    description: command.description,
-                                })
-                                .collect(),
                         }
                     })
                     .collect::<Vec<_>>();
@@ -2112,20 +2162,12 @@ impl Config {
                 }
 
                 Some(SlackConfig {
+                    authority: s.authority,
                     enabled: s.enabled,
                     bot_token: bot_token.unwrap_or_default(),
                     app_token: app_token.unwrap_or_default(),
                     instances,
                     dm_allowed_users: s.dm_allowed_users,
-                    commands: s
-                        .commands
-                        .into_iter()
-                        .map(|c| SlackCommandConfig {
-                            command: c.command,
-                            agent_id: c.agent_id,
-                            description: c.description,
-                        })
-                        .collect(),
                 })
             }),
             telegram: toml.messaging.telegram.and_then(|t| {
@@ -2141,6 +2183,7 @@ impl Config {
                             );
                         }
                         TelegramInstanceConfig {
+                            authority: instance.authority,
                             name: instance.name,
                             enabled: instance.enabled && token.is_some(),
                             token: token.unwrap_or_default(),
@@ -2158,6 +2201,7 @@ impl Config {
                 }
 
                 Some(TelegramConfig {
+                    authority: t.authority,
                     enabled: t.enabled,
                     token: token.unwrap_or_default(),
                     instances,
@@ -2211,6 +2255,7 @@ impl Config {
                             instance.from_name.as_deref().and_then(resolve_env_value);
 
                         EmailInstanceConfig {
+                            authority: instance.authority,
                             name: instance.name,
                             enabled: instance.enabled && has_credentials,
                             imap_host: imap_host.unwrap_or_default(),
@@ -2282,6 +2327,7 @@ impl Config {
                     .or_else(|| email.from_name.as_deref().and_then(resolve_env_value));
 
                 Some(EmailConfig {
+                    authority: email.authority,
                     enabled: email.enabled,
                     imap_host,
                     imap_port: email.imap_port,
@@ -2340,6 +2386,7 @@ impl Config {
                             .as_deref()
                             .and_then(resolve_env_value);
                         TwitchInstanceConfig {
+                            authority: instance.authority,
                             name: instance.name,
                             enabled: instance.enabled && has_credentials,
                             username: username.unwrap_or_default(),
@@ -2380,6 +2427,7 @@ impl Config {
                     .and_then(resolve_env_value)
                     .or_else(|| std::env::var("TWITCH_REFRESH_TOKEN").ok());
                 Some(TwitchConfig {
+                    authority: t.authority,
                     enabled: t.enabled,
                     username: username.unwrap_or_default(),
                     oauth_token: oauth_token.unwrap_or_default(),
@@ -2406,6 +2454,7 @@ impl Config {
                         }
                         let has_credentials = http_url.is_some() && account.is_some();
                         SignalInstanceConfig {
+                            authority: instance.authority,
                             name: instance.name,
                             enabled: instance.enabled && has_credentials,
                             http_url: http_url.unwrap_or_default(),
@@ -2430,6 +2479,7 @@ impl Config {
                 }
 
                 Some(SignalConfig {
+                    authority: s.authority,
                     enabled: s.enabled,
                     http_url: http_url.unwrap_or_default(),
                     account: account.unwrap_or_default(),
@@ -2455,6 +2505,7 @@ impl Config {
                             );
                         }
                         MattermostInstanceConfig {
+                            authority: instance.authority,
                             name: instance.name,
                             enabled: instance.enabled && has_credentials,
                             base_url: base_url.unwrap_or_default(),
@@ -2479,6 +2530,7 @@ impl Config {
                 }
 
                 Some(MattermostConfig {
+                    authority: mm.authority,
                     enabled: mm.enabled,
                     base_url: base_url.unwrap_or_default(),
                     token: token.unwrap_or_default(),
@@ -2538,6 +2590,7 @@ impl Config {
                     cs
                 });
                 Binding {
+                    authority: b.authority,
                     agent_id: b.agent_id,
                     channel: b.channel,
                     adapter: normalize_adapter(b.adapter),
@@ -2680,6 +2733,19 @@ impl Config {
                 .unwrap_or_else(|| MemoryJanitorConfig::default().interval_secs),
         };
 
+        let autonomy_ceiling = match toml
+            .autonomy
+            .as_ref()
+            .and_then(|autonomy| autonomy.ceiling.as_deref())
+        {
+            Some(value) => AutonomyLevel::parse(value).ok_or_else(|| {
+                ConfigError::Invalid(format!(
+                    "autonomy.ceiling must be one of off, observe, suggest, act (got `{value}`)"
+                ))
+            })?,
+            None => AutonomyLevel::Act,
+        };
+
         Ok(Config {
             instance_dir,
             llm,
@@ -2694,6 +2760,7 @@ impl Config {
             metrics,
             telemetry,
             memory_janitor,
+            autonomy_ceiling,
         })
     }
 }
@@ -2735,5 +2802,116 @@ mod skills_config_tests {
         let merged = resolve_skills_config(toml, base);
         assert!(!merged.reflection.enabled);
         assert_eq!(merged.reflection.cooldown_secs, 60);
+    }
+}
+
+#[cfg(test)]
+mod autonomy_config_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_merges_partial_toml_over_defaults() {
+        let toml: TomlAutonomyConfig =
+            toml::from_str("level = \"suggest\"\ninterval_secs = 900\nactive_hours = [8, 22]")
+                .unwrap();
+        let resolved =
+            AutonomyConfig::resolve(toml, AutonomyConfig::default(), "defaults.autonomy")
+                .expect("valid overrides must resolve");
+
+        assert_eq!(resolved.level, crate::config::AutonomyLevel::Suggest);
+        assert_eq!(resolved.interval_secs, 900);
+        assert_eq!(resolved.active_hours, Some((8, 22)));
+        // Untouched fields inherit the defaults.
+        assert_eq!(
+            resolved.timeout_secs,
+            AutonomyConfig::default().timeout_secs
+        );
+        assert_eq!(
+            resolved.claim_unowned,
+            AutonomyConfig::default().claim_unowned
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_invalid_overrides_with_scoped_error() {
+        let toml: TomlAutonomyConfig = toml::from_str("interval_secs = 10").unwrap();
+        let error =
+            AutonomyConfig::resolve(toml, AutonomyConfig::default(), "agents.main.autonomy")
+                .expect_err("interval below the floor must reject the load");
+        assert!(
+            error
+                .to_string()
+                .contains("agents.main.autonomy.interval_secs")
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_unknown_level() {
+        assert!(toml::from_str::<TomlAutonomyConfig>("level = \"yolo\"").is_err());
+    }
+}
+
+#[cfg(test)]
+mod wake_config_tests {
+    use super::*;
+
+    #[test]
+    fn agent_wakes_parse_with_defaults() {
+        let agent: TomlAgentConfig = toml::from_str(
+            r#"
+            id = "main"
+
+            [[wakes]]
+            id = "morning-brief"
+            name = "Morning brief"
+            schedule = "0 8 * * *"
+            instructions = "Summarize overnight activity."
+            delivery_target = "discord:123456789"
+
+            [[wakes]]
+            id = "on-approve"
+            name = "Task approved"
+            event = "task.approved"
+            instructions = "Pick up the approved task."
+            min_level = "act"
+            enabled = false
+            "#,
+        )
+        .expect("agent wakes must parse");
+
+        assert_eq!(agent.wakes.len(), 2);
+        let brief = &agent.wakes[0];
+        assert_eq!(brief.min_level, crate::config::AutonomyLevel::Observe);
+        assert!(brief.enabled);
+        assert_eq!(
+            brief.validated("agents.main.wakes.morning-brief").unwrap(),
+            crate::wakes::WakeTrigger::Schedule {
+                cron_expr: Some("0 8 * * *".to_string()),
+                interval_secs: None,
+            }
+        );
+
+        let approve = &agent.wakes[1];
+        assert_eq!(approve.min_level, crate::config::AutonomyLevel::Act);
+        assert!(!approve.enabled);
+    }
+
+    #[test]
+    fn agent_wakes_reject_unknown_min_level() {
+        assert!(
+            toml::from_str::<TomlAgentConfig>(
+                r#"
+                id = "main"
+
+                [[wakes]]
+                id = "w"
+                name = "w"
+                event = "task.approved"
+                instructions = "x"
+                min_level = "yolo"
+                "#,
+            )
+            .is_err()
+        );
     }
 }

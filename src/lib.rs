@@ -12,8 +12,10 @@ pub mod db;
 pub mod error;
 pub mod factory;
 pub mod github_copilot_auth;
+pub mod goals;
 pub mod hooks;
 pub mod identity;
+pub mod lifecycle;
 pub mod links;
 pub mod llm;
 pub mod mcp;
@@ -25,6 +27,7 @@ pub mod opencode;
 pub mod projects;
 pub mod prompts;
 pub mod sandbox;
+pub mod schedule;
 pub mod secrets;
 pub mod self_awareness;
 pub mod settings;
@@ -34,6 +37,7 @@ pub mod tasks;
 pub mod telemetry;
 pub mod tools;
 pub mod update;
+pub mod wakes;
 pub mod wiki;
 
 pub use error::{Error, Result};
@@ -438,6 +442,17 @@ pub struct AgentDeps {
     pub llm_manager: Arc<llm::LlmManager>,
     pub mcp_manager: Arc<mcp::McpManager>,
     pub task_store: Arc<tasks::TaskStore>,
+    pub goal_store: Arc<goals::GoalStore>,
+    /// Per-agent persisted wake-event queue, consumed by the autonomy channel.
+    pub wake_event_store: Arc<wakes::WakeEventStore>,
+    /// Instance-wide autonomy ceiling shared by every agent and the API. The
+    /// effective autonomy level is `min(ceiling, agent level)` — the ceiling
+    /// caps the per-agent dial without overwriting it.
+    pub autonomy_ceiling: Arc<arc_swap::ArcSwap<config::AutonomyLevel>>,
+    /// Per-agent wake definition registry (builtin, config, and user wakes).
+    pub wake_def_store: Arc<wakes::WakeDefStore>,
+    /// Per-agent autonomy run history (begin/complete + recent summaries).
+    pub autonomy_run_store: Arc<wakes::AutonomyRunStore>,
     pub project_store: Arc<projects::ProjectStore>,
     pub cron_tool: Option<tools::CronTool>,
     pub runtime_config: Arc<config::RuntimeConfig>,
@@ -473,6 +488,14 @@ pub struct AgentDeps {
 }
 
 impl AgentDeps {
+    /// Lifecycle handle for daemon restart/shutdown requests. `None` outside
+    /// the daemon runtime (tests, config preview).
+    pub fn lifecycle(&self) -> Option<lifecycle::LifecycleHandle> {
+        self.api_state
+            .as_ref()
+            .and_then(|state| state.lifecycle.load().as_ref().clone())
+    }
+
     pub fn memory_search(&self) -> &Arc<memory::MemorySearch> {
         &self.memory_search
     }

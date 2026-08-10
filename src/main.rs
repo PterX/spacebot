@@ -175,6 +175,17 @@ fn forward_sse_event(
                 })
                 .ok();
         }
+        // Portal has no ephemeral surface; command replies render as
+        // ordinary messages instead of disappearing.
+        spacebot::OutboundResponse::Ephemeral { text, .. } => {
+            api_event_tx
+                .send(spacebot::api::ApiEvent::OutboundMessage {
+                    agent_id: agent_id.to_string(),
+                    channel_id: channel_id.to_string(),
+                    text: text.clone(),
+                })
+                .ok();
+        }
         _ => {}
     }
 }
@@ -209,12 +220,16 @@ fn main() -> anyhow::Result<()> {
     let command = cli.command.unwrap_or(Command::Start { foreground: false });
 
     match command {
-        Command::Start { foreground } => cmd_start(cli.config, cli.debug, foreground),
-        Command::Stop => cmd_stop(),
-        Command::Restart { foreground } => {
-            cmd_stop_if_running();
-            cmd_start(cli.config, cli.debug, foreground)
+        Command::Start { foreground } => {
+            let restart_spec = spacebot::lifecycle::RestartSpec::capture(
+                cli.config.as_deref(),
+                cli.debug,
+                foreground,
+            );
+            cmd_start(cli.config, cli.debug, foreground, restart_spec)
         }
+        Command::Stop => cmd_stop(),
+        Command::Restart { foreground } => cmd_restart(cli.config, cli.debug, foreground),
         Command::Status => cmd_status(),
         command => cli::dispatch(
             command,
@@ -232,6 +247,7 @@ fn cmd_start(
     config_path: Option<std::path::PathBuf>,
     debug: bool,
     foreground: bool,
+    restart_spec: spacebot::lifecycle::RestartSpec,
 ) -> anyhow::Result<()> {
     // Use the config path (if provided) to derive the correct instance dir
     // for the PID check, so it matches the PID file written during daemonize.
@@ -244,10 +260,14 @@ fn cmd_start(
         std::process::exit(1);
     }
 
-    // Run onboarding interactively before daemonizing
+    // Run onboarding interactively before daemonizing. Skipped after a
+    // self-restart re-exec: stdin is /dev/null there, so the wizard could
+    // never complete — fall through to setup mode instead.
     let resolved_config_path = if config_path.is_some() {
         config_path.clone()
-    } else if spacebot::config::Config::needs_onboarding() {
+    } else if std::env::var_os("SPACEBOT_REEXEC").is_none()
+        && spacebot::config::Config::needs_onboarding()
+    {
         // Returns Some(path) if CLI wizard ran, None if user chose the UI.
         spacebot::config::run_onboarding().with_context(|| "onboarding failed")?
     } else {
@@ -295,8 +315,116 @@ fn cmd_start(
             spacebot::daemon::init_background_tracing(&paths, debug, &config.telemetry)
         };
 
-        run(config, foreground, otel_provider, bootstrapped_store).await
+        run(
+            config,
+            foreground,
+            otel_provider,
+            bootstrapped_store,
+            restart_spec,
+        )
+        .await
     })
+}
+
+/// Restart the daemon. When it is running and supports in-place restart, ask
+/// it to re-exec itself over IPC and confirm via the run_id nonce; otherwise
+/// fall back to stop-then-start.
+fn cmd_restart(
+    config_path: Option<std::path::PathBuf>,
+    debug: bool,
+    foreground: bool,
+) -> anyhow::Result<()> {
+    let instance_dir = resolve_instance_dir(&config_path);
+    let paths = spacebot::daemon::DaemonPaths::new(&instance_dir);
+
+    // A foreground restart must attach the daemon to this terminal, which an
+    // in-place re-exec of the already-daemonized process cannot do — use the
+    // stop-then-start path for that, and when nothing is running yet.
+    if foreground || spacebot::daemon::is_running(&paths).is_none() {
+        return stop_then_start(config_path, debug, foreground, &paths);
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
+    let outcome = runtime.block_on(request_daemon_restart(&paths));
+    drop(runtime);
+
+    match outcome {
+        RestartOutcome::Confirmed { pid } => {
+            eprintln!("spacebot restarted (pid {pid})");
+            Ok(())
+        }
+        RestartOutcome::Rejected { message } => {
+            eprintln!("restart rejected: {message}");
+            std::process::exit(1);
+        }
+        RestartOutcome::Unconfirmed => {
+            eprintln!("restart requested, but no restarted daemon responded within 30 seconds");
+            eprintln!("check `spacebot status`");
+            std::process::exit(1);
+        }
+        RestartOutcome::Unsupported => {
+            // The running daemon predates the in-place restart command.
+            stop_then_start(config_path, debug, foreground, &paths)
+        }
+    }
+}
+
+/// Stop any running daemon, then start fresh. The fallback restart path when
+/// an in-place re-exec is not possible.
+fn stop_then_start(
+    config_path: Option<std::path::PathBuf>,
+    debug: bool,
+    foreground: bool,
+    paths: &spacebot::daemon::DaemonPaths,
+) -> anyhow::Result<()> {
+    cmd_stop_if_running(paths);
+    let restart_spec =
+        spacebot::lifecycle::RestartSpec::capture(config_path.as_deref(), debug, foreground);
+    cmd_start(config_path, debug, foreground, restart_spec)
+}
+
+enum RestartOutcome {
+    Confirmed { pid: u32 },
+    Rejected { message: String },
+    Unconfirmed,
+    Unsupported,
+}
+
+async fn request_daemon_restart(paths: &spacebot::daemon::DaemonPaths) -> RestartOutcome {
+    use spacebot::daemon::{IpcCommand, IpcResponse, send_command};
+
+    let old_run_id = match send_command(paths, IpcCommand::Status).await {
+        Ok(IpcResponse::Status { run_id, .. }) => run_id,
+        _ => None,
+    };
+
+    match send_command(paths, IpcCommand::Restart).await {
+        Ok(IpcResponse::Ok) => {}
+        Ok(IpcResponse::Error { message }) => return RestartOutcome::Rejected { message },
+        // An older daemon fails to parse the command and drops the connection
+        // without responding.
+        _ => return RestartOutcome::Unsupported,
+    }
+
+    eprintln!("restarting spacebot...");
+
+    // The daemon tears down after a grace delay, then re-execs (foreground)
+    // or re-daemonizes (background). A foreground re-exec keeps its PID, so
+    // the run_id nonce is the only reliable confirmation. Connection failures
+    // are the gap between the old daemon unbinding and the new one binding.
+    for _ in 0..120 {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        if let Ok(IpcResponse::Status { pid, run_id, .. }) =
+            send_command(paths, IpcCommand::Status).await
+            && run_id != old_run_id
+        {
+            return RestartOutcome::Confirmed { pid };
+        }
+    }
+    RestartOutcome::Unconfirmed
 }
 
 /// Resolve the instance directory from the config path without loading the
@@ -350,10 +478,8 @@ async fn cmd_stop() -> anyhow::Result<()> {
 }
 
 /// Stop if running, don't error if not.
-fn cmd_stop_if_running() {
-    let paths = spacebot::daemon::DaemonPaths::from_default();
-
-    let Some(pid) = spacebot::daemon::is_running(&paths) else {
+fn cmd_stop_if_running(paths: &spacebot::daemon::DaemonPaths) {
+    let Some(pid) = spacebot::daemon::is_running(paths) else {
         return;
     };
 
@@ -366,7 +492,7 @@ fn cmd_stop_if_running() {
 
     runtime.block_on(async {
         if let Ok(spacebot::daemon::IpcResponse::Ok) =
-            spacebot::daemon::send_command(&paths, spacebot::daemon::IpcCommand::Shutdown).await
+            spacebot::daemon::send_command(paths, spacebot::daemon::IpcCommand::Shutdown).await
         {
             eprintln!("stopping spacebot (pid {pid})...");
             spacebot::daemon::wait_for_exit(pid);
@@ -392,6 +518,7 @@ fn cmd_status() -> anyhow::Result<()> {
             Ok(spacebot::daemon::IpcResponse::Status {
                 pid,
                 uptime_seconds,
+                ..
             }) => {
                 let hours = uptime_seconds / 3600;
                 let minutes = (uptime_seconds % 3600) / 60;
@@ -687,14 +814,25 @@ async fn run(
     foreground: bool,
     otel_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
     bootstrapped_store: Option<Arc<spacebot::secrets::store::SecretsStore>>,
+    restart_spec: spacebot::lifecycle::RestartSpec,
 ) -> anyhow::Result<()> {
     let paths = spacebot::daemon::DaemonPaths::new(&config.instance_dir);
 
     tracing::info!("starting spacebot");
     tracing::info!(instance_dir = %config.instance_dir.display(), "configuration loaded");
 
-    // Start the IPC server for stop/status commands
-    let (mut shutdown_rx, _ipc_handle) = spacebot::daemon::start_ipc_server(&paths)
+    // SIGTERM stream for orchestrated stops (docker stop, systemctl stop).
+    // Installed before agent initialization: that window includes database
+    // migrations and model warmup, and a SIGTERM under the default disposition
+    // would kill the process with no teardown at all. Signals arriving during
+    // startup are buffered by the stream and picked up by the main loop.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("failed to install SIGTERM handler")?;
+
+    // Start the IPC server for stop/restart/status commands
+    let (lifecycle, mut shutdown_rx) = spacebot::lifecycle::LifecycleHandle::new();
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let _ipc_handle = spacebot::daemon::start_ipc_server(&paths, lifecycle.clone(), run_id)
         .await
         .context("failed to start IPC server")?;
 
@@ -723,6 +861,9 @@ async fn run(
 
     let global_task_store = Arc::new(spacebot::tasks::TaskStore::new(instance_pool.clone()));
 
+    // Instance-level goal store. Goals are instance-scoped like tasks.
+    let global_goal_store = Arc::new(spacebot::goals::GoalStore::new(instance_pool.clone()));
+
     // Instance-wide wiki knowledge base.
     let global_wiki_store = Arc::new(spacebot::wiki::WikiStore::new(instance_pool.clone()));
 
@@ -748,9 +889,14 @@ async fn run(
         injection_tx.clone(),
     );
     api_state.auth_token = config.api.auth_token.clone();
+    // Instance-wide autonomy ceiling: one ArcSwap shared between the API and
+    // every AgentDeps so ceiling writes take effect without a restart.
+    api_state.autonomy_ceiling = Arc::new(arc_swap::ArcSwap::from_pointee(config.autonomy_ceiling));
     api_state.set_task_store(global_task_store.clone());
+    api_state.set_goal_store(global_goal_store.clone());
     api_state.set_wiki_store(global_wiki_store.clone());
     api_state.set_notification_store(global_notification_store.clone());
+    api_state.set_lifecycle(lifecycle.clone());
     let api_state = Arc::new(api_state);
 
     // Keep the secrets API available in setup mode so encrypted stores can be
@@ -864,6 +1010,10 @@ async fn run(
     let bindings: Arc<ArcSwap<Vec<spacebot::config::Binding>>> =
         Arc::new(ArcSwap::from_pointee(config.bindings.clone()));
     api_state.set_bindings(bindings.clone()).await;
+    let authority_defaults: Arc<ArcSwap<spacebot::commands::access::AdapterAuthorityDefaults>> =
+        Arc::new(ArcSwap::from_pointee(
+            spacebot::commands::access::AdapterAuthorityDefaults::from_config(&config),
+        ));
     let default_agent_id = config.default_agent_id().to_string();
 
     // Set the config path on the API state for config.toml writes
@@ -917,6 +1067,7 @@ async fn run(
             agent_humans.clone(),
             injection_tx.clone(),
             global_task_store.clone(),
+            global_goal_store.clone(),
             global_wiki_store.clone(),
             global_project_store.clone(),
             global_notification_store.clone(),
@@ -937,6 +1088,7 @@ async fn run(
             mattermost_permissions,
             signal_permissions,
             bindings.clone(),
+            authority_defaults.clone(),
             Some(messaging_manager.clone()),
             llm_manager.clone(),
             agent_links.clone(),
@@ -955,6 +1107,7 @@ async fn run(
             None, // mattermost_permissions
             None, // signal_permissions
             bindings.clone(),
+            authority_defaults.clone(),
             None,
             llm_manager.clone(),
             agent_links.clone(),
@@ -1128,6 +1281,7 @@ async fn run(
 
                     let (mut channel, channel_tx) = spacebot::agent::channel::Channel::new(
                         channel_id,
+                        spacebot::agent::channel::ChannelKind::User,
                         agent.deps.clone(),
                         response_tx,
                         event_rx,
@@ -1137,6 +1291,7 @@ async fn run(
                         Some(api_state.live_worker_transcripts.clone()),
                         resolved_settings,
                         None, // no cron outcome for normal channels
+                        None, // no autonomy run for normal channels
                     );
                     let channel_registration_id = agent
                         .deps
@@ -1285,7 +1440,43 @@ async fn run(
         }
     }
 
-    // Main event loop: route inbound messages to agent channels
+    // Announce a completed self-restart back to the channel that requested it.
+    // Delivery goes through the proactive broadcast path (bounded retry with
+    // backoff) rather than channel injection, which would sit queued until the
+    // next inbound message on that exact channel. In setup mode the marker is
+    // left in place for the fully-initialized boot that follows.
+    if agents_initialized
+        && let Some(pending) = spacebot::lifecycle::PendingRestart::take(&config.instance_dir)
+    {
+        let age = chrono::Utc::now().signed_duration_since(pending.requested_at);
+        if age > chrono::Duration::minutes(15) {
+            tracing::info!(reason = %pending.reason, "skipping stale restart announcement");
+        } else if let (Some(adapter), Some(target)) = (pending.adapter, pending.target) {
+            let manager = messaging_manager.clone();
+            let note = format!("Back online after restart ({}).", pending.reason);
+            tokio::spawn(async move {
+                if let Err(error) = manager
+                    .broadcast_proactive(&adapter, &target, spacebot::OutboundResponse::Text(note))
+                    .await
+                {
+                    tracing::warn!(
+                        %error,
+                        adapter,
+                        target,
+                        "failed to deliver restart announcement"
+                    );
+                }
+            });
+        } else {
+            tracing::info!(reason = %pending.reason, "restart complete, no channel to announce to");
+        }
+    }
+
+    // Main event loop: route inbound messages to agent channels. The break
+    // reason is recorded per arm: only a lifecycle-driven break may carry
+    // Restart. An operator signal (SIGTERM, Ctrl-C) always means exit, even
+    // when it races an armed restart whose channel value has already flipped.
+    let mut final_state = spacebot::lifecycle::LifecycleState::Exit;
     loop {
         // Poll the inbound stream if it exists, otherwise yield a never-resolving future
         let inbound_next = async {
@@ -1297,7 +1488,16 @@ async fn run(
         tokio::select! {
             Some(mut message) = inbound_next, if agents_initialized => {
                 let mut binding_settings: Option<spacebot::conversation::ConversationSettings> = None;
+                let mut binding_authority: Option<Vec<String>> = None;
                 let agent_id = if let Some(existing) = message.agent_id.as_ref() {
+                    // Preassigned agent (portal sends set `agent_id` up
+                    // front): the binding scan still runs so binding-level
+                    // settings and authority apply to this scope.
+                    let current_bindings = bindings.load();
+                    if let Some(binding) = spacebot::config::matched_binding(&current_bindings, &message) {
+                        binding_settings = binding.settings.clone();
+                        binding_authority = binding.authority.clone();
+                    }
                     existing.clone()
                 } else {
                     let current_bindings = bindings.load();
@@ -1310,12 +1510,47 @@ async fn run(
                         continue;
                     };
                     binding_settings = matched_settings;
+                    binding_authority = spacebot::config::matched_binding_authority(&current_bindings, &message);
                     message.agent_id = Some(resolved.clone());
                     resolved
                 };
 
                 let conversation_id = message.conversation_id.clone();
                 let channel_key = ActiveChannelKey::new(agent_id.to_string(), conversation_id.clone());
+
+                // Slash-command dispatch, in the messaging layer before the
+                // channel queue. Control commands execute on the control
+                // plane without creating an inbound message, so they land
+                // even while the channel is mid-turn; Agent commands are
+                // rewritten to structured Command content and forwarded.
+                if let Some(agent) = agents.get(&agent_id) {
+                    let turn_active = {
+                        let channel_ref: spacebot::ChannelId = Arc::from(conversation_id.as_str());
+                        match agent.deps.process_control_registry.channel_handle(&channel_ref).await {
+                            Some(handle) => handle.turn_active(),
+                            None => false,
+                        }
+                    };
+                    let authority_snapshot = authority_defaults.load();
+                    let scope = spacebot::commands::dispatch::DispatchScope {
+                        binding_authority: binding_authority.as_deref(),
+                        adapter_defaults: &authority_snapshot,
+                        binding_settings: binding_settings.as_ref(),
+                        turn_active,
+                    };
+                    match spacebot::commands::dispatch::dispatch_inbound(
+                        &mut message,
+                        scope,
+                        &agent.deps,
+                        &messaging_manager,
+                    )
+                    .await
+                    {
+                        spacebot::commands::dispatch::Dispatch::Handled => continue,
+                        spacebot::commands::dispatch::Dispatch::Forward
+                        | spacebot::commands::dispatch::Dispatch::ForwardCommand => {}
+                    }
+                }
 
                 // Find or create a channel for this conversation
                 if !active_channels.contains_key(&channel_key) {
@@ -1416,6 +1651,7 @@ async fn run(
 
                     let (mut channel, channel_tx) = spacebot::agent::channel::Channel::new(
                         channel_id,
+                        spacebot::agent::channel::ChannelKind::User,
                         agent.deps.clone(),
                         response_tx,
                         event_rx,
@@ -1425,6 +1661,7 @@ async fn run(
                         Some(api_state.live_worker_transcripts.clone()),
                         resolved_settings,
                         None, // no cron outcome for normal channels
+                        None, // no autonomy run for normal channels
                     );
                     let channel_registration_id = agent
                         .deps
@@ -1711,6 +1948,7 @@ async fn run(
                                     agent_humans.clone(),
                                     injection_tx.clone(),
                                     global_task_store.clone(),
+                                    global_goal_store.clone(),
                                     global_wiki_store.clone(),
                                     global_project_store.clone(),
                                     global_notification_store.clone(),
@@ -1731,6 +1969,7 @@ async fn run(
                                             new_mattermost_permissions,
                                             new_signal_permissions,
                                             bindings.clone(),
+                                            authority_defaults.clone(),
                                             Some(messaging_manager.clone()),
                                             new_llm_manager.clone(),
                                             agent_links.clone(),
@@ -1756,12 +1995,21 @@ async fn run(
                     }
                 }
             }
-            _ = shutdown_rx.wait_for(|shutdown| *shutdown) => {
-                tracing::info!("shutdown signal received via IPC");
+            state = shutdown_rx.wait_for(|state| *state != spacebot::lifecycle::LifecycleState::Running) => {
+                tracing::info!("lifecycle signal received via IPC/API");
+                // A dropped sender can't happen while `lifecycle` is alive in
+                // this scope; treat it as a plain exit if it somehow does.
+                final_state = state
+                    .map(|state| *state)
+                    .unwrap_or(spacebot::lifecycle::LifecycleState::Exit);
                 break;
             }
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("shutdown signal received");
+                break;
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("SIGTERM received");
                 break;
             }
         }
@@ -1776,6 +2024,26 @@ async fn run(
     drop(cron_schedulers_for_shutdown);
 
     messaging_manager.shutdown().await;
+
+    // Close shared browsers inline — their Drop-spawned cleanup task would
+    // race the process exit (or never run before an exec) and orphan Chromium
+    // on every restart. Shutdowns run concurrently, each bounded so a stuck
+    // browser (or a tool call still holding the lock) can't stall teardown
+    // past the restart confirmation window.
+    futures::future::join_all(agents.iter().filter_map(|(agent_id, agent)| {
+        let shared_browser = agent.deps.runtime_config.shared_browser.clone()?;
+        let agent_id = agent_id.clone();
+        Some(async move {
+            let teardown = async { shared_browser.lock().await.shutdown().await };
+            if tokio::time::timeout(std::time::Duration::from_secs(10), teardown)
+                .await
+                .is_err()
+            {
+                tracing::warn!(%agent_id, "shared browser teardown timed out after 10s");
+            }
+        })
+    }))
+    .await;
 
     for (agent_id, agent) in agents {
         tracing::info!(%agent_id, "shutting down agent");
@@ -1794,6 +2062,24 @@ async fn run(
     }
 
     spacebot::daemon::cleanup(&paths);
+
+    if final_state == spacebot::lifecycle::LifecycleState::Restart {
+        tracing::info!(exe = %restart_spec.exe.display(), "re-executing for restart");
+        // exec() replaces the process image: every fd (locks, sockets, DB
+        // handles) closes atomically, and startup re-runs from main() as if
+        // launched fresh. Only returns on failure.
+        let error = restart_spec.exec();
+        // In background mode stderr is redirected away, so the log file is the
+        // only place this failure can be diagnosed.
+        tracing::error!(%error, exe = %restart_spec.exe.display(), "restart exec failed");
+        eprintln!("restart exec failed: {error}");
+        std::process::exit(1);
+    }
+
+    // A restart may have been superseded by this shutdown after the restart
+    // tool already persisted its marker; drop it so the next boot doesn't
+    // announce a restart that never happened.
+    spacebot::lifecycle::PendingRestart::discard(&config.instance_dir);
 
     // Force exit — detached tasks (e.g. the serenity gateway client) may keep
     // the tokio runtime alive after all owned resources have been cleaned up.
@@ -1858,6 +2144,7 @@ async fn initialize_agents(
     agent_humans: Arc<ArcSwap<Vec<spacebot::config::HumanDef>>>,
     injection_tx: tokio::sync::mpsc::Sender<spacebot::ChannelInjection>,
     global_task_store: Arc<spacebot::tasks::TaskStore>,
+    global_goal_store: Arc<spacebot::goals::GoalStore>,
     global_wiki_store: Arc<spacebot::wiki::WikiStore>,
     global_project_store: Arc<spacebot::projects::ProjectStore>,
     global_notification_store: Arc<spacebot::notifications::NotificationStore>,
@@ -2118,6 +2405,11 @@ async fn initialize_agents(
             llm_manager: llm_manager.clone(),
             mcp_manager,
             task_store: global_task_store.clone(),
+            goal_store: global_goal_store.clone(),
+            wake_event_store: Arc::new(spacebot::wakes::WakeEventStore::new(db.sqlite.clone())),
+            autonomy_ceiling: api_state.autonomy_ceiling.clone(),
+            wake_def_store: Arc::new(spacebot::wakes::WakeDefStore::new(db.sqlite.clone())),
+            autonomy_run_store: Arc::new(spacebot::wakes::AutonomyRunStore::new(db.sqlite.clone())),
             project_store: project_store.clone(),
             cron_tool: None,
             runtime_config,
@@ -2377,7 +2669,6 @@ async fn initialize_agents(
                 slack_permissions.clone().ok_or_else(|| {
                     anyhow::anyhow!("slack permissions not initialized when slack is enabled")
                 })?,
-                slack_config.commands.clone(),
             ) {
                 Ok(adapter) => {
                     new_messaging_manager.register(adapter).await;
@@ -2412,7 +2703,6 @@ async fn initialize_agents(
                 &instance.bot_token,
                 &instance.app_token,
                 perms,
-                instance.commands.clone(),
             ) {
                 Ok(adapter) => {
                     new_messaging_manager.register(adapter).await;
@@ -2767,6 +3057,18 @@ async fn initialize_agents(
     for (agent_id, agent) in agents.iter_mut() {
         let store = Arc::new(spacebot::cron::CronStore::new(agent.db.sqlite.clone()));
         agent.deps.messaging_manager = Some(messaging_manager.clone());
+
+        // Seed built-in wakes, then reconcile config-owned wake definitions.
+        // Builtins go first so a config id colliding with one is detected.
+        if let Err(error) = spacebot::wakes::seed_builtin_wakes(&agent.deps.wake_def_store).await {
+            tracing::warn!(agent_id = %agent_id, %error, "failed to seed builtin wakes");
+        }
+        if let Err(error) =
+            spacebot::wakes::reconcile_config_wakes(&agent.deps.wake_def_store, &agent.config.wakes)
+                .await
+        {
+            tracing::warn!(agent_id = %agent_id, %error, "failed to reconcile config wakes");
+        }
 
         // Seed cron jobs from config into the database
         for cron_def in &agent.config.cron {
