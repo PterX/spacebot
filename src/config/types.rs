@@ -1808,9 +1808,11 @@ pub struct Binding {
     /// User IDs allowed to DM the bot through this binding.
     pub dm_allowed_users: Vec<String>,
     /// User IDs allowed to run authority-gated slash commands in scopes
-    /// matched by this binding. Empty means commands are open to everyone
-    /// this binding admits.
-    pub authority: Vec<String>,
+    /// matched by this binding. `None` (key omitted) falls back to the
+    /// adapter-instance default; `Some(vec![])` (explicit `authority = []`)
+    /// opens commands to everyone this binding admits, even when the
+    /// adapter default is restricted.
+    pub authority: Option<Vec<String>>,
     /// Default conversation settings for channels matched by this binding.
     pub settings: Option<crate::conversation::ConversationSettings>,
 }
@@ -2515,18 +2517,26 @@ pub fn resolve_agent_for_message(
     Some((std::sync::Arc::from(default_agent_id), None))
 }
 
+/// The binding that routes `message`, matched on routing criteria only.
+/// Uses the same first-match-wins scan as [`resolve_agent_for_message`], so
+/// the result is always the binding that actually routed the message.
+pub fn matched_binding<'a>(
+    bindings: &'a [Binding],
+    message: &crate::InboundMessage,
+) -> Option<&'a Binding> {
+    bindings
+        .iter()
+        .find(|binding| binding.matches_route(message))
+}
+
 /// Authority list of the binding that routes `message`, for slash-command
-/// access checks. Uses the same first-match-wins scan as
-/// [`resolve_agent_for_message`], so the list always belongs to the binding
-/// that actually routed the message.
+/// access checks. `None` when no binding matched or the matched binding
+/// omits `authority` — both fall back to the adapter default downstream.
 pub fn matched_binding_authority(
     bindings: &[Binding],
     message: &crate::InboundMessage,
 ) -> Option<Vec<String>> {
-    bindings
-        .iter()
-        .find(|binding| binding.matches_route(message))
-        .map(|binding| binding.authority.clone())
+    matched_binding(bindings, message).and_then(|binding| binding.authority.clone())
 }
 
 // ---------------------------------------------------------------------------

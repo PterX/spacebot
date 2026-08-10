@@ -83,7 +83,9 @@ impl AdapterAuthorityDefaults {
 /// The identity and scope facts needed to answer "may this sender run this
 /// command here".
 pub struct AccessContext<'a> {
-    /// Authority list from the matched binding, if one matched and set it.
+    /// Authority list from the matched binding, if one matched and set the
+    /// key. An explicit empty list opens the scope; `None` (key omitted)
+    /// falls back to the adapter default.
     pub binding_authority: Option<&'a [String]>,
     /// Adapter-instance default authority for this message's adapter.
     pub adapter_default: Option<&'a [String]>,
@@ -96,15 +98,18 @@ pub struct AccessContext<'a> {
 
 impl AccessContext<'_> {
     /// Whether the sender holds authority in this scope. Open (true for
-    /// everyone) when no authority list is configured at either level.
+    /// everyone) when no authority list is configured at either level. A
+    /// binding's explicit empty list opens its scope without falling back
+    /// to the adapter default; an omitted binding list defers to it.
     pub fn is_authority(&self) -> bool {
         let non_empty = |list: &&[String]| !list.is_empty();
-        let Some(list) = self
-            .binding_authority
-            .filter(non_empty)
-            .or(self.adapter_default.filter(non_empty))
-        else {
-            return true;
+        let list = match self.binding_authority {
+            Some([]) => return true,
+            Some(list) => list,
+            None => match self.adapter_default.filter(non_empty) {
+                Some(list) => list,
+                None => return true,
+            },
         };
 
         list.iter().any(|entry| {
@@ -186,15 +191,42 @@ mod tests {
     }
 
     #[test]
-    fn empty_lists_are_treated_as_absent() {
+    fn empty_adapter_default_is_treated_as_absent() {
         let empty: Vec<String> = Vec::new();
         let context = AccessContext {
-            binding_authority: Some(&empty),
+            binding_authority: None,
             adapter_default: Some(&empty),
             sender_id: "12345",
             sender_login: None,
         };
         assert!(context.is_authority());
+    }
+
+    #[test]
+    fn explicit_empty_binding_list_opens_scope_despite_restricted_adapter_default() {
+        let empty: Vec<String> = Vec::new();
+        let adapter = owned(&["999"]);
+        let context = AccessContext {
+            binding_authority: Some(&empty),
+            adapter_default: Some(&adapter),
+            sender_id: "12345",
+            sender_login: None,
+        };
+        assert!(context.is_authority());
+        assert!(context.allows(def("quiet")));
+    }
+
+    #[test]
+    fn omitted_binding_list_defers_to_restricted_adapter_default() {
+        let adapter = owned(&["999"]);
+        let context = AccessContext {
+            binding_authority: None,
+            adapter_default: Some(&adapter),
+            sender_id: "12345",
+            sender_login: None,
+        };
+        assert!(!context.is_authority());
+        assert!(!context.allows(def("quiet")));
     }
 
     #[test]

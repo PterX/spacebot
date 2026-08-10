@@ -104,14 +104,12 @@ pub fn telegram_menu() -> Vec<TelegramMenuEntry> {
                 return None;
             }
             let mut description = def.description.to_string();
-            if let ArgSpec::Choice(options) = def.args {
-                description.push_str(&format!(" [{}]", options.join("|")));
-            } else if let Some(hint) = def.args.hint() {
+            if let Some(hint) = def.args.hint() {
                 description.push_str(&format!(" {hint}"));
             }
             let mut description: String =
                 description.chars().take(TELEGRAM_DESCRIPTION_MAX).collect();
-            if description.len() < 3 {
+            if description.chars().count() < 3 {
                 description = format!("/{command}");
             }
             Some(TelegramMenuEntry {

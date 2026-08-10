@@ -18,7 +18,9 @@ pub struct BindingResponse {
     pub channel_ids: Vec<String>,
     pub require_mention: bool,
     pub dm_allowed_users: Vec<String>,
-    pub authority: Vec<String>,
+    /// Omitted key and explicit empty list are distinct: `None` defers to
+    /// the adapter default, `[]` opens the scope.
+    pub authority: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]

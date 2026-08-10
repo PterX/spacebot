@@ -1316,6 +1316,14 @@ async fn run(
                 let mut binding_settings: Option<spacebot::conversation::ConversationSettings> = None;
                 let mut binding_authority: Option<Vec<String>> = None;
                 let agent_id = if let Some(existing) = message.agent_id.as_ref() {
+                    // Preassigned agent (portal sends set `agent_id` up
+                    // front): the binding scan still runs so binding-level
+                    // settings and authority apply to this scope.
+                    let current_bindings = bindings.load();
+                    if let Some(binding) = spacebot::config::matched_binding(&current_bindings, &message) {
+                        binding_settings = binding.settings.clone();
+                        binding_authority = binding.authority.clone();
+                    }
                     existing.clone()
                 } else {
                     let current_bindings = bindings.load();

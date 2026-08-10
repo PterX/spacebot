@@ -707,6 +707,7 @@ Channel/worker temporal context timezone precedence is:
 | `enabled` | bool | true | Enable this named instance |
 | `token` | string | **required** | Bot token (or `env:VAR_NAME`) |
 | `dm_allowed_users` | string[] | [] | User IDs allowed to DM this instance |
+| `authority` | string[] | [] | Authority list for this instance's slash commands |
 
 ### `[messaging.twitch]`
 
@@ -718,6 +719,7 @@ Channel/worker temporal context timezone precedence is:
 | `instances` | table[] | [] | Optional named Twitch bot instances |
 | `channels` | string[] | [] | Channels to join |
 | `trigger_prefix` | string | None | Optional prefix required to trigger replies |
+| `authority` | string[] | [] | User IDs or logins (matched case-insensitively) allowed to run authority-gated slash commands. Empty = open |
 
 ### `[[messaging.twitch.instances]]`
 
@@ -729,6 +731,7 @@ Channel/worker temporal context timezone precedence is:
 | `oauth_token` | string | **required** | OAuth token (`oauth:...` or plain token) |
 | `channels` | string[] | [] | Channels to join for this instance |
 | `trigger_prefix` | string | None | Optional prefix required to trigger replies |
+| `authority` | string[] | [] | Authority list for this instance's slash commands |
 
 ### `[messaging.email]`
 
@@ -750,6 +753,7 @@ Channel/worker temporal context timezone precedence is:
 | `poll_interval_secs` | integer | 30 | How often to check for new email |
 | `folders` | string[] | `["INBOX"]` | IMAP folders to poll |
 | `allowed_senders` | string[] | `[]` | Optional allowlist for inbound senders (empty = all) |
+| `authority` | string[] | [] | Sender addresses allowed to run authority-gated slash commands. Empty = open |
 | `max_body_bytes` | integer | 262144 | Max inbound body bytes before truncation |
 | `max_attachment_bytes` | integer | 10485760 | Max attachment bytes to process metadata for |
 
@@ -774,8 +778,63 @@ Channel/worker temporal context timezone precedence is:
 | `poll_interval_secs` | integer | 30 | How often to check for new email |
 | `folders` | string[] | `["INBOX"]` | IMAP folders to poll |
 | `allowed_senders` | string[] | `[]` | Optional allowlist (empty = all) |
+| `authority` | string[] | [] | Authority list for this instance's slash commands |
 | `max_body_bytes` | integer | 262144 | Max inbound body bytes |
 | `max_attachment_bytes` | integer | 10485760 | Max attachment bytes |
+
+### `[messaging.signal]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | false | Enable Signal adapter (via signal-cli HTTP endpoint) |
+| `http_url` | string | None | signal-cli JSON-RPC HTTP endpoint URL |
+| `account` | string | None | Signal account (phone number) to receive as |
+| `instances` | table[] | [] | Optional named Signal instances |
+| `dm_allowed_users` | string[] | [] | Numbers allowed to DM the bot |
+| `authority` | string[] | [] | Numbers allowed to run authority-gated slash commands. Empty = open |
+| `group_ids` | string[] | [] | Group IDs to listen in |
+| `group_allowed_users` | string[] | [] | Numbers allowed to trigger the bot in groups |
+| `ignore_stories` | bool | true | Ignore story messages |
+
+### `[[messaging.signal.instances]]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `name` | string | **required** | Instance selector used by bindings (`adapter = "name"`) |
+| `enabled` | bool | true | Enable this named instance |
+| `http_url` | string | **required** | signal-cli JSON-RPC HTTP endpoint URL |
+| `account` | string | **required** | Signal account (phone number) to receive as |
+| `dm_allowed_users` | string[] | [] | Numbers allowed to DM this instance |
+| `authority` | string[] | [] | Authority list for this instance's slash commands |
+| `group_ids` | string[] | [] | Group IDs to listen in |
+| `group_allowed_users` | string[] | [] | Numbers allowed to trigger the bot in groups |
+| `ignore_stories` | bool | true | Ignore story messages |
+
+### `[messaging.mattermost]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | false | Enable Mattermost adapter |
+| `base_url` | string | None | Mattermost server base URL |
+| `token` | string | None | Bot token (or `env:VAR_NAME`) |
+| `team_id` | string | None | Team ID to scope the bot to |
+| `instances` | table[] | [] | Optional named Mattermost instances |
+| `dm_allowed_users` | string[] | [] | User IDs allowed to DM the bot |
+| `authority` | string[] | [] | User IDs allowed to run authority-gated slash commands. Empty = open |
+| `max_attachment_bytes` | integer | 10485760 | Max attachment bytes to process |
+
+### `[[messaging.mattermost.instances]]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `name` | string | **required** | Instance selector used by bindings (`adapter = "name"`) |
+| `enabled` | bool | true | Enable this named instance |
+| `base_url` | string | **required** | Mattermost server base URL |
+| `token` | string | **required** | Bot token (or `env:VAR_NAME`) |
+| `team_id` | string | None | Team ID to scope this instance to |
+| `dm_allowed_users` | string[] | [] | User IDs allowed to DM this instance |
+| `authority` | string[] | [] | Authority list for this instance's slash commands |
+| `max_attachment_bytes` | integer | 10485760 | Max attachment bytes to process |
 
 ### `[messaging.webhook]`
 
@@ -792,9 +851,9 @@ Routes platform conversations to agents. Checked in order; first match wins. Unm
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `agent_id` | string | **required** | Which agent handles matched messages |
-| `channel` | string | **required** | Platform name (`discord`, `slack`, `telegram`, `twitch`, `email`, `webhook`) |
+| `channel` | string | **required** | Platform name (`discord`, `slack`, `telegram`, `twitch`, `signal`, `mattermost`, `email`, `webhook`) |
 | `adapter` | string | None | Optional named adapter selector (e.g. `ops` => `discord:ops`) |
 | `guild_id` | string | None | Discord guild filter |
 | `chat_id` | string | None | Telegram chat filter |
 | `channel_ids` | string[] | [] | Discord channel ID filter (includes threads in those channels) |
-| `authority` | string[] | User IDs allowed to run authority-gated slash commands in this scope. Empty = open to everyone the binding admits |
+| `authority` | string[] | None | User IDs allowed to run authority-gated slash commands in this scope. Omitted falls back to the adapter's `authority` default; an explicit `[]` opens commands to everyone the binding admits |

@@ -414,6 +414,22 @@ fn slack_error_handler(
     HttpStatusCode::OK
 }
 
+/// Resolve a `/spacebot` subcommand token. Resolution mirrors the native
+/// listing: a command that isn't available on the Slack surface is treated
+/// as unknown, so the umbrella command can't reach commands its own listing
+/// hides. An empty token answers with the usage listing.
+fn resolve_slack_subcommand(
+    registry: &crate::commands::CommandRegistry,
+    subcommand: &str,
+) -> Option<&'static crate::commands::CommandDef> {
+    if subcommand.is_empty() {
+        return None;
+    }
+    registry
+        .resolve(subcommand)
+        .filter(|def| def.availability.on(crate::commands::Surface::Slack))
+}
+
 /// Handle Slack slash command events (e.g. `/ask What is the weather?`).
 ///
 /// Slack requires an acknowledgement within 3 seconds. This handler acks
@@ -491,11 +507,7 @@ async fn handle_command_event(
         Some((subcommand, rest)) => (subcommand.to_string(), rest.trim().to_string()),
         None => (text.trim().to_string(), String::new()),
     };
-    let resolved = if subcommand.is_empty() {
-        None
-    } else {
-        crate::commands::REGISTRY.resolve(&subcommand)
-    };
+    let resolved = resolve_slack_subcommand(&crate::commands::REGISTRY, &subcommand);
     let Some(def) = resolved else {
         let listing = crate::commands::native::slack_subcommands()
             .into_iter()
@@ -1724,6 +1736,53 @@ fn resolve_slack_user_identity(user: &SlackUser, user_id: &str) -> SlackUserIden
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slack_subcommands_resolve_only_when_available_on_slack() {
+        use crate::commands::{
+            ArgSpec, BusyPolicy, CommandAccess, CommandAvailability, CommandCategory, CommandDef,
+            CommandHandler, CommandRegistry, ControlAction,
+        };
+
+        static DEFS: &[CommandDef] = &[
+            CommandDef {
+                name: "everywhere",
+                description: "available on all surfaces",
+                category: CommandCategory::Info,
+                aliases: &[],
+                args: ArgSpec::None,
+                handler: CommandHandler::Control(ControlAction::Help),
+                access: CommandAccess::Everyone,
+                busy: BusyPolicy::Queue,
+                availability: CommandAvailability::ALL,
+            },
+            CommandDef {
+                name: "not-on-slack",
+                description: "hidden from the slack listing",
+                category: CommandCategory::Info,
+                aliases: &[],
+                args: ArgSpec::None,
+                handler: CommandHandler::Control(ControlAction::Help),
+                access: CommandAccess::Everyone,
+                busy: BusyPolicy::Queue,
+                availability: CommandAvailability {
+                    portal: true,
+                    discord: true,
+                    slack: false,
+                    telegram: true,
+                    text_adapters: true,
+                },
+            },
+        ];
+        let registry = CommandRegistry::new(DEFS);
+
+        assert!(resolve_slack_subcommand(&registry, "everywhere").is_some());
+        assert!(
+            resolve_slack_subcommand(&registry, "not-on-slack").is_none(),
+            "a command unavailable on slack must fall through to the usage listing"
+        );
+        assert!(resolve_slack_subcommand(&registry, "").is_none());
+    }
 
     #[test]
     fn sanitize_reaction_name_unicode_emoji_with_shortcode() {

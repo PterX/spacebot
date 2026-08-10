@@ -857,8 +857,11 @@ pub(super) struct TomlBinding {
     pub(super) require_mention: bool,
     #[serde(default)]
     pub(super) dm_allowed_users: Vec<String>,
+    /// `None` when the key is omitted, `Some(vec![])` for an explicit
+    /// `authority = []` — the distinction decides whether the adapter
+    /// default applies.
     #[serde(default)]
-    pub(super) authority: Vec<String>,
+    pub(super) authority: Option<Vec<String>>,
     #[serde(default)]
     pub(super) settings: Option<TomlConversationSettings>,
 }

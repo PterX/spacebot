@@ -15,7 +15,7 @@
 
 use super::access::{self, AccessContext};
 use super::control::ControlPlane;
-use super::registry::{BusyPolicy, CommandHandler, ParseResult, Surface};
+use super::registry::{BusyPolicy, CommandHandler, ControlAction, ParseResult, Surface};
 use crate::messaging::MessagingManager;
 use crate::{InboundMessage, MessageContent, OutboundResponse};
 use std::sync::Arc;
@@ -34,7 +34,9 @@ pub enum Dispatch {
 
 /// Facts about the matched scope the router already holds.
 pub struct DispatchScope<'a> {
-    /// Authority list from the matched binding, when one matched.
+    /// Authority list from the matched binding, when one matched and set
+    /// the key. An explicit empty list opens the scope; `None` falls back
+    /// to the adapter default.
     pub binding_authority: Option<&'a [String]>,
     /// Adapter-instance default authority lists.
     pub adapter_defaults: &'a access::AdapterAuthorityDefaults,
@@ -109,13 +111,30 @@ pub async fn dispatch_inbound(
                 is_authority,
                 is_portal: message.adapter.as_deref() == Some("portal"),
             };
-            let messaging = messaging.clone();
-            let deps = deps.clone();
-            let target = message.clone();
-            tokio::spawn(async move {
-                let reply = plane.execute(action).await;
-                send_ephemeral(&messaging, &deps, &target, reply).await;
-            });
+            match action {
+                // State-mutating control commands execute inline. The router
+                // handles inbound messages sequentially, so awaiting here
+                // serializes mode changes in delivery order — an earlier
+                // /quiet can't land its store write and live update after a
+                // later /active. The work is a local SQLite roundtrip plus
+                // an in-memory cell update; only the reply delivery goes
+                // over the network, and that stays on a spawned task.
+                ControlAction::SetResponseMode(_) => {
+                    let reply = plane.execute(action).await;
+                    reply_ephemeral(messaging, deps, message, reply);
+                }
+                // Read-only control commands stay off the router's critical
+                // path entirely.
+                ControlAction::Status | ControlAction::Help | ControlAction::AgentId => {
+                    let messaging = messaging.clone();
+                    let deps = deps.clone();
+                    let target = message.clone();
+                    tokio::spawn(async move {
+                        let reply = plane.execute(action).await;
+                        send_ephemeral(&messaging, &deps, &target, reply).await;
+                    });
+                }
+            }
             Dispatch::Handled
         }
         CommandHandler::Agent(_) => {

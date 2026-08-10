@@ -809,9 +809,8 @@ impl EventHandler for Handler {
             let http = ctx.http.clone();
             let permissions = self.permissions.clone();
             let guard = self.command_sync_active.clone();
-            let ready_guilds: Vec<GuildId> = ready.guilds.iter().map(|guild| guild.id).collect();
             tokio::spawn(async move {
-                sync_application_commands(&http, &permissions, &ready_guilds).await;
+                sync_application_commands(&http, &permissions).await;
                 guard.store(false, std::sync::atomic::Ordering::Release);
             });
         }
@@ -1006,7 +1005,67 @@ impl EventHandler for Handler {
     }
 }
 
+/// Discord application-command field limits (CHAT_INPUT).
+const DISCORD_NAME_MAX: usize = 32;
+const DISCORD_DESCRIPTION_MAX: usize = 100;
+const DISCORD_CHOICE_CAP: usize = 25;
+const DISCORD_CHOICE_VALUE_MAX: usize = 100;
+
+/// Why a spec can't be expressed as a Discord application command, if it
+/// can't. One invalid entry in a bulk `set_commands` call fails the whole
+/// batch, so specs are validated up front and invalid ones skipped.
+fn discord_spec_violation(spec: &crate::commands::native::NativeCommandSpec) -> Option<String> {
+    use crate::commands::native::NativeArg;
+
+    // Registry names are ASCII; Discord additionally allows lowercase
+    // unicode letters, which no command uses.
+    let name_valid = !spec.name.is_empty()
+        && spec.name.chars().count() <= DISCORD_NAME_MAX
+        && spec
+            .name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+    if !name_valid {
+        return Some(format!(
+            "name must be 1-{DISCORD_NAME_MAX} lowercase [a-z0-9_-] characters"
+        ));
+    }
+    if let Some(NativeArg::Choice { options }) = &spec.arg {
+        if options.len() > DISCORD_CHOICE_CAP {
+            return Some(format!(
+                "{} choices exceed discord's cap of {DISCORD_CHOICE_CAP}",
+                options.len()
+            ));
+        }
+        // A truncated choice value would dispatch different args than the
+        // user picked, so over-long choices invalidate the command instead.
+        if options
+            .iter()
+            .any(|option| option.is_empty() || option.chars().count() > DISCORD_CHOICE_VALUE_MAX)
+        {
+            return Some(format!(
+                "choice values must be 1-{DISCORD_CHOICE_VALUE_MAX} characters"
+            ));
+        }
+    }
+    None
+}
+
+/// Clamp a description to Discord's 1-100 character range, falling back to
+/// the command name when empty.
+fn normalize_discord_description(description: &str, command_name: &str) -> String {
+    let normalized: String = description.chars().take(DISCORD_DESCRIPTION_MAX).collect();
+    if normalized.is_empty() {
+        format!("/{command_name}")
+    } else {
+        normalized
+    }
+}
+
 /// Build serenity command definitions from the registry's native specs.
+/// Returned specs are normalized to Discord limits and match the built
+/// commands one-to-one, so the diff comparison sees exactly what was
+/// registered.
 fn build_discord_create_commands() -> (
     Vec<CreateCommand>,
     Vec<crate::commands::native::NativeCommandSpec>,
@@ -1015,6 +1074,24 @@ fn build_discord_create_commands() -> (
     use crate::commands::native::discord_commands;
 
     let (specs, dropped) = discord_commands();
+    let specs: Vec<_> = specs
+        .into_iter()
+        .filter(|spec| match discord_spec_violation(spec) {
+            Some(reason) => {
+                tracing::warn!(
+                    command = %spec.name,
+                    reason,
+                    "command cannot be registered as a discord application command, skipping"
+                );
+                false
+            }
+            None => true,
+        })
+        .map(|mut spec| {
+            spec.description = normalize_discord_description(&spec.description, &spec.name);
+            spec
+        })
+        .collect();
     let commands = specs
         .iter()
         .map(|spec| {
@@ -1044,7 +1121,14 @@ fn expected_option(
         None => None,
         Some(NativeArg::Text { hint, required }) => Some((
             "input".to_string(),
-            hint.chars().take(100).collect(),
+            {
+                let description: String = hint.chars().take(DISCORD_DESCRIPTION_MAX).collect();
+                if description.is_empty() {
+                    "input".to_string()
+                } else {
+                    description
+                }
+            },
             *required,
             Vec::new(),
         )),
@@ -1053,7 +1137,7 @@ fn expected_option(
             {
                 let description: String = format!("one of: {}", options.join(", "))
                     .chars()
-                    .take(100)
+                    .take(DISCORD_DESCRIPTION_MAX)
                     .collect();
                 description
             },
@@ -1110,7 +1194,6 @@ fn command_set_matches(
 async fn sync_application_commands(
     http: &Arc<Http>,
     permissions: &Arc<ArcSwap<DiscordPermissions>>,
-    ready_guilds: &[GuildId],
 ) {
     let (commands, specs, dropped) = build_discord_create_commands();
     if dropped > 0 {
@@ -1140,20 +1223,31 @@ async fn sync_application_commands(
                 }
             }
 
-            for guild_id in ready_guilds
+            // Every configured guild is synced, not just the ones present
+            // in a READY payload — a served guild missing from one gateway
+            // session would otherwise get no commands until a reconnect
+            // happens to include it. Per-guild failures (the bot not being
+            // a member yet, transient API errors) are logged and the loop
+            // continues with the remaining guilds. The filter can repeat a
+            // guild (one binding per channel set), so duplicates are synced
+            // once.
+            let mut seen_guilds = std::collections::HashSet::new();
+            for guild_id in guild_ids
                 .iter()
-                .filter(|guild| guild_ids.contains(&guild.get()))
+                .copied()
+                .filter(|guild_id| seen_guilds.insert(*guild_id))
+                .map(GuildId::new)
             {
-                match guild_id.get_commands(http).await {
-                    Ok(existing) if command_set_matches(&existing, &specs) => {
-                        tracing::debug!(guild_id = %guild_id, "discord commands already in sync");
-                        continue;
-                    }
-                    Ok(_) => {}
+                let in_sync = match guild_id.get_commands(http).await {
+                    Ok(existing) => command_set_matches(&existing, &specs),
                     Err(error) => {
                         tracing::warn!(%error, guild_id = %guild_id, "failed to fetch guild commands");
-                        continue;
+                        false
                     }
+                };
+                if in_sync {
+                    tracing::debug!(guild_id = %guild_id, "discord commands already in sync");
+                    continue;
                 }
                 match guild_id.set_commands(http, commands.clone()).await {
                     Ok(registered) => {
@@ -1655,6 +1749,97 @@ fn build_poll(
 mod tests {
     use super::*;
     use crate::{Button, ButtonStyle, Card, CardField, InteractiveElements, Poll};
+
+    #[test]
+    fn discord_specs_satisfy_platform_limits() {
+        let (commands, specs, _) = build_discord_create_commands();
+        assert_eq!(commands.len(), specs.len());
+        for spec in &specs {
+            assert!(
+                discord_spec_violation(spec).is_none(),
+                "spec /{} violates discord limits",
+                spec.name
+            );
+            assert!(
+                (1..=DISCORD_DESCRIPTION_MAX).contains(&spec.description.chars().count()),
+                "discord description length for /{}",
+                spec.name
+            );
+            if let Some((_, description, _, choices)) = expected_option(spec) {
+                assert!(
+                    (1..=DISCORD_DESCRIPTION_MAX).contains(&description.chars().count()),
+                    "discord option description length for /{}",
+                    spec.name
+                );
+                assert!(
+                    choices.len() <= DISCORD_CHOICE_CAP,
+                    "discord choice cap for /{}",
+                    spec.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn discord_validation_drops_no_registry_command() {
+        // Every command the registry exposes on Discord must survive
+        // validation — a violation here means a registry entry silently
+        // disappears from Discord instead of failing the build.
+        let (specs, _) = crate::commands::native::discord_commands();
+        let (_, validated, _) = build_discord_create_commands();
+        let expected: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
+        let actual: Vec<&str> = validated.iter().map(|spec| spec.name.as_str()).collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn discord_spec_violation_flags_invalid_specs() {
+        use crate::commands::native::{NativeArg, NativeCommandSpec};
+
+        let valid = NativeCommandSpec {
+            name: "mention-only".into(),
+            description: "only respond when mentioned".into(),
+            arg: None,
+        };
+        assert!(discord_spec_violation(&valid).is_none());
+
+        let uppercase = NativeCommandSpec {
+            name: "Status".into(),
+            ..valid.clone()
+        };
+        assert!(discord_spec_violation(&uppercase).is_some());
+
+        let too_long = NativeCommandSpec {
+            name: "a".repeat(DISCORD_NAME_MAX + 1),
+            ..valid.clone()
+        };
+        assert!(discord_spec_violation(&too_long).is_some());
+
+        let too_many_choices = NativeCommandSpec {
+            arg: Some(NativeArg::Choice {
+                options: (0..DISCORD_CHOICE_CAP + 1)
+                    .map(|i| format!("option-{i}"))
+                    .collect(),
+            }),
+            ..valid.clone()
+        };
+        assert!(discord_spec_violation(&too_many_choices).is_some());
+
+        let oversized_choice = NativeCommandSpec {
+            arg: Some(NativeArg::Choice {
+                options: vec!["x".repeat(DISCORD_CHOICE_VALUE_MAX + 1)],
+            }),
+            ..valid
+        };
+        assert!(discord_spec_violation(&oversized_choice).is_some());
+    }
+
+    #[test]
+    fn discord_description_normalization_clamps_and_falls_back() {
+        let clamped = normalize_discord_description(&"d".repeat(300), "status");
+        assert_eq!(clamped.chars().count(), DISCORD_DESCRIPTION_MAX);
+        assert_eq!(normalize_discord_description("", "status"), "/status");
+    }
 
     #[test]
     fn test_build_embed_limits() {

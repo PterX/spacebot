@@ -2714,7 +2714,11 @@ export interface components {
         BindingResponse: {
             adapter?: string | null;
             agent_id: string;
-            authority: string[];
+            /**
+             * @description Omitted key and explicit empty list are distinct: `None` defers to
+             *     the adapter default, `[]` opens the scope.
+             */
+            authority?: string[] | null;
             channel: string;
             channel_ids: string[];
             chat_id?: string | null;
