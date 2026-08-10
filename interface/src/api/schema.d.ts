@@ -1924,6 +1924,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/providers/default-models": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_provider_default_models"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/providers/openai/browser-oauth/start": {
         parameters: {
             query?: never;
@@ -3953,7 +3969,11 @@ export interface components {
             notifications: components["schemas"]["Notification"][];
         };
         OpenAiOAuthBrowserStartRequest: {
-            model: string;
+            /**
+             * @description Model to apply after sign-in. Omitted or empty means the backend's
+             *     default for the ChatGPT OAuth provider.
+             */
+            model?: string | null;
         };
         OpenAiOAuthBrowserStartResponse: {
             message: string;
@@ -4209,6 +4229,14 @@ export interface components {
             deployment?: string | null;
             message: string;
             success: boolean;
+        };
+        ProviderDefaultModelsResponse: {
+            /** @description Default model applied by the ChatGPT device OAuth flow. */
+            chatgpt_oauth: string;
+            /** @description Default model per provider id, from the backend routing defaults. */
+            defaults: {
+                [key: string]: string;
+            };
         };
         ProviderModelTestRequest: {
             api_key: string;
@@ -4574,6 +4602,23 @@ export interface components {
             tool_name: string;
             /** @enum {string} */
             type: "tool_call_run";
+        } | {
+            covers_from: string;
+            covers_to: string;
+            created_at: string;
+            id: string;
+            kind: string;
+            /** Format: int64 */
+            level: number;
+            /** Format: int64 */
+            message_count: number;
+            rolled_up_into?: string | null;
+            /** Format: int64 */
+            seq: number;
+            summary: string;
+            title: string;
+            /** @enum {string} */
+            type: "checkpoint";
         };
         ToggleCronRequest: {
             agent_id: string;
@@ -9881,6 +9926,25 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    get_provider_default_models: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderDefaultModelsResponse"];
+                };
             };
         };
     };

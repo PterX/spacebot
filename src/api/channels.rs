@@ -785,6 +785,25 @@ pub(super) async fn inspect_prompt(
         .await
         .unwrap_or_default();
 
+    // ── Render the session chronicle view (chronicle mode only) ──
+    let compaction = **rc.compaction.load();
+    let session_chronicle = if compaction.mode == crate::config::CompactionMode::Chronicle
+        && !channel_state.kind.self_exits()
+    {
+        let store =
+            crate::conversation::ChronicleStore::new(channel_state.deps.sqlite_pool.clone());
+        crate::agent::chronicle::render_chronicle_view(
+            &store,
+            &query.channel_id,
+            chrono::Utc::now(),
+            compaction.chronicle,
+        )
+        .await
+        .unwrap_or_default()
+    } else {
+        None
+    };
+
     // ── Render the full system prompt ──
     let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
     let system_prompt = prompt_engine
@@ -803,6 +822,7 @@ pub(super) async fn inspect_prompt(
             adapter_prompt,
             project_context,
             None, // backfill_transcript — only set during channel initialization
+            session_chronicle,
             empty_to_none(working_memory),
             empty_to_none(channel_activity_map),
             empty_to_none(participant_context),

@@ -11,10 +11,12 @@ use crate::agent::channel_history::{
 use crate::agent::channel_prompt::{
     MAX_RETRIGGERS_PER_TURN, RETRIGGER_DEBOUNCE_MS, RETRIGGER_MAX_TURNS, TemporalContext,
 };
+use crate::agent::chronicle::Chronicler;
 use crate::agent::compactor::Compactor;
 use crate::agent::process_control::ControlActionResult;
 use crate::agent::status::{StatusBlock, SystemInfo};
 use crate::agent::worker::Worker;
+use crate::config::CompactionMode;
 use crate::conversation::settings::{
     DelegationMode, MemoryMode, ResolvedConversationSettings, ResponseMode,
 };
@@ -824,6 +826,10 @@ pub struct Channel {
     pub conversation_context: Option<String>,
     /// Context monitor that triggers background compaction.
     pub compactor: Compactor,
+    /// Context monitor for chronicle mode. Only one of the two acts per turn,
+    /// selected by `CompactionConfig::mode`; short-lived system channels always
+    /// use the compactor.
+    pub chronicler: Chronicler,
     /// Count of user messages since last memory persistence branch.
     message_count: usize,
     /// When the last memory persistence branch was triggered.
@@ -984,14 +990,17 @@ impl Channel {
         let process_run_logger = ProcessRunLogger::new(deps.sqlite_pool.clone());
         let channel_store = ChannelStore::new(deps.sqlite_pool.clone());
 
+        let compactor_model = resolved_settings
+            .resolve_model("compactor")
+            .map(String::from);
         let compactor = Compactor::new(
             id.clone(),
             deps.clone(),
             history.clone(),
-            resolved_settings
-                .resolve_model("compactor")
-                .map(String::from),
+            compactor_model.clone(),
         );
+        let chronicler =
+            Chronicler::new(id.clone(), deps.clone(), history.clone(), compactor_model);
 
         let state = ChannelState {
             channel_id: id.clone(),
@@ -1070,6 +1079,7 @@ impl Channel {
             source_adapter: None,
             conversation_context: None,
             compactor,
+            chronicler,
             message_count: 0,
             last_persistence_at: std::time::Instant::now(),
             memory_persistence_branches: HashSet::new(),
@@ -1094,6 +1104,57 @@ impl Channel {
     }
 
     /// Set the backfill transcript for injection into the system prompt.
+    /// Whether this channel sheds history through the chronicle.
+    ///
+    /// Cron and autonomy channels self-exit once their work settles, so
+    /// chronicling them costs an LLM call for a story nobody will read.
+    fn uses_chronicle(&self) -> bool {
+        self.deps.runtime_config.compaction.load().mode == CompactionMode::Chronicle
+            && !self.state.kind.self_exits()
+    }
+
+    /// Run whichever context monitor this channel is configured for.
+    ///
+    /// Called after every turn. Both monitors are non-blocking: the LLM work
+    /// happens on a spawned task, and only emergency truncation is synchronous.
+    async fn maintain_context(&self) {
+        let result = if self.uses_chronicle() {
+            self.chronicler.check_and_chronicle().await.map(|_| ())
+        } else {
+            self.compactor.check_and_compact().await.map(|_| ())
+        };
+
+        if let Err(error) = result {
+            tracing::warn!(channel_id = %self.id, %error, "context maintenance check failed");
+        }
+    }
+
+    /// The bounded chronicle view for this channel's system prompt.
+    ///
+    /// Recomputed from durable state each turn, so a restarted channel renders
+    /// the same section the running one did.
+    async fn render_session_chronicle(&self) -> Option<String> {
+        if !self.uses_chronicle() {
+            return None;
+        }
+
+        let config = self.deps.runtime_config.compaction.load().chronicle;
+        match crate::agent::chronicle::render_chronicle_view(
+            self.chronicler.store(),
+            &self.id,
+            chrono::Utc::now(),
+            config,
+        )
+        .await
+        {
+            Ok(view) => view,
+            Err(error) => {
+                tracing::warn!(channel_id = %self.id, %error, "failed to render session chronicle");
+                None
+            }
+        }
+    }
+
     pub fn set_backfill_transcript(&mut self, transcript: String) {
         self.backfill_transcript = Some(transcript);
     }
@@ -1941,9 +2002,7 @@ impl Channel {
                     });
                 }
             }
-            if let Err(error) = self.compactor.check_and_compact().await {
-                tracing::warn!(channel_id = %self.id, %error, "compaction check failed");
-            }
+            self.maintain_context().await;
             // Both Observe and MentionOnly keep passive memory capture.
             self.message_count += message_count;
             self.check_memory_persistence().await;
@@ -2048,10 +2107,7 @@ impl Channel {
         {
             self.record_decision_event(turn_result.reply_text.as_deref(), None);
         }
-        // Check compaction
-        if let Err(error) = self.compactor.check_and_compact().await {
-            tracing::warn!(channel_id = %self.id, %error, "compaction check failed");
-        }
+        self.maintain_context().await;
 
         // Increment message counter for memory persistence
         self.message_count += message_count;
@@ -2147,6 +2203,7 @@ impl Channel {
             adapter_prompt,
             project_context,
             self.backfill_transcript.clone(),
+            self.render_session_chronicle().await,
             empty_to_none(working_memory),
             empty_to_none(channel_activity_map),
             empty_to_none(participant_context),
@@ -2393,9 +2450,7 @@ impl Channel {
                         content: OneOrMany::one(UserContent::text(&user_text)),
                     });
                 }
-                if let Err(error) = self.compactor.check_and_compact().await {
-                    tracing::warn!(channel_id = %self.id, %error, "compaction check failed");
-                }
+                self.maintain_context().await;
                 // Both Observe and MentionOnly keep passive memory capture.
                 self.message_count += 1;
                 self.check_memory_persistence().await;
@@ -2579,10 +2634,7 @@ impl Channel {
             }
         }
 
-        // Check context size and trigger compaction if needed
-        if let Err(error) = self.compactor.check_and_compact().await {
-            tracing::warn!(channel_id = %self.id, %error, "compaction check failed");
-        }
+        self.maintain_context().await;
 
         // Increment message counter and spawn memory persistence branch if threshold reached
         if !is_retrigger {
@@ -2909,6 +2961,7 @@ impl Channel {
             adapter_prompt,
             project_context,
             self.backfill_transcript.clone(),
+            self.render_session_chronicle().await,
             empty_to_none(working_memory),
             empty_to_none(channel_activity_map),
             empty_to_none(participant_context),

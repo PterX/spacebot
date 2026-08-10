@@ -752,12 +752,66 @@ impl McpTransport {
     }
 }
 
+/// How a channel sheds history once its context fills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionMode {
+    /// One rolling summary at the head of the in-memory history, rewritten
+    /// under context pressure.
+    #[default]
+    Rolling,
+    /// Append-only interval checkpoints persisted per channel, with a bounded
+    /// checkpoint view rendered into the system prompt. See
+    /// `docs/design-docs/session-chronicles.md`.
+    Chronicle,
+}
+
 /// Compaction threshold configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct CompactionConfig {
+    pub mode: CompactionMode,
     pub background_threshold: f32,
     pub aggressive_threshold: f32,
     pub emergency_threshold: f32,
+    pub chronicle: ChronicleConfig,
+}
+
+/// Session chronicle tuning. Only consulted in [`CompactionMode::Chronicle`].
+#[derive(Debug, Clone, Copy)]
+pub struct ChronicleConfig {
+    /// Logged messages since the last checkpoint that trigger the next cut.
+    pub interval_messages: usize,
+    /// Share of the context window of history growth that triggers a cut
+    /// before the message interval elapses. Catches tool-heavy turns that
+    /// consume the window in few messages.
+    pub interval_token_fraction: f32,
+    /// How far back the recent-checkpoint window reaches, in hours.
+    pub recent_window_hours: i64,
+    /// Maximum checkpoints rendered in full in the recent window.
+    pub max_recent: usize,
+    /// Maximum older checkpoints rendered, collapsed first under budget.
+    pub max_older: usize,
+    /// Token budget for the whole chronicle section of the system prompt.
+    pub context_token_budget: usize,
+    /// Raw messages a single `expand` may return.
+    pub expand_message_limit: i64,
+    /// Raw messages a single checkpoint summarization may read.
+    pub max_messages_per_checkpoint: i64,
+}
+
+impl Default for ChronicleConfig {
+    fn default() -> Self {
+        Self {
+            interval_messages: 40,
+            interval_token_fraction: 0.12,
+            recent_window_hours: 24,
+            max_recent: 8,
+            max_older: 12,
+            context_token_budget: 2000,
+            expand_message_limit: 100,
+            max_messages_per_checkpoint: 400,
+        }
+    }
 }
 
 /// Auto-branching memory persistence configuration.
@@ -917,9 +971,13 @@ impl Default for ParticipantContextConfig {
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
+            // Rolling has the production hours. The chronicle default flips
+            // once it has soak time on long-running channels.
+            mode: CompactionMode::Rolling,
             background_threshold: 0.80,
             aggressive_threshold: 0.85,
             emergency_threshold: 0.95,
+            chronicle: ChronicleConfig::default(),
         }
     }
 }

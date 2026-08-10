@@ -296,6 +296,21 @@ pub enum TimelineItem {
         started_at: String,
         completed_at: Option<String>,
     },
+    /// A session chronicle checkpoint, placed inline at the point the
+    /// conversation reached it. Authored by neither the user nor the agent.
+    Checkpoint {
+        id: String,
+        seq: i64,
+        level: i64,
+        kind: String,
+        title: String,
+        summary: String,
+        covers_from: String,
+        covers_to: String,
+        message_count: i64,
+        rolled_up_into: Option<String>,
+        created_at: String,
+    },
 }
 
 /// Persists branch and worker run records for channel timeline history.
@@ -792,102 +807,152 @@ impl ProcessRunLogger {
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
 
-        let mut items: Vec<TimelineItem> = rows
+        // Each entry carries the timestamp of the row it came from. Tool calls
+        // expanded out of a message share that message's key, so the stable
+        // merge below cannot separate them from the message they belong to.
+        let mut items: Vec<(chrono::DateTime<chrono::Utc>, TimelineItem)> = rows
             .into_iter()
-            .filter_map(|row| -> Option<Vec<TimelineItem>> {
-                let item_type: String = row.try_get("item_type").ok()?;
-                match item_type.as_str() {
-                    "message" => {
-                        let metadata_json: Option<String> = row.try_get("metadata").ok().flatten();
-                        let metadata_value = metadata_json
-                            .as_deref()
-                            .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok());
-                        let attachments = metadata_value
-                            .as_ref()
-                            .and_then(|v| v.get("attachments").cloned())
-                            .and_then(|a| {
-                                serde_json::from_value::<
-                                    Vec<crate::agent::channel_attachments::SavedAttachmentMeta>,
-                                >(a)
-                                .ok()
-                            })
-                            .unwrap_or_default();
+            .filter_map(
+                |row| -> Option<Vec<(chrono::DateTime<chrono::Utc>, TimelineItem)>> {
+                    let item_type: String = row.try_get("item_type").ok()?;
+                    let row_timestamp = row
+                        .try_get::<chrono::DateTime<chrono::Utc>, _>("timestamp")
+                        .unwrap_or_else(|_| chrono::Utc::now());
+                    match item_type.as_str() {
+                        "message" => {
+                            let metadata_json: Option<String> =
+                                row.try_get("metadata").ok().flatten();
+                            let metadata_value = metadata_json.as_deref().and_then(|json| {
+                                serde_json::from_str::<serde_json::Value>(json).ok()
+                            });
+                            let attachments = metadata_value
+                                .as_ref()
+                                .and_then(|v| v.get("attachments").cloned())
+                                .and_then(|a| {
+                                    serde_json::from_value::<
+                                        Vec<crate::agent::channel_attachments::SavedAttachmentMeta>,
+                                    >(a)
+                                    .ok()
+                                })
+                                .unwrap_or_default();
 
-                        // Expand tool calls stored in message metadata into ToolCallRun items.
-                        let tool_call_items: Vec<TimelineItem> = metadata_value
-                            .as_ref()
-                            .and_then(|v| v.get("tool_calls"))
-                            .and_then(|tc| {
-                                serde_json::from_value::<Vec<crate::api::ChannelToolCallEntry>>(
-                                    tc.clone(),
-                                )
-                                .ok()
-                            })
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|tc| TimelineItem::ToolCallRun {
-                                id: tc.id,
-                                tool_name: tc.tool_name,
-                                args: tc.args,
-                                result: tc.result,
-                                status: tc.status,
-                                started_at: tc.started_at,
-                                completed_at: tc.completed_at,
-                            })
-                            .collect();
+                            // Expand tool calls stored in message metadata into ToolCallRun items.
+                            let tool_call_items: Vec<TimelineItem> = metadata_value
+                                .as_ref()
+                                .and_then(|v| v.get("tool_calls"))
+                                .and_then(|tc| {
+                                    serde_json::from_value::<Vec<crate::api::ChannelToolCallEntry>>(
+                                        tc.clone(),
+                                    )
+                                    .ok()
+                                })
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|tc| TimelineItem::ToolCallRun {
+                                    id: tc.id,
+                                    tool_name: tc.tool_name,
+                                    args: tc.args,
+                                    result: tc.result,
+                                    status: tc.status,
+                                    started_at: tc.started_at,
+                                    completed_at: tc.completed_at,
+                                })
+                                .collect();
 
-                        let message = TimelineItem::Message {
-                            id: row.try_get("id").unwrap_or_default(),
-                            role: row.try_get("role").unwrap_or_default(),
-                            sender_name: row.try_get("sender_name").ok().flatten(),
-                            sender_id: row.try_get("sender_id").ok().flatten(),
-                            content: row.try_get("content").unwrap_or_default(),
-                            created_at: row
-                                .try_get::<chrono::DateTime<chrono::Utc>, _>("timestamp")
-                                .map(|t| t.to_rfc3339())
-                                .unwrap_or_default(),
-                            attachments,
-                        };
+                            let message = TimelineItem::Message {
+                                id: row.try_get("id").unwrap_or_default(),
+                                role: row.try_get("role").unwrap_or_default(),
+                                sender_name: row.try_get("sender_name").ok().flatten(),
+                                sender_id: row.try_get("sender_id").ok().flatten(),
+                                content: row.try_get("content").unwrap_or_default(),
+                                created_at: row
+                                    .try_get::<chrono::DateTime<chrono::Utc>, _>("timestamp")
+                                    .map(|t| t.to_rfc3339())
+                                    .unwrap_or_default(),
+                                attachments,
+                            };
 
-                        // Tool calls come before the message they belong to.
-                        let mut result = tool_call_items;
-                        result.push(message);
-                        Some(result)
+                            // Tool calls come before the message they belong to.
+                            let mut result = tool_call_items;
+                            result.push(message);
+                            Some(
+                                result
+                                    .into_iter()
+                                    .map(|item| (row_timestamp, item))
+                                    .collect(),
+                            )
+                        }
+                        "branch_run" => Some(vec![(
+                            row_timestamp,
+                            TimelineItem::BranchRun {
+                                id: row.try_get("id").unwrap_or_default(),
+                                description: row.try_get("description").unwrap_or_default(),
+                                conclusion: row.try_get("conclusion").ok(),
+                                started_at: row
+                                    .try_get::<chrono::DateTime<chrono::Utc>, _>("timestamp")
+                                    .map(|t| t.to_rfc3339())
+                                    .unwrap_or_default(),
+                                completed_at: row
+                                    .try_get::<chrono::DateTime<chrono::Utc>, _>("completed_at")
+                                    .ok()
+                                    .map(|t| t.to_rfc3339()),
+                            },
+                        )]),
+                        "worker_run" => Some(vec![(
+                            row_timestamp,
+                            TimelineItem::WorkerRun {
+                                id: row.try_get("id").unwrap_or_default(),
+                                task: row.try_get("task").unwrap_or_default(),
+                                result: row.try_get("result").ok(),
+                                status: row.try_get("status").unwrap_or_default(),
+                                started_at: row
+                                    .try_get::<chrono::DateTime<chrono::Utc>, _>("timestamp")
+                                    .map(|t| t.to_rfc3339())
+                                    .unwrap_or_default(),
+                                completed_at: row
+                                    .try_get::<chrono::DateTime<chrono::Utc>, _>("completed_at")
+                                    .ok()
+                                    .map(|t| t.to_rfc3339()),
+                            },
+                        )]),
+                        _ => None,
                     }
-                    "branch_run" => Some(vec![TimelineItem::BranchRun {
-                        id: row.try_get("id").unwrap_or_default(),
-                        description: row.try_get("description").unwrap_or_default(),
-                        conclusion: row.try_get("conclusion").ok(),
-                        started_at: row
-                            .try_get::<chrono::DateTime<chrono::Utc>, _>("timestamp")
-                            .map(|t| t.to_rfc3339())
-                            .unwrap_or_default(),
-                        completed_at: row
-                            .try_get::<chrono::DateTime<chrono::Utc>, _>("completed_at")
-                            .ok()
-                            .map(|t| t.to_rfc3339()),
-                    }]),
-                    "worker_run" => Some(vec![TimelineItem::WorkerRun {
-                        id: row.try_get("id").unwrap_or_default(),
-                        task: row.try_get("task").unwrap_or_default(),
-                        result: row.try_get("result").ok(),
-                        status: row.try_get("status").unwrap_or_default(),
-                        started_at: row
-                            .try_get::<chrono::DateTime<chrono::Utc>, _>("timestamp")
-                            .map(|t| t.to_rfc3339())
-                            .unwrap_or_default(),
-                        completed_at: row
-                            .try_get::<chrono::DateTime<chrono::Utc>, _>("completed_at")
-                            .ok()
-                            .map(|t| t.to_rfc3339()),
-                    }]),
-                    _ => None,
-                }
-            })
+                },
+            )
             .flatten()
             .collect();
 
-        // Reverse to chronological order
+        // Chronicle checkpoints live in their own table, so they are fetched
+        // separately and merged. Each source returns up to `limit` rows, which
+        // is what makes the merged newest-`limit` slice the correct page.
+        let checkpoints = crate::conversation::chronicle::ChronicleStore::new(self.pool.clone())
+            .list_for_timeline(channel_id, limit, before)
+            .await?;
+        items.extend(checkpoints.into_iter().map(|checkpoint| {
+            (
+                checkpoint.created_at,
+                TimelineItem::Checkpoint {
+                    id: checkpoint.id,
+                    seq: checkpoint.seq,
+                    level: checkpoint.level,
+                    kind: checkpoint.kind.as_str().to_string(),
+                    title: checkpoint.title,
+                    summary: checkpoint.summary,
+                    covers_from: checkpoint.covers_from_at.to_rfc3339(),
+                    covers_to: checkpoint.covers_to_at.to_rfc3339(),
+                    message_count: checkpoint.message_count,
+                    rolled_up_into: checkpoint.rolled_up_into,
+                    created_at: checkpoint.created_at.to_rfc3339(),
+                },
+            )
+        }));
+
+        // Both sources arrive newest-first. A stable sort by the shared key
+        // leaves an unchecked timeline in exactly the order it already had and
+        // slots checkpoints into place; the page is then the newest `limit`.
+        items.sort_by_key(|(timestamp, _)| std::cmp::Reverse(*timestamp));
+        items.truncate(limit as usize);
+        let mut items: Vec<TimelineItem> = items.into_iter().map(|(_, item)| item).collect();
         items.reverse();
         Ok(items)
     }
@@ -1097,7 +1162,7 @@ pub struct WorkerDetailRow {
 
 #[cfg(test)]
 mod tests {
-    use super::ProcessRunLogger;
+    use super::{ProcessRunLogger, TimelineItem};
 
     async fn setup_worker_runs_table() -> sqlx::SqlitePool {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -1271,6 +1336,94 @@ mod tests {
             .expect("fetch");
         let result: String = sqlx::Row::try_get(&row, "result").expect("result");
         assert_eq!(result, "Worker cancelled: user requested");
+    }
+
+    #[tokio::test]
+    async fn timeline_places_checkpoints_between_the_messages_they_follow() {
+        use crate::conversation::chronicle::{
+            CheckpointKind, ChronicleBoundary, ChronicleStore, NewCheckpoint,
+        };
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        for migration in [
+            include_str!("../../migrations/20260211000002_conversations.sql"),
+            include_str!("../../migrations/20260213000003_process_runs.sql"),
+            include_str!("../../migrations/20260809000004_session_chronicles.sql"),
+        ] {
+            sqlx::raw_sql(migration)
+                .execute(&pool)
+                .await
+                .expect("migration");
+        }
+
+        for (id, at) in [
+            ("m1", "2026-08-01 00:00:01"),
+            ("m2", "2026-08-01 00:00:02"),
+            ("m3", "2026-08-01 00:00:09"),
+        ] {
+            sqlx::query(
+                "INSERT INTO conversation_messages (id, channel_id, role, content, created_at) \
+                 VALUES (?, 'ch', 'user', 'hi', ?)",
+            )
+            .bind(id)
+            .bind(at)
+            .execute(&pool)
+            .await
+            .expect("insert message");
+        }
+
+        let at = |value: &str| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        ChronicleStore::new(pool.clone())
+            .commit(NewCheckpoint {
+                channel_id: "ch".into(),
+                level: 0,
+                kind: CheckpointKind::Interval,
+                title: "Opening span".into(),
+                summary: "They greeted each other twice.".into(),
+                covers_from: ChronicleBoundary::origin(at("2026-08-01T00:00:01Z")),
+                covers_to: ChronicleBoundary::new(at("2026-08-01T00:00:02Z"), Some("m2".into())),
+                message_count: 2,
+                token_estimate: 5,
+                rolls_up_from_seq: None,
+                rolls_up_to_seq: None,
+                model: None,
+            })
+            .await
+            .expect("commit");
+        // The commit stamps `created_at` at wall-clock now; pin it between m2
+        // and m3 so its timeline position is deterministic.
+        sqlx::query("UPDATE channel_chronicle_checkpoints SET created_at = '2026-08-01 00:00:05'")
+            .execute(&pool)
+            .await
+            .expect("pin commit time");
+
+        let items = ProcessRunLogger::new(pool)
+            .load_channel_timeline("ch", 20, None)
+            .await
+            .expect("timeline");
+
+        let shape: Vec<String> = items
+            .iter()
+            .map(|item| match item {
+                TimelineItem::Message { id, .. } => format!("message:{id}"),
+                TimelineItem::Checkpoint { seq, .. } => format!("checkpoint:{seq}"),
+                other => format!("other:{other:?}"),
+            })
+            .collect();
+
+        assert_eq!(
+            shape,
+            vec!["message:m1", "message:m2", "checkpoint:1", "message:m3"],
+            "a checkpoint sits inline after the messages it covers"
+        );
     }
 
     #[tokio::test]
