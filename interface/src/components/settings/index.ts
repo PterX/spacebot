@@ -11,7 +11,7 @@ export {ChangelogSection} from "./ChangelogSection";
 export {ConfigFileSection} from "./ConfigFileSection";
 export {ProviderCard} from "./ProviderCard";
 export {ChatGptOAuthDialog} from "./ChatGptOAuthDialog";
-export {SECTIONS, PROVIDERS, CHATGPT_OAUTH_DEFAULT_MODEL, PERMISSION_OPTIONS} from "./constants";
+export {SECTIONS, PROVIDERS, PERMISSION_OPTIONS} from "./constants";
 export type {
 	SectionId,
 	Platform,

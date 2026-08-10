@@ -113,9 +113,20 @@ pub struct ProviderModelTestResponse {
     pub sample: Option<String>,
 }
 
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct ProviderDefaultModelsResponse {
+    /// Default model per provider id, from the backend routing defaults.
+    pub defaults: HashMap<String, String>,
+    /// Default model applied by the ChatGPT device OAuth flow.
+    pub chatgpt_oauth: String,
+}
+
 #[derive(Deserialize, utoipa::ToSchema)]
 pub(super) struct OpenAiOAuthBrowserStartRequest {
-    model: String,
+    /// Model to apply after sign-in. Omitted or empty means the backend's
+    /// default for the ChatGPT OAuth provider.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -317,20 +328,128 @@ async fn update_device_oauth_status(state_key: &str, status: DeviceOAuthSessionS
     }
 }
 
+/// Outcome of walking the ChatGPT OAuth model candidates to find one the
+/// account actually serves.
+#[derive(Debug, PartialEq, Eq)]
+enum ModelVerification {
+    /// The requested model responded.
+    Requested(String),
+    /// The requested model was rejected and this default candidate responded.
+    Fallback(String),
+    /// No candidate responded. Each entry is `model: error`.
+    Unverified(Vec<String>),
+}
+
+/// Try the requested model first, then the provider's default candidates, and
+/// report the first one that responds. Only a model that reaches this point
+/// verified is safe to write into routing.
+async fn resolve_verified_model<Verify, Fut>(requested: &str, verify: Verify) -> ModelVerification
+where
+    Verify: Fn(String) -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    let mut candidates = vec![requested.to_string()];
+    for candidate in crate::llm::routing::default_model_candidates("openai-chatgpt") {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+
+    let mut failures = Vec::new();
+    for candidate in candidates {
+        match verify(candidate.clone()).await {
+            Ok(()) => {
+                return if candidate == requested {
+                    ModelVerification::Requested(candidate)
+                } else {
+                    ModelVerification::Fallback(candidate)
+                };
+            }
+            Err(error) => {
+                tracing::warn!(model = %candidate, %error, "ChatGPT OAuth model verification failed");
+                failures.push(format!("{candidate}: {error}"));
+            }
+        }
+    }
+
+    ModelVerification::Unverified(failures)
+}
+
+/// Run a one-shot completion against the ChatGPT OAuth provider to prove a
+/// model id is actually served for this account.
+async fn verify_openai_chatgpt_model(
+    llm_manager: &Arc<crate::llm::LlmManager>,
+    model: &str,
+) -> Result<(), String> {
+    let model = crate::llm::SpacebotModel::make(llm_manager, model);
+    let agent = AgentBuilder::new(model)
+        .preamble("You are running a provider connectivity check. Reply with exactly: OK")
+        .build();
+    agent
+        .prompt("Connection test")
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 async fn finalize_openai_oauth(
     state: &Arc<ApiState>,
     credentials: &crate::openai_auth::OAuthCredentials,
     model: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let instance_dir = (**state.instance_dir.load()).clone();
     crate::openai_auth::save_credentials(&instance_dir, credentials)
         .context("failed to save OpenAI OAuth credentials")?;
 
-    if let Some(llm_manager) = state.llm_manager.read().await.as_ref() {
-        llm_manager
-            .set_openai_oauth_credentials(credentials.clone())
-            .await;
-    }
+    let llm_manager = match state.llm_manager.read().await.as_ref() {
+        Some(llm_manager) => {
+            llm_manager
+                .set_openai_oauth_credentials(credentials.clone())
+                .await;
+            llm_manager.clone()
+        }
+        None => {
+            // No manager yet (first-run setup) — build one just for verification.
+            let llm_manager =
+                Arc::new(crate::llm::LlmManager::new(build_test_llm_config("", "")).await?);
+            llm_manager
+                .set_openai_oauth_credentials(credentials.clone())
+                .await;
+            llm_manager
+        }
+    };
+
+    // Verify the requested model before writing it into routing; if the
+    // provider rejects it, walk the default candidates until one responds.
+    let verification = resolve_verified_model(model, |candidate| {
+        let llm_manager = llm_manager.clone();
+        async move { verify_openai_chatgpt_model(&llm_manager, &candidate).await }
+    })
+    .await;
+
+    let (applied_model, message) = match verification {
+        ModelVerification::Requested(applied) => {
+            let message = format!(
+                "OpenAI configured via device OAuth. Model '{applied}' verified and applied to defaults and default agent routing."
+            );
+            (applied, message)
+        }
+        ModelVerification::Fallback(applied) => {
+            let message = format!(
+                "OpenAI configured via device OAuth. Model '{model}' was rejected by the provider, so verified fallback '{applied}' was applied to defaults and default agent routing instead."
+            );
+            (applied, message)
+        }
+        ModelVerification::Unverified(failures) => {
+            // The credentials stay saved so the sign-in doesn't have to be
+            // repeated, but routing keeps the models it already had rather than
+            // pointing every slot at an id this account can't serve.
+            anyhow::bail!(
+                "can't apply model routing: this ChatGPT account served none of the candidate models ({}). Existing routing is unchanged — set a working model under Settings → Model Routing and report this as a bug.",
+                failures.join("; ")
+            );
+        }
+    };
 
     let config_path = state.config_path.read().await.clone();
     let content = if config_path.exists() {
@@ -342,7 +461,7 @@ async fn finalize_openai_oauth(
     };
 
     let mut doc: toml_edit::DocumentMut = content.parse().context("failed to parse config.toml")?;
-    apply_model_routing(&mut doc, model);
+    apply_model_routing(&mut doc, &applied_model);
     tokio::fs::write(&config_path, doc.to_string())
         .await
         .context("failed to write config.toml")?;
@@ -355,7 +474,7 @@ async fn finalize_openai_oauth(
         .try_send(crate::ProviderSetupEvent::ProvidersConfigured)
         .ok();
 
-    Ok(())
+    Ok(message)
 }
 
 #[utoipa::path(
@@ -562,6 +681,60 @@ pub(super) async fn get_providers(
 }
 
 #[utoipa::path(
+    get,
+    path = "/providers/default-models",
+    responses(
+        (status = 200, body = ProviderDefaultModelsResponse),
+    ),
+    tag = "providers",
+)]
+pub(super) async fn get_provider_default_models() -> Json<ProviderDefaultModelsResponse> {
+    const PROVIDER_IDS: &[&str] = &[
+        "anthropic",
+        "openai",
+        "openai-chatgpt",
+        "openrouter",
+        "kilo",
+        "zhipu",
+        "groq",
+        "together",
+        "fireworks",
+        "deepseek",
+        "xai",
+        "mistral",
+        "gemini",
+        "nvidia",
+        "opencode-zen",
+        "opencode-go",
+        "minimax",
+        "minimax-cn",
+        "moonshot",
+        "zai-coding-plan",
+        "github-copilot",
+        "ollama",
+    ];
+
+    let mut defaults: HashMap<String, String> = PROVIDER_IDS
+        .iter()
+        .map(|id| {
+            (
+                id.to_string(),
+                crate::llm::routing::defaults_for_provider(id).channel,
+            )
+        })
+        .collect();
+    // Azure model ids name the user's own deployment, so this is a placeholder
+    // rather than a routing default.
+    defaults.insert("azure".to_string(), "azure/gpt-4o".to_string());
+
+    let chatgpt_oauth = crate::llm::routing::defaults_for_provider("openai-chatgpt").channel;
+    Json(ProviderDefaultModelsResponse {
+        defaults,
+        chatgpt_oauth,
+    })
+}
+
+#[utoipa::path(
     post,
     path = "/providers/openai/browser-oauth/start",
     request_body = OpenAiOAuthBrowserStartRequest,
@@ -575,26 +748,24 @@ pub(super) async fn start_openai_browser_oauth(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<OpenAiOAuthBrowserStartRequest>,
 ) -> Result<Json<OpenAiOAuthBrowserStartResponse>, StatusCode> {
-    if request.model.trim().is_empty() {
-        return Ok(Json(OpenAiOAuthBrowserStartResponse {
-            success: false,
-            message: "Model cannot be empty".to_string(),
-            user_code: None,
-            verification_url: None,
-            state: None,
-        }));
-    }
-    let Some(chatgpt_model) = normalize_openai_chatgpt_model(&request.model) else {
-        return Ok(Json(OpenAiOAuthBrowserStartResponse {
-            success: false,
-            message: format!(
-                "Model '{}' must use provider 'openai' or 'openai-chatgpt'.",
-                request.model
-            ),
-            user_code: None,
-            verification_url: None,
-            state: None,
-        }));
+    let requested_model = request.model.unwrap_or_default();
+    let chatgpt_model = if requested_model.trim().is_empty() {
+        crate::llm::routing::defaults_for_provider("openai-chatgpt").channel
+    } else {
+        match normalize_openai_chatgpt_model(&requested_model) {
+            Some(model) => model,
+            None => {
+                return Ok(Json(OpenAiOAuthBrowserStartResponse {
+                    success: false,
+                    message: format!(
+                        "Model '{requested_model}' must use provider 'openai' or 'openai-chatgpt'."
+                    ),
+                    user_code: None,
+                    verification_url: None,
+                    state: None,
+                }));
+            }
+        }
     };
 
     prune_expired_device_oauth_sessions().await;
@@ -733,13 +904,10 @@ async fn run_device_oauth_background(
         };
 
         match finalize_openai_oauth(&state, &credentials, &model).await {
-            Ok(()) => {
+            Ok(message) => {
                 update_device_oauth_status(
                     &state_key,
-                    DeviceOAuthSessionStatus::Completed(format!(
-                        "OpenAI configured via device OAuth. Model '{}' applied to defaults and default agent routing.",
-                        model
-                    )),
+                    DeviceOAuthSessionStatus::Completed(message),
                 )
                 .await;
             }
@@ -1632,7 +1800,14 @@ pub(super) async fn delete_provider(
 
 #[cfg(test)]
 mod tests {
-    use super::build_test_llm_config;
+    use super::{ModelVerification, build_test_llm_config, resolve_verified_model};
+
+    use std::sync::Mutex;
+
+    /// Records every candidate a verification run attempted, in order.
+    fn record_attempts() -> Mutex<Vec<String>> {
+        Mutex::new(Vec::new())
+    }
 
     #[test]
     fn build_test_llm_config_registers_ollama_provider_from_base_url() {
@@ -1644,5 +1819,84 @@ mod tests {
 
         assert_eq!(provider.base_url, "http://remote-ollama.local:11434");
         assert_eq!(provider.api_key, "");
+    }
+
+    #[tokio::test]
+    async fn resolve_verified_model_keeps_the_requested_model_when_it_responds() {
+        let attempts = record_attempts();
+        let verification = resolve_verified_model("openai-chatgpt/gpt-5.6-sol", |candidate| {
+            attempts.lock().unwrap().push(candidate);
+            async { Ok(()) }
+        })
+        .await;
+
+        assert_eq!(
+            verification,
+            ModelVerification::Requested("openai-chatgpt/gpt-5.6-sol".into())
+        );
+        assert_eq!(attempts.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_verified_model_falls_back_when_the_requested_model_is_rejected() {
+        let requested = "openai-chatgpt/gpt-5.3-codex";
+        let verification = resolve_verified_model(requested, |candidate| async move {
+            if candidate == requested {
+                Err("model_not_found: the model does not exist".to_string())
+            } else {
+                Ok(())
+            }
+        })
+        .await;
+
+        let ModelVerification::Fallback(applied) = verification else {
+            panic!("a default candidate should have verified");
+        };
+        assert_ne!(applied, requested);
+        assert!(applied.starts_with("openai-chatgpt/"), "got {applied}");
+    }
+
+    #[tokio::test]
+    async fn resolve_verified_model_reports_every_failure_when_nothing_responds() {
+        let attempts = record_attempts();
+        let verification = resolve_verified_model("openai-chatgpt/bogus", |candidate| {
+            attempts.lock().unwrap().push(candidate.clone());
+            async move { Err(format!("model_not_found: {candidate}")) }
+        })
+        .await;
+
+        let ModelVerification::Unverified(failures) = verification else {
+            panic!("no candidate responded, so nothing should be applied");
+        };
+        let attempts = attempts.lock().unwrap();
+        assert!(
+            attempts.len() > 1,
+            "default candidates should be tried after the requested model"
+        );
+        assert_eq!(failures.len(), attempts.len());
+        assert!(failures[0].starts_with("openai-chatgpt/bogus: "));
+    }
+
+    #[tokio::test]
+    async fn resolve_verified_model_does_not_retry_a_requested_default() {
+        let requested = crate::llm::routing::default_model_candidates("openai-chatgpt")
+            .into_iter()
+            .next()
+            .expect("openai-chatgpt has default candidates");
+        let attempts = record_attempts();
+        resolve_verified_model(&requested, |candidate| {
+            attempts.lock().unwrap().push(candidate);
+            async { Err("model_not_found".to_string()) }
+        })
+        .await;
+
+        let attempts = attempts.lock().unwrap();
+        assert_eq!(
+            attempts
+                .iter()
+                .filter(|candidate| **candidate == requested)
+                .count(),
+            1
+        );
     }
 }

@@ -13,6 +13,7 @@ export function ProviderCard({
 	removing,
 	actionLabel,
 	showRemove,
+	editDisabled,
 }: ProviderCardProps) {
 	const primaryLabel = actionLabel ?? (configured ? "Update" : "Add key");
 	const shouldShowRemove = showRemove ?? configured;
@@ -34,12 +35,20 @@ export function ProviderCard({
 						)}
 					</div>
 					<p className="mt-0.5 text-sm text-ink-dull">{description}</p>
-					<p className="mt-1 text-tiny text-ink-faint">
-						Default model: <span className="text-ink-dull">{defaultModel}</span>
-					</p>
+					{defaultModel && (
+						<p className="mt-1 text-tiny text-ink-faint">
+							Default model:{" "}
+							<span className="text-ink-dull">{defaultModel}</span>
+						</p>
+					)}
 				</div>
 				<div className="flex gap-2">
-					<Button onClick={onEdit} variant="outline" size="md">
+					<Button
+						onClick={onEdit}
+						variant="outline"
+						size="md"
+						disabled={editDisabled}
+					>
 						{primaryLabel}
 					</Button>
 					{shouldShowRemove && (

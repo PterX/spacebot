@@ -144,6 +144,56 @@ pub fn is_retriable_error(error_message: &str) -> bool {
         || lower.contains("error decoding response body")
 }
 
+/// Whether a completion error indicates the provider rejected the model id
+/// itself — a stale default, a typo, or a model the account cannot access.
+/// These never succeed on retry with the same id, but a sibling model from
+/// the same provider usually works.
+pub fn is_model_not_found_error(error_message: &str) -> bool {
+    let lower = error_message.to_lowercase();
+    (lower.contains("not_found") && lower.contains("model"))
+        || lower.contains("model not found")
+        || lower.contains("unknown model")
+        || lower.contains("invalid model")
+        || lower.contains("unsupported model")
+        || lower.contains("no such model")
+        || (lower.contains("model") && lower.contains("does not exist"))
+        || (lower.contains("model") && lower.contains("do not have access"))
+        || (lower.contains("404") && lower.contains("model"))
+}
+
+/// Ordered, de-duplicated model ids drawn from a provider's default routing
+/// table (slots first, then fallback chains). Used to recover when a
+/// configured model id is rejected by the provider.
+pub fn default_model_candidates(provider: &str) -> Vec<String> {
+    let prefix = provider_to_prefix(provider);
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+
+    let defaults = defaults_for_provider(provider);
+    let mut candidates: Vec<String> = Vec::new();
+    let slots = [
+        &defaults.channel,
+        &defaults.branch,
+        &defaults.worker,
+        &defaults.compactor,
+        &defaults.cortex,
+    ];
+    for model in slots {
+        if model.starts_with(prefix) && !candidates.contains(model) {
+            candidates.push(model.clone());
+        }
+    }
+    for chain in defaults.fallbacks.values() {
+        for model in chain {
+            if model.starts_with(prefix) && !candidates.contains(model) {
+                candidates.push(model.clone());
+            }
+        }
+    }
+    candidates
+}
+
 /// Whether a completion error indicates context window overflow.
 ///
 /// Providers return 400 with various phrasings when the request exceeds
@@ -218,17 +268,25 @@ pub fn defaults_for_provider(provider: &str) -> RoutingConfig {
             }
         }
         "openai-chatgpt" => {
-            let channel: String = "openai-chatgpt/gpt-4.1".into();
-            let worker: String = "openai-chatgpt/gpt-4.1-mini".into();
+            // ChatGPT OAuth bills against the subscription, not per token, and the
+            // codex backend only serves a narrow model set — one verified model
+            // across all slots beats guessing at a cheaper tier that may not exist.
+            let primary: String = "openai-chatgpt/gpt-5.6-sol".into();
             RoutingConfig {
-                channel: channel.clone(),
-                branch: channel.clone(),
-                worker: worker.clone(),
-                compactor: worker.clone(),
-                cortex: worker.clone(),
+                channel: primary.clone(),
+                branch: primary.clone(),
+                worker: primary.clone(),
+                compactor: primary.clone(),
+                cortex: primary.clone(),
                 voice: String::new(),
-                task_overrides: HashMap::from([("coding".into(), channel.clone())]),
-                fallbacks: HashMap::from([(channel, vec![worker])]),
+                task_overrides: HashMap::from([("coding".into(), primary.clone())]),
+                fallbacks: HashMap::from([(
+                    primary,
+                    vec![
+                        "openai-chatgpt/gpt-5.6".into(),
+                        "openai-chatgpt/gpt-5.5".into(),
+                    ],
+                )]),
                 rate_limit_cooldown_secs: 60,
                 ..RoutingConfig::default()
             }
@@ -401,6 +459,7 @@ pub fn defaults_for_provider(provider: &str) -> RoutingConfig {
         "minimax-cn" => RoutingConfig::for_model("minimax-cn/MiniMax-M2.5".into()),
         "moonshot" => RoutingConfig::for_model("moonshot/kimi-k2.5".into()),
         "zai-coding-plan" => RoutingConfig::for_model("zai-coding-plan/glm-5".into()),
+        "ollama" => RoutingConfig::for_model("ollama/llama3.2".into()),
         "github-copilot" => {
             let channel: String = "github-copilot/claude-sonnet-4".into();
             let worker: String = "github-copilot/gpt-4.1-mini".into();
@@ -446,6 +505,8 @@ pub fn provider_to_prefix(provider: &str) -> &str {
         "moonshot" => "moonshot/",
         "zai-coding-plan" => "zai-coding-plan/",
         "github-copilot" => "github-copilot/",
+        "ollama" => "ollama/",
+        "azure" => "azure/",
         _ => "",
     }
 }
@@ -540,6 +601,43 @@ mod tests {
         // Other errors should not be retriable
         assert!(!is_retriable_error("unexpected EOF"));
         assert!(!is_retriable_error("parse error"));
+    }
+
+    #[test]
+    fn is_model_not_found_error_detection() {
+        // OpenAI phrasing
+        assert!(is_model_not_found_error(
+            "The model `gpt-5.3-codex` does not exist or you do not have access to it."
+        ));
+        assert!(is_model_not_found_error("model_not_found"));
+        // Anthropic phrasing
+        assert!(is_model_not_found_error(
+            "not_found_error: model: claude-sonnet-9"
+        ));
+        // Generic gateway phrasings
+        assert!(is_model_not_found_error("unknown model: foo"));
+        assert!(is_model_not_found_error("Invalid model ID"));
+        assert!(is_model_not_found_error("404: no such model"));
+        // Unrelated errors must not match
+        assert!(!is_model_not_found_error("429 Too Many Requests"));
+        assert!(!is_model_not_found_error("401 Unauthorized"));
+        assert!(!is_model_not_found_error("404 Not Found"));
+        assert!(!is_model_not_found_error("context length exceeded"));
+    }
+
+    #[test]
+    fn default_model_candidates_are_provider_prefixed_and_unique() {
+        let candidates = default_model_candidates("openai-chatgpt");
+        assert!(!candidates.is_empty());
+        assert!(candidates.iter().all(|m| m.starts_with("openai-chatgpt/")));
+        let mut deduped = candidates.clone();
+        deduped.dedup();
+        assert_eq!(candidates.len(), deduped.len());
+        // Fallback chain members are included
+        assert!(candidates.iter().any(|m| m == "openai-chatgpt/gpt-5.6"));
+
+        // Unknown providers yield no candidates rather than anthropic defaults
+        assert!(default_model_candidates("not-a-provider").is_empty());
     }
 
     #[test]

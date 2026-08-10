@@ -45,6 +45,7 @@ export interface ProviderCardProps {
 	removing: boolean;
 	actionLabel?: string;
 	showRemove?: boolean;
+	editDisabled?: boolean;
 }
 
 export interface ChatGptOAuthDialogProps {

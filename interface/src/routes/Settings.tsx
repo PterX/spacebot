@@ -30,7 +30,6 @@ import {
 	ChatGptOAuthDialog,
 	SECTIONS,
 	PROVIDERS,
-	CHATGPT_OAUTH_DEFAULT_MODEL,
 	type SectionId,
 } from "@/components/settings";
 
@@ -90,10 +89,25 @@ export function Settings() {
 		enabled: activeSection === "providers",
 	});
 
+	// Per-provider default models come from the backend routing defaults so the
+	// UI can never drift from what the server would actually apply. The editor
+	// seeds its model field from these, so provider editing stays disabled until
+	// they arrive.
+	const {
+		data: defaultModels,
+		isLoading: defaultModelsLoading,
+		isError: defaultModelsError,
+	} = useQuery({
+		queryKey: ["provider-default-models"],
+		queryFn: api.providerDefaultModels,
+		staleTime: Infinity,
+		enabled: activeSection === "providers",
+	});
+
 	// Fetch agents list and default agent config so we can pre-populate the
 	// model field with the currently active routing model when editing an
-	// already-configured provider (instead of always showing the hardcoded
-	// defaultModel).
+	// already-configured provider (instead of always showing the provider's
+	// default model).
 	const { data: agentsData } = useQuery({
 		queryKey: ["agents"],
 		queryFn: api.agents,
@@ -208,7 +222,7 @@ export function Settings() {
 			),
 	});
 	const startOpenAiBrowserOAuthMutation = useMutation({
-		mutationFn: (params: {model: string}) =>
+		mutationFn: (params: {model?: string}) =>
 			api.startOpenAiOAuthBrowser(params),
 	});
 
@@ -451,9 +465,8 @@ export function Settings() {
 		setDeviceCodeInfo(null);
 		setDeviceCodeCopied(false);
 		try {
-			const result = await startOpenAiBrowserOAuthMutation.mutateAsync({
-				model: CHATGPT_OAUTH_DEFAULT_MODEL,
-			});
+			// The backend picks and verifies its own default model for this flow.
+			const result = await startOpenAiBrowserOAuthMutation.mutateAsync({});
 			if (
 				!result.success ||
 				!result.user_code ||
@@ -609,7 +622,16 @@ export function Settings() {
 								</p>
 							</div>
 
-							{isLoading ? (
+							{defaultModelsError && (
+								<div className="mb-4 rounded-md border border-red-500/20 bg-red-500/10 px-4 py-3">
+									<p className="text-sm text-red-400">
+										Couldn't load the provider default models. Editing is
+										disabled until they load — reload the page to try again.
+									</p>
+								</div>
+							)}
+
+							{isLoading || defaultModelsLoading ? (
 								<div className="flex items-center gap-2 text-ink-dull">
 									<div className="h-2 w-2 animate-pulse rounded-full bg-accent" />
 									Loading providers...
@@ -623,20 +645,21 @@ export function Settings() {
 											name={provider.name}
 											description={provider.description}
 											configured={isConfigured(provider.id)}
-											defaultModel={provider.defaultModel}
+											defaultModel={defaultModels?.defaults[provider.id] ?? ""}
+											editDisabled={!defaultModels}
 											onEdit={() => {
 												setEditingProvider(provider.id);
 												setKeyInput("");
 												// When the provider is already configured, pre-populate
 												// the model field with the current routing model so the
 												// user sees what's actually active rather than the
-												// hardcoded defaultModel placeholder.
+												// default placeholder.
 												const currentChannel = defaultAgentConfig?.routing?.channel;
 												const currentModel =
 													isConfigured(provider.id) && currentChannel?.startsWith(`${provider.id}/`)
 														? currentChannel
 														: null;
-												setModelInput(currentModel ?? provider.defaultModel ?? "");
+												setModelInput(currentModel ?? defaultModels?.defaults[provider.id] ?? "");
 												setTestedSignature(null);
 												setTestResult(null);
 												setMessage(null);
@@ -689,7 +712,7 @@ export function Settings() {
 												name="ChatGPT Plus (OAuth)"
 												description="Sign in with your ChatGPT Plus account using a device code."
 												configured={isConfigured("openai-chatgpt")}
-												defaultModel={CHATGPT_OAUTH_DEFAULT_MODEL}
+												defaultModel={defaultModels?.chatgpt_oauth ?? ""}
 												onEdit={() => setOpenAiOAuthDialogOpen(true)}
 												onRemove={() => removeMutation.mutate("openai-chatgpt")}
 												removing={removeMutation.isPending}
