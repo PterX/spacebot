@@ -285,9 +285,11 @@ pub(super) async fn update_autonomy_ceiling(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
+    // Store while still holding the config write mutex so concurrent updates
+    // apply to the in-memory ceiling in the same order as the file writes.
+    state.autonomy_ceiling.store(Arc::new(request.ceiling));
     drop(config_guard);
 
-    state.autonomy_ceiling.store(Arc::new(request.ceiling));
     tracing::info!(ceiling = %request.ceiling, "instance autonomy ceiling updated via API");
 
     autonomy_fleet(State(state)).await

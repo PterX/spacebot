@@ -338,10 +338,13 @@ pub async fn start_http_server(
         // Mount all protected routes
         .merge(protected_routes)
         // Wake webhook ingress is public: the per-wake token in the path is
-        // the authority boundary, so it bypasses api_auth_middleware.
+        // the authority boundary, so it bypasses api_auth_middleware. The
+        // route-scoped body limit overrides the global 10 MiB limit so
+        // unauthenticated callers cannot force large buffer allocations.
         .route(
             "/hooks/wakes/{token}",
-            axum::routing::post(wakes::webhook_ingress),
+            axum::routing::post(wakes::webhook_ingress)
+                .layer(DefaultBodyLimit::max(wakes::MAX_WEBHOOK_BODY_BYTES)),
         )
         // Static file handler for frontend (unprotected)
         .fallback(static_handler)

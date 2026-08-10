@@ -7,6 +7,7 @@
 use super::state::ApiState;
 use crate::goals::{
     CreateGoalInput, Goal, GoalListFilter, GoalStatus, GoalStore, GoalTaskCounts, UpdateGoalInput,
+    can_transition,
 };
 
 use axum::Json;
@@ -114,6 +115,20 @@ fn parse_priority(value: Option<&str>) -> Result<Option<crate::tasks::TaskPriori
             crate::tasks::TaskPriority::parse(value).ok_or(StatusCode::BAD_REQUEST)?,
         )),
     }
+}
+
+/// Validate an optional due date at the API boundary so a malformed value
+/// maps to 400 rather than surfacing as a store failure. Empty strings pass
+/// through: they clear the field on update.
+fn validate_due_date(value: Option<&str>) -> Result<(), StatusCode> {
+    if let Some(value) = value
+        && !value.is_empty()
+        && chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_err()
+    {
+        tracing::warn!(due_date = %value, "invalid due_date (expected YYYY-MM-DD)");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(())
 }
 
 /// Fan a goal lifecycle event out to every registered agent. Goals are
@@ -226,6 +241,7 @@ pub(super) async fn get_goal(
     responses(
         (status = 200, body = GoalResponse),
         (status = 400, description = "Invalid request"),
+        (status = 500, description = "Internal server error"),
         (status = 503, description = "Goal store not initialized"),
     ),
     tag = "goals",
@@ -237,6 +253,7 @@ pub(super) async fn create_goal(
     let store = get_goal_store(&state)?;
     let priority =
         parse_priority(request.priority.as_deref())?.unwrap_or(crate::tasks::TaskPriority::Medium);
+    validate_due_date(request.due_date.as_deref())?;
 
     let goal = store
         .create(CreateGoalInput {
@@ -249,7 +266,7 @@ pub(super) async fn create_goal(
         .await
         .map_err(|error| {
             tracing::warn!(%error, "failed to create goal");
-            StatusCode::BAD_REQUEST
+            StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
     emit_goal_event(&state, crate::wakes::SystemEvent::GoalCreated, &goal).await;
@@ -272,6 +289,7 @@ pub(super) async fn create_goal(
         (status = 200, body = GoalResponse),
         (status = 400, description = "Invalid request or status transition"),
         (status = 404, description = "Goal not found"),
+        (status = 500, description = "Internal server error"),
         (status = 503, description = "Goal store not initialized"),
     ),
     tag = "goals",
@@ -284,6 +302,31 @@ pub(super) async fn update_goal(
     let store = get_goal_store(&state)?;
     let status = parse_status(request.status.as_deref())?;
     let priority = parse_priority(request.priority.as_deref())?;
+    validate_due_date(request.due_date.as_deref())?;
+
+    // The store's update error does not distinguish an invalid status
+    // transition from an infrastructure failure, so check the transition
+    // here to report it as 400. The store re-checks inside its transaction;
+    // a race that slips past this check surfaces as a 500.
+    if let Some(next_status) = status {
+        let current = store
+            .get(&id)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, goal_id = %id, "failed to get goal");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .ok_or(StatusCode::NOT_FOUND)?;
+        if !can_transition(current.status, next_status) {
+            tracing::warn!(
+                goal_id = %id,
+                from = %current.status,
+                to = %next_status,
+                "invalid goal status transition"
+            );
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
 
     let goal = store
         .update(
@@ -301,7 +344,7 @@ pub(super) async fn update_goal(
         .await
         .map_err(|error| {
             tracing::warn!(%error, goal_id = %id, "failed to update goal");
-            StatusCode::BAD_REQUEST
+            StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
 

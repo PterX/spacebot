@@ -128,6 +128,20 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         ("en", "fragments/system/memory_persistence") => {
             include_str!("../../prompts/en/fragments/system/memory_persistence.md.j2")
         }
+        ("en", "fragments/system/memory_persistence_contract_retry") => {
+            include_str!(
+                "../../prompts/en/fragments/system/memory_persistence_contract_retry.md.j2"
+            )
+        }
+        ("en", "fragments/system/autonomy_contract_retry") => {
+            include_str!("../../prompts/en/fragments/system/autonomy_contract_retry.md.j2")
+        }
+        ("en", "fragments/system/autonomy_soft_warning") => {
+            include_str!("../../prompts/en/fragments/system/autonomy_soft_warning.md.j2")
+        }
+        ("en", "fragments/system/autonomy_hard_timeout") => {
+            include_str!("../../prompts/en/fragments/system/autonomy_hard_timeout.md.j2")
+        }
         ("en", "fragments/system/cortex_synthesis") => {
             include_str!("../../prompts/en/fragments/system/cortex_synthesis.md.j2")
         }

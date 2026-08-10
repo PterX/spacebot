@@ -173,6 +173,28 @@ async fn fire_schedule_wake(
         }
         Err(error) => {
             tracing::warn!(wake_id = %def.id, %error, "failed to enqueue schedule wake event");
+            // The claim already advanced the cursor past this occurrence.
+            // Roll it back so the next pass retries instead of silently
+            // dropping the fire until the following occurrence.
+            match defs
+                .claim_schedule_fire(&def.id, Some(&next_text), cursor)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(
+                        wake_id = %def.id,
+                        "schedule wake cursor moved during rollback, occurrence dropped"
+                    );
+                }
+                Err(rollback_error) => {
+                    tracing::warn!(
+                        wake_id = %def.id,
+                        error = %rollback_error,
+                        "failed to roll back schedule wake cursor, occurrence dropped"
+                    );
+                }
+            }
             false
         }
     }
@@ -208,6 +230,7 @@ mod tests {
 
     struct Harness {
         _dir: tempfile::TempDir,
+        pool: sqlx::SqlitePool,
         defs: WakeDefStore,
         events: WakeEventStore,
         runtime_config: Arc<RuntimeConfig>,
@@ -248,6 +271,7 @@ mod tests {
 
         Harness {
             _dir: dir,
+            pool: pool.clone(),
             defs: WakeDefStore::new(pool.clone()),
             events: WakeEventStore::new(pool),
             runtime_config,
@@ -385,6 +409,37 @@ mod tests {
             fire_schedule_wake(&h.defs, &h.events, &h.runtime_config, &stale, Utc::now()).await;
         assert!(!fired);
         assert_eq!(h.events.pending_count().await.expect("count"), 0);
+    }
+
+    #[tokio::test]
+    async fn enqueue_failure_rolls_the_cursor_back() {
+        let h = harness().await;
+        h.defs
+            .upsert(&schedule_def("sched", 600))
+            .await
+            .expect("upsert");
+        let due_at = "2026-08-09T10:00:00.000Z";
+        assert!(
+            h.defs
+                .claim_schedule_fire("sched", None, due_at)
+                .await
+                .expect("seed cursor")
+        );
+
+        // Break the event queue so the enqueue after a won claim fails.
+        sqlx::query("DROP TABLE wake_events")
+            .execute(&h.pool)
+            .await
+            .expect("drop wake_events");
+
+        let enqueued = run_schedule_pass(&h.defs, &h.events, &h.runtime_config, Utc::now()).await;
+
+        assert!(!enqueued);
+        // The rollback restores the due cursor so the next pass retries the
+        // occurrence instead of waiting for the one after it.
+        let def = h.defs.get("sched").await.expect("get").expect("row");
+        assert_eq!(def.next_run_at.as_deref(), Some(due_at));
+        assert!(def.last_fired_at.is_none());
     }
 
     #[tokio::test]

@@ -39,28 +39,6 @@ pub const AUTONOMY_CONTRACT_MAX_RETRIES: usize =
 /// Fallback summary recorded when a run ends without calling `autonomy_complete`.
 pub const AUTONOMY_FALLBACK_SUMMARY: &str = "run ended without summary";
 
-/// Prompt injected when the channel is about to exit without having called
-/// `autonomy_complete`.
-pub const AUTONOMY_CONTRACT_RETRY_PROMPT: &str = "You must finish this autonomy run by calling autonomy_complete. Provide a 2-5 line \
-     summary of what this run observed and did, plus an actions entry for every task you \
-     enriched, created, or executed. Do not start new work.";
-
-/// Soft-timeout warning injected at `warn_secs`.
-fn soft_warning_text(remaining_secs: u64) -> String {
-    let remaining_minutes = remaining_secs.div_ceil(60).max(1);
-    format!(
-        "You have approximately {remaining_minutes} minute{} remaining in this run. \
-         Finish your current task, add any final notes, and call autonomy_complete. \
-         Do not start a new task.",
-        if remaining_minutes == 1 { "" } else { "s" }
-    )
-}
-
-/// Hard-timeout wrap-up injected when `timeout_secs` elapses.
-const HARD_TIMEOUT_PROMPT: &str = "Time is up. Some work may not have finished. \
-     Call autonomy_complete NOW with a summary of whatever this run accomplished. \
-     Do not start any new work.";
-
 /// Shared state between the run driver, the channel, and the
 /// `autonomy_complete` tool for a single autonomy run.
 #[derive(Debug, Clone)]
@@ -266,6 +244,21 @@ pub async fn run_autonomy_channel(
 
     let briefing = build_run_briefing(deps, &config, &pending_events).await?;
 
+    // Timeout prompts are rendered before the channel spawns so a template
+    // failure surfaces immediately instead of mid-run. Config validation
+    // guarantees warn < timeout.
+    let remaining_secs = config.timeout_secs.saturating_sub(config.warn_secs).max(1);
+    let (soft_warning_prompt, hard_timeout_prompt) = {
+        let prompt_engine = deps.runtime_config.prompts.load();
+        let soft = prompt_engine
+            .render_system_autonomy_soft_warning(remaining_secs.div_ceil(60).max(1))
+            .map_err(|error| anyhow::anyhow!("failed to render autonomy soft warning: {error}"))?;
+        let hard = prompt_engine
+            .render_system_autonomy_hard_timeout()
+            .map_err(|error| anyhow::anyhow!("failed to render autonomy hard timeout: {error}"))?;
+        (soft, hard)
+    };
+
     let channel_id: crate::ChannelId = Arc::from(AUTONOMY_CONVERSATION_ID);
     let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<RoutedResponse>(32);
     // The autonomy channel has no delivery target — drain and drop anything
@@ -329,23 +322,28 @@ pub async fn run_autonomy_channel(
         anyhow::bail!("failed to send autonomy briefing to channel: {error}");
     }
 
-    // Soft warning at warn_secs, hard timeout at timeout_secs. Config
-    // validation guarantees warn < timeout.
+    // Soft warning at warn_secs, hard timeout at timeout_secs.
     let warn_after = Duration::from_secs(config.warn_secs.min(config.timeout_secs).max(1));
     let mut timed_out = false;
     let first_phase = tokio::time::timeout(warn_after, &mut channel_handle).await;
     let join_result = match first_phase {
         Ok(join_result) => Some(join_result),
         Err(_elapsed) => {
-            let remaining_secs = config.timeout_secs.saturating_sub(config.warn_secs).max(1);
             tracing::info!(
                 run_id = %run_id,
                 remaining_secs,
                 "autonomy run reached soft warning, injecting wrap-up notice"
             );
-            let _ = channel_tx
-                .send(system_message(deps, soft_warning_text(remaining_secs)))
-                .await;
+            if channel_tx
+                .send(system_message(deps, soft_warning_prompt))
+                .await
+                .is_err()
+            {
+                tracing::debug!(
+                    run_id = %run_id,
+                    "soft warning not delivered; autonomy channel already exited"
+                );
+            }
 
             match tokio::time::timeout(Duration::from_secs(remaining_secs), &mut channel_handle)
                 .await
@@ -356,9 +354,10 @@ pub async fn run_autonomy_channel(
                     // run, mirroring the cron wrap-up pattern.
                     timed_out = true;
                     tracing::warn!(run_id = %run_id, "autonomy run hit hard timeout, sending wrap-up prompt");
-                    let _ = channel_tx
-                        .send(system_message(deps, HARD_TIMEOUT_PROMPT.to_string()))
-                        .await;
+                    channel_tx
+                        .send(system_message(deps, hard_timeout_prompt))
+                        .await
+                        .ok();
                     drop(channel_tx);
 
                     let grace = Duration::from_secs(HARD_TIMEOUT_GRACE_SECS);
@@ -366,7 +365,15 @@ pub async fn run_autonomy_channel(
                         Ok(join_result) => Some(join_result),
                         Err(_elapsed) => {
                             channel_handle.abort();
-                            let _ = (&mut channel_handle).await;
+                            if let Err(join_error) = (&mut channel_handle).await
+                                && !join_error.is_cancelled()
+                            {
+                                tracing::warn!(
+                                    run_id = %run_id,
+                                    %join_error,
+                                    "autonomy channel task failed after abort"
+                                );
+                            }
                             None
                         }
                     }

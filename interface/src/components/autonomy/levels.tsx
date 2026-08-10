@@ -50,7 +50,8 @@ export function effectiveLevel(
 }
 
 interface LevelDialProps {
-	value: AutonomyLevel;
+	/** Undefined renders the dial with no selection. */
+	value: AutonomyLevel | undefined;
 	onChange: (level: AutonomyLevel) => void;
 }
 

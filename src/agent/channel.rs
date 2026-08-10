@@ -1346,6 +1346,23 @@ impl Channel {
                         attempt = self.autonomy_contract_retries,
                         "autonomy run missing autonomy_complete call, retrying"
                     );
+                    let retry_prompt = match self
+                        .deps
+                        .runtime_config
+                        .prompts
+                        .load()
+                        .render_system_autonomy_contract_retry()
+                    {
+                        Ok(text) => text,
+                        Err(error) => {
+                            tracing::error!(
+                                %error,
+                                channel_id = %self.id,
+                                "failed to render autonomy contract retry prompt"
+                            );
+                            break;
+                        }
+                    };
                     let retry = InboundMessage {
                         id: uuid::Uuid::new_v4().to_string(),
                         source: "system".into(),
@@ -1355,9 +1372,7 @@ impl Channel {
                         }),
                         sender_id: "system".into(),
                         agent_id: Some(self.deps.agent_id.clone()),
-                        content: crate::MessageContent::Text(
-                            crate::agent::autonomy::AUTONOMY_CONTRACT_RETRY_PROMPT.to_string(),
-                        ),
+                        content: crate::MessageContent::Text(retry_prompt),
                         timestamp: chrono::Utc::now(),
                         metadata: HashMap::new(),
                         formatted_author: None,
@@ -3522,20 +3537,27 @@ impl Channel {
                 } else {
                     crate::wakes::SystemEvent::WorkerFailed
                 };
-                crate::wakes::emit_system_event(
-                    &self.deps,
-                    worker_event,
-                    &format!("worker:{worker_id}"),
-                    &serde_json::json!({
-                        "worker_id": worker_id.to_string(),
-                        "success": *success,
-                        "summary": crate::summarize_first_non_empty_line(
-                            result,
-                            crate::EVENT_SUMMARY_MAX_CHARS,
-                        ),
-                    }),
-                )
-                .await;
+                // Wake emission writes to SQLite; run it off the event loop so
+                // a slow disk cannot stall channel event handling.
+                let emit_deps = self.deps.clone();
+                let dedupe_key = format!("worker:{worker_id}");
+                let payload = serde_json::json!({
+                    "worker_id": worker_id.to_string(),
+                    "success": *success,
+                    "summary": crate::summarize_first_non_empty_line(
+                        result,
+                        crate::EVENT_SUMMARY_MAX_CHARS,
+                    ),
+                });
+                tokio::spawn(async move {
+                    crate::wakes::emit_system_event(
+                        &emit_deps,
+                        worker_event,
+                        &dedupe_key,
+                        &payload,
+                    )
+                    .await;
+                });
 
                 // A worker finishing real work successfully is a reflection
                 // signal: the session likely produced a reusable lesson.

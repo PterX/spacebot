@@ -15,7 +15,9 @@ function formatTimeAgo(iso: string): string {
 }
 
 interface FleetCardProps {
-	ceiling: AutonomyLevel;
+	/** Undefined while fleet data loads; capping is not computed until the
+	 * real ceiling is known. */
+	ceiling?: AutonomyLevel;
 }
 
 export function FleetCard({ceiling}: FleetCardProps) {
@@ -54,7 +56,10 @@ export function FleetCard({ceiling}: FleetCardProps) {
 							const state = states.get(agent.id);
 							if (!state) return null;
 							const name = agent.display_name ?? agent.id;
-							const effective = effectiveLevel(ceiling, state.level);
+							const effective =
+								ceiling === undefined
+									? state.level
+									: effectiveLevel(ceiling, state.level);
 							const capped = effective !== state.level;
 							const levelMeta = LEVELS.find((l) => l.key === state.level);
 							const effectiveMeta = LEVELS.find((l) => l.key === effective);

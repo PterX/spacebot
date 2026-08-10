@@ -818,11 +818,38 @@ fn update_cortex_table(
     Ok(())
 }
 
+/// Read a `u64` field from a TOML table, treating non-integer or negative
+/// values as absent.
+fn table_u64(table: &toml_edit::Table, key: &str) -> Option<u64> {
+    table.get(key)?.as_integer()?.try_into().ok()
+}
+
+/// Read a `u64` field from the `[defaults.autonomy]` table, if present.
+fn defaults_autonomy_u64(doc: &toml_edit::DocumentMut, key: &str) -> Option<u64> {
+    doc.get("defaults")?
+        .as_table_like()?
+        .get("autonomy")?
+        .as_table_like()?
+        .get(key)?
+        .as_integer()?
+        .try_into()
+        .ok()
+}
+
 fn update_autonomy_table(
     doc: &mut toml_edit::DocumentMut,
     agent_idx: usize,
     autonomy: &AutonomyUpdate,
 ) -> Result<(), StatusCode> {
+    // Fallbacks for fields absent from both the patch and the agent table,
+    // mirroring load-time resolution: `[defaults.autonomy]` over built-ins.
+    let built_in = crate::config::AutonomyConfig::default();
+    let default_interval =
+        defaults_autonomy_u64(doc, "interval_secs").unwrap_or(built_in.interval_secs);
+    let default_timeout =
+        defaults_autonomy_u64(doc, "timeout_secs").unwrap_or(built_in.timeout_secs);
+    let default_warn = defaults_autonomy_u64(doc, "warn_secs").unwrap_or(built_in.warn_secs);
+
     let agent = get_agent_table_mut(doc, agent_idx)?;
     let table = get_or_create_subtable(agent, "autonomy")?;
     if let Some(level) = autonomy.level {
@@ -859,6 +886,10 @@ fn update_autonomy_table(
         table["max_turns"] = toml_edit::value(i64::from(v));
     }
     if let Some(v) = autonomy.max_tasks_per_run {
+        if v < 1 {
+            tracing::warn!("autonomy max_tasks_per_run must be >= 1");
+            return Err(StatusCode::BAD_REQUEST);
+        }
         table["max_tasks_per_run"] = toml_edit::value(i64::from(v));
     }
     if let Some(v) = autonomy.timeout_secs {
@@ -872,6 +903,34 @@ fn update_autonomy_table(
     }
     if let Some(v) = autonomy.claim_unowned {
         table["claim_unowned"] = toml_edit::value(v);
+    }
+
+    // Validate the merged result (existing table values plus the patch) so
+    // partial updates are checked in context, mirroring
+    // `AutonomyConfig::validated`. The load path clamps an out-of-range
+    // `warn_secs`; an interactive caller gets an error instead.
+    let interval_secs = table_u64(table, "interval_secs").unwrap_or(default_interval);
+    let timeout_secs = table_u64(table, "timeout_secs").unwrap_or(default_timeout);
+    let warn_secs = table_u64(table, "warn_secs").unwrap_or(default_warn);
+    if interval_secs < 60 {
+        tracing::warn!(interval_secs, "autonomy interval_secs must be >= 60");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if timeout_secs > interval_secs {
+        tracing::warn!(
+            timeout_secs,
+            interval_secs,
+            "autonomy timeout_secs must be <= interval_secs"
+        );
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if warn_secs >= timeout_secs {
+        tracing::warn!(
+            warn_secs,
+            timeout_secs,
+            "autonomy warn_secs must be < timeout_secs"
+        );
+        return Err(StatusCode::BAD_REQUEST);
     }
     Ok(())
 }

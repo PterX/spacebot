@@ -132,7 +132,9 @@ impl WakeDefStore {
 
     /// Insert or update a definition. Cursor columns (`next_run_at`,
     /// `last_fired_at`, `consecutive_failures`) and `created_at` survive
-    /// updates so redefining a wake does not reset its schedule state.
+    /// updates so redefining a wake does not reset its schedule state. A
+    /// stored webhook token likewise survives an upsert carrying `None`, so
+    /// config reconciliation cannot invalidate published webhook URLs.
     pub async fn upsert(&self, def: &WakeDef) -> Result<()> {
         sqlx::query(
             "INSERT INTO wake_defs (id, name, trigger_kind, trigger_spec, instructions, \
@@ -149,7 +151,7 @@ impl WakeDefStore {
                  builtin = excluded.builtin, \
                  config_owned = excluded.config_owned, \
                  delivery_target = excluded.delivery_target, \
-                 webhook_token = excluded.webhook_token, \
+                 webhook_token = COALESCE(excluded.webhook_token, wake_defs.webhook_token), \
                  active_hours_start = excluded.active_hours_start, \
                  active_hours_end = excluded.active_hours_end, \
                  created_by = excluded.created_by, \
@@ -584,6 +586,28 @@ mod tests {
             loaded.next_run_at.as_deref(),
             Some("2026-08-09T10:00:00.000Z")
         );
+    }
+
+    #[tokio::test]
+    async fn upsert_preserves_webhook_token() {
+        let store = store().await;
+        let mut hook = def("hook", WakeTrigger::Webhook);
+        store.upsert(&hook).await.expect("insert");
+        assert!(
+            store
+                .set_webhook_token_if_absent("hook", "minted-token")
+                .await
+                .expect("mint")
+        );
+
+        // Reconciliation rebuilds defs without a token; the stored one stays.
+        hook.instructions = "updated instructions".to_string();
+        hook.webhook_token = None;
+        store.upsert(&hook).await.expect("update");
+
+        let loaded = store.get("hook").await.expect("get").expect("row");
+        assert_eq!(loaded.instructions, "updated instructions");
+        assert_eq!(loaded.webhook_token.as_deref(), Some("minted-token"));
     }
 
     #[tokio::test]

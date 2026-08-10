@@ -17,7 +17,9 @@ export function Autonomy() {
 		staleTime: 30_000,
 	});
 
-	const ceiling = fleetData?.ceiling ?? "act";
+	// Undefined until fleet data loads; the cards render inert rather than
+	// showing a made-up level.
+	const ceiling = fleetData?.ceiling;
 
 	const ceilingMutation = useMutation({
 		mutationFn: (level: AutonomyLevel) => api.updateAutonomyCeiling(level),

@@ -50,9 +50,13 @@ impl ScheduleSpec {
         }
 
         // A zero interval would recur immediately forever; treat it as no
-        // schedule rather than a hot loop.
+        // schedule rather than a hot loop. An interval too large to represent
+        // as a duration or to add to the anchor likewise yields no occurrence.
         let interval = self.interval_secs.filter(|secs| *secs > 0)?;
-        Some(after + chrono::Duration::seconds(interval as i64))
+        let duration = i64::try_from(interval)
+            .ok()
+            .and_then(chrono::Duration::try_seconds)?;
+        after.checked_add_signed(duration)
     }
 }
 
@@ -149,6 +153,20 @@ mod tests {
             spec.next_occurrence(utc(2026, 8, 9, 10, 0, 0), chrono_tz::UTC),
             None
         );
+    }
+
+    #[test]
+    fn oversized_interval_yields_no_occurrence() {
+        for interval in [u64::MAX, i64::MAX as u64] {
+            let spec = ScheduleSpec {
+                cron_expr: None,
+                interval_secs: Some(interval),
+            };
+            assert_eq!(
+                spec.next_occurrence(utc(2026, 8, 9, 10, 0, 0), chrono_tz::UTC),
+                None
+            );
+        }
     }
 
     #[test]

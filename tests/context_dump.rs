@@ -55,6 +55,12 @@ async fn bootstrap_deps() -> anyhow::Result<(spacebot::AgentDeps, spacebot::conf
         .await
         .context("failed to connect databases")?;
 
+    // Tasks, goals, and projects live in the instance database (global
+    // migrations), not the per-agent database — mirror main.rs.
+    let instance_pool = spacebot::db::connect_instance_db(&config.instance_dir.join("data"))
+        .await
+        .context("failed to connect instance database")?;
+
     let memory_store = spacebot::memory::MemoryStore::new(db.sqlite.clone());
 
     let embedding_table = spacebot::memory::EmbeddingTable::open_or_create(&db.lance)
@@ -70,7 +76,7 @@ async fn bootstrap_deps() -> anyhow::Result<(spacebot::AgentDeps, spacebot::conf
         embedding_table,
         embedding_model,
     ));
-    let task_store = Arc::new(spacebot::tasks::TaskStore::new(db.sqlite.clone()));
+    let task_store = Arc::new(spacebot::tasks::TaskStore::new(instance_pool.clone()));
 
     let identity = spacebot::identity::Identity::load(&agent_config.workspace).await;
     let prompts =
@@ -115,14 +121,14 @@ async fn bootstrap_deps() -> anyhow::Result<(spacebot::AgentDeps, spacebot::conf
         llm_manager,
         mcp_manager,
         task_store,
-        goal_store: Arc::new(spacebot::goals::GoalStore::new(db.sqlite.clone())),
+        goal_store: Arc::new(spacebot::goals::GoalStore::new(instance_pool.clone())),
         wake_event_store: Arc::new(spacebot::wakes::WakeEventStore::new(db.sqlite.clone())),
         autonomy_ceiling: Arc::new(arc_swap::ArcSwap::from_pointee(
             spacebot::config::AutonomyLevel::Act,
         )),
         wake_def_store: Arc::new(spacebot::wakes::WakeDefStore::new(db.sqlite.clone())),
         autonomy_run_store: Arc::new(spacebot::wakes::AutonomyRunStore::new(db.sqlite.clone())),
-        project_store: Arc::new(spacebot::projects::ProjectStore::new(db.sqlite.clone())),
+        project_store: Arc::new(spacebot::projects::ProjectStore::new(instance_pool.clone())),
         cron_tool: None,
         runtime_config,
         event_tx,

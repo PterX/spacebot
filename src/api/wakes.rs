@@ -23,8 +23,10 @@ use std::sync::Arc;
 const INTERVAL_SURVEY_WAKE_ID: &str = "interval-survey";
 
 /// Upper bound on webhook ingress bodies. The payload is persisted per
-/// event row, so this caps row size.
-const MAX_WEBHOOK_BODY_BYTES: usize = 64 * 1024;
+/// event row, so this caps row size. Enforced at the transport level via a
+/// route-scoped `DefaultBodyLimit` where the ingress route is registered,
+/// so oversized bodies are rejected before they are buffered.
+pub(super) const MAX_WEBHOOK_BODY_BYTES: usize = 64 * 1024;
 
 type ApiError = (StatusCode, Json<Value>);
 
@@ -421,6 +423,8 @@ pub(super) async fn webhook_ingress(
     Path(token): Path<String>,
     body: axum::body::Bytes,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    // Defense in depth: the route-scoped body limit at registration rejects
+    // oversized bodies with 413 before they are buffered here.
     if body.len() > MAX_WEBHOOK_BODY_BYTES {
         return Err(error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -436,16 +440,17 @@ pub(super) async fn webhook_ingress(
     let registry: Vec<crate::AgentDeps> =
         state.wake_registry.read().await.values().cloned().collect();
 
+    // A failing lookup on one agent must not mask a match on another, so
+    // scan every agent and only report the failure when nothing matched.
+    let mut lookup_failed = false;
     for deps in registry {
         let def = match deps.wake_def_store.find_by_webhook_token(&token).await {
             Ok(Some(def)) => def,
             Ok(None) => continue,
             Err(error) => {
                 tracing::warn!(%error, agent_id = %deps.agent_id, "webhook token lookup failed");
-                return Err(error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "wake lookup failed",
-                ));
+                lookup_failed = true;
+                continue;
             }
         };
 
@@ -471,5 +476,11 @@ pub(super) async fn webhook_ingress(
         return Ok((StatusCode::ACCEPTED, Json(json!({ "status": "queued" }))));
     }
 
+    if lookup_failed {
+        return Err(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "wake lookup failed",
+        ));
+    }
     Err(error_response(StatusCode::NOT_FOUND, "unknown token"))
 }

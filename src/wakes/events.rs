@@ -9,16 +9,24 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "snake_case")]
 pub enum SystemEvent {
+    #[serde(rename = "task.approved")]
     TaskApproved,
+    #[serde(rename = "task.commented")]
     TaskCommented,
+    #[serde(rename = "goal.created")]
     GoalCreated,
+    #[serde(rename = "goal.updated")]
     GoalUpdated,
+    #[serde(rename = "worker.completed")]
     WorkerCompleted,
+    #[serde(rename = "worker.failed")]
     WorkerFailed,
+    #[serde(rename = "agent.message")]
     AgentMessage,
+    #[serde(rename = "cortex.observation")]
     CortexObservation,
+    #[serde(rename = "ingest.file_added")]
     IngestFileAdded,
 }
 
@@ -86,5 +94,16 @@ mod tests {
     fn rejects_unknown_names() {
         assert_eq!(SystemEvent::parse("task.deleted"), None);
         assert_eq!(SystemEvent::parse(""), None);
+    }
+
+    #[test]
+    fn serde_names_match_as_str() {
+        for event in SystemEvent::ALL {
+            let serialized = serde_json::to_value(event).expect("serialize");
+            assert_eq!(serialized, serde_json::Value::from(event.as_str()));
+            let deserialized: SystemEvent =
+                serde_json::from_value(serialized).expect("deserialize");
+            assert_eq!(deserialized, event);
+        }
     }
 }

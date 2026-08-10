@@ -167,6 +167,22 @@ impl PromptEngine {
             crate::prompts::text::get("fragments/system/memory_persistence"),
         )?;
         env.add_template(
+            "fragments/system/memory_persistence_contract_retry",
+            crate::prompts::text::get("fragments/system/memory_persistence_contract_retry"),
+        )?;
+        env.add_template(
+            "fragments/system/autonomy_contract_retry",
+            crate::prompts::text::get("fragments/system/autonomy_contract_retry"),
+        )?;
+        env.add_template(
+            "fragments/system/autonomy_soft_warning",
+            crate::prompts::text::get("fragments/system/autonomy_soft_warning"),
+        )?;
+        env.add_template(
+            "fragments/system/autonomy_hard_timeout",
+            crate::prompts::text::get("fragments/system/autonomy_hard_timeout"),
+        )?;
+        env.add_template(
             "fragments/system/cortex_synthesis",
             crate::prompts::text::get("fragments/system/cortex_synthesis"),
         )?;
@@ -472,6 +488,26 @@ impl PromptEngine {
     /// Retry nudge sent to a memory-persistence branch that missed its terminal completion call.
     pub fn render_system_memory_persistence_contract_retry(&self) -> Result<String> {
         self.render_static("fragments/system/memory_persistence_contract_retry")
+    }
+
+    /// Retry nudge sent to an autonomy channel that missed its `autonomy_complete` call.
+    pub fn render_system_autonomy_contract_retry(&self) -> Result<String> {
+        self.render_static("fragments/system/autonomy_contract_retry")
+    }
+
+    /// Soft-timeout warning injected into an autonomy run at `warn_secs`.
+    pub fn render_system_autonomy_soft_warning(&self, remaining_minutes: u64) -> Result<String> {
+        self.render(
+            "fragments/system/autonomy_soft_warning",
+            context! {
+                remaining_minutes => remaining_minutes,
+            },
+        )
+    }
+
+    /// Hard-timeout wrap-up injected when an autonomy run's `timeout_secs` elapses.
+    pub fn render_system_autonomy_hard_timeout(&self) -> Result<String> {
+        self.render_static("fragments/system/autonomy_hard_timeout")
     }
 
     /// Render the profile synthesis prompt with identity and bulletin context.
@@ -1063,6 +1099,69 @@ mod tests {
         assert!(act.contains("Execute ready tasks"));
         assert!(act.contains("up to 1 task this run"));
         assert!(!act.contains("claim unowned tasks"));
+
+        // An unrecognized level falls back to observe-only rules.
+        let unknown = engine
+            .render_autonomy_channel_prompt(
+                "Iris",
+                "unrecognized",
+                Vec::new(),
+                Vec::new(),
+                "No active tasks.\n",
+                None,
+                None,
+                1,
+                1,
+                false,
+            )
+            .expect("unknown level prompt should render");
+        assert!(unknown.contains("Treat this run as observe: survey and summarize only."));
+    }
+
+    #[test]
+    fn autonomy_run_fragments_render() {
+        let engine = PromptEngine::new("en").expect("prompt engine should build");
+
+        let retry = engine
+            .render_system_autonomy_contract_retry()
+            .expect("contract retry should render");
+        assert_eq!(
+            retry,
+            "You must finish this autonomy run by calling autonomy_complete. Provide a 2-5 \
+             line summary of what this run observed and did, plus an actions entry for every \
+             task you enriched, created, or executed. Do not start new work."
+        );
+
+        let singular = engine
+            .render_system_autonomy_soft_warning(1)
+            .expect("soft warning should render");
+        assert_eq!(
+            singular,
+            "You have approximately 1 minute remaining in this run. Finish your current task, \
+             add any final notes, and call autonomy_complete. Do not start a new task."
+        );
+        let plural = engine
+            .render_system_autonomy_soft_warning(5)
+            .expect("soft warning should render");
+        assert!(plural.contains("approximately 5 minutes remaining"));
+
+        let hard = engine
+            .render_system_autonomy_hard_timeout()
+            .expect("hard timeout should render");
+        assert_eq!(
+            hard,
+            "Time is up. Some work may not have finished. Call autonomy_complete NOW with a \
+             summary of whatever this run accomplished. Do not start any new work."
+        );
+    }
+
+    #[test]
+    fn memory_persistence_contract_retry_fragment_renders() {
+        let engine = PromptEngine::new("en").expect("prompt engine should build");
+        let retry = engine
+            .render_system_memory_persistence_contract_retry()
+            .expect("contract retry should render");
+        assert!(retry.contains("memory_persistence_complete"));
     }
 
     #[test]

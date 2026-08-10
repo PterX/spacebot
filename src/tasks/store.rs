@@ -843,7 +843,7 @@ pub(crate) async fn setup_test_store() -> TaskStore {
             status TEXT NOT NULL DEFAULT 'backlog',
             priority TEXT NOT NULL DEFAULT 'medium',
             owner_agent_id TEXT NOT NULL,
-            assigned_agent_id TEXT NOT NULL,
+            assigned_agent_id TEXT,
             subtasks TEXT,
             metadata TEXT,
             goal_id TEXT,
@@ -901,6 +901,26 @@ mod tests {
             source_memory_id: None,
             created_by: "branch".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn unassigned_task_persists_and_falls_back_to_owner() {
+        let store = setup_store().await;
+        let created = store
+            .create(CreateTaskInput {
+                assigned_agent_id: None,
+                ..self_assigned_input("unassigned task", TaskStatus::Backlog)
+            })
+            .await
+            .expect("task should be created");
+
+        let loaded = store
+            .get_by_number(created.task_number)
+            .await
+            .expect("task should load")
+            .expect("task should exist");
+        assert_eq!(loaded.assigned_agent_id, None);
+        assert_eq!(loaded.effective_agent_id(), "agent-test");
     }
 
     #[tokio::test]

@@ -3,6 +3,7 @@ import {useQuery} from "@tanstack/react-query";
 import {
 	CaretDown,
 	CaretRight,
+	Circle,
 	MagnifyingGlass,
 	PlusCircle,
 	Play,
@@ -23,6 +24,14 @@ const ACTION_CONFIG: Record<
 	},
 	created: {icon: PlusCircle, iconClass: "text-violet-400", label: "Proposed"},
 	executed: {icon: Play, iconClass: "text-status-success", label: "Executed"},
+};
+
+/** Action kinds are free-form strings in persistence, so a kind outside
+ * ACTION_CONFIG renders neutrally instead of crashing the card. */
+const FALLBACK_ACTION = {
+	icon: Circle,
+	iconClass: "text-ink-faint",
+	label: "Action",
 };
 
 function formatTimeAgo(iso: string): string {
@@ -160,7 +169,7 @@ export function RunHistoryCard({showAgent, agentId}: RunHistoryCardProps) {
 													icon: Icon,
 													iconClass,
 													label,
-												} = ACTION_CONFIG[action.kind];
+												} = ACTION_CONFIG[action.kind] ?? FALLBACK_ACTION;
 												return (
 													<div key={i} className="flex items-start gap-2.5">
 														<Icon

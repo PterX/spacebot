@@ -12,7 +12,9 @@ const CEILING_TAGLINES: Record<AutonomyLevel, string> = {
 };
 
 interface CeilingCardProps {
-	ceiling: AutonomyLevel;
+	/** Undefined while fleet data loads; the dial renders inert with no
+	 * selection until the real value arrives. */
+	ceiling?: AutonomyLevel;
 	onCeilingChange: (level: AutonomyLevel) => void;
 }
 
@@ -27,10 +29,16 @@ export function CeilingCard({ceiling, onCeilingChange}: CeilingCardProps) {
 					</p>
 				</div>
 
-				<LevelDial value={ceiling} onChange={onCeilingChange} />
+				<div
+					className={
+						ceiling === undefined ? "pointer-events-none opacity-50" : undefined
+					}
+				>
+					<LevelDial value={ceiling} onChange={onCeilingChange} />
+				</div>
 
 				<p className="mt-3 min-h-[2.5rem] text-sm text-ink-dull">
-					{CEILING_TAGLINES[ceiling]}
+					{ceiling !== undefined ? CEILING_TAGLINES[ceiling] : ""}
 				</p>
 
 				<p className="mt-1 text-tiny text-ink-faint">

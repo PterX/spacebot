@@ -147,9 +147,11 @@ impl WakeConfig {
 
 /// Reconcile `[[agents.X.wakes]]` entries into the store: upsert config-owned
 /// rows by id (schedule cursors survive), delete config-owned rows whose
-/// entry is gone, and never touch builtin or user-owned rows. A config id
-/// colliding with a non-config row is skipped with a warning, the same
-/// tolerance cron config seeding has for per-row failures.
+/// entry is gone, and never touch builtin or user-owned rows. Per-row
+/// failures — id collisions with non-config rows, invalid entries, and store
+/// errors alike — are logged and skipped so one bad row does not abort the
+/// rest of the reconciliation, the same tolerance cron config seeding has.
+/// Errors out only when the existing rows cannot be listed at all.
 pub async fn reconcile_config_wakes(store: &WakeDefStore, configs: &[WakeConfig]) -> Result<()> {
     let existing = store.list().await?;
     let existing_by_id: HashMap<&str, &WakeDef> =
@@ -178,12 +180,20 @@ pub async fn reconcile_config_wakes(store: &WakeDefStore, configs: &[WakeConfig]
                 continue;
             }
         };
-        store.upsert(&config.to_def(trigger)).await?;
+        if let Err(error) = store.upsert(&config.to_def(trigger)).await {
+            tracing::warn!(wake_id = %config.id, %error, "failed to upsert config wake, skipping");
+        }
     }
 
     for def in &existing {
         if def.config_owned && !def.builtin && !config_ids.contains(def.id.as_str()) {
-            store.delete(&def.id).await?;
+            if let Err(error) = store.delete(&def.id).await {
+                tracing::warn!(
+                    wake_id = %def.id,
+                    %error,
+                    "failed to delete removed config wake, skipping"
+                );
+            }
         }
     }
 
