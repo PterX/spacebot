@@ -57,6 +57,35 @@ Two things legitimately arrive mid-run and so must be messages: the soft wrap-up
 
 The rule the channel is built around: **the transcript holds the agent's own output.** Everything the system tells it is either the system prompt, re-rendered per wake, or an ephemeral mid-run injection. Nothing the system says accumulates.
 
+### Journaled events
+
+That rule governs scaffolding. It does not exclude the agent's own actions — and some of those leave the transcript entirely. When a run sends a message to the home channel, the effect lands on a human, not in the conversation the run is having with itself. The next wake has no way to know it happened.
+
+So actions with effects outside the transcript are journaled into it as they occur:
+
+```text
+Sent to home channel (telegram:8659410676):
+"Found three open issues on the repo you cloned — the oldest looks like a quick win."
+```
+
+**These are recorded as the agent's own turn.** Not as a system row: `log_system_message` persists `role = "system"`, and rehydration keeps only `user` and `assistant` rows (`render_conversation_history_backfill`). A system row is visible in the dashboard and invisible to the agent, which is precisely backwards for a journal entry — the dashboard is not who needs to read it.
+
+What qualifies is decided by one test: **journal only what the next wake cannot re-derive.** Task state, goals, worker status, and run counts are all re-rendered into the system prompt on every wake, so journaling them duplicates content that is already arriving fresh. An outbound message fails that test on both counts — nothing regenerates it, and it cannot be undone. The agent has to know it already spoke.
+
+Held to that test, the set stays small: things a human perceived, and writes to the world outside the agent. Internal state transitions stay out. The failure mode to avoid is a transcript that degrades from a train of thought into a syslog, which is the same pollution the briefing rule exists to prevent, arriving through a different door.
+
+**Journaling is independent of waking.** Two axes that happen to share a vocabulary:
+
+| | Wakes the agent | Appears in the transcript |
+|---|---|---|
+| Registered as a wake trigger | yes | yes, via the run it causes |
+| Journal-only | no | yes, on the next wake |
+| Neither | no | no |
+
+An event is journaled because the agent needs to remember it, and it triggers a wake because it needs acting on *now*. Most things are one or the other. This is what several declared-but-unproduced `SystemEvent` variants are reaching for: `cortex.observation` wants to be journal-only.
+
+**Journal entries must survive compaction.** A run's detail collapses into its summary on exit, and "have I already told them this?" is a question spanning days — exactly the range compaction removes. An outbound-message record that lives only in run detail works for one wake and then silently stops. Outward-facing actions are promoted into the run summary rather than discarded with the rest of the detail.
+
 ---
 
 ## What It Does

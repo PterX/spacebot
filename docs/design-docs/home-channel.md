@@ -125,7 +125,7 @@ Mute-by-default survives the feature: an instance with a home set and the dial a
 | Adapter unbound or offline at send | Send fails, run completes, content falls back to a memory. The run is not retried for delivery alone. |
 | Bot removed from the home channel | Send fails as above; repeated failures clear the implicit home and notify on the next reachable surface. An explicit home is never silently cleared. |
 | Target no longer parses after an adapter rename | Treated as unset. Resolution falls through to the record branch. |
-| Same finding repeatedly worth sending | Outreach is deduped by content key, the way wake events debounce by `dedupe_key`. An agent that repeats itself daily gets muted by its user. |
+| Same finding repeatedly worth sending | Every send is journaled into the autonomy transcript, so the next run sees what it already said and judges whether repeating is worth it. A content key backstops that against loops. An agent that repeats itself daily gets muted by its user. |
 
 ---
 
@@ -148,7 +148,8 @@ Mute-by-default survives the feature: an instance with a home set and the dial a
 
 **Phase 4 — Autonomous outreach**
 - Level gating on send
-- Content-key dedupe for repeated outreach
+- Sends journaled into the autonomy transcript as the agent's own turn, surviving run compaction — see [`autonomy.md`](autonomy.md)
+- Content-key dedupe as a loop backstop beneath that judgment
 - Record-instead-of-send fallback wired to the memory path
 
 ---
