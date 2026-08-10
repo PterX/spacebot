@@ -4,7 +4,7 @@ use crate::error::Result;
 use crate::hooks::SpacebotHook;
 use crate::llm::SpacebotModel;
 use crate::llm::routing::is_context_overflow_error;
-use crate::tools::MemoryPersistenceContractState;
+use crate::tools::{MemoryPersistenceContractState, MemoryPersistenceTerminalOutcome};
 use crate::{AgentDeps, BranchId, ChannelId, ProcessEvent, ProcessId, ProcessType};
 use rig::agent::AgentBuilder;
 use rig::completion::CompletionModel;
@@ -161,6 +161,16 @@ impl Branch {
                     break partial;
                 }
                 Err(rig::completion::PromptError::PromptCancelled { reason, .. })
+                    if SpacebotHook::is_memory_persistence_complete_reason(&reason) =>
+                {
+                    self.hook.set_completion_contract_request_active(false);
+                    tracing::info!(
+                        branch_id = %self.id,
+                        "memory persistence branch reached terminal outcome"
+                    );
+                    break self.memory_persistence_conclusion();
+                }
+                Err(rig::completion::PromptError::PromptCancelled { reason, .. })
                     if enforce_memory_contract
                         && SpacebotHook::is_memory_persistence_contract_reason(&reason) =>
                 {
@@ -277,6 +287,28 @@ impl Branch {
         tracing::info!(branch_id = %self.id, "branch completed");
 
         Ok(conclusion)
+    }
+
+    /// Describe the recorded terminal outcome for the branch log. Memory
+    /// persistence branches complete silently, so this text is only ever
+    /// surfaced to operators.
+    fn memory_persistence_conclusion(&self) -> String {
+        match self
+            .memory_persistence_contract
+            .as_ref()
+            .and_then(|contract| contract.terminal_outcome())
+        {
+            Some(MemoryPersistenceTerminalOutcome::Saved { saved_memory_ids }) => {
+                format!(
+                    "Memory persistence complete: {} memories saved.",
+                    saved_memory_ids.len()
+                )
+            }
+            Some(MemoryPersistenceTerminalOutcome::NoMemories { reason }) => {
+                format!("Memory persistence complete: no memories saved ({reason}).")
+            }
+            None => "Memory persistence complete.".to_string(),
+        }
     }
 
     /// Compact history down to what the context window has left once this

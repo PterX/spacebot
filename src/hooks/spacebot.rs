@@ -90,6 +90,9 @@ impl SpacebotHook {
     /// PromptCancelled reason used for memory-persistence contract retries.
     pub const MEMORY_PERSISTENCE_CONTRACT_REASON: &str =
         "spacebot_memory_persistence_contract_retry";
+    /// PromptCancelled reason used once a memory-persistence run has recorded
+    /// its terminal outcome and the loop should stop.
+    pub const MEMORY_PERSISTENCE_COMPLETE_REASON: &str = "spacebot_memory_persistence_complete";
     /// Maximum nudge retries per prompt request.
     pub const TOOL_NUDGE_MAX_RETRIES: usize = 2;
     /// Maximum completion-contract retries per prompt request.
@@ -257,6 +260,12 @@ impl SpacebotHook {
 
     pub fn is_memory_persistence_contract_reason(reason: &str) -> bool {
         reason == Self::MEMORY_PERSISTENCE_CONTRACT_REASON
+    }
+
+    /// Return true if a PromptCancelled reason indicates the memory-persistence
+    /// run recorded its terminal outcome and stopped deliberately.
+    pub fn is_memory_persistence_complete_reason(reason: &str) -> bool {
+        reason == Self::MEMORY_PERSISTENCE_COMPLETE_REASON
     }
 
     /// Drain and return all buffered injected messages.
@@ -1366,12 +1375,20 @@ where
             );
         }
 
+        // The terminal completion tool ends a memory-persistence run. Stopping
+        // here skips the trailing LLM call that has nothing left to say —
+        // providers answer it with an empty message, which the response parser
+        // rejects and which surfaced as a failed branch even though every
+        // memory had already been persisted.
         if !is_tool_error
             && tool_name == "memory_persistence_complete"
             && let Some(contract_state) = &self.memory_persistence_contract
             && let Some(outcome) = Self::parse_memory_persistence_terminal_outcome(result)
         {
             contract_state.set_terminal_outcome(outcome);
+            return HookAction::Terminate {
+                reason: Self::MEMORY_PERSISTENCE_COMPLETE_REASON.into(),
+            };
         }
 
         // A successful tool call proves the worker is still productive.
@@ -2447,6 +2464,55 @@ mod tests {
         )
         .await;
 
+        assert!(matches!(action, HookAction::Continue));
+    }
+
+    #[tokio::test]
+    async fn memory_persistence_terminal_outcome_stops_the_loop() {
+        for result in [
+            "{\"success\":true,\"outcome\":\"no_memories\",\"saved_memory_ids\":[],\"reason\":\"No durable facts found\"}",
+            "{\"success\":true,\"outcome\":\"saved\",\"saved_memory_ids\":[\"mem_real_1\"]}",
+        ] {
+            let (hook, contract_state) = make_memory_persistence_hook();
+
+            let action = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
+                &hook,
+                "memory_persistence_complete",
+                None,
+                "internal_1",
+                "{}",
+                result,
+            )
+            .await;
+
+            assert!(contract_state.has_terminal_outcome());
+            match action {
+                HookAction::Terminate { reason } => assert!(
+                    SpacebotHook::is_memory_persistence_complete_reason(&reason),
+                    "unexpected terminate reason: {reason}"
+                ),
+                HookAction::Continue => {
+                    panic!("terminal outcome should stop the loop before the trailing LLM call")
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_persistence_tool_error_does_not_stop_the_loop() {
+        let (hook, contract_state) = make_memory_persistence_hook();
+
+        let action = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
+            &hook,
+            "memory_persistence_complete",
+            None,
+            "internal_1",
+            "{}",
+            "Toolset error: memory_persistence_complete failed: saved_memory_ids mismatch",
+        )
+        .await;
+
+        assert!(!contract_state.has_terminal_outcome());
         assert!(matches!(action, HookAction::Continue));
     }
 }
