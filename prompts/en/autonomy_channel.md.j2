@@ -42,7 +42,7 @@ Already running — do not duplicate this work.
 Survey the task state above and decide what is most valuable, given the goals and what recent runs already covered. This is not a FIFO queue — reason about priorities.
 
 {% if level == "observe" %}
-Your autonomy level is **observe**: survey and summarize only. You may investigate and read anything, but you must NOT mutate anything — no creating tasks, no updating tasks, no executing work, no writing files. Your output is your `autonomy_complete` summary.
+Your autonomy level is **observe**: survey and summarize only. You may investigate and read anything, and you record what you learn with `memory_save` — observing without remembering is what the level is for. Otherwise you must NOT change anything: no creating tasks, no updating tasks, no executing work, no writing files. Your output is your memories and your `autonomy_complete` summary.
 {% elif level == "suggest" %}
 Your autonomy level is **suggest**: enrich and propose, never execute. You may:
 - **Enrich pending_approval tasks** — investigate (workers, web, files) and record findings in task metadata/updates so the user reviews a fully reasoned brief.

@@ -58,6 +58,30 @@ pub struct DispatchScope<'a> {
 /// inherit one.
 pub const AUTHORITY_METADATA_KEY: &str = "sender_is_authority";
 
+/// Resolve the sender's authority for the scope this message arrived in and
+/// record it on the message, returning the verdict.
+///
+/// Every non-system inbound message gets one, whether or not the router goes
+/// on to handle it as a command.
+pub(crate) fn stamp_authority(message: &mut InboundMessage, scope: &DispatchScope<'_>) -> bool {
+    let is_authority = AccessContext {
+        binding_authority: scope.binding_authority,
+        adapter_default: scope.adapter_defaults.for_adapter(message.adapter_key()),
+        sender_id: &message.sender_id,
+        sender_login: message
+            .metadata
+            .get("twitch_user_login")
+            .and_then(|value| value.as_str()),
+    }
+    .is_authority();
+
+    message.metadata.insert(
+        AUTHORITY_METADATA_KEY.to_string(),
+        serde_json::Value::Bool(is_authority),
+    );
+    is_authority
+}
+
 /// Whether the router resolved this sender as holding authority in the scope
 /// the message arrived in.
 pub fn sender_is_authority(message: &InboundMessage) -> bool {
@@ -77,35 +101,25 @@ pub async fn dispatch_inbound(
     if message.source == "system" {
         return Dispatch::Forward;
     }
+    let surface = Surface::from_source(&message.source);
+    // Stamped for every non-system message, ahead of both the content match
+    // and the parse. The channel builds its command text from media captions
+    // too, and registers authority-gated tools per turn, so anything this
+    // function declines to handle still has to carry the verdict.
+    let is_authority = stamp_authority(message, &scope);
+
     let text = match &message.content {
         MessageContent::Text(text) => text.clone(),
         // Command content arrives from surfaces that parse client-side
         // (Discord interactions, Slack subcommands, the portal palette); it
         // renders as "/name args" so the shared parser revalidates it.
         MessageContent::Command { .. } => message.content.to_string(),
+        // A media caption can carry a command, but the router does not
+        // dispatch it: attachments have to reach the channel with the
+        // message. The channel's own command path handles it, gated on the
+        // verdict stamped above.
         _ => return Dispatch::Forward,
     };
-
-    let surface = Surface::from_source(&message.source);
-    let is_authority = {
-        let context = AccessContext {
-            binding_authority: scope.binding_authority,
-            adapter_default: scope.adapter_defaults.for_adapter(message.adapter_key()),
-            sender_id: &message.sender_id,
-            sender_login: message
-                .metadata
-                .get("twitch_user_login")
-                .and_then(|value| value.as_str()),
-        };
-        context.is_authority()
-    };
-    // Stamped before the parse gives up on non-commands: the channel re-parses
-    // raw text on its own command path and registers authority-gated tools per
-    // turn, so both need this on every forwarded message.
-    message.metadata.insert(
-        AUTHORITY_METADATA_KEY.to_string(),
-        serde_json::Value::Bool(is_authority),
-    );
 
     let bot_username = message
         .metadata

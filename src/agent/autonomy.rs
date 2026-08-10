@@ -525,7 +525,14 @@ async fn build_run_briefing(
 
     // Nothing to survey and no direction to work from. The run needs different
     // instructions, not a shorter version of the same ones.
-    let instance_is_empty = !has_tasks && active_goals.is_empty();
+    //
+    // A wake event or a running worker is direction: the run has a reason to
+    // exist and a bounded turn to spend on it, which cold-start discovery
+    // would spend on the workspace instead.
+    let instance_is_empty = !has_tasks
+        && active_goals.is_empty()
+        && wake_event_views.is_empty()
+        && active_workers.is_none();
 
     let prompt_engine = deps.runtime_config.prompts.load();
     prompt_engine
