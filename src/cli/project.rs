@@ -29,7 +29,7 @@ pub enum ProjectCommand {
         /// Absolute path to the project root directory
         root_path: String,
         /// Project description
-        #[arg(short, long)]
+        #[arg(long)]
         description: Option<String>,
         /// Icon identifier
         #[arg(long)]
@@ -49,7 +49,7 @@ pub enum ProjectCommand {
         #[arg(short, long)]
         name: Option<String>,
         /// New description
-        #[arg(short, long)]
+        #[arg(long)]
         description: Option<String>,
         /// New icon identifier
         #[arg(long)]
@@ -101,7 +101,7 @@ pub enum RepoCommand {
         #[arg(long)]
         default_branch: Option<String>,
         /// Repo description
-        #[arg(short, long)]
+        #[arg(long)]
         description: Option<String>,
     },
     /// Remove a repo from a project (database record only)

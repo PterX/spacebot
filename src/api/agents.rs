@@ -509,6 +509,10 @@ pub(super) async fn trigger_warmup(
             );
             continue;
         };
+        let Some(goal_store) = state.goal_store.load().as_ref().clone() else {
+            tracing::warn!(agent_id, "goal store not initialized, skipping warmup");
+            continue;
+        };
         let Some(project_store) = state.project_store.load().as_ref().clone() else {
             tracing::warn!(
                 agent_id,
@@ -523,6 +527,7 @@ pub(super) async fn trigger_warmup(
         let injection_tx = state.injection_tx.clone();
         let humans = (**state.agent_humans.load()).clone();
         let notif_store_warmup = state.notification_store.load().as_ref().clone();
+        let autonomy_ceiling = state.autonomy_ceiling.clone();
         tokio::spawn(async move {
             let process_event_buses = crate::create_process_event_buses();
             let event_tx = process_event_buses.control;
@@ -551,6 +556,13 @@ pub(super) async fn trigger_warmup(
                 messaging_manager: None,
                 sandbox,
                 task_store,
+                goal_store,
+                wake_event_store: Arc::new(crate::wakes::WakeEventStore::new(sqlite_pool.clone())),
+                autonomy_ceiling,
+                wake_def_store: Arc::new(crate::wakes::WakeDefStore::new(sqlite_pool.clone())),
+                autonomy_run_store: Arc::new(crate::wakes::AutonomyRunStore::new(
+                    sqlite_pool.clone(),
+                )),
                 project_store,
                 links: Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
                 agent_names: Arc::new(std::collections::HashMap::new()),
@@ -780,6 +792,7 @@ pub async fn create_agent_internal(
         coalesce: None,
         ingestion: None,
         cortex: None,
+        autonomy: None,
         warmup: None,
         browser: None,
         channel: None,
@@ -790,6 +803,7 @@ pub async fn create_agent_internal(
         sandbox: None,
         projects: None,
         cron: Vec::new(),
+        wakes: Vec::new(),
     };
     let agent_config = raw_config.resolve(&instance_dir, defaults);
 
@@ -855,6 +869,12 @@ pub async fn create_agent_internal(
         .as_ref()
         .clone()
         .ok_or_else(|| "global task store not initialized".to_string())?;
+    let goal_store = state
+        .goal_store
+        .load()
+        .as_ref()
+        .clone()
+        .ok_or_else(|| "goal store not initialized".to_string())?;
 
     let process_event_buses = crate::create_process_event_buses();
     let event_tx = process_event_buses.control;
@@ -963,6 +983,11 @@ pub async fn create_agent_internal(
         llm_manager,
         mcp_manager: mcp_manager.clone(),
         task_store: task_store.clone(),
+        goal_store: goal_store.clone(),
+        wake_event_store: Arc::new(crate::wakes::WakeEventStore::new(db.sqlite.clone())),
+        autonomy_ceiling: state.autonomy_ceiling.clone(),
+        wake_def_store: Arc::new(crate::wakes::WakeDefStore::new(db.sqlite.clone())),
+        autonomy_run_store: Arc::new(crate::wakes::AutonomyRunStore::new(db.sqlite.clone())),
         project_store: project_store.clone(),
         cron_tool: None,
         runtime_config: runtime_config.clone(),
@@ -1029,6 +1054,11 @@ pub async fn create_agent_internal(
         .write()
         .await
         .insert(arc_agent_id.clone(), deps.clone());
+
+    // Runtime-created agents have no config wakes; seed the builtins only.
+    if let Err(error) = crate::wakes::seed_builtin_wakes(&deps.wake_def_store).await {
+        tracing::warn!(agent_id = %agent_id, %error, "failed to seed builtin wakes");
+    }
 
     let cron_store = std::sync::Arc::new(crate::cron::CronStore::new(db.sqlite.clone()));
     let cron_context = crate::cron::CronContext {

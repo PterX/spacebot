@@ -15,7 +15,7 @@ pub enum AgentCommand {
         /// Agent ID (e.g. main)
         agent_id: String,
         /// Human-friendly display name
-        #[arg(short, long)]
+        #[arg(long)]
         display_name: Option<String>,
         /// Role description
         #[arg(short, long)]

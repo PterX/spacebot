@@ -831,6 +831,9 @@ async fn run(
 
     let global_task_store = Arc::new(spacebot::tasks::TaskStore::new(instance_pool.clone()));
 
+    // Instance-level goal store. Goals are instance-scoped like tasks.
+    let global_goal_store = Arc::new(spacebot::goals::GoalStore::new(instance_pool.clone()));
+
     // Instance-wide wiki knowledge base.
     let global_wiki_store = Arc::new(spacebot::wiki::WikiStore::new(instance_pool.clone()));
 
@@ -856,7 +859,11 @@ async fn run(
         injection_tx.clone(),
     );
     api_state.auth_token = config.api.auth_token.clone();
+    // Instance-wide autonomy ceiling: one ArcSwap shared between the API and
+    // every AgentDeps so ceiling writes take effect without a restart.
+    api_state.autonomy_ceiling = Arc::new(arc_swap::ArcSwap::from_pointee(config.autonomy_ceiling));
     api_state.set_task_store(global_task_store.clone());
+    api_state.set_goal_store(global_goal_store.clone());
     api_state.set_wiki_store(global_wiki_store.clone());
     api_state.set_notification_store(global_notification_store.clone());
     api_state.set_lifecycle(lifecycle.clone());
@@ -1026,6 +1033,7 @@ async fn run(
             agent_humans.clone(),
             injection_tx.clone(),
             global_task_store.clone(),
+            global_goal_store.clone(),
             global_wiki_store.clone(),
             global_project_store.clone(),
             global_notification_store.clone(),
@@ -1237,6 +1245,7 @@ async fn run(
 
                     let (mut channel, channel_tx) = spacebot::agent::channel::Channel::new(
                         channel_id,
+                        spacebot::agent::channel::ChannelKind::User,
                         agent.deps.clone(),
                         response_tx,
                         event_rx,
@@ -1246,6 +1255,7 @@ async fn run(
                         Some(api_state.live_worker_transcripts.clone()),
                         resolved_settings,
                         None, // no cron outcome for normal channels
+                        None, // no autonomy run for normal channels
                     );
                     let channel_registration_id = agent
                         .deps
@@ -1561,6 +1571,7 @@ async fn run(
 
                     let (mut channel, channel_tx) = spacebot::agent::channel::Channel::new(
                         channel_id,
+                        spacebot::agent::channel::ChannelKind::User,
                         agent.deps.clone(),
                         response_tx,
                         event_rx,
@@ -1570,6 +1581,7 @@ async fn run(
                         Some(api_state.live_worker_transcripts.clone()),
                         resolved_settings,
                         None, // no cron outcome for normal channels
+                        None, // no autonomy run for normal channels
                     );
                     let channel_registration_id = agent
                         .deps
@@ -1856,6 +1868,7 @@ async fn run(
                                     agent_humans.clone(),
                                     injection_tx.clone(),
                                     global_task_store.clone(),
+                                    global_goal_store.clone(),
                                     global_wiki_store.clone(),
                                     global_project_store.clone(),
                                     global_notification_store.clone(),
@@ -2026,6 +2039,7 @@ async fn initialize_agents(
     agent_humans: Arc<ArcSwap<Vec<spacebot::config::HumanDef>>>,
     injection_tx: tokio::sync::mpsc::Sender<spacebot::ChannelInjection>,
     global_task_store: Arc<spacebot::tasks::TaskStore>,
+    global_goal_store: Arc<spacebot::goals::GoalStore>,
     global_wiki_store: Arc<spacebot::wiki::WikiStore>,
     global_project_store: Arc<spacebot::projects::ProjectStore>,
     global_notification_store: Arc<spacebot::notifications::NotificationStore>,
@@ -2286,6 +2300,11 @@ async fn initialize_agents(
             llm_manager: llm_manager.clone(),
             mcp_manager,
             task_store: global_task_store.clone(),
+            goal_store: global_goal_store.clone(),
+            wake_event_store: Arc::new(spacebot::wakes::WakeEventStore::new(db.sqlite.clone())),
+            autonomy_ceiling: api_state.autonomy_ceiling.clone(),
+            wake_def_store: Arc::new(spacebot::wakes::WakeDefStore::new(db.sqlite.clone())),
+            autonomy_run_store: Arc::new(spacebot::wakes::AutonomyRunStore::new(db.sqlite.clone())),
             project_store: project_store.clone(),
             cron_tool: None,
             runtime_config,
@@ -2935,6 +2954,18 @@ async fn initialize_agents(
     for (agent_id, agent) in agents.iter_mut() {
         let store = Arc::new(spacebot::cron::CronStore::new(agent.db.sqlite.clone()));
         agent.deps.messaging_manager = Some(messaging_manager.clone());
+
+        // Seed built-in wakes, then reconcile config-owned wake definitions.
+        // Builtins go first so a config id colliding with one is detected.
+        if let Err(error) = spacebot::wakes::seed_builtin_wakes(&agent.deps.wake_def_store).await {
+            tracing::warn!(agent_id = %agent_id, %error, "failed to seed builtin wakes");
+        }
+        if let Err(error) =
+            spacebot::wakes::reconcile_config_wakes(&agent.deps.wake_def_store, &agent.config.wakes)
+                .await
+        {
+            tracing::warn!(agent_id = %agent_id, %error, "failed to reconcile config wakes");
+        }
 
         // Seed cron jobs from config into the database
         for cron_def in &agent.config.cron {

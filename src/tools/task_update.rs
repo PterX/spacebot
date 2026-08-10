@@ -321,7 +321,7 @@ mod tests {
         let created = task_store
             .create(crate::tasks::CreateTaskInput {
                 owner_agent_id: "agent-test".to_string(),
-                assigned_agent_id: "agent-test".to_string(),
+                assigned_agent_id: Some("agent-test".to_string()),
                 title: "Review PR 2".to_string(),
                 description: None,
                 status: TaskStatus::InProgress,
@@ -371,7 +371,7 @@ mod tests {
         let created = task_store
             .create(crate::tasks::CreateTaskInput {
                 owner_agent_id: "agent-test".to_string(),
-                assigned_agent_id: "agent-test".to_string(),
+                assigned_agent_id: Some("agent-test".to_string()),
                 title: "Review merged changes".to_string(),
                 description: None,
                 status: TaskStatus::Done,
@@ -419,7 +419,7 @@ mod tests {
         let assigned = task_store
             .create(crate::tasks::CreateTaskInput {
                 owner_agent_id: "agent-test".to_string(),
-                assigned_agent_id: "agent-test".to_string(),
+                assigned_agent_id: Some("agent-test".to_string()),
                 title: "Assigned task".to_string(),
                 description: None,
                 status: TaskStatus::InProgress,
@@ -434,7 +434,7 @@ mod tests {
         let other = task_store
             .create(crate::tasks::CreateTaskInput {
                 owner_agent_id: "agent-test".to_string(),
-                assigned_agent_id: "agent-test".to_string(),
+                assigned_agent_id: Some("agent-test".to_string()),
                 title: "Other task".to_string(),
                 description: None,
                 status: TaskStatus::InProgress,

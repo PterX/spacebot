@@ -205,7 +205,7 @@ async fn reload_after_skill_change(state: &ApiState, agent_id: Option<&str>, ins
         let workspace_skills_dir = runtime_config.workspace_dir.join("skills");
         let skills =
             crate::skills::SkillSet::load(&instance_skills_dir, &workspace_skills_dir).await;
-        runtime_config.reload_skills(skills);
+        runtime_config.reload_skills(skills).await;
 
         if !installed.is_empty()
             && let Some(store) = runtime_config.skill_usage.load().as_ref()

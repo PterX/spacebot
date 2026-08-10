@@ -41,6 +41,60 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/agents/autonomy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get the autonomy status for a single agent. */
+        get: operations["autonomy_status"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/autonomy/fleet": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get the autonomy status for every agent, in agent-list order. */
+        get: operations["autonomy_fleet"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/autonomy/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List recent autonomy runs, newest first. Scoped to one agent when
+         *     `agent_id` is given, aggregated across all agents otherwise.
+         */
+        get: operations["autonomy_runs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/agents/avatar": {
         parameters: {
             query?: never;
@@ -1209,6 +1263,46 @@ export interface paths {
         /** Load a full preset by ID, including soul, identity, and role content. */
         get: operations["get_preset"];
         put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/goals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /goals` — list goals with optional status filter. */
+        get: operations["list_goals"];
+        put?: never;
+        /** `POST /goals` — create a goal. New goals start active. */
+        post: operations["create_goal"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/goals/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /goals/{id}` — get a goal by id. */
+        get: operations["get_goal"];
+        /**
+         * `PUT /goals/{id}` — update a goal. Status changes follow the goal
+         *     lifecycle (active ↔ paused, active → completed, active → abandoned);
+         *     user-initiated completion happens here via `status: "completed"`.
+         */
+        put: operations["update_goal"];
         post?: never;
         delete?: never;
         options?: never;
@@ -2598,6 +2692,7 @@ export interface components {
             runtime_key: string;
         };
         AgentConfigResponse: {
+            autonomy: components["schemas"]["AutonomySection"];
             browser: components["schemas"]["BrowserSection"];
             channel: components["schemas"]["ChannelSection"];
             coalesce: components["schemas"]["CoalesceSection"];
@@ -2613,6 +2708,7 @@ export interface components {
         };
         AgentConfigUpdateRequest: {
             agent_id: string;
+            autonomy?: null | components["schemas"]["AutonomyUpdate"];
             browser?: null | components["schemas"]["BrowserUpdate"];
             channel?: null | components["schemas"]["ChannelUpdate"];
             coalesce?: null | components["schemas"]["CoalesceUpdate"];
@@ -2725,6 +2821,120 @@ export interface components {
         AuthorizedKeyResponse: {
             message: string;
             success: boolean;
+        };
+        /** @description A single action taken during an autonomy run. */
+        AutonomyAction: {
+            /** @description One-line description of what was done. */
+            detail: string;
+            /** @description "enriched", "created", or "executed". */
+            kind: string;
+            /**
+             * Format: int64
+             * @description Task the action touched, when applicable.
+             */
+            task_number?: number | null;
+        };
+        AutonomyCurrentRun: {
+            started_at: string;
+        };
+        AutonomyFleetResponse: {
+            agents: components["schemas"]["AutonomyStatusResponse"][];
+        };
+        /**
+         * @description How much the autonomy channel may do without a user present.
+         *
+         *     The dial is cumulative: each level includes everything below it.
+         *     `Off` disables the autonomy channel entirely; `Act` additionally allows
+         *     executing user-approved `ready` tasks.
+         * @enum {string}
+         */
+        AutonomyLevel: "off" | "observe" | "suggest" | "act";
+        AutonomyRun: {
+            actions: components["schemas"]["AutonomyAction"][];
+            /** Format: int64 */
+            duration_secs?: number | null;
+            finished_at?: string | null;
+            id: string;
+            started_at: string;
+            status: components["schemas"]["AutonomyRunStatus"];
+            summary?: string | null;
+            wake_event_ids: string[];
+        };
+        AutonomyRunEntry: components["schemas"]["AutonomyRun"] & {
+            agent_id: string;
+        };
+        /**
+         * @description Terminal status of an autonomy run.
+         * @enum {string}
+         */
+        AutonomyRunStatus: "running" | "completed" | "timeout" | "failed";
+        AutonomyRunsResponse: {
+            runs: components["schemas"]["AutonomyRunEntry"][];
+        };
+        AutonomySection: {
+            active_hours?: [
+                number,
+                number
+            ] | null;
+            claim_unowned: boolean;
+            /** Format: int64 */
+            interval_secs: number;
+            level: components["schemas"]["AutonomyLevel"];
+            /** Format: int32 */
+            max_tasks_per_run: number;
+            /** Format: int32 */
+            max_turns: number;
+            /** Format: int32 */
+            run_history_count: number;
+            /** Format: int64 */
+            timeout_secs: number;
+            /** Format: int64 */
+            warn_secs: number;
+        };
+        AutonomyStatusResponse: {
+            active_hours?: [
+                number,
+                number
+            ] | null;
+            agent_id: string;
+            current_run?: null | components["schemas"]["AutonomyCurrentRun"];
+            /** Format: int64 */
+            interval_secs: number;
+            /** @description When the most recent finished run started. */
+            last_run_at?: string | null;
+            /** @description Summary of the most recent finished run. */
+            last_run_summary?: string | null;
+            level: components["schemas"]["AutonomyLevel"];
+            /** Format: int32 */
+            max_tasks_per_run: number;
+            /**
+             * @description Interval anchor: last run start + interval, clamped to now when
+             *     overdue. `null` when the level is `off`.
+             */
+            next_run_at?: string | null;
+            /** Format: int64 */
+            pending_wake_events: number;
+        };
+        AutonomyUpdate: {
+            /**
+             * @description `[start, end]` sets the window; an empty array clears it (always
+             *     active). Omit to leave unchanged.
+             */
+            active_hours?: number[] | null;
+            claim_unowned?: boolean | null;
+            /** Format: int64 */
+            interval_secs?: number | null;
+            level?: null | components["schemas"]["AutonomyLevel"];
+            /** Format: int32 */
+            max_tasks_per_run?: number | null;
+            /** Format: int32 */
+            max_turns?: number | null;
+            /** Format: int32 */
+            run_history_count?: number | null;
+            /** Format: int64 */
+            timeout_secs?: number | null;
+            /** Format: int64 */
+            warn_secs?: number | null;
         };
         BinaryEntry: {
             modified?: string | null;
@@ -3027,6 +3237,14 @@ export interface components {
             /** Format: int64 */
             timeout_secs?: number | null;
         };
+        CreateGoalRequest: {
+            description?: string | null;
+            /** @description Optional deadline as YYYY-MM-DD. */
+            due_date?: string | null;
+            metadata?: unknown;
+            priority?: string | null;
+            title: string;
+        };
         CreateGroupRequest: {
             agent_ids?: string[];
             color?: string | null;
@@ -3313,6 +3531,45 @@ export interface components {
             message: string;
             requires_restart: boolean;
             success: boolean;
+        };
+        Goal: {
+            completed_at?: string | null;
+            created_at: string;
+            description?: string | null;
+            due_date?: string | null;
+            id: string;
+            metadata: unknown;
+            notes?: string | null;
+            priority: components["schemas"]["TaskPriority"];
+            status: components["schemas"]["GoalStatus"];
+            title: string;
+            updated_at: string;
+        };
+        GoalListResponse: {
+            goals: components["schemas"]["GoalWithCounts"][];
+        };
+        GoalResponse: {
+            goal: components["schemas"]["GoalWithCounts"];
+        };
+        /** @enum {string} */
+        GoalStatus: "active" | "paused" | "completed" | "abandoned";
+        /** @description Linked task counts by status for a single goal. */
+        GoalTaskCounts: {
+            /** Format: int64 */
+            backlog: number;
+            /** Format: int64 */
+            done: number;
+            /** Format: int64 */
+            failed: number;
+            /** Format: int64 */
+            in_progress: number;
+            /** Format: int64 */
+            pending_approval: number;
+            /** Format: int64 */
+            ready: number;
+        };
+        GoalWithCounts: components["schemas"]["Goal"] & {
+            task_counts: components["schemas"]["GoalTaskCounts"];
         };
         HealthResponse: {
             status: string;
@@ -4142,11 +4399,13 @@ export interface components {
         Task: {
             approved_at?: string | null;
             approved_by?: string | null;
-            assigned_agent_id: string;
+            assigned_agent_id?: string | null;
             completed_at?: string | null;
             created_at: string;
             created_by: string;
             description?: string | null;
+            /** @description Goal this task contributes to, when linked. */
+            goal_id?: string | null;
             id: string;
             metadata: unknown;
             owner_agent_id: string;
@@ -4173,7 +4432,7 @@ export interface components {
             task: components["schemas"]["Task"];
         };
         /** @enum {string} */
-        TaskStatus: "pending_approval" | "backlog" | "ready" | "in_progress" | "done";
+        TaskStatus: "pending_approval" | "backlog" | "ready" | "in_progress" | "done" | "failed";
         TaskSubtask: {
             completed: boolean;
             title: string;
@@ -4366,6 +4625,19 @@ export interface components {
         UpdateChannelSettingsRequest: {
             agent_id: string;
             settings: components["schemas"]["ConversationSettings"];
+        };
+        UpdateGoalRequest: {
+            description?: string | null;
+            /** @description New deadline as YYYY-MM-DD, or empty string to clear. */
+            due_date?: string | null;
+            /** @description Object patch deep-merged into the current metadata. */
+            metadata?: unknown;
+            /** @description Replacement progress notes, or empty string to clear. */
+            notes?: string | null;
+            priority?: string | null;
+            /** @description New status. Completion happens here: set `"completed"` to close a goal. */
+            status?: string | null;
+            title?: string | null;
         };
         UpdateGroupRequest: {
             agent_ids?: string[] | null;
@@ -4871,6 +5143,104 @@ export interface operations {
             };
             /** @description Invalid request */
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    autonomy_status: {
+        parameters: {
+            query: {
+                agent_id: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AutonomyStatusResponse"];
+                };
+            };
+            /** @description Agent not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    autonomy_fleet: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AutonomyFleetResponse"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    autonomy_runs: {
+        parameters: {
+            query?: {
+                /** @description Agent to list runs for. Omit to aggregate runs across all agents. */
+                agent_id?: string | null;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AutonomyRunsResponse"];
+                };
+            };
+            /** @description Agent not found */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -7703,6 +8073,162 @@ export interface operations {
             };
             /** @description Preset not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_goals: {
+        parameters: {
+            query?: {
+                status?: string | null;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GoalListResponse"];
+                };
+            };
+            /** @description Invalid status filter */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Goal store not initialized */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_goal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateGoalRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GoalResponse"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Goal store not initialized */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_goal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Goal id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GoalResponse"];
+                };
+            };
+            /** @description Goal not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Goal store not initialized */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_goal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Goal id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateGoalRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GoalResponse"];
+                };
+            };
+            /** @description Invalid request or status transition */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Goal not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Goal store not initialized */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

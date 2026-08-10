@@ -55,6 +55,7 @@ fn lookup(lang: &str, key: &str) -> &'static str {
     match (lang, key) {
         // Process Prompts
         ("en", "channel") => include_str!("../../prompts/en/channel.md.j2"),
+        ("en", "autonomy_channel") => include_str!("../../prompts/en/autonomy_channel.md.j2"),
         ("en", "branch") => include_str!("../../prompts/en/branch.md.j2"),
         ("en", "worker") => include_str!("../../prompts/en/worker.md.j2"),
         ("en", "cortex") => include_str!("../../prompts/en/cortex.md.j2"),
@@ -126,6 +127,20 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         }
         ("en", "fragments/system/memory_persistence") => {
             include_str!("../../prompts/en/fragments/system/memory_persistence.md.j2")
+        }
+        ("en", "fragments/system/memory_persistence_contract_retry") => {
+            include_str!(
+                "../../prompts/en/fragments/system/memory_persistence_contract_retry.md.j2"
+            )
+        }
+        ("en", "fragments/system/autonomy_contract_retry") => {
+            include_str!("../../prompts/en/fragments/system/autonomy_contract_retry.md.j2")
+        }
+        ("en", "fragments/system/autonomy_soft_warning") => {
+            include_str!("../../prompts/en/fragments/system/autonomy_soft_warning.md.j2")
+        }
+        ("en", "fragments/system/autonomy_hard_timeout") => {
+            include_str!("../../prompts/en/fragments/system/autonomy_hard_timeout.md.j2")
         }
         ("en", "fragments/system/cortex_synthesis") => {
             include_str!("../../prompts/en/fragments/system/cortex_synthesis.md.j2")
@@ -203,6 +218,9 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         ("en", "tools/memory_persistence_complete") => {
             include_str!("../../prompts/en/tools/memory_persistence_complete_description.md.j2")
         }
+        ("en", "tools/autonomy_complete") => {
+            include_str!("../../prompts/en/tools/autonomy_complete_description.md.j2")
+        }
         ("en", "tools/memory_recall") => {
             include_str!("../../prompts/en/tools/memory_recall_description.md.j2")
         }
@@ -257,6 +275,15 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         }
         ("en", "tools/task_update") => {
             include_str!("../../prompts/en/tools/task_update_description.md.j2")
+        }
+        ("en", "tools/goal_create") => {
+            include_str!("../../prompts/en/tools/goal_create_description.md.j2")
+        }
+        ("en", "tools/goal_list") => {
+            include_str!("../../prompts/en/tools/goal_list_description.md.j2")
+        }
+        ("en", "tools/goal_update") => {
+            include_str!("../../prompts/en/tools/goal_update_description.md.j2")
         }
         ("en", "tools/skills_search") => {
             include_str!("../../prompts/en/tools/skills_search_description.md.j2")
