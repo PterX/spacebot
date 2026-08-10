@@ -54,8 +54,11 @@ pub(super) struct CreateBindingRequest {
     require_mention: bool,
     #[serde(default)]
     dm_allowed_users: Vec<String>,
+    /// Omitted and explicit `[]` are distinct: omitted writes no TOML key
+    /// (adapter default applies), `[]` writes an explicit empty list that
+    /// opens the scope.
     #[serde(default)]
-    authority: Vec<String>,
+    authority: Option<Vec<String>>,
     /// Optional: set platform credentials if not yet configured.
     #[serde(default)]
     platform_credentials: Option<PlatformCredentials>,
@@ -166,8 +169,10 @@ pub(super) struct UpdateBindingRequest {
     require_mention: bool,
     #[serde(default)]
     dm_allowed_users: Vec<String>,
+    /// Omitted removes the TOML key (adapter default applies); `[]` writes
+    /// an explicit empty list that opens the scope.
     #[serde(default)]
-    authority: Vec<String>,
+    authority: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]
@@ -499,9 +504,9 @@ pub(super) async fn create_binding(
         }
         binding_table["dm_allowed_users"] = toml_edit::value(arr);
     }
-    if !request.authority.is_empty() {
+    if let Some(authority) = &request.authority {
         let mut arr = toml_edit::Array::new();
-        for id in &request.authority {
+        for id in authority {
             arr.push(id.as_str());
         }
         binding_table["authority"] = toml_edit::value(arr);
@@ -885,9 +890,9 @@ pub(super) async fn update_binding(
         binding.remove("dm_allowed_users");
     }
 
-    if !request.authority.is_empty() {
+    if let Some(authority) = &request.authority {
         let mut arr = toml_edit::Array::new();
-        for id in &request.authority {
+        for id in authority {
             arr.push(id.as_str());
         }
         binding["authority"] = toml_edit::value(arr);

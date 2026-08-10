@@ -664,7 +664,7 @@ Channel/worker temporal context timezone precedence is:
 | `enabled` | bool | true | Enable this named instance |
 | `token` | string | **required** | Bot token (or `env:VAR_NAME`) |
 | `dm_allowed_users` | string[] | [] | User IDs allowed to DM this instance |
-| `authority` | string[] | [] | Authority list for this instance's slash commands |
+| `authority` | string[] | [] | Authority list for this instance's slash commands. Empty = open |
 | `allow_bot_messages` | bool | false | Whether this instance accepts bot-authored messages |
 
 ### `[messaging.slack]`
@@ -687,7 +687,7 @@ Channel/worker temporal context timezone precedence is:
 | `bot_token` | string | **required** | Bot token (or `env:VAR_NAME`) |
 | `app_token` | string | **required** | App-level token (or `env:VAR_NAME`) |
 | `dm_allowed_users` | string[] | [] | Slack user IDs allowed to DM this instance |
-| `authority` | string[] | [] | Authority list for this instance's slash commands |
+| `authority` | string[] | [] | Authority list for this instance's slash commands. Empty = open |
 
 ### `[messaging.telegram]`
 
@@ -707,7 +707,7 @@ Channel/worker temporal context timezone precedence is:
 | `enabled` | bool | true | Enable this named instance |
 | `token` | string | **required** | Bot token (or `env:VAR_NAME`) |
 | `dm_allowed_users` | string[] | [] | User IDs allowed to DM this instance |
-| `authority` | string[] | [] | Authority list for this instance's slash commands |
+| `authority` | string[] | [] | Authority list for this instance's slash commands. Empty = open |
 
 ### `[messaging.twitch]`
 
@@ -731,7 +731,7 @@ Channel/worker temporal context timezone precedence is:
 | `oauth_token` | string | **required** | OAuth token (`oauth:...` or plain token) |
 | `channels` | string[] | [] | Channels to join for this instance |
 | `trigger_prefix` | string | None | Optional prefix required to trigger replies |
-| `authority` | string[] | [] | Authority list for this instance's slash commands |
+| `authority` | string[] | [] | Authority list for this instance's slash commands. Empty = open |
 
 ### `[messaging.email]`
 
@@ -778,7 +778,7 @@ Channel/worker temporal context timezone precedence is:
 | `poll_interval_secs` | integer | 30 | How often to check for new email |
 | `folders` | string[] | `["INBOX"]` | IMAP folders to poll |
 | `allowed_senders` | string[] | `[]` | Optional allowlist (empty = all) |
-| `authority` | string[] | [] | Authority list for this instance's slash commands |
+| `authority` | string[] | [] | Authority list for this instance's slash commands. Empty = open |
 | `max_body_bytes` | integer | 262144 | Max inbound body bytes |
 | `max_attachment_bytes` | integer | 10485760 | Max attachment bytes |
 
@@ -805,7 +805,7 @@ Channel/worker temporal context timezone precedence is:
 | `http_url` | string | **required** | signal-cli JSON-RPC HTTP endpoint URL |
 | `account` | string | **required** | Signal account (phone number) to receive as |
 | `dm_allowed_users` | string[] | [] | Numbers allowed to DM this instance |
-| `authority` | string[] | [] | Authority list for this instance's slash commands |
+| `authority` | string[] | [] | Authority list for this instance's slash commands. Empty = open |
 | `group_ids` | string[] | [] | Group IDs to listen in |
 | `group_allowed_users` | string[] | [] | Numbers allowed to trigger the bot in groups |
 | `ignore_stories` | bool | true | Ignore story messages |
@@ -833,7 +833,7 @@ Channel/worker temporal context timezone precedence is:
 | `token` | string | **required** | Bot token (or `env:VAR_NAME`) |
 | `team_id` | string | None | Team ID to scope this instance to |
 | `dm_allowed_users` | string[] | [] | User IDs allowed to DM this instance |
-| `authority` | string[] | [] | Authority list for this instance's slash commands |
+| `authority` | string[] | [] | Authority list for this instance's slash commands. Empty = open |
 | `max_attachment_bytes` | integer | 10485760 | Max attachment bytes to process |
 
 ### `[messaging.webhook]`

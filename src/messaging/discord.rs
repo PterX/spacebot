@@ -1207,22 +1207,6 @@ async fn sync_application_commands(
     let guild_filter = permissions.load().guild_filter.clone();
     match guild_filter {
         Some(guild_ids) => {
-            // Clear stale globals first so they don't linger next to
-            // guild-scoped registrations.
-            match ApplicationCommand::get_global_commands(http).await {
-                Ok(global) if !global.is_empty() => {
-                    if let Err(error) =
-                        ApplicationCommand::set_global_commands(http, Vec::new()).await
-                    {
-                        tracing::warn!(%error, "failed to clear stale global discord commands");
-                    }
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!(%error, "failed to fetch global discord commands");
-                }
-            }
-
             // Every configured guild is synced, not just the ones present
             // in a READY payload — a served guild missing from one gateway
             // session would otherwise get no commands until a reconnect
@@ -1231,6 +1215,7 @@ async fn sync_application_commands(
             // continues with the remaining guilds. The filter can repeat a
             // guild (one binding per channel set), so duplicates are synced
             // once.
+            let mut all_guilds_synced = true;
             let mut seen_guilds = std::collections::HashSet::new();
             for guild_id in guild_ids
                 .iter()
@@ -1258,8 +1243,34 @@ async fn sync_application_commands(
                         );
                     }
                     Err(error) => {
+                        all_guilds_synced = false;
                         tracing::warn!(%error, guild_id = %guild_id, "failed to register guild commands");
                     }
+                }
+            }
+
+            // Stale globals are cleared only after every configured guild is
+            // confirmed in sync — clearing first would leave a guild whose
+            // registration then failed with no commands at all until a later
+            // reconnect. A guild that failed keeps the globals as a fallback;
+            // the next `ready` re-sync retries both.
+            if !all_guilds_synced {
+                tracing::warn!(
+                    "leaving global discord commands in place until every configured guild syncs"
+                );
+                return;
+            }
+            match ApplicationCommand::get_global_commands(http).await {
+                Ok(global) if !global.is_empty() => {
+                    if let Err(error) =
+                        ApplicationCommand::set_global_commands(http, Vec::new()).await
+                    {
+                        tracing::warn!(%error, "failed to clear stale global discord commands");
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "failed to fetch global discord commands");
                 }
             }
         }

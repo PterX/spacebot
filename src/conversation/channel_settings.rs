@@ -42,6 +42,39 @@ impl ChannelSettingsStore {
         }))
     }
 
+    /// Atomically set only the response mode. A single JSON-patch statement
+    /// avoids the read-modify-write window in which a concurrent whole-row
+    /// writer's changes could be overwritten with stale fields.
+    pub async fn set_response_mode(
+        &self,
+        agent_id: &str,
+        conversation_id: &str,
+        mode: crate::conversation::settings::ResponseMode,
+    ) -> crate::error::Result<()> {
+        let mode_value = serde_json::to_value(mode).map_err(|e| anyhow::anyhow!(e))?;
+        let mode_str = mode_value
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("response mode did not serialize to a string"))?
+            .to_string();
+
+        sqlx::query(
+            "INSERT INTO channel_settings (agent_id, conversation_id, settings, updated_at) \
+             VALUES (?, ?, json_set('{}', '$.response_mode', ?), CURRENT_TIMESTAMP) \
+             ON CONFLICT (agent_id, conversation_id) \
+             DO UPDATE SET settings = json_set(COALESCE(NULLIF(channel_settings.settings, ''), '{}'), '$.response_mode', ?), \
+                 updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(agent_id)
+        .bind(conversation_id)
+        .bind(&mode_str)
+        .bind(&mode_str)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+        Ok(())
+    }
+
     /// Insert or update settings for a channel.
     pub async fn upsert(
         &self,

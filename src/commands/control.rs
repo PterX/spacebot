@@ -173,11 +173,9 @@ impl ControlPlane {
     }
 
     async fn set_response_mode(&self, mode: ResponseMode) -> String {
-        // A failed settings read must not become a default-settings write:
-        // upserting defaults would silently discard the conversation's other
-        // persisted settings. On any read or write failure the change is
-        // abandoned — no live update, and the reply reports the failure
-        // instead of confirming a mode that never persisted.
+        // On persistence failure the change is abandoned — no live update,
+        // and the reply reports the failure instead of confirming a mode
+        // that never persisted.
         if let Err(error) = persist_response_mode(
             &self.deps.sqlite_pool,
             &self.deps.agent_id,
@@ -209,9 +207,10 @@ impl ControlPlane {
     }
 }
 
-/// Read-modify-write of the persisted response mode, preserving every other
-/// field of the stored settings. A record that can't be read fails the
-/// change instead of being replaced with defaults.
+/// Persist the response mode through the stores' atomic field updates,
+/// leaving every other settings field untouched. No settings read happens
+/// here, so concurrent whole-row writers can't be clobbered with stale
+/// fields, and an unreadable record can't be replaced with defaults.
 pub(crate) async fn persist_response_mode(
     pool: &sqlx::SqlitePool,
     agent_id: &str,
@@ -221,26 +220,17 @@ pub(crate) async fn persist_response_mode(
 ) -> anyhow::Result<()> {
     if is_portal {
         let store = crate::conversation::PortalConversationStore::new(pool.clone());
-        let conversation = store
-            .get(agent_id, conversation_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("portal conversation {conversation_id} not found"))?;
-        let mut settings = conversation.settings.unwrap_or_default();
-        settings.response_mode = mode;
         let updated = store
-            .update(agent_id, conversation_id, None, None, Some(settings))
+            .set_response_mode(agent_id, conversation_id, mode)
             .await?;
-        if updated.is_none() {
-            anyhow::bail!("portal conversation {conversation_id} disappeared during update");
+        if !updated {
+            anyhow::bail!("portal conversation {conversation_id} not found");
         }
     } else {
         let store = crate::conversation::ChannelSettingsStore::new(pool.clone());
-        let mut settings = store
-            .get(agent_id, conversation_id)
-            .await?
-            .unwrap_or_default();
-        settings.response_mode = mode;
-        store.upsert(agent_id, conversation_id, &settings).await?;
+        store
+            .set_response_mode(agent_id, conversation_id, mode)
+            .await?;
     }
     Ok(())
 }
@@ -356,6 +346,51 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.response_mode, ResponseMode::MentionOnly);
         assert_eq!(loaded.model.as_deref(), Some("special-model"));
+    }
+
+    #[tokio::test]
+    async fn portal_mode_change_initializes_null_settings() {
+        let pool = memory_pool().await;
+        create_portal_conversations_table(&pool).await;
+
+        let store = crate::conversation::PortalConversationStore::new(pool.clone());
+        store.ensure("agent", "session").await.unwrap();
+
+        persist_response_mode(&pool, "agent", "session", true, ResponseMode::Observe)
+            .await
+            .unwrap();
+
+        let loaded = store
+            .get("agent", "session")
+            .await
+            .unwrap()
+            .unwrap()
+            .settings
+            .unwrap();
+        assert_eq!(loaded.response_mode, ResponseMode::Observe);
+    }
+
+    #[tokio::test]
+    async fn channel_mode_change_handles_empty_string_settings() {
+        let pool = memory_pool().await;
+        create_channel_settings_table(&pool).await;
+
+        sqlx::query(
+            "INSERT INTO channel_settings (agent_id, conversation_id, settings) VALUES (?, ?, '')",
+        )
+        .bind("agent")
+        .bind("conv")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        persist_response_mode(&pool, "agent", "conv", false, ResponseMode::MentionOnly)
+            .await
+            .unwrap();
+
+        let store = crate::conversation::ChannelSettingsStore::new(pool.clone());
+        let loaded = store.get("agent", "conv").await.unwrap().unwrap();
+        assert_eq!(loaded.response_mode, ResponseMode::MentionOnly);
     }
 
     #[tokio::test]

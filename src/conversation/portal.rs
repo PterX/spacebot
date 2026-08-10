@@ -187,6 +187,38 @@ impl PortalConversationStore {
         self.get(agent_id, session_id).await
     }
 
+    /// Atomically set only the response mode in the conversation's settings.
+    /// A single JSON-patch statement avoids the read-modify-write window in
+    /// which a concurrent whole-row writer's changes could be overwritten
+    /// with stale fields. Returns false when the conversation doesn't exist.
+    pub async fn set_response_mode(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        mode: crate::conversation::settings::ResponseMode,
+    ) -> crate::error::Result<bool> {
+        let mode_value = serde_json::to_value(mode).map_err(|e| anyhow::anyhow!(e))?;
+        let mode_str = mode_value
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("response mode did not serialize to a string"))?
+            .to_string();
+
+        let result = sqlx::query(
+            "UPDATE portal_conversations \
+             SET settings = json_set(COALESCE(NULLIF(settings, ''), '{}'), '$.response_mode', ?), \
+                 updated_at = CURRENT_TIMESTAMP \
+             WHERE agent_id = ? AND id = ?",
+        )
+        .bind(&mode_str)
+        .bind(agent_id)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn delete(&self, agent_id: &str, session_id: &str) -> crate::error::Result<bool> {
         let mut tx = self
             .pool
