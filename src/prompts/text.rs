@@ -71,6 +71,9 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         }
         ("en", "cortex_profile") => include_str!("../../prompts/en/cortex_profile.md.j2"),
         ("en", "compactor") => include_str!("../../prompts/en/compactor.md.j2"),
+        ("en", "chronicle_checkpoint") => {
+            include_str!("../../prompts/en/chronicle_checkpoint.md.j2")
+        }
         ("en", "memory_persistence") => include_str!("../../prompts/en/memory_persistence.md.j2"),
         ("en", "ingestion") => include_str!("../../prompts/en/ingestion.md.j2"),
         ("en", "cortex_chat") => include_str!("../../prompts/en/cortex_chat.md.j2"),
@@ -232,6 +235,9 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         }
         ("en", "tools/channel_recall") => {
             include_str!("../../prompts/en/tools/channel_recall_description.md.j2")
+        }
+        ("en", "tools/chronicle") => {
+            include_str!("../../prompts/en/tools/chronicle_description.md.j2")
         }
         ("en", "tools/email_search") => {
             include_str!("../../prompts/en/tools/email_search_description.md.j2")

@@ -12,9 +12,9 @@ use super::providers::{
 use super::toml_schema::*;
 use super::{
     AgentConfig, ApiConfig, ApiType, AutonomyConfig, AutonomyLevel, Binding, BrowserConfig,
-    ChannelConfig, ClosePolicy, CoalesceConfig, CompactionConfig, Config, CortexConfig, CronDef,
-    DefaultsConfig, DiscordConfig, DiscordInstanceConfig, EmailConfig, EmailInstanceConfig,
-    GroupDef, HumanDef, IngestionConfig, LinkDef, LlmConfig, MattermostConfig,
+    ChannelConfig, ChronicleConfig, ClosePolicy, CoalesceConfig, CompactionConfig, Config,
+    CortexConfig, CronDef, DefaultsConfig, DiscordConfig, DiscordInstanceConfig, EmailConfig,
+    EmailInstanceConfig, GroupDef, HumanDef, IngestionConfig, LinkDef, LlmConfig, MattermostConfig,
     MattermostInstanceConfig, McpServerConfig, McpTransport, MemoryJanitorConfig,
     MemoryPersistenceConfig, MessagingConfig, MetricsConfig, OpenCodeConfig,
     ParticipantContextConfig, ProjectsConfig, ProviderConfig, ReflectionConfig, SignalConfig,
@@ -38,6 +38,80 @@ fn resolve_skills_config(toml: TomlSkillsConfig, base: SkillsConfig) -> SkillsCo
             })
             .unwrap_or(base.reflection),
     }
+}
+
+/// Merge a `[compaction]` TOML section over a base config.
+///
+/// Every key is optional, so a config predating `mode` and `[compaction.chronicle]`
+/// resolves to the base values with the existing thresholds intact.
+fn resolve_compaction_config(
+    toml: TomlCompactionConfig,
+    base: CompactionConfig,
+) -> CompactionConfig {
+    CompactionConfig {
+        mode: toml.mode.unwrap_or(base.mode),
+        background_threshold: toml
+            .background_threshold
+            .unwrap_or(base.background_threshold),
+        aggressive_threshold: toml
+            .aggressive_threshold
+            .unwrap_or(base.aggressive_threshold),
+        emergency_threshold: toml.emergency_threshold.unwrap_or(base.emergency_threshold),
+        chronicle: clamp_chronicle_config(
+            toml.chronicle
+                .map(|c| ChronicleConfig {
+                    interval_messages: c
+                        .interval_messages
+                        .unwrap_or(base.chronicle.interval_messages),
+                    interval_token_fraction: c
+                        .interval_token_fraction
+                        .unwrap_or(base.chronicle.interval_token_fraction),
+                    recent_window_hours: c
+                        .recent_window_hours
+                        .unwrap_or(base.chronicle.recent_window_hours),
+                    max_recent: c.max_recent.unwrap_or(base.chronicle.max_recent),
+                    max_older: c.max_older.unwrap_or(base.chronicle.max_older),
+                    context_token_budget: c
+                        .context_token_budget
+                        .unwrap_or(base.chronicle.context_token_budget),
+                    expand_message_limit: c
+                        .expand_message_limit
+                        .unwrap_or(base.chronicle.expand_message_limit),
+                    max_messages_per_checkpoint: c
+                        .max_messages_per_checkpoint
+                        .unwrap_or(base.chronicle.max_messages_per_checkpoint),
+                })
+                .unwrap_or(base.chronicle),
+        ),
+    }
+}
+
+/// Keep chronicle tuning inside ranges the assembly and tools can honour.
+///
+/// An unbounded `context_token_budget` or list size would let configuration
+/// silently defeat the prompt cap, and a zero interval would cut every turn.
+fn clamp_chronicle_config(mut config: ChronicleConfig) -> ChronicleConfig {
+    const MAX_CONTEXT_TOKEN_BUDGET: usize = 32_000;
+    const MAX_LIST_ENTRIES: usize = 100;
+    const MAX_EXPAND_MESSAGES: i64 = 500;
+    const MAX_MESSAGES_PER_CHECKPOINT: i64 = 5_000;
+
+    config.interval_messages = config.interval_messages.max(1);
+    config.interval_token_fraction = config.interval_token_fraction.clamp(0.01, 0.9);
+    // Upper bound matters as much as the lower one: `Duration::hours` panics on
+    // out-of-range values, and the window is only ever a lookback.
+    const MAX_RECENT_WINDOW_HOURS: i64 = 8_760; // one year
+    config.recent_window_hours = config.recent_window_hours.clamp(1, MAX_RECENT_WINDOW_HOURS);
+    config.max_recent = config.max_recent.clamp(1, MAX_LIST_ENTRIES);
+    config.max_older = config.max_older.min(MAX_LIST_ENTRIES);
+    config.context_token_budget = config
+        .context_token_budget
+        .clamp(200, MAX_CONTEXT_TOKEN_BUDGET);
+    config.expand_message_limit = config.expand_message_limit.clamp(1, MAX_EXPAND_MESSAGES);
+    config.max_messages_per_checkpoint = config
+        .max_messages_per_checkpoint
+        .clamp(1, MAX_MESSAGES_PER_CHECKPOINT);
+    config
 }
 
 use anyhow::Context as _;
@@ -1607,17 +1681,7 @@ impl Config {
             compaction: toml
                 .defaults
                 .compaction
-                .map(|c| CompactionConfig {
-                    background_threshold: c
-                        .background_threshold
-                        .unwrap_or(base_defaults.compaction.background_threshold),
-                    aggressive_threshold: c
-                        .aggressive_threshold
-                        .unwrap_or(base_defaults.compaction.aggressive_threshold),
-                    emergency_threshold: c
-                        .emergency_threshold
-                        .unwrap_or(base_defaults.compaction.emergency_threshold),
-                })
+                .map(|c| resolve_compaction_config(c, base_defaults.compaction))
                 .unwrap_or(base_defaults.compaction),
             memory_persistence: toml
                 .defaults
@@ -1924,17 +1988,9 @@ impl Config {
                     branch_max_turns: a.branch_max_turns,
                     context_window: a.context_window,
                     tool_use_enforcement: a.tool_use_enforcement,
-                    compaction: a.compaction.map(|c| CompactionConfig {
-                        background_threshold: c
-                            .background_threshold
-                            .unwrap_or(defaults.compaction.background_threshold),
-                        aggressive_threshold: c
-                            .aggressive_threshold
-                            .unwrap_or(defaults.compaction.aggressive_threshold),
-                        emergency_threshold: c
-                            .emergency_threshold
-                            .unwrap_or(defaults.compaction.emergency_threshold),
-                    }),
+                    compaction: a
+                        .compaction
+                        .map(|c| resolve_compaction_config(c, defaults.compaction)),
                     memory_persistence: a.memory_persistence.map(|mp| MemoryPersistenceConfig {
                         enabled: mp.enabled.unwrap_or(defaults.memory_persistence.enabled),
                         message_interval: mp
@@ -2816,6 +2872,52 @@ mod skills_config_tests {
         let merged = resolve_skills_config(toml, base);
         assert!(!merged.reflection.enabled);
         assert_eq!(merged.reflection.cooldown_secs, 60);
+    }
+
+    /// A config written before chronicle mode existed keeps its thresholds and
+    /// stays on rolling compaction.
+    #[test]
+    fn compaction_config_without_mode_stays_rolling() {
+        let base = CompactionConfig::default();
+        let toml: TomlCompactionConfig =
+            toml::from_str("background_threshold = 0.7\nemergency_threshold = 0.99").unwrap();
+        let merged = resolve_compaction_config(toml, base);
+
+        assert_eq!(merged.mode, crate::config::CompactionMode::Rolling);
+        assert_eq!(merged.background_threshold, 0.7);
+        assert_eq!(merged.emergency_threshold, 0.99);
+        assert_eq!(merged.aggressive_threshold, base.aggressive_threshold);
+        assert_eq!(
+            merged.chronicle.interval_messages,
+            base.chronicle.interval_messages
+        );
+    }
+
+    #[test]
+    fn compaction_config_reads_chronicle_mode_and_overrides() {
+        let base = CompactionConfig::default();
+        let toml: TomlCompactionConfig = toml::from_str(
+            "mode = \"chronicle\"\n[chronicle]\ninterval_messages = 12\nmax_recent = 3",
+        )
+        .unwrap();
+        let merged = resolve_compaction_config(toml, base);
+
+        assert_eq!(merged.mode, crate::config::CompactionMode::Chronicle);
+        assert_eq!(merged.chronicle.interval_messages, 12);
+        assert_eq!(merged.chronicle.max_recent, 3);
+        assert_eq!(
+            merged.chronicle.context_token_budget, base.chronicle.context_token_budget,
+            "unspecified chronicle keys keep their defaults"
+        );
+        assert_eq!(
+            merged.background_threshold, base.background_threshold,
+            "chronicle mode keeps the pressure thresholds as a floor"
+        );
+    }
+
+    #[test]
+    fn compaction_config_rejects_an_unknown_mode() {
+        assert!(toml::from_str::<TomlCompactionConfig>("mode = \"chronical\"").is_err());
     }
 }
 

@@ -188,7 +188,8 @@ mod tests {
                 sender_id TEXT,
                 content TEXT NOT NULL,
                 metadata TEXT,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                seq INTEGER
             )",
         )
         .execute(&pool)

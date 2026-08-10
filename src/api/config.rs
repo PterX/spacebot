@@ -30,9 +30,25 @@ pub struct TuningSection {
 
 #[derive(Serialize, Deserialize, Debug, utoipa::ToSchema)]
 pub struct CompactionSection {
+    /// "rolling" or "chronicle".
+    pub mode: String,
     pub background_threshold: f32,
     pub aggressive_threshold: f32,
     pub emergency_threshold: f32,
+    pub chronicle: ChronicleSection,
+}
+
+/// Session chronicle tuning. Only consulted when `mode` is "chronicle".
+#[derive(Serialize, Deserialize, Debug, utoipa::ToSchema)]
+pub struct ChronicleSection {
+    pub interval_messages: usize,
+    pub interval_token_fraction: f32,
+    pub recent_window_hours: i64,
+    pub max_recent: usize,
+    pub max_older: usize,
+    pub context_token_budget: usize,
+    pub expand_message_limit: i64,
+    pub max_messages_per_checkpoint: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug, utoipa::ToSchema)]
@@ -202,9 +218,24 @@ pub(super) struct TuningUpdate {
 
 #[derive(Deserialize, Debug, utoipa::ToSchema)]
 pub(super) struct CompactionUpdate {
+    /// "rolling" or "chronicle".
+    mode: Option<String>,
     background_threshold: Option<f32>,
     aggressive_threshold: Option<f32>,
     emergency_threshold: Option<f32>,
+    chronicle: Option<ChronicleUpdate>,
+}
+
+#[derive(Deserialize, Debug, utoipa::ToSchema)]
+pub(super) struct ChronicleUpdate {
+    interval_messages: Option<usize>,
+    interval_token_fraction: Option<f32>,
+    recent_window_hours: Option<i64>,
+    max_recent: Option<usize>,
+    max_older: Option<usize>,
+    context_token_budget: Option<usize>,
+    expand_message_limit: Option<i64>,
+    max_messages_per_checkpoint: Option<i64>,
 }
 
 #[derive(Deserialize, Debug, utoipa::ToSchema)]
@@ -351,9 +382,23 @@ pub(super) async fn get_agent_config(
             history_backfill_count: **rc.history_backfill_count.load(),
         },
         compaction: CompactionSection {
+            mode: match compaction.mode {
+                crate::config::CompactionMode::Chronicle => "chronicle".to_string(),
+                crate::config::CompactionMode::Rolling => "rolling".to_string(),
+            },
             background_threshold: compaction.background_threshold,
             aggressive_threshold: compaction.aggressive_threshold,
             emergency_threshold: compaction.emergency_threshold,
+            chronicle: ChronicleSection {
+                interval_messages: compaction.chronicle.interval_messages,
+                interval_token_fraction: compaction.chronicle.interval_token_fraction,
+                recent_window_hours: compaction.chronicle.recent_window_hours,
+                max_recent: compaction.chronicle.max_recent,
+                max_older: compaction.chronicle.max_older,
+                context_token_budget: compaction.chronicle.context_token_budget,
+                expand_message_limit: compaction.chronicle.expand_message_limit,
+                max_messages_per_checkpoint: compaction.chronicle.max_messages_per_checkpoint,
+            },
         },
         cortex: CortexSection {
             tick_interval_secs: cortex.tick_interval_secs,
@@ -719,6 +764,43 @@ fn update_compaction_table(
     }
     if let Some(v) = compaction.emergency_threshold {
         table["emergency_threshold"] = toml_edit::value(v as f64);
+    }
+    if let Some(mode) = &compaction.mode {
+        // Reject anything the enum cannot represent rather than writing a
+        // value that would fail to deserialize on the next config load.
+        if !matches!(mode.as_str(), "rolling" | "chronicle") {
+            tracing::warn!(mode, "rejecting unknown compaction mode");
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        table["mode"] = toml_edit::value(mode.as_str());
+    }
+    if let Some(chronicle) = &compaction.chronicle {
+        let chronicle_table = get_or_create_subtable(table, "chronicle")?;
+        if let Some(v) = chronicle.interval_messages {
+            chronicle_table["interval_messages"] = toml_edit::value(v as i64);
+        }
+        if let Some(v) = chronicle.interval_token_fraction {
+            validate_maintenance_unit_interval("interval_token_fraction", v)?;
+            chronicle_table["interval_token_fraction"] = toml_edit::value(v as f64);
+        }
+        if let Some(v) = chronicle.recent_window_hours {
+            chronicle_table["recent_window_hours"] = toml_edit::value(v);
+        }
+        if let Some(v) = chronicle.max_recent {
+            chronicle_table["max_recent"] = toml_edit::value(v as i64);
+        }
+        if let Some(v) = chronicle.max_older {
+            chronicle_table["max_older"] = toml_edit::value(v as i64);
+        }
+        if let Some(v) = chronicle.context_token_budget {
+            chronicle_table["context_token_budget"] = toml_edit::value(v as i64);
+        }
+        if let Some(v) = chronicle.expand_message_limit {
+            chronicle_table["expand_message_limit"] = toml_edit::value(v);
+        }
+        if let Some(v) = chronicle.max_messages_per_checkpoint {
+            chronicle_table["max_messages_per_checkpoint"] = toml_edit::value(v);
+        }
     }
     Ok(())
 }

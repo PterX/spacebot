@@ -3136,6 +3136,35 @@ export interface components {
         ChannelsResponse: {
             channels: components["schemas"]["ChannelResponse"][];
         };
+        /** @description Session chronicle tuning. Only consulted when `mode` is "chronicle". */
+        ChronicleSection: {
+            context_token_budget: number;
+            /** Format: int64 */
+            expand_message_limit: number;
+            interval_messages: number;
+            /** Format: float */
+            interval_token_fraction: number;
+            /** Format: int64 */
+            max_messages_per_checkpoint: number;
+            max_older: number;
+            max_recent: number;
+            /** Format: int64 */
+            recent_window_hours: number;
+        };
+        ChronicleUpdate: {
+            context_token_budget?: number | null;
+            /** Format: int64 */
+            expand_message_limit?: number | null;
+            interval_messages?: number | null;
+            /** Format: float */
+            interval_token_fraction?: number | null;
+            /** Format: int64 */
+            max_messages_per_checkpoint?: number | null;
+            max_older?: number | null;
+            max_recent?: number | null;
+            /** Format: int64 */
+            recent_window_hours?: number | null;
+        };
         /**
          * @description What happens when a worker explicitly calls "close" on the browser.
          * @enum {string}
@@ -3164,16 +3193,22 @@ export interface components {
             aggressive_threshold: number;
             /** Format: float */
             background_threshold: number;
+            chronicle: components["schemas"]["ChronicleSection"];
             /** Format: float */
             emergency_threshold: number;
+            /** @description "rolling" or "chronicle". */
+            mode: string;
         };
         CompactionUpdate: {
             /** Format: float */
             aggressive_threshold?: number | null;
             /** Format: float */
             background_threshold?: number | null;
+            chronicle?: null | components["schemas"]["ChronicleUpdate"];
             /** Format: float */
             emergency_threshold?: number | null;
+            /** @description "rolling" or "chronicle". */
+            mode?: string | null;
         };
         /** @description Response payload for conversation defaults endpoint. */
         ConversationDefaultsResponse: {
@@ -4632,6 +4667,23 @@ export interface components {
             tool_name: string;
             /** @enum {string} */
             type: "tool_call_run";
+        } | {
+            covers_from: string;
+            covers_to: string;
+            created_at: string;
+            id: string;
+            kind: string;
+            /** Format: int64 */
+            level: number;
+            /** Format: int64 */
+            message_count: number;
+            rolled_up_into?: string | null;
+            /** Format: int64 */
+            seq: number;
+            summary: string;
+            title: string;
+            /** @enum {string} */
+            type: "checkpoint";
         };
         ToggleCronRequest: {
             agent_id: string;
@@ -7965,7 +8017,7 @@ export interface operations {
                 channel_id: string;
                 /** @description Maximum number of messages to return (default: 20, max: 100) */
                 limit: number;
-                /** @description Pagination cursor for fetching older messages */
+                /** @description Pagination cursor for fetching older messages, as "<rfc3339>|<item id>". A bare timestamp is accepted for older clients but can skip same-second items. */
                 before?: string;
             };
             header?: never;

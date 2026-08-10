@@ -387,9 +387,23 @@ pub(super) struct TomlIngestionConfig {
 
 #[derive(Deserialize)]
 pub(super) struct TomlCompactionConfig {
+    pub(super) mode: Option<crate::config::CompactionMode>,
     pub(super) background_threshold: Option<f32>,
     pub(super) aggressive_threshold: Option<f32>,
     pub(super) emergency_threshold: Option<f32>,
+    pub(super) chronicle: Option<TomlChronicleConfig>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct TomlChronicleConfig {
+    pub(super) interval_messages: Option<usize>,
+    pub(super) interval_token_fraction: Option<f32>,
+    pub(super) recent_window_hours: Option<i64>,
+    pub(super) max_recent: Option<usize>,
+    pub(super) max_older: Option<usize>,
+    pub(super) context_token_budget: Option<usize>,
+    pub(super) expand_message_limit: Option<i64>,
+    pub(super) max_messages_per_checkpoint: Option<i64>,
 }
 
 #[derive(Deserialize)]

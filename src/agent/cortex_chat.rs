@@ -901,6 +901,16 @@ impl CortexChatSession {
                                     .push_str(&format!("*[Tool: {tool_name}]*: {result}\n\n"));
                             }
                         }
+                        crate::conversation::history::TimelineItem::Checkpoint {
+                            seq,
+                            title,
+                            summary,
+                            ..
+                        } => {
+                            transcript.push_str(&format!(
+                                "*[Chronicle checkpoint #{seq}: {title}]*: {summary}\n\n"
+                            ));
+                        }
                     }
                 }
                 Some(transcript)

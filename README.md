@@ -81,7 +81,7 @@ Five process types. Each does one job.
 
 **Workers** are independent processes. Each gets a specific task, a focused prompt, and task-appropriate tools, with no conversation context. Fire-and-forget for one-shot tasks, or interactive for longer sessions where follow-up routes to the active worker.
 
-**The Compactor** is a programmatic monitor (not an LLM) that watches context size per channel and triggers compaction before the channel fills up. Compaction workers run alongside without blocking.
+**The Compactor** is a programmatic monitor (not an LLM) that watches context size per channel and triggers compaction before the channel fills up. Compaction workers run alongside without blocking. Two modes, selected by `compaction.mode`: `rolling` keeps one summary at the head of history and rewrites it under pressure, while `chronicle` cuts durable interval checkpoints that each summarize only the span since the last one, and renders a bounded window of them into the prompt. Chronicle mode suits sessions that run for weeks; the agent can list its checkpoints, open one, or have a branch expand a range back into raw transcript.
 
 **The Cortex** sees across all channels, workers, and branches simultaneously. It maintains the agent's working memory — a layered context assembly system that gives every conversation structured awareness of what's happening across the agent. Events are recorded as they happen; intra-day synthesis compresses them into narrative; daily summaries roll up at midnight; knowledge synthesis regenerates when the memory graph changes. The cortex supervises processes and maintains the memory graph.
 

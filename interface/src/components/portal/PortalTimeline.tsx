@@ -1,11 +1,51 @@
-import {useEffect, useRef} from "react";
+import {useEffect, useRef, useState} from "react";
 import {useQuery} from "@tanstack/react-query";
 import {InlineBranchCard, MessageBubble} from "@spacedrive/ai";
 import {File as FileIcon} from "@phosphor-icons/react";
-import {api, type AttachmentMeta, type TimelineBranchRun, type TimelineItem, type WorkerListItem} from "@/api/client";
+import {api, type AttachmentMeta, type TimelineBranchRun, type TimelineCheckpoint, type TimelineItem, type WorkerListItem} from "@/api/client";
+import {Markdown} from "@/components/Markdown";
 import {ToolCall, type ToolCallPair, tryParseJson, isErrorResult} from "@/components/ToolCall";
 import {PortalWorkerCard} from "./PortalWorkerCard";
 import clsx from "clsx";
+
+/**
+ * A chronicle checkpoint in the portal timeline: a quiet divider that names
+ * the span it covers and opens to the summary. Not a message — it was written
+ * by neither side of the conversation.
+ */
+function InlineCheckpointCard({item}: {item: TimelineCheckpoint}) {
+	const [expanded, setExpanded] = useState(false);
+	const from = new Date(item.covers_from);
+	const to = new Date(item.covers_to);
+	const day = (value: Date) =>
+		value.toLocaleDateString(undefined, {month: "short", day: "numeric"});
+	const range =
+		from.toDateString() === to.toDateString()
+			? day(from)
+			: `${day(from)} → ${day(to)}`;
+
+	return (
+		<div className="py-2">
+			<button
+				type="button"
+				onClick={() => setExpanded((value) => !value)}
+				className="flex w-full items-center gap-3 text-left"
+			>
+				<span className="h-px flex-1 bg-app-line/60" />
+				<span className="flex-shrink-0 text-tiny text-ink-faint">
+					{item.level > 0 ? "Rollup" : "Checkpoint"} · {item.title} · {range} ·{" "}
+					{item.message_count} messages {expanded ? "▾" : "▸"}
+				</span>
+				<span className="h-px flex-1 bg-app-line/60" />
+			</button>
+			{expanded && (
+				<div className="mt-2 rounded-md border border-app-line/60 px-3 py-2 text-sm text-ink-dull">
+					<Markdown>{item.summary}</Markdown>
+				</div>
+			)}
+		</div>
+	);
+}
 
 function formatFileSize(bytes: number): string {
 	if (bytes < 1024) return `${bytes} B`;
@@ -319,6 +359,9 @@ export function PortalTimeline({
 								<ToolCall pair={pair} />
 							</div>
 						);
+					}
+					if (item.type === "checkpoint") {
+						return <InlineCheckpointCard key={item.id} item={item} />;
 					}
 					return null;
 				})}
