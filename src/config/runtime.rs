@@ -339,21 +339,19 @@ impl RuntimeConfig {
     /// Reload skills from disk.
     ///
     /// Seeds usage rows for skills seen for the first time, so their
-    /// staleness clock starts at discovery.
-    pub fn reload_skills(&self, skills: crate::skills::SkillSet) {
+    /// staleness clock starts at discovery. Seeding completes before this
+    /// returns so a seed from a stale snapshot can never land after a later
+    /// usage-row removal and resurrect a deleted skill.
+    pub async fn reload_skills(&self, skills: crate::skills::SkillSet) {
         let names: Vec<String> = skills.iter().map(|s| s.name.to_lowercase()).collect();
         self.skills.store(Arc::new(skills));
         tracing::info!("skills reloaded");
 
-        if let Some(store) = self.skill_usage.load().as_ref()
-            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        let store = self.skill_usage.load().as_ref().clone();
+        if let Some(store) = store
+            && let Err(error) = store.seed(&names).await
         {
-            let store = store.clone();
-            handle.spawn(async move {
-                if let Err(error) = store.seed(&names).await {
-                    tracing::warn!(%error, "failed to seed skill usage rows");
-                }
-            });
+            tracing::warn!(%error, "failed to seed skill usage rows");
         }
     }
 }

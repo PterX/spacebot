@@ -186,14 +186,16 @@ pub async fn reconcile_config_wakes(store: &WakeDefStore, configs: &[WakeConfig]
     }
 
     for def in &existing {
-        if def.config_owned && !def.builtin && !config_ids.contains(def.id.as_str()) {
-            if let Err(error) = store.delete(&def.id).await {
-                tracing::warn!(
-                    wake_id = %def.id,
-                    %error,
-                    "failed to delete removed config wake, skipping"
-                );
-            }
+        if def.config_owned
+            && !def.builtin
+            && !config_ids.contains(def.id.as_str())
+            && let Err(error) = store.delete(&def.id).await
+        {
+            tracing::warn!(
+                wake_id = %def.id,
+                %error,
+                "failed to delete removed config wake, skipping"
+            );
         }
     }
 
