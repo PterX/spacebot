@@ -47,6 +47,7 @@ impl std::fmt::Debug for AskTool {
 
 impl AskTool {
     /// Create a new ask tool bound to a conversation.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         question_store: QuestionStore,
         sender: RoutedSender,

@@ -70,9 +70,9 @@ impl QuestionStore {
     }
 
     /// Insert a new pending question.
-    pub async fn insert(&self, q: &NewQuestion) -> Result<()> {
-        let options_json =
-            serde_json::to_string(&q.options).context("failed to serialize question options")?;
+    pub async fn insert(&self, question: &NewQuestion) -> Result<()> {
+        let options_json = serde_json::to_string(&question.options)
+            .context("failed to serialize question options")?;
 
         sqlx::query(
             r#"
@@ -81,13 +81,13 @@ impl QuestionStore {
             VALUES (?, ?, ?, ?, ?, ?, ?)
             "#,
         )
-        .bind(&q.question_id)
-        .bind(&q.agent_id)
-        .bind(&q.channel_id)
-        .bind(&q.question)
+        .bind(&question.question_id)
+        .bind(&question.agent_id)
+        .bind(&question.channel_id)
+        .bind(&question.question)
         .bind(&options_json)
-        .bind(q.multi_select as i64)
-        .bind(&q.message_ref)
+        .bind(question.multi_select as i64)
+        .bind(&question.message_ref)
         .execute(&self.pool)
         .await
         .context("failed to insert pending question")?;
