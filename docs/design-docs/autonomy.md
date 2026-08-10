@@ -47,6 +47,16 @@ The cortex assembles the autonomy channel's context before each wake. It gets:
 
 The last run summaries are surfaced up front: "Last run (2h ago): enriched tasks X and Y, created tasks Z for backlog." The autonomy channel wakes with spatial awareness of where things stand and what it did recently.
 
+### The briefing is the system prompt, not a message
+
+All of the above renders into the channel's system prompt, re-rendered on each wake. It is not delivered as an inbound message.
+
+This matters because the autonomy channel is one conversation that spans every run — a single conversation id, one persistent transcript. Anything delivered as a message is written into that transcript and stays there. A briefing sent as a message means run fifty wakes to forty-nine copies of its own instructions, with its actual work crowded out between them. Rendering the same content as the system prompt costs nothing extra, since the cortex already assembles it fresh each wake, and it leaves no residue. It is also the honest representation: a briefing stored with a user role and a system sender describes a participant who does not exist.
+
+Two things legitimately arrive mid-run and so must be messages: the soft wrap-up warning at `warn_secs` and the hard timeout notice at `timeout_secs`. Both are ephemeral — present in the live run's context, never persisted to the transcript. They are scaffolding for one run, not history.
+
+The rule the channel is built around: **the transcript holds the agent's own output.** Everything the system tells it is either the system prompt, re-rendered per wake, or an ephemeral mid-run injection. Nothing the system says accumulates.
+
 ---
 
 ## What It Does
@@ -193,9 +203,15 @@ Delivery mechanism: a synthetic system message between turns, the same pattern t
 
 **Task comments** — the primary record of what has been investigated and found. Persist indefinitely. The next run sees all prior comments when it reads task state on wake, so it does not duplicate completed investigation.
 
-**Run summaries** — on exit, `autonomy_complete` records what was enriched, what was executed, what was created, and which wake events the run consumed. The next wake receives the last `run_history_count` summaries as part of its context, and the UI renders the consumed wakes as "woken by" provenance per run.
+**Run summaries** — on exit, `autonomy_complete` records what was enriched, what was executed, what was created, and which wake events the run consumed. The summary is persisted as the run's assistant turn in the channel transcript, and the UI renders the consumed wakes as "woken by" provenance per run.
 
-Working memory provides broader system context. Run summaries provide the autonomy-specific thread.
+**The summary is the compaction unit.** During a run the channel carries full detail: tool calls, worker results, intermediate reasoning. When the run ends, that detail collapses to the summary. What persists is a stream of summaries — roughly five lines per run — plus the live detail of whichever run is currently executing. The transcript is therefore a continuous record of the agent's own thinking that stays bounded no matter how many times it wakes.
+
+This makes the transcript itself the continuity mechanism, so `run_history_count` is a compaction window rather than a second delivery path. Persisting the transcript *and* injecting the last N summaries from the runs table would feed the same content twice by two mechanisms; the run store remains the queryable index and the provenance record, not a parallel context source.
+
+One consequence worth stating: wake provenance lives in the run store and the UI, not in the transcript. Read on its own, the transcript is uninterrupted thought with no visible cause — "why did run 47 happen" is answered by run history, not by scrolling back.
+
+Working memory provides broader system context. The transcript provides the autonomy-specific thread.
 
 ---
 
@@ -208,9 +224,10 @@ Cortex tick
   → no autonomy channel currently running
   → autonomy.enabled = true
   ↓
-Cortex assembles context (identity + bulletin + working memory + tasks + goals + run summaries)
+Cortex assembles context (identity + bulletin + working memory + tasks + goals)
+  → rendered into the channel's system prompt, not sent as a message
   ↓
-Autonomy channel wakes with full context
+Autonomy channel wakes with full context + its own prior transcript
   ↓
   ├─ pending_approval tasks exist?
   │    → enrich: spawn investigation workers, reason about findings, add_task_comment
@@ -222,7 +239,8 @@ Autonomy channel wakes with full context
   └─ no tasks worth acting on?
        → create pending_approval tasks from goals, or exit with "nothing to do"
   ↓
-Calls set_outcome → summary recorded
+Calls autonomy_complete → summary recorded in the run store
+  → and persisted as the run's assistant turn; the run's detail compacts to it
   ↓
 Channel exits → cortex records last_run_at, cleans up
 ```
