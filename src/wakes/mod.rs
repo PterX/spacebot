@@ -7,13 +7,17 @@
 
 mod config;
 mod defs;
+mod emit;
 mod events;
 mod runs;
+mod schedule;
 mod store;
 
 pub use config::{WakeConfig, reconcile_config_wakes};
 pub use defs::{TASK_APPROVED_WAKE_ID, WakeDef, WakeDefStore, WakeTrigger, seed_builtin_wakes};
+pub use emit::{emit_system_event, emit_to_all_agents, emit_to_stores};
 pub use events::SystemEvent;
 pub(crate) use runs::parse_run_timestamp;
 pub use runs::{AutonomyAction, AutonomyRun, AutonomyRunStatus, AutonomyRunStore};
+pub use schedule::fire_due_schedule_wakes;
 pub use store::{EnqueueOutcome, WakeEvent, WakeEventStore};

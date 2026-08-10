@@ -150,6 +150,12 @@ pub fn task_visible_to_agent(task: &Task, agent_id: &str, claim_unowned: bool) -
 /// this the single-flight gate.
 pub async fn maybe_run_autonomy(deps: &AgentDeps) {
     let config = **deps.runtime_config.autonomy.load();
+    // The instance ceiling caps the per-agent dial without overwriting it:
+    // the run executes at the intersection of the two levels.
+    let config = AutonomyConfig {
+        level: config.level.min(**deps.autonomy_ceiling.load()),
+        ..config
+    };
     if config.level == AutonomyLevel::Off {
         return;
     }

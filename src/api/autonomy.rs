@@ -1,8 +1,11 @@
-//! Autonomy status and run-history endpoints for the control interface.
+//! Autonomy status, run-history, and instance-ceiling endpoints for the
+//! control interface.
 //!
-//! Read-only surface over the per-agent autonomy stores threaded through
+//! Status reads ride the per-agent autonomy stores threaded through
 //! `AgentDeps` (via the wake registry) and the hot-reloaded `RuntimeConfig`.
-//! Level and tuning writes ride the agent-config path in `api::config`.
+//! Per-agent level and tuning writes ride the agent-config path in
+//! `api::config`; the instance-wide ceiling is written here, to the top-level
+//! `[autonomy]` table in config.toml.
 
 use super::state::ApiState;
 use crate::config::AutonomyLevel;
@@ -45,6 +48,9 @@ pub struct AutonomyCurrentRun {
 pub struct AutonomyStatusResponse {
     pub agent_id: String,
     pub level: AutonomyLevel,
+    /// The agent's dial capped by the instance ceiling — what the agent
+    /// actually runs at.
+    pub effective_level: AutonomyLevel,
     pub interval_secs: u64,
     pub active_hours: Option<(u8, u8)>,
     pub max_tasks_per_run: u32,
@@ -62,7 +68,14 @@ pub struct AutonomyStatusResponse {
 
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AutonomyFleetResponse {
+    /// Instance-wide autonomy ceiling applied to every agent.
+    pub ceiling: AutonomyLevel,
     pub agents: Vec<AutonomyStatusResponse>,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+pub(super) struct AutonomyCeilingUpdateRequest {
+    ceiling: AutonomyLevel,
 }
 
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]
@@ -87,8 +100,10 @@ async fn agent_deps(state: &ApiState, agent_id: &str) -> Option<crate::AgentDeps
 async fn build_status(
     agent_id: &str,
     deps: &crate::AgentDeps,
+    ceiling: AutonomyLevel,
 ) -> crate::error::Result<AutonomyStatusResponse> {
     let config = **deps.runtime_config.autonomy.load();
+    let effective_level = config.level.min(ceiling);
     let recent = deps.autonomy_run_store.recent(STATUS_RUN_WINDOW).await?;
     let pending_wake_events = deps.wake_event_store.pending_count().await?;
 
@@ -102,7 +117,7 @@ async fn build_status(
         .iter()
         .find(|run| run.status != AutonomyRunStatus::Running);
 
-    let next_run_at = if config.level == AutonomyLevel::Off {
+    let next_run_at = if effective_level == AutonomyLevel::Off {
         None
     } else {
         let now = chrono::Utc::now();
@@ -122,6 +137,7 @@ async fn build_status(
     Ok(AutonomyStatusResponse {
         agent_id: agent_id.to_string(),
         level: config.level,
+        effective_level,
         interval_secs: config.interval_secs,
         active_hours: config.active_hours,
         max_tasks_per_run: config.max_tasks_per_run,
@@ -152,8 +168,9 @@ pub(super) async fn autonomy_status(
     let deps = agent_deps(&state, &query.agent_id)
         .await
         .ok_or(StatusCode::NOT_FOUND)?;
+    let ceiling = **state.autonomy_ceiling.load();
 
-    let status = build_status(&query.agent_id, &deps)
+    let status = build_status(&query.agent_id, &deps, ceiling)
         .await
         .map_err(|error| {
             tracing::warn!(%error, agent_id = %query.agent_id, "failed to build autonomy status");
@@ -182,6 +199,7 @@ pub(super) async fn autonomy_fleet(
         .iter()
         .map(|info| info.id.clone())
         .collect();
+    let ceiling = **state.autonomy_ceiling.load();
 
     let mut agents = Vec::with_capacity(agent_ids.len());
     for agent_id in agent_ids {
@@ -190,14 +208,89 @@ pub(super) async fn autonomy_fleet(
         let Some(deps) = agent_deps(&state, &agent_id).await else {
             continue;
         };
-        let status = build_status(&agent_id, &deps).await.map_err(|error| {
-            tracing::warn!(%error, %agent_id, "failed to build autonomy status");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        let status = build_status(&agent_id, &deps, ceiling)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, %agent_id, "failed to build autonomy status");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
         agents.push(status);
     }
 
-    Ok(Json(AutonomyFleetResponse { agents }))
+    Ok(Json(AutonomyFleetResponse { ceiling, agents }))
+}
+
+/// Set the instance-wide autonomy ceiling.
+///
+/// Persists to the top-level `[autonomy]` table in config.toml, then stores
+/// the new level into the shared ArcSwap so every agent picks it up
+/// immediately. Returns the resulting fleet snapshot.
+#[utoipa::path(
+    put,
+    path = "/agents/autonomy/ceiling",
+    request_body = AutonomyCeilingUpdateRequest,
+    responses(
+        (status = 200, body = AutonomyFleetResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "autonomy",
+)]
+pub(super) async fn update_autonomy_ceiling(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<AutonomyCeilingUpdateRequest>,
+) -> Result<Json<AutonomyFleetResponse>, StatusCode> {
+    let config_path = state.config_path.read().await.clone();
+    if config_path.as_os_str().is_empty() {
+        tracing::error!("config_path not set in ApiState");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // Hold the config write mutex across the read-modify-write so concurrent
+    // config.toml editors cannot clobber each other.
+    let config_guard = state.config_write_mutex.lock().await;
+
+    let config_content = tokio::fs::read_to_string(&config_path)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "failed to read config.toml");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let mut doc = config_content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| {
+            tracing::warn!(%error, "failed to parse config.toml");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    if doc.get("autonomy").is_none() {
+        doc["autonomy"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let table = doc["autonomy"]
+        .as_table_mut()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    table["ceiling"] = toml_edit::value(request.ceiling.as_str());
+
+    let updated_content = doc.to_string();
+    if let Err(error) = crate::config::Config::validate_toml(&updated_content) {
+        tracing::warn!(%error, "rejected ceiling update due to invalid resulting TOML");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    tokio::fs::write(&config_path, updated_content)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "failed to write config.toml");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    drop(config_guard);
+
+    state.autonomy_ceiling.store(Arc::new(request.ceiling));
+    tracing::info!(ceiling = %request.ceiling, "instance autonomy ceiling updated via API");
+
+    autonomy_fleet(State(state)).await
 }
 
 /// List recent autonomy runs, newest first. Scoped to one agent when

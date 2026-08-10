@@ -26,6 +26,7 @@ pub mod opencode;
 pub mod projects;
 pub mod prompts;
 pub mod sandbox;
+pub mod schedule;
 pub mod secrets;
 pub mod self_awareness;
 pub mod settings;
@@ -443,6 +444,10 @@ pub struct AgentDeps {
     pub goal_store: Arc<goals::GoalStore>,
     /// Per-agent persisted wake-event queue, consumed by the autonomy channel.
     pub wake_event_store: Arc<wakes::WakeEventStore>,
+    /// Instance-wide autonomy ceiling shared by every agent and the API. The
+    /// effective autonomy level is `min(ceiling, agent level)` — the ceiling
+    /// caps the per-agent dial without overwriting it.
+    pub autonomy_ceiling: Arc<arc_swap::ArcSwap<config::AutonomyLevel>>,
     /// Per-agent wake definition registry (builtin, config, and user wakes).
     pub wake_def_store: Arc<wakes::WakeDefStore>,
     /// Per-agent autonomy run history (begin/complete + recent summaries).

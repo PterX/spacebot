@@ -1128,6 +1128,8 @@ export interface AutonomyCurrentRun {
 export interface AutonomyStatus {
 	agent_id: string;
 	level: AutonomyLevel;
+	/** The agent's dial capped by the instance ceiling — what it actually runs at. */
+	effective_level: AutonomyLevel;
 	interval_secs: number;
 	active_hours: [number, number] | null;
 	max_tasks_per_run: number;
@@ -1139,6 +1141,8 @@ export interface AutonomyStatus {
 }
 
 export interface AutonomyFleetResponse {
+	/** Instance-wide autonomy ceiling applied to every agent. */
+	ceiling: AutonomyLevel;
 	agents: AutonomyStatus[];
 }
 
@@ -1162,6 +1166,33 @@ export interface AutonomyRunEntry {
 
 export interface AutonomyRunsResponse {
 	runs: AutonomyRunEntry[];
+}
+
+export type WakeTriggerKind = "schedule" | "webhook" | "event";
+
+export interface WakeItem {
+	id: string;
+	name: string;
+	trigger_kind: WakeTriggerKind;
+	trigger_label: string;
+	instructions: string;
+	min_level: AutonomyLevel;
+	enabled: boolean;
+	builtin: boolean;
+	virtual: boolean;
+	last_fired_at: string | null;
+	webhook_url: string | null;
+}
+
+export interface WakesResponse {
+	wakes: WakeItem[];
+}
+
+export interface WakeUpdate {
+	enabled?: boolean;
+	name?: string;
+	instructions?: string;
+	min_level?: AutonomyLevel;
 }
 
 // -- Notification Types --
@@ -1802,12 +1833,54 @@ export const api = {
 
 	autonomyFleet: () => fetchJson<AutonomyFleetResponse>("/agents/autonomy/fleet"),
 
+	updateAutonomyCeiling: async (ceiling: AutonomyLevel) => {
+		const response = await fetch(`${getApiBase()}/agents/autonomy/ceiling`, {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ ceiling }),
+		});
+		if (!response.ok) {
+			throw new Error(`API error: ${response.status}`);
+		}
+		return response.json() as Promise<AutonomyFleetResponse>;
+	},
+
 	autonomyRuns: (agentId?: string, limit?: number) => {
 		const search = new URLSearchParams();
 		if (agentId) search.set("agent_id", agentId);
 		if (limit) search.set("limit", String(limit));
 		const query = search.toString();
 		return fetchJson<AutonomyRunsResponse>(query ? `/agents/autonomy/runs?${query}` : "/agents/autonomy/runs");
+	},
+
+	// Wakes API
+	listWakes: (agentId: string) =>
+		fetchJson<WakesResponse>(`/agents/wakes?agent_id=${encodeURIComponent(agentId)}`),
+
+	updateWake: async (agentId: string, wakeId: string, patch: WakeUpdate) => {
+		const response = await fetch(
+			`${getApiBase()}/agents/wakes/${encodeURIComponent(wakeId)}?agent_id=${encodeURIComponent(agentId)}`,
+			{
+				method: "PUT",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(patch),
+			},
+		);
+		if (!response.ok) {
+			throw new Error(`API error: ${response.status}`);
+		}
+		return response.json() as Promise<WakeItem>;
+	},
+
+	fireWake: async (agentId: string, wakeId: string) => {
+		const response = await fetch(
+			`${getApiBase()}/agents/wakes/${encodeURIComponent(wakeId)}/fire?agent_id=${encodeURIComponent(agentId)}`,
+			{ method: "POST" },
+		);
+		if (!response.ok) {
+			throw new Error(`API error: ${response.status}`);
+		}
+		return response.json() as Promise<{ status: string }>;
 	},
 
 	cancelProcess: async (channelId: string, processType: "worker" | "branch", processId: string) => {

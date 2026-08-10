@@ -1,9 +1,8 @@
-import {useState} from "react";
-import {useQuery} from "@tanstack/react-query";
-import {Clock, Globe, Lightning, Gauge, Plus} from "@phosphor-icons/react";
-import {Card, CardHeader, CardContent, Button} from "@spacedrive/primitives";
+import {useMutation, useQuery, useQueryClient} from "@tanstack/react-query";
+import {Clock, Globe, Lightning} from "@phosphor-icons/react";
+import {Card, CardHeader, CardContent} from "@spacedrive/primitives";
 import {Toggle} from "@/ui/Toggle";
-import {mockAutonomyApi, type WakeTriggerKind} from "./mock";
+import {api, type WakeTriggerKind, type WakesResponse} from "@/api/client";
 
 const TRIGGER_CONFIG: Record<
 	WakeTriggerKind,
@@ -12,7 +11,6 @@ const TRIGGER_CONFIG: Record<
 	schedule: {icon: Clock, iconClass: "text-blue-400", label: "Schedule"},
 	webhook: {icon: Globe, iconClass: "text-violet-400", label: "Webhook"},
 	event: {icon: Lightning, iconClass: "text-amber-400", label: "Event"},
-	condition: {icon: Gauge, iconClass: "text-emerald-400", label: "Condition"},
 };
 
 const LEVEL_LABEL: Record<string, string> = {
@@ -29,13 +27,41 @@ function formatTimeAgo(iso: string): string {
 	return `${Math.floor(seconds / 86400)}d ago`;
 }
 
-export function WakesCard() {
-	const [overrides, setOverrides] = useState<Record<string, boolean>>({});
+interface WakesCardProps {
+	agentId: string;
+}
+
+export function WakesCard({agentId}: WakesCardProps) {
+	const queryClient = useQueryClient();
 
 	const {data} = useQuery({
-		queryKey: ["autonomy-wakes"],
-		queryFn: mockAutonomyApi.wakes,
+		queryKey: ["wakes", agentId],
+		queryFn: () => api.listWakes(agentId),
 		staleTime: 30_000,
+	});
+
+	const toggleMutation = useMutation({
+		mutationFn: ({wakeId, enabled}: {wakeId: string; enabled: boolean}) =>
+			api.updateWake(agentId, wakeId, {enabled}),
+		onMutate: ({wakeId, enabled}) => {
+			const previous = queryClient.getQueryData<WakesResponse>(["wakes", agentId]);
+			if (previous) {
+				queryClient.setQueryData<WakesResponse>(["wakes", agentId], {
+					wakes: previous.wakes.map((wake) =>
+						wake.id === wakeId ? {...wake, enabled} : wake,
+					),
+				});
+			}
+			return {previous};
+		},
+		onError: (_error, _vars, context) => {
+			if (context?.previous) {
+				queryClient.setQueryData(["wakes", agentId], context.previous);
+			}
+		},
+		onSettled: () => {
+			queryClient.invalidateQueries({queryKey: ["wakes", agentId]});
+		},
 	});
 
 	const wakes = data?.wakes ?? [];
@@ -46,26 +72,20 @@ export function WakesCard() {
 				<div className="flex items-center gap-2">
 					<h2 className="font-plex text-sm font-medium text-ink-dull">Wakes</h2>
 					<span className="text-tiny text-ink-faint">
-						what stirs your agent, and what it does when stirred · design
-						preview
+						what stirs your agent, and what it does when stirred
 					</span>
 				</div>
-				<Button size="xs" variant="subtle">
-					<Plus className="mr-1 size-3.5" weight="bold" />
-					Add wake
-				</Button>
 			</CardHeader>
 
 			<CardContent className="px-6 pb-4 pt-0">
 				<div className="flex flex-col divide-y divide-app-line/40">
 					{wakes.map((wake) => {
-						const enabled = overrides[wake.id] ?? wake.enabled;
 						const {icon: Icon, iconClass, label} = TRIGGER_CONFIG[wake.trigger_kind];
 						return (
 							<div
 								key={wake.id}
 								className={`flex items-center gap-4 py-3 first:pt-0 last:pb-0 ${
-									enabled ? "" : "opacity-50"
+									wake.enabled ? "" : "opacity-50"
 								}`}
 							>
 								<span
@@ -89,6 +109,18 @@ export function WakesCard() {
 												built-in
 											</span>
 										)}
+										{wake.webhook_url && (
+											<button
+												type="button"
+												className="shrink-0 cursor-pointer rounded-full bg-app-line/50 px-1.5 py-px font-mono text-tiny text-ink-faint hover:text-ink"
+												title="Copy webhook URL"
+												onClick={() =>
+													navigator.clipboard.writeText(wake.webhook_url!)
+												}
+											>
+												{wake.webhook_url}
+											</button>
+										)}
 									</div>
 									<p className="mt-0.5 truncate text-tiny text-ink-faint">
 										{wake.instructions}
@@ -103,13 +135,20 @@ export function WakesCard() {
 										? formatTimeAgo(wake.last_fired_at)
 										: "never"}
 								</span>
-								<Toggle
-									size="sm"
-									checked={enabled}
-									onCheckedChange={(v) =>
-										setOverrides((o) => ({...o, [wake.id]: v}))
+								<span
+									title={
+										wake.virtual ? "Governed by the autonomy dial" : undefined
 									}
-								/>
+								>
+									<Toggle
+										size="sm"
+										checked={wake.enabled}
+										disabled={wake.virtual}
+										onCheckedChange={(enabled) =>
+											toggleMutation.mutate({wakeId: wake.id, enabled})
+										}
+									/>
+								</span>
 							</div>
 						);
 					})}

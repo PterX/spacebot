@@ -76,7 +76,7 @@ export function AgentAutonomy({agentId}: AgentAutonomyProps) {
 					</div>
 
 					<div className="mt-5">
-						<WakesCard />
+						<WakesCard agentId={agentId} />
 					</div>
 
 					<div className="mt-5">

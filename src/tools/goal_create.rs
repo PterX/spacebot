@@ -12,6 +12,7 @@ use std::sync::Arc;
 pub struct GoalCreateTool {
     goal_store: Arc<GoalStore>,
     working_memory: Option<Arc<crate::memory::WorkingMemoryStore>>,
+    api_state: Option<Arc<crate::api::ApiState>>,
 }
 
 impl std::fmt::Debug for GoalCreateTool {
@@ -25,11 +26,18 @@ impl GoalCreateTool {
         Self {
             goal_store,
             working_memory: None,
+            api_state: None,
         }
     }
 
     pub fn with_working_memory(mut self, store: Arc<crate::memory::WorkingMemoryStore>) -> Self {
         self.working_memory = Some(store);
+        self
+    }
+
+    /// Enables goal.created wake emission across the agent registry.
+    pub fn with_api_state(mut self, api_state: Arc<crate::api::ApiState>) -> Self {
+        self.api_state = Some(api_state);
         self
     }
 }
@@ -115,6 +123,20 @@ impl Tool for GoalCreateTool {
                 )
                 .importance(0.5)
                 .record();
+        }
+
+        if let Some(api_state) = &self.api_state {
+            crate::wakes::emit_to_all_agents(
+                &api_state.wake_registry,
+                crate::wakes::SystemEvent::GoalCreated,
+                &format!("goal:{}", goal.id),
+                &serde_json::json!({
+                    "goal_id": goal.id,
+                    "title": goal.title,
+                    "status": goal.status.to_string(),
+                }),
+            )
+            .await;
         }
 
         Ok(GoalCreateOutput {

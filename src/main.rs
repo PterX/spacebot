@@ -751,6 +751,9 @@ async fn run(
         injection_tx.clone(),
     );
     api_state.auth_token = config.api.auth_token.clone();
+    // Instance-wide autonomy ceiling: one ArcSwap shared between the API and
+    // every AgentDeps so ceiling writes take effect without a restart.
+    api_state.autonomy_ceiling = Arc::new(arc_swap::ArcSwap::from_pointee(config.autonomy_ceiling));
     api_state.set_task_store(global_task_store.clone());
     api_state.set_goal_store(global_goal_store.clone());
     api_state.set_wiki_store(global_wiki_store.clone());
@@ -2131,6 +2134,7 @@ async fn initialize_agents(
             task_store: global_task_store.clone(),
             goal_store: global_goal_store.clone(),
             wake_event_store: Arc::new(spacebot::wakes::WakeEventStore::new(db.sqlite.clone())),
+            autonomy_ceiling: api_state.autonomy_ceiling.clone(),
             wake_def_store: Arc::new(spacebot::wakes::WakeDefStore::new(db.sqlite.clone())),
             autonomy_run_store: Arc::new(spacebot::wakes::AutonomyRunStore::new(db.sqlite.clone())),
             project_store: project_store.clone(),

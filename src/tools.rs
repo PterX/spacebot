@@ -918,8 +918,12 @@ pub fn create_branch_tool_server(
     }
 
     let mut task_create = TaskCreateTool::new(task_store.clone(), agent_id.to_string(), "branch");
+    let mut goal_create = GoalCreateTool::new(goal_store.clone());
+    let mut goal_update = GoalUpdateTool::new(goal_store.clone());
     if let Some(ref api) = api_state {
         task_create = task_create.with_api_state(api.clone());
+        goal_create = goal_create.with_api_state(api.clone());
+        goal_update = goal_update.with_api_state(api.clone());
     }
 
     let mut server = ToolServer::new()
@@ -933,9 +937,9 @@ pub fn create_branch_tool_server(
         .tool(task_create)
         .tool(TaskListTool::new(task_store.clone(), agent_id.to_string()))
         .tool(TaskUpdateTool::for_branch(task_store, agent_id.clone()))
-        .tool(GoalCreateTool::new(goal_store.clone()))
-        .tool(GoalListTool::new(goal_store.clone()))
-        .tool(GoalUpdateTool::new(goal_store))
+        .tool(goal_create)
+        .tool(GoalListTool::new(goal_store))
+        .tool(goal_update)
         .tool(FileReadTool::new(
             runtime_config.workspace_dir.clone(),
             sandbox,
@@ -1212,13 +1216,13 @@ pub fn create_cortex_chat_tool_server(
         .tool(spawn_tool)
         .tool(
             TaskCreateTool::new(task_store.clone(), agent_id.to_string(), "cortex")
-                .with_api_state(api_state),
+                .with_api_state(api_state.clone()),
         )
         .tool(TaskListTool::new(task_store.clone(), agent_id.to_string()))
         .tool(TaskUpdateTool::for_branch(task_store, agent_id.clone()))
-        .tool(GoalCreateTool::new(goal_store.clone()))
+        .tool(GoalCreateTool::new(goal_store.clone()).with_api_state(api_state.clone()))
         .tool(GoalListTool::new(goal_store.clone()))
-        .tool(GoalUpdateTool::new(goal_store))
+        .tool(GoalUpdateTool::new(goal_store).with_api_state(api_state))
         .tool(ShellTool::new(workspace.clone(), sandbox.clone()));
 
     server = register_file_tools(server, workspace, sandbox);

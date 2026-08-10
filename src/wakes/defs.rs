@@ -329,6 +329,55 @@ impl WakeDefStore {
         Ok(())
     }
 
+    /// Update user-tunable fields, leaving `None` fields unchanged. Returns
+    /// whether a row was updated.
+    pub async fn update_tuning(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        instructions: Option<&str>,
+        min_level: Option<AutonomyLevel>,
+        enabled: Option<bool>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE wake_defs SET \
+                 name = COALESCE(?, name), \
+                 instructions = COALESCE(?, instructions), \
+                 min_level = COALESCE(?, min_level), \
+                 enabled = COALESCE(?, enabled), \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE id = ?",
+        )
+        .bind(name)
+        .bind(instructions)
+        .bind(min_level.map(AutonomyLevel::as_str))
+        .bind(enabled)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .context("failed to update wake def tuning")?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Store a webhook bearer token only when the row has none, so a
+    /// concurrent minter cannot clobber a token already handed out. Returns
+    /// whether this caller's token was stored.
+    pub async fn set_webhook_token_if_absent(&self, id: &str, token: &str) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE wake_defs SET webhook_token = ?, \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE id = ? AND trigger_kind = 'webhook' AND webhook_token IS NULL",
+        )
+        .bind(token)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .context("failed to set wake def webhook token")?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Look up the wake definition owning a webhook bearer token.
     pub async fn find_by_webhook_token(&self, token: &str) -> Result<Option<WakeDef>> {
         let row = sqlx::query(&format!(
@@ -708,6 +757,82 @@ mod tests {
         assert!(store.delete("wake").await.expect("delete"));
         assert!(store.get("wake").await.expect("get").is_none());
         assert!(!store.delete("wake").await.expect("second delete"));
+    }
+
+    #[tokio::test]
+    async fn update_tuning_leaves_unset_fields_unchanged() {
+        let store = store().await;
+        store
+            .upsert(&def("wake", WakeTrigger::Webhook))
+            .await
+            .expect("upsert");
+
+        assert!(
+            store
+                .update_tuning(
+                    "wake",
+                    None,
+                    Some("new instructions"),
+                    Some(AutonomyLevel::Act),
+                    Some(false),
+                )
+                .await
+                .expect("update")
+        );
+
+        let loaded = store.get("wake").await.expect("get").expect("row");
+        assert_eq!(loaded.name, "wake name");
+        assert_eq!(loaded.instructions, "new instructions");
+        assert_eq!(loaded.min_level, AutonomyLevel::Act);
+        assert!(!loaded.enabled);
+        assert!(
+            !store
+                .update_tuning("missing", None, None, None, Some(true))
+                .await
+                .expect("missing")
+        );
+    }
+
+    #[tokio::test]
+    async fn set_webhook_token_if_absent_never_overwrites() {
+        let store = store().await;
+        store
+            .upsert(&def("hook", WakeTrigger::Webhook))
+            .await
+            .expect("upsert");
+        store
+            .upsert(&def(
+                "sched",
+                WakeTrigger::Schedule {
+                    cron_expr: None,
+                    interval_secs: Some(600),
+                },
+            ))
+            .await
+            .expect("upsert");
+
+        assert!(
+            store
+                .set_webhook_token_if_absent("hook", "first")
+                .await
+                .expect("mint")
+        );
+        assert!(
+            !store
+                .set_webhook_token_if_absent("hook", "second")
+                .await
+                .expect("re-mint")
+        );
+        // Non-webhook wakes never receive tokens.
+        assert!(
+            !store
+                .set_webhook_token_if_absent("sched", "token")
+                .await
+                .expect("schedule")
+        );
+
+        let loaded = store.get("hook").await.expect("get").expect("row");
+        assert_eq!(loaded.webhook_token.as_deref(), Some("first"));
     }
 
     #[tokio::test]

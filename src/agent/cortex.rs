@@ -2512,6 +2512,8 @@ async fn run_cortex_loop(
                     tracing::warn!(%error, "working memory event pruning failed");
                 }
 
+                crate::wakes::fire_due_schedule_wakes(&cortex.deps).await;
+
                 // Autonomy: start a run when the interval has elapsed or wake
                 // events are pending. The check is a few cheap SQL queries;
                 // the run itself is spawned as a task so the tick never blocks.
@@ -3909,8 +3911,14 @@ async fn run_ready_task_loop(deps: &AgentDeps, logger: &CortexLogger) -> anyhow:
 async fn pickup_one_ready_task(deps: &AgentDeps, logger: &CortexLogger) -> anyhow::Result<()> {
     // Ready-task execution is Act-only. Observe and Suggest agents survey and
     // propose but never execute approved work without a user present, and Off
-    // disables autonomous pickup entirely. See docs/design-docs/autonomy.md.
-    let autonomy_level = deps.runtime_config.autonomy.load().level;
+    // disables autonomous pickup entirely. The instance ceiling caps the
+    // per-agent dial. See docs/design-docs/autonomy.md.
+    let autonomy_level = deps
+        .runtime_config
+        .autonomy
+        .load()
+        .level
+        .min(**deps.autonomy_ceiling.load());
     if !crate::agent::autonomy::ready_pickup_allowed(autonomy_level) {
         tracing::debug!(
             agent_id = %deps.agent_id,

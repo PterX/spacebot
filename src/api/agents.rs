@@ -527,6 +527,7 @@ pub(super) async fn trigger_warmup(
         let injection_tx = state.injection_tx.clone();
         let humans = (**state.agent_humans.load()).clone();
         let notif_store_warmup = state.notification_store.load().as_ref().clone();
+        let autonomy_ceiling = state.autonomy_ceiling.clone();
         tokio::spawn(async move {
             let process_event_buses = crate::create_process_event_buses();
             let event_tx = process_event_buses.control;
@@ -557,6 +558,7 @@ pub(super) async fn trigger_warmup(
                 task_store,
                 goal_store,
                 wake_event_store: Arc::new(crate::wakes::WakeEventStore::new(sqlite_pool.clone())),
+                autonomy_ceiling,
                 wake_def_store: Arc::new(crate::wakes::WakeDefStore::new(sqlite_pool.clone())),
                 autonomy_run_store: Arc::new(crate::wakes::AutonomyRunStore::new(
                     sqlite_pool.clone(),
@@ -983,6 +985,7 @@ pub async fn create_agent_internal(
         task_store: task_store.clone(),
         goal_store: goal_store.clone(),
         wake_event_store: Arc::new(crate::wakes::WakeEventStore::new(db.sqlite.clone())),
+        autonomy_ceiling: state.autonomy_ceiling.clone(),
         wake_def_store: Arc::new(crate::wakes::WakeDefStore::new(db.sqlite.clone())),
         autonomy_run_store: Arc::new(crate::wakes::AutonomyRunStore::new(db.sqlite.clone())),
         project_store: project_store.clone(),

@@ -38,10 +38,6 @@ export function CeilingCard({ceiling, onCeilingChange}: CeilingCardProps) {
 					Lower it to pause the fleet; raise it and every agent resumes at its
 					own setting.
 				</p>
-
-				<p className="mt-1 text-tiny text-ink-faint">
-					ceiling is design-preview — it doesn't change agent behavior yet
-				</p>
 			</CardContent>
 		</Card>
 	);

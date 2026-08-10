@@ -31,6 +31,15 @@ pub(super) struct TomlConfig {
     pub(super) telemetry: TomlTelemetryConfig,
     #[serde(default)]
     pub(super) memory_janitor: TomlMemoryJanitorConfig,
+    #[serde(default)]
+    pub(super) autonomy: Option<TomlInstanceAutonomyConfig>,
+}
+
+/// Top-level `[autonomy]` table: instance-wide settings that apply across
+/// all agents, as opposed to the per-agent `[agents.autonomy]` tables.
+#[derive(Deserialize, Default)]
+pub(super) struct TomlInstanceAutonomyConfig {
+    pub(super) ceiling: Option<String>,
 }
 
 #[derive(Deserialize, Default)]

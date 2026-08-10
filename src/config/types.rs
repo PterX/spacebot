@@ -64,6 +64,10 @@ pub struct Config {
     /// (their cortex tick never runs maintenance), additive on active-mode
     /// agents.
     pub memory_janitor: MemoryJanitorConfig,
+    /// Instance-wide autonomy ceiling. Every agent runs at
+    /// `min(ceiling, agent level)` — the ceiling caps the per-agent dial
+    /// without overwriting it. `Act` (the default) applies no cap.
+    pub autonomy_ceiling: AutonomyLevel,
 }
 
 /// Instance-wide memory maintenance scheduler.

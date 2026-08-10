@@ -4,7 +4,7 @@ use super::state::ApiState;
 use super::{
     activity, agents, attachments, autonomy, bindings, channels, config, cortex, cron, factory,
     goals, ingest, links, mcp, memories, messaging, models, notifications, opencode_proxy, portal,
-    projects, providers, secrets, settings, skills, ssh, system, tasks, tools, usage, wiki,
+    projects, providers, secrets, settings, skills, ssh, system, tasks, tools, usage, wakes, wiki,
     workers,
 };
 
@@ -129,7 +129,12 @@ pub fn api_router() -> OpenApiRouter<Arc<ApiState>> {
         // Autonomy routes
         .routes(routes!(autonomy::autonomy_status))
         .routes(routes!(autonomy::autonomy_fleet))
+        .routes(routes!(autonomy::update_autonomy_ceiling))
         .routes(routes!(autonomy::autonomy_runs))
+        // Wake routes
+        .routes(routes!(wakes::list_wakes))
+        .routes(routes!(wakes::update_wake, wakes::delete_wake))
+        .routes(routes!(wakes::fire_wake))
         // Notification routes
         .routes(routes!(notifications::list_notifications))
         .routes(routes!(notifications::unread_count))
@@ -332,6 +337,12 @@ pub async fn start_http_server(
     let app = Router::new()
         // Mount all protected routes
         .merge(protected_routes)
+        // Wake webhook ingress is public: the per-wake token in the path is
+        // the authority boundary, so it bypasses api_auth_middleware.
+        .route(
+            "/hooks/wakes/{token}",
+            axum::routing::post(wakes::webhook_ingress),
+        )
         // Static file handler for frontend (unprotected)
         .fallback(static_handler)
         .layer(cors)

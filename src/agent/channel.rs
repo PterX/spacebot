@@ -3517,6 +3517,26 @@ impl Channel {
 
                 run_logger.log_worker_completed(*worker_id, result, *success);
 
+                let worker_event = if *success {
+                    crate::wakes::SystemEvent::WorkerCompleted
+                } else {
+                    crate::wakes::SystemEvent::WorkerFailed
+                };
+                crate::wakes::emit_system_event(
+                    &self.deps,
+                    worker_event,
+                    &format!("worker:{worker_id}"),
+                    &serde_json::json!({
+                        "worker_id": worker_id.to_string(),
+                        "success": *success,
+                        "summary": crate::summarize_first_non_empty_line(
+                            result,
+                            crate::EVENT_SUMMARY_MAX_CHARS,
+                        ),
+                    }),
+                )
+                .await;
+
                 // A worker finishing real work successfully is a reflection
                 // signal: the session likely produced a reusable lesson.
                 if *success {

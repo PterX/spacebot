@@ -4,7 +4,8 @@ use crate::agent::channel::ChannelState;
 use crate::agent::cortex_chat::CortexChatSession;
 use crate::agent::status::StatusBlock;
 use crate::config::{
-    Binding, DefaultsConfig, DiscordPermissions, RuntimeConfig, SignalPermissions, SlackPermissions,
+    AutonomyLevel, Binding, DefaultsConfig, DiscordPermissions, RuntimeConfig, SignalPermissions,
+    SlackPermissions,
 };
 use crate::conversation::worker_transcript::{ActionContent, ToolResultStatus, TranscriptStep};
 use crate::cron::{CronStore, Scheduler};
@@ -251,6 +252,9 @@ pub struct ApiState {
     /// Guards read-modify-write cycles on config.toml to prevent concurrent
     /// modifications from clobbering each other.
     pub config_write_mutex: tokio::sync::Mutex<()>,
+    /// Instance-wide autonomy ceiling. The same Arc is cloned into every
+    /// AgentDeps, so API writes are visible to agents immediately.
+    pub autonomy_ceiling: Arc<ArcSwap<AutonomyLevel>>,
     /// Per-agent cron stores for cron job CRUD operations.
     pub cron_stores: arc_swap::ArcSwap<HashMap<String, Arc<CronStore>>>,
     /// Per-agent cron schedulers for job timer management.
@@ -538,6 +542,7 @@ impl ApiState {
             agent_data_dirs: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             config_path: RwLock::new(PathBuf::new()),
             config_write_mutex: tokio::sync::Mutex::new(()),
+            autonomy_ceiling: Arc::new(ArcSwap::from_pointee(AutonomyLevel::Act)),
             cron_stores: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             cron_schedulers: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             task_store: ArcSwap::from_pointee(None),

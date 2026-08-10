@@ -36,6 +36,7 @@ mod system;
 pub mod tasks;
 mod tools;
 pub mod usage;
+pub mod wakes;
 pub mod wiki;
 pub mod workers;
 

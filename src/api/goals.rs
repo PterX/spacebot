@@ -116,6 +116,24 @@ fn parse_priority(value: Option<&str>) -> Result<Option<crate::tasks::TaskPriori
     }
 }
 
+/// Fan a goal lifecycle event out to every registered agent. Goals are
+/// instance-level; per-agent wake definitions filter, so agents without a
+/// subscribed wake enqueue nothing.
+async fn emit_goal_event(state: &ApiState, event: crate::wakes::SystemEvent, goal: &Goal) {
+    let payload = serde_json::json!({
+        "goal_id": goal.id,
+        "title": goal.title,
+        "status": goal.status.to_string(),
+    });
+    crate::wakes::emit_to_all_agents(
+        &state.wake_registry,
+        event,
+        &format!("goal:{}", goal.id),
+        &payload,
+    )
+    .await;
+}
+
 async fn with_counts(store: &GoalStore, goal: Goal) -> Result<GoalWithCounts, StatusCode> {
     let task_counts = store.linked_task_counts(&goal.id).await.map_err(|error| {
         tracing::warn!(%error, goal_id = %goal.id, "failed to count linked tasks");
@@ -234,6 +252,7 @@ pub(super) async fn create_goal(
             StatusCode::BAD_REQUEST
         })?;
 
+    emit_goal_event(&state, crate::wakes::SystemEvent::GoalCreated, &goal).await;
     Ok(Json(GoalResponse {
         goal: with_counts(&store, goal).await?,
     }))
@@ -286,6 +305,7 @@ pub(super) async fn update_goal(
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
 
+    emit_goal_event(&state, crate::wakes::SystemEvent::GoalUpdated, &goal).await;
     Ok(Json(GoalResponse {
         goal: with_counts(&store, goal).await?,
     }))

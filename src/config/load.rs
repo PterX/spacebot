@@ -11,16 +11,16 @@ use super::providers::{
 };
 use super::toml_schema::*;
 use super::{
-    AgentConfig, ApiConfig, ApiType, AutonomyConfig, Binding, BrowserConfig, ChannelConfig,
-    ClosePolicy, CoalesceConfig, CompactionConfig, Config, CortexConfig, CronDef, DefaultsConfig,
-    DiscordConfig, DiscordInstanceConfig, EmailConfig, EmailInstanceConfig, GroupDef, HumanDef,
-    IngestionConfig, LinkDef, LlmConfig, MattermostConfig, MattermostInstanceConfig,
-    McpServerConfig, McpTransport, MemoryJanitorConfig, MemoryPersistenceConfig, MessagingConfig,
-    MetricsConfig, OpenCodeConfig, ParticipantContextConfig, ProjectsConfig, ProviderConfig,
-    ReflectionConfig, SignalConfig, SignalInstanceConfig, SkillsConfig, SlackCommandConfig,
-    SlackConfig, SlackInstanceConfig, TelegramConfig, TelegramInstanceConfig, TelemetryConfig,
-    TwitchConfig, TwitchInstanceConfig, WarmupConfig, WebhookConfig, normalize_adapter,
-    validate_named_messaging_adapters,
+    AgentConfig, ApiConfig, ApiType, AutonomyConfig, AutonomyLevel, Binding, BrowserConfig,
+    ChannelConfig, ClosePolicy, CoalesceConfig, CompactionConfig, Config, CortexConfig, CronDef,
+    DefaultsConfig, DiscordConfig, DiscordInstanceConfig, EmailConfig, EmailInstanceConfig,
+    GroupDef, HumanDef, IngestionConfig, LinkDef, LlmConfig, MattermostConfig,
+    MattermostInstanceConfig, McpServerConfig, McpTransport, MemoryJanitorConfig,
+    MemoryPersistenceConfig, MessagingConfig, MetricsConfig, OpenCodeConfig,
+    ParticipantContextConfig, ProjectsConfig, ProviderConfig, ReflectionConfig, SignalConfig,
+    SignalInstanceConfig, SkillsConfig, SlackCommandConfig, SlackConfig, SlackInstanceConfig,
+    TelegramConfig, TelegramInstanceConfig, TelemetryConfig, TwitchConfig, TwitchInstanceConfig,
+    WarmupConfig, WebhookConfig, normalize_adapter, validate_named_messaging_adapters,
 };
 use crate::error::{ConfigError, Result};
 
@@ -98,6 +98,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "metrics",
     "telemetry",
     "memory_janitor",
+    "autonomy",
 ];
 
 /// Pre-parse check that warns about unrecognised top-level keys in a config
@@ -1039,6 +1040,7 @@ impl Config {
                 sample_rate: 1.0,
             },
             memory_janitor: MemoryJanitorConfig::default(),
+            autonomy_ceiling: AutonomyLevel::Act,
         })
     }
 
@@ -2734,6 +2736,19 @@ impl Config {
                 .unwrap_or_else(|| MemoryJanitorConfig::default().interval_secs),
         };
 
+        let autonomy_ceiling = match toml
+            .autonomy
+            .as_ref()
+            .and_then(|autonomy| autonomy.ceiling.as_deref())
+        {
+            Some(value) => AutonomyLevel::parse(value).ok_or_else(|| {
+                ConfigError::Invalid(format!(
+                    "autonomy.ceiling must be one of off, observe, suggest, act (got `{value}`)"
+                ))
+            })?,
+            None => AutonomyLevel::Act,
+        };
+
         Ok(Config {
             instance_dir,
             llm,
@@ -2748,6 +2763,7 @@ impl Config {
             metrics,
             telemetry,
             memory_janitor,
+            autonomy_ceiling,
         })
     }
 }
