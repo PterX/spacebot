@@ -518,7 +518,7 @@ mod tests {
             other => format!("{other:?}"),
         };
         assert!(front.contains("Forked context compacted"));
-        assert!(!format!("{:?}", &history[1]).contains("Forked context compacted"));
+        assert!(!format!("{:?}", history[1]).contains("Forked context compacted"));
     }
 
     #[test]
