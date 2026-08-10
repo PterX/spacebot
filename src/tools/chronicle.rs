@@ -78,6 +78,10 @@ pub struct ChronicleArgs {
     /// Maximum checkpoints to list, or maximum raw messages to expand.
     #[serde(default)]
     pub limit: Option<i64>,
+    /// Cursor for "expand": continue after this message sequence number, as
+    /// returned by the previous page.
+    #[serde(default)]
+    pub after: Option<i64>,
 }
 
 fn default_action() -> String {
@@ -128,6 +132,10 @@ impl Tool for ChronicleTool {
                         "type": "integer",
                         "minimum": 1,
                         "description": "Checkpoints to list (default 20, max 50), or raw messages to expand."
+                    },
+                    "after": {
+                        "type": "integer",
+                        "description": "Continue an expansion after this message sequence number, as returned by the previous page."
                     }
                 }
             }),
@@ -138,7 +146,7 @@ impl Tool for ChronicleTool {
         match args.action.as_str() {
             "list" => self.list(args.limit).await,
             "open" => self.open(args.checkpoint).await,
-            "expand" => self.expand(args.checkpoint, args.limit).await,
+            "expand" => self.expand(args.checkpoint, args.limit, args.after).await,
             other => Err(ChronicleError(format!(
                 "Unknown action \"{other}\". Use \"list\", \"open\"{}.",
                 if self.capability.allows_expand() {
@@ -222,6 +230,7 @@ impl ChronicleTool {
         &self,
         seq: Option<i64>,
         limit: Option<i64>,
+        after: Option<i64>,
     ) -> Result<ChronicleOutput, ChronicleError> {
         if !self.capability.allows_expand() {
             return Err(ChronicleError(
@@ -236,20 +245,20 @@ impl ChronicleTool {
             .unwrap_or(self.expand_limit)
             .clamp(1, self.expand_limit);
 
-        let from = crate::conversation::chronicle::ChronicleBoundary::new(
-            checkpoint.covers_from_at,
-            checkpoint.covers_from_message_id.clone(),
-        );
+        let from = checkpoint.start_boundary();
         let to = checkpoint.end_boundary();
 
         let messages = self
             .store
-            .messages_in_range(&self.channel_id, &from, &to, limit)
+            .messages_in_range(&self.channel_id, from, to, after, limit)
             .await
             .map_err(|error| ChronicleError(format!("Failed to expand checkpoint: {error}")))?;
 
+        let start = after.unwrap_or(from.seq);
+        let read_so_far = (start - from.seq).max(0) + messages.len() as i64;
         let mut summary = format!(
-            "## Raw transcript for checkpoint #{} — {}\n\n{} → {} · {} of {} covered messages\n\n",
+            "## Raw transcript for checkpoint #{} — {}\n\n{} → {} · showing {} of {} covered \
+             messages\n\n",
             checkpoint.seq,
             checkpoint.title,
             checkpoint.covers_from_at.format("%Y-%m-%d %H:%M"),
@@ -259,10 +268,20 @@ impl ChronicleTool {
         );
         summary.push_str(&crate::agent::chronicle::render_log_transcript(&messages));
 
-        if (messages.len() as i64) < checkpoint.message_count {
-            summary.push_str(&format!(
-                "\n[Truncated at {limit} messages. Raise `limit` to read further into this span.]\n"
-            ));
+        // A checkpoint may cover more messages than one page returns. Hand back
+        // the cursor to continue from rather than suggesting a larger limit
+        // that would just be clamped again.
+        match messages.last().and_then(|message| message.seq) {
+            Some(cursor) if cursor < to.seq => {
+                let remaining = checkpoint.message_count - read_so_far;
+                summary.push_str(&format!(
+                    "\n[{} more message(s) in this span. Continue with \
+                     `action: \"expand\", checkpoint: {}, after: {cursor}`.]\n",
+                    remaining.max(0),
+                    checkpoint.seq,
+                ));
+            }
+            _ => {}
         }
 
         Ok(self.output("expand", summary))
@@ -331,11 +350,18 @@ mod tests {
         .execute(&pool)
         .await
         .expect("chronicle migration");
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20260810000001_conversation_message_seq.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("seq migration");
 
         for (index, id) in ["m1", "m2", "m3"].iter().enumerate() {
             sqlx::query(
-                "INSERT INTO conversation_messages (id, channel_id, role, content, created_at) \
-                 VALUES (?, 'ch', 'user', 'hello', ?)",
+                "INSERT INTO conversation_messages (id, channel_id, role, content, created_at, seq) \
+                 VALUES (?, 'ch', 'user', 'hello', ?, \
+                    COALESCE((SELECT MAX(seq) FROM conversation_messages WHERE channel_id = 'ch'), 0) + 1)",
             )
             .bind(id)
             .bind(format!("2026-08-01 00:00:0{index}"))
@@ -357,8 +383,12 @@ mod tests {
                 kind: CheckpointKind::Interval,
                 title: "First span".into(),
                 summary: "They said hello three times.".into(),
-                covers_from: ChronicleBoundary::origin(at("2026-08-01T00:00:00Z")),
-                covers_to: ChronicleBoundary::new(at("2026-08-01T00:00:02Z"), Some("m3".into())),
+                covers_from: ChronicleBoundary::origin(),
+                covers_to: ChronicleBoundary::new(3),
+                covers_from_at: at("2026-08-01T00:00:00Z"),
+                covers_to_at: at("2026-08-01T00:00:02Z"),
+                covers_from_message_id: None,
+                covers_to_message_id: Some("m3".into()),
                 message_count: 3,
                 token_estimate: 5,
                 rolls_up_from_seq: None,
@@ -394,14 +424,17 @@ mod tests {
     #[tokio::test]
     async fn metadata_capability_refuses_expand() {
         let tool = tool(store_with_checkpoint().await, ChronicleCapability::Metadata);
-        let error = tool.expand(Some(1), None).await.expect_err("must refuse");
+        let error = tool
+            .expand(Some(1), None, None)
+            .await
+            .expect_err("must refuse");
         assert!(error.to_string().contains("not available here"));
     }
 
     #[tokio::test]
     async fn expand_capability_returns_raw_messages() {
         let tool = tool(store_with_checkpoint().await, ChronicleCapability::Expand);
-        let output = tool.expand(Some(1), None).await.expect("expand");
+        let output = tool.expand(Some(1), None, None).await.expect("expand");
         assert!(output.summary.contains("Raw transcript for checkpoint #1"));
         assert_eq!(
             output.summary.matches("hello").count(),
@@ -411,16 +444,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expand_respects_its_limit_and_says_so() {
+    async fn expand_pages_forward_with_a_cursor_instead_of_a_bigger_limit() {
         let tool = ChronicleTool::new(
             store_with_checkpoint().await,
             "ch",
             ChronicleCapability::Expand,
             2,
         );
-        let output = tool.expand(Some(1), None).await.expect("expand");
-        assert_eq!(output.summary.matches("hello").count(), 2);
-        assert!(output.summary.contains("Truncated at 2 messages"));
+
+        let first = tool.expand(Some(1), None, None).await.expect("expand");
+        assert_eq!(first.summary.matches("hello").count(), 2);
+        assert!(
+            first.summary.contains("after: 2"),
+            "a partial page hands back the cursor to continue from: {}",
+            first.summary
+        );
+
+        // Continuing from the cursor reaches the rest of the span, which a
+        // clamped `limit` never could.
+        let second = tool.expand(Some(1), None, Some(2)).await.expect("expand");
+        assert_eq!(second.summary.matches("hello").count(), 1);
+        assert!(
+            !second.summary.contains("more message(s)"),
+            "the final page is not advertised as partial"
+        );
     }
 
     #[tokio::test]
@@ -434,7 +481,7 @@ mod tests {
             100,
         );
         assert!(tool.open(Some(1)).await.is_err());
-        assert!(tool.expand(Some(1), None).await.is_err());
+        assert!(tool.expand(Some(1), None, None).await.is_err());
         let listed = tool.list(None).await.expect("list");
         assert!(listed.summary.contains("no chronicle checkpoints yet"));
     }

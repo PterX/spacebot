@@ -28,7 +28,7 @@ Note the pre-flight fork trimming in the same file — `precompact_forked_histor
 ## The Invariant
 
 ```text
-conversation_messages, ordered by (created_at, id)
+conversation_messages, ordered by seq (per-channel insertion order)
 ├──────────────┼──────────────┼──────────────┼─────────────────────┤
      cp #1          cp #2          cp #3        unsummarized tail
      ▲              ▲              ▲            ▲
@@ -46,11 +46,14 @@ active context = system prompt { header + rollups + recent checkpoints }
 2. **A checkpoint summarizes raw messages only.** Prior summaries may be supplied to the summarizer as narrative context, but the output describes only the new interval. No checkpoint is ever regenerated from another checkpoint's text.
 3. **Checkpoints are append-only and immutable.** Rollups add rows; they never delete or rewrite the rows they cover. A level-0 checkpoint's summary text, boundaries, and sequence are fixed at commit.
 4. **Commit is idempotent under retry and restart.** Boundaries are derived inside the transaction and constrained by unique indexes, so a duplicate or late commit is rejected rather than written. A checkpoint that fails to commit leaves the span unsummarized — the next cut picks it up.
-5. **The chronicle never blocks a turn.** Cut selection takes a read lock, the LLM call holds none, and the in-memory trim is a bounded write-lock section guarded by a generation check.
+5. **The chronicle never blocks a turn.** Cut selection takes a read lock, the LLM call holds none, and the in-memory trim is a bounded write-lock section guarded by the shared fence.
+6. **One fence guards every head mutation.** Both compaction modes share it, so a mode switch cannot leave two summarizers mutating the same head, and emergency truncation cannot interleave with a cut mid-commit.
 
 ### Ordering key
 
-`conversation_messages.created_at` defaults to `CURRENT_TIMESTAMP`, which SQLite resolves to whole seconds, and `id` is a random UUID. Neither is individually a total order. The chronicle uses `(created_at, id)` as *the* ordering key everywhere — cut selection, boundary comparison, and expansion all use the same `ORDER BY created_at, id`. Within a one-second burst the resulting order may not be true arrival order, but it is deterministic and identical across every consumer, which is what contiguity requires. Messages are never reordered after insert, so a boundary stays valid. Adding a monotonic sequence column was considered and rejected: the log's writers are fire-and-forget `tokio::spawn` tasks (`ConversationLogger`), so a per-channel counter would have to be serialized across them for no gain over a deterministic composite key, and implicit `rowid` is not VACUUM-stable on a `TEXT PRIMARY KEY` table.
+Coverage is keyed on `conversation_messages.seq`, a monotonic per-channel value assigned inside the INSERT from the channel's current maximum. It is insertion order, not wall-clock order, and that distinction is the whole point: `ConversationLogger` writes are detached `tokio::spawn` tasks, so a row written *after* a checkpoint committed can carry the same whole-second `created_at` (SQLite's `CURRENT_TIMESTAMP` has one-second resolution) and a lexically smaller random UUID. Under a `(created_at, id)` key that row sorts behind the committed boundary and is excluded from every future `messages_after` call — silently lost. Under `seq` it always sorts after, because the sequence is taken when the write lands.
+
+SQLite serializes writers, so read-max-and-increment inside one INSERT is atomic; a unique index on `(channel_id, seq)` makes any violation loud rather than silent. Rows predating the column are backfilled in `(created_at, id)` order so historical coverage stays stable across the upgrade.
 
 ---
 
@@ -58,9 +61,13 @@ active context = system prompt { header + rollups + recent checkpoints }
 
 ### Coverage is anchored to the durable log, not the in-memory vector
 
-The in-memory `Vec<Message>` is empty on restart and is mutated by the turn loop in ways the chronicle does not control. Boundaries anchored to it would not survive a restart and could not be expanded back into anything. So a checkpoint's identity is a range over `conversation_messages`, which is durable, append-only in practice, and already the source `channel_recall` and the portal timeline read from.
+The in-memory `Vec<Message>` is empty on restart and is mutated by the turn loop in ways the chronicle does not control. Boundaries anchored to it would not survive a restart and could not be expanded back into anything. So a checkpoint's identity is a `seq` range over `conversation_messages`.
 
-The in-memory trim is then a *derived* action, not the definition of the checkpoint. After a checkpoint commits, the channel drops the corresponding prefix of its live history. If that trim is skipped — because the generation changed, or the process restarted mid-flight — the checkpoint is still correct and the next context assembly still uses it. Durable state and live state can disagree temporarily without corrupting either.
+The in-memory trim is then a *derived* action. It is not a count: live entries and durable rows are not one-to-one, because a successful turn appends every tool call and tool result to live history while only a user row and a final assistant row are persisted. Trimming `durable_uncovered + margin` entries would therefore drop a tool-heavy turn's working detail that no checkpoint ever summarized and no expansion can recover.
+
+Instead the channel records a **turn boundary** after every turn — the live-history length paired with the durable watermark at that moment — and a trim lands only on a boundary whose watermark the checkpoint already covers. Turns are never split. The `HistoryFence` owns those boundaries, and because `max_seq` is read after the turn while logger writes are still in flight, the watermark can lag; lagging low makes the trim keep more, never less.
+
+The live entries a cut is about to drop are also fed into the summarizer alongside the durable rows, under their own heading. Tool traffic never reaches the log, so this is the only place it can be captured at all.
 
 ### The chronicle view renders into the system prompt, not into history
 
@@ -72,9 +79,17 @@ To be precise about the cache: trimming the live history is still a head mutatio
 
 ### Interval, not pressure — with pressure kept as a floor
 
-A cut fires when **either** `messages_since_last_checkpoint >= interval_messages` (default 40) **or** `tokens_since_last_checkpoint >= interval_tokens` (default 12% of the context window). Message count gives predictable narrative granularity in conversational channels; token growth catches the tool-heavy turn that consumes a third of the window in four messages. Either alone leaves an obvious hole.
+A cut fires when **either** `messages_since_last_checkpoint >= interval_messages` (default 40) **or** `tokens_since_last_checkpoint >= interval_tokens` (default 12% of the context window). Message count gives predictable narrative granularity; token growth catches the tool-heavy turn that consumes a third of the window in four messages.
 
-The existing thresholds stay as a safety net rather than the primary trigger. Crossing `background_threshold` forces a cut immediately regardless of interval (`kind = 'pressure'`), and `emergency_threshold` still performs the synchronous no-LLM truncation — but records a `kind = 'emergency'` checkpoint marking the discarded span, so a gap in the chronicle is visible rather than silent. That is the one case where a checkpoint's summary does not describe its contents, and it says so.
+The existing thresholds stay as a safety net. Crossing `background_threshold` forces a cut regardless of interval (`kind = 'pressure'`), and `emergency_threshold` performs the synchronous no-LLM truncation, recording a `kind = 'emergency'` checkpoint over **only the span it actually discarded** — live entries still in context stay uncovered so a later interval cut can summarize them properly. At the retention floor there is nothing to drop, and the monitor reports that nothing happened rather than an emergency every turn.
+
+### One fence for every head mutation
+
+Both compaction modes share a `HistoryFence`. Mode is resolved per turn, so a `chronicle → rolling` switch while a cut is in flight would otherwise let the rolling compactor drain the head and the old cut trim it again; the reverse switch would let a stale rolling worker insert a legacy summary on top of a chronicle-trimmed head. The fence carries a generation counter bumped by *every* head mutation from either mode, a mode epoch bumped whenever the channel observes a different mode, and a mutation mutex held across any head mutation and any commit — which is also what serializes emergency truncation against a regular cut. A cut captures the fence state before its LLM call and re-checks it before committing and again before trimming; a mismatch discards the trim and leaves the checkpoint valid.
+
+### Bootstrap never inherits an unrelated summary
+
+An earlier revision reused the rolling compactor's `[Compaction Summary]` head as the bootstrap checkpoint's text. That is wrong: the rolling head describes whatever live history *that process* had drained, while the bootstrap range is the channel's oldest readable durable slice, which can predate it by months. There is no recorded coverage for the rolling summary to check against, so it is not reused at all — the bootstrap span is summarized from its own durable rows, and the prompt states plainly that the slice is not the whole past.
 
 ### Rollups add a level; they never replace a row
 
@@ -198,15 +213,17 @@ render_chronicle_view(channel_id, now, budget_tokens):
   return header ++ body
 ```
 
-Defaults: `recent_window` 24h, `max_recent` 8, `context_token_budget` 2000 — the same order of magnitude as `WorkingMemoryConfig::context_token_budget` (1500). The header never collapses; it is what tells the agent that more exists and that the chronicle tool can reach it. Degradation is graceful and monotone: the oldest entries lose their bodies first, and a title plus a date range is still a usable index entry.
+Defaults: `recent_window` 24h, `max_recent` 8, `context_token_budget` 2000. All chronicle tuning is clamped at load: an unbounded budget or list size would let configuration defeat the cap it exists to enforce.
 
-The live history in chronicle mode holds only messages after the last checkpoint's boundary, so steady-state context is roughly `interval_tokens` of raw turns plus a bounded chronicle view — substantially below the 80% the rolling mode idles at, continuously, rather than sawtoothing between 80% and 50%.
+The budget is a hard upper bound, not a hint. Collapsing every entry to a title is not sufficient — a long index of one-liners can still exceed it — so after collapsing, entries are dropped oldest-first and the header reports how many are not shown and that the `chronicle` tool can list them. The header itself never collapses.
 
----
+### Restart
+
+A restarting channel in chronicle mode must reconstruct *checkpoint view + raw uncovered tail*. Loading the last `history_backfill_count` rows unconditionally duplicates messages the checkpoints already cover and silently omits an uncovered tail longer than that limit, while the chronicle header claims all of it is in context. The resume path instead queries strictly after the latest level-0 boundary; when the tail exceeds the limit the omission is stated in the injected transcript rather than left implicit.
 
 ## Surfaces
 
-**Tool.** `chronicle`, `src/tools/chronicle.rs`, actions `list` / `open` / `expand`. Registered into the branch tool server (`create_branch_tool_server`) with `Expand`, and into the channel tool server (`add_channel_tools`) with `Metadata`. Prompt text in `prompts/en/tools/chronicle.md`, following the existing `crate::prompts::text::get("tools/…")` convention.
+**Tool.** `chronicle`, `src/tools/chronicle.rs`, actions `list` / `open` / `expand`. A checkpoint can cover more messages than one page returns, so `expand` takes an `after` cursor and hands back the next one — raising `limit` cannot work, since it is clamped to `expand_message_limit`. Registered into the branch tool server (`create_branch_tool_server`) with `Expand`, and into the channel tool server (`add_channel_tools`) with `Metadata`. Prompt text in `prompts/en/tools/chronicle.md`, following the existing `crate::prompts::text::get("tools/…")` convention.
 
 **API and timeline.** `TimelineItem` (`src/conversation/history.rs:264`) gains a `Checkpoint` variant, and `load_channel_timeline`'s `UNION ALL` gains a fourth arm over the checkpoint table. It flows to the portal unchanged: `GET /channels/messages` → OpenAPI → `interface/src/api/schema.d.ts` via `just typegen` → the `TimelineEntry` switch in `ChannelDetail.tsx:424` and `PortalTimeline.tsx`. Checkpoints render as their own entry kind — neither user nor assistant — showing kind, covered range, message count, summary, and a rollup badge where `rolled_up_into` is set, with the body expandable.
 

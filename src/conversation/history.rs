@@ -26,6 +26,10 @@ pub struct ConversationMessage {
     pub content: String,
     pub metadata: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Monotonic per-channel insertion order. Rows written before the
+    /// migration that introduced it are backfilled; only a row that somehow
+    /// escaped both is `None`.
+    pub seq: Option<i64>,
 }
 
 impl ConversationLogger {
@@ -52,8 +56,10 @@ impl ConversationLogger {
 
         tokio::spawn(async move {
             if let Err(error) = sqlx::query(
-                "INSERT INTO conversation_messages (id, channel_id, role, sender_name, sender_id, content, metadata) \
-                 VALUES (?, ?, 'user', ?, ?, ?, ?)"
+                "INSERT INTO conversation_messages \
+                 (id, channel_id, role, sender_name, sender_id, content, metadata, seq) \
+                 VALUES (?, ?, 'user', ?, ?, ?, ?, \
+                    COALESCE((SELECT MAX(seq) FROM conversation_messages WHERE channel_id = ?), 0) + 1)"
             )
             .bind(&id)
             .bind(&channel_id)
@@ -61,6 +67,7 @@ impl ConversationLogger {
             .bind(&sender_id)
             .bind(&content)
             .bind(&metadata_json)
+            .bind(&channel_id)
             .execute(&pool)
             .await
             {
@@ -87,12 +94,14 @@ impl ConversationLogger {
 
         tokio::spawn(async move {
             if let Err(error) = sqlx::query(
-                "INSERT INTO conversation_messages (id, channel_id, role, sender_name, content) \
-                 VALUES (?, ?, 'system', 'system', ?)",
+                "INSERT INTO conversation_messages (id, channel_id, role, sender_name, content, seq) \
+                 VALUES (?, ?, 'system', 'system', ?, \
+                    COALESCE((SELECT MAX(seq) FROM conversation_messages WHERE channel_id = ?), 0) + 1)",
             )
             .bind(&id)
             .bind(&channel_id)
             .bind(&content)
+            .bind(&channel_id)
             .execute(&pool)
             .await
             {
@@ -130,14 +139,17 @@ impl ConversationLogger {
 
         tokio::spawn(async move {
             if let Err(error) = sqlx::query(
-                "INSERT INTO conversation_messages (id, channel_id, role, sender_name, content, metadata) \
-                 VALUES (?, ?, 'assistant', ?, ?, ?)",
+                "INSERT INTO conversation_messages \
+                 (id, channel_id, role, sender_name, content, metadata, seq) \
+                 VALUES (?, ?, 'assistant', ?, ?, ?, \
+                    COALESCE((SELECT MAX(seq) FROM conversation_messages WHERE channel_id = ?), 0) + 1)",
             )
             .bind(&id)
             .bind(&channel_id)
             .bind(&sender_name)
             .bind(&content)
             .bind(&metadata_json)
+            .bind(&channel_id)
             .execute(&pool)
             .await
             {
@@ -153,7 +165,7 @@ impl ConversationLogger {
         limit: i64,
     ) -> crate::error::Result<Vec<ConversationMessage>> {
         let rows = sqlx::query(
-            "SELECT id, channel_id, role, sender_name, sender_id, content, metadata, created_at \
+            "SELECT id, channel_id, role, sender_name, sender_id, content, metadata, created_at, seq \
              FROM conversation_messages \
              WHERE channel_id = ? \
              ORDER BY created_at DESC \
@@ -178,6 +190,7 @@ impl ConversationLogger {
                 created_at: row
                     .try_get("created_at")
                     .unwrap_or_else(|_| chrono::Utc::now()),
+                seq: row.try_get("seq").ok().flatten(),
             })
             .collect();
 
@@ -201,7 +214,7 @@ impl ConversationLogger {
         oldest_first: bool,
     ) -> crate::error::Result<Vec<ConversationMessage>> {
         let mut sql = String::from(
-            "SELECT id, channel_id, role, sender_name, sender_id, content, metadata, created_at \
+            "SELECT id, channel_id, role, sender_name, sender_id, content, metadata, created_at, seq \
              FROM conversation_messages \
              WHERE channel_id = ?",
         );
@@ -247,6 +260,7 @@ impl ConversationLogger {
                 created_at: row
                     .try_get("created_at")
                     .unwrap_or_else(|_| chrono::Utc::now()),
+                seq: row.try_get("seq").ok().flatten(),
             })
             .collect();
 
@@ -1353,6 +1367,7 @@ mod tests {
             include_str!("../../migrations/20260211000002_conversations.sql"),
             include_str!("../../migrations/20260213000003_process_runs.sql"),
             include_str!("../../migrations/20260809000004_session_chronicles.sql"),
+            include_str!("../../migrations/20260810000001_conversation_message_seq.sql"),
         ] {
             sqlx::raw_sql(migration)
                 .execute(&pool)
@@ -1366,8 +1381,9 @@ mod tests {
             ("m3", "2026-08-01 00:00:09"),
         ] {
             sqlx::query(
-                "INSERT INTO conversation_messages (id, channel_id, role, content, created_at) \
-                 VALUES (?, 'ch', 'user', 'hi', ?)",
+                "INSERT INTO conversation_messages (id, channel_id, role, content, created_at, seq) \
+                 VALUES (?, 'ch', 'user', 'hi', ?, \
+                    COALESCE((SELECT MAX(seq) FROM conversation_messages WHERE channel_id = 'ch'), 0) + 1)",
             )
             .bind(id)
             .bind(at)
@@ -1388,8 +1404,12 @@ mod tests {
                 kind: CheckpointKind::Interval,
                 title: "Opening span".into(),
                 summary: "They greeted each other twice.".into(),
-                covers_from: ChronicleBoundary::origin(at("2026-08-01T00:00:01Z")),
-                covers_to: ChronicleBoundary::new(at("2026-08-01T00:00:02Z"), Some("m2".into())),
+                covers_from: ChronicleBoundary::origin(),
+                covers_to: ChronicleBoundary::new(2),
+                covers_from_at: at("2026-08-01T00:00:01Z"),
+                covers_to_at: at("2026-08-01T00:00:02Z"),
+                covers_from_message_id: None,
+                covers_to_message_id: Some("m2".into()),
                 message_count: 2,
                 token_estimate: 5,
                 rolls_up_from_seq: None,

@@ -105,6 +105,60 @@ fn render_platform_history_backfill(
     serialize_backfill_transcript(entries)
 }
 
+/// The raw tail a chronicle-mode channel should resume with: everything
+/// strictly after the latest committed checkpoint boundary.
+///
+/// Returns `None` when the channel is not chronicling or has no checkpoints,
+/// leaving the legacy "last N rows" path in charge. When the tail is longer
+/// than the backfill limit the oldest part is dropped and the transcript says
+/// so, rather than the chronicle header claiming context that is not there.
+async fn resume_chronicle_tail(
+    channel: &spacebot::agent::channel::Channel,
+    limit: i64,
+    conversation_id: &str,
+) -> Option<Vec<spacebot::conversation::history::ConversationMessage>> {
+    let compaction = **channel.deps.runtime_config.compaction.load();
+    if compaction.mode != spacebot::config::CompactionMode::Chronicle
+        || channel.state.kind.self_exits()
+    {
+        return None;
+    }
+
+    let store = channel.chronicler.store();
+    let latest = store.latest(&channel.id, 0).await.ok().flatten()?;
+    let boundary = latest.end_boundary();
+
+    let uncovered = store
+        .count_messages_after(&channel.id, boundary)
+        .await
+        .ok()?;
+    // Read one extra so a truncated tail is detectable.
+    let mut messages = store
+        .messages_after(&channel.id, boundary, limit)
+        .await
+        .ok()?;
+
+    if uncovered > messages.len() as i64 {
+        tracing::warn!(
+            conversation_id = %conversation_id,
+            uncovered,
+            loaded = messages.len(),
+            "chronicle raw tail exceeds the backfill limit; the oldest uncovered messages are \
+             omitted from the resumed context"
+        );
+        let omitted = uncovered - messages.len() as i64;
+        if let Some(first) = messages.first_mut() {
+            first.content = format!(
+                "[{omitted} older uncovered message(s) omitted from this resumed session — \
+                 expand them with the chronicle tool.]\n{}",
+                first.content
+            );
+        }
+    }
+
+    Some(messages)
+}
+
 fn render_conversation_history_backfill(
     history_messages: &[spacebot::conversation::history::ConversationMessage],
 ) -> Option<String> {
@@ -1312,12 +1366,28 @@ async fn run(
                     if backfill_count > 0 {
                         let backfill_limit =
                             std::cmp::min(backfill_count, i64::MAX as usize) as i64;
-                        match channel
-                            .state
-                            .conversation_logger
-                            .load_recent(&channel.id, backfill_limit)
-                            .await
-                        {
+
+                        // In chronicle mode the checkpoint view already covers
+                        // everything up to the latest boundary, so the raw tail
+                        // must start strictly after it. Loading the last N rows
+                        // unconditionally would duplicate covered messages and
+                        // silently omit an uncovered tail longer than N, while
+                        // the chronicle header claims all of it is present.
+                        let chronicle_tail =
+                            resume_chronicle_tail(&channel, backfill_limit, &conversation_id).await;
+
+                        let loaded = match chronicle_tail {
+                            Some(messages) => Ok(messages),
+                            None => {
+                                channel
+                                    .state
+                                    .conversation_logger
+                                    .load_recent(&channel.id, backfill_limit)
+                                    .await
+                            }
+                        };
+
+                        match loaded {
                             Ok(history_messages) => {
                                 if let Some(transcript) =
                                     render_conversation_history_backfill(&history_messages)

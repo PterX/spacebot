@@ -57,32 +57,58 @@ fn resolve_compaction_config(
             .aggressive_threshold
             .unwrap_or(base.aggressive_threshold),
         emergency_threshold: toml.emergency_threshold.unwrap_or(base.emergency_threshold),
-        chronicle: toml
-            .chronicle
-            .map(|c| ChronicleConfig {
-                interval_messages: c
-                    .interval_messages
-                    .unwrap_or(base.chronicle.interval_messages),
-                interval_token_fraction: c
-                    .interval_token_fraction
-                    .unwrap_or(base.chronicle.interval_token_fraction),
-                recent_window_hours: c
-                    .recent_window_hours
-                    .unwrap_or(base.chronicle.recent_window_hours),
-                max_recent: c.max_recent.unwrap_or(base.chronicle.max_recent),
-                max_older: c.max_older.unwrap_or(base.chronicle.max_older),
-                context_token_budget: c
-                    .context_token_budget
-                    .unwrap_or(base.chronicle.context_token_budget),
-                expand_message_limit: c
-                    .expand_message_limit
-                    .unwrap_or(base.chronicle.expand_message_limit),
-                max_messages_per_checkpoint: c
-                    .max_messages_per_checkpoint
-                    .unwrap_or(base.chronicle.max_messages_per_checkpoint),
-            })
-            .unwrap_or(base.chronicle),
+        chronicle: clamp_chronicle_config(
+            toml.chronicle
+                .map(|c| ChronicleConfig {
+                    interval_messages: c
+                        .interval_messages
+                        .unwrap_or(base.chronicle.interval_messages),
+                    interval_token_fraction: c
+                        .interval_token_fraction
+                        .unwrap_or(base.chronicle.interval_token_fraction),
+                    recent_window_hours: c
+                        .recent_window_hours
+                        .unwrap_or(base.chronicle.recent_window_hours),
+                    max_recent: c.max_recent.unwrap_or(base.chronicle.max_recent),
+                    max_older: c.max_older.unwrap_or(base.chronicle.max_older),
+                    context_token_budget: c
+                        .context_token_budget
+                        .unwrap_or(base.chronicle.context_token_budget),
+                    expand_message_limit: c
+                        .expand_message_limit
+                        .unwrap_or(base.chronicle.expand_message_limit),
+                    max_messages_per_checkpoint: c
+                        .max_messages_per_checkpoint
+                        .unwrap_or(base.chronicle.max_messages_per_checkpoint),
+                })
+                .unwrap_or(base.chronicle),
+        ),
     }
+}
+
+/// Keep chronicle tuning inside ranges the assembly and tools can honour.
+///
+/// An unbounded `context_token_budget` or list size would let configuration
+/// silently defeat the prompt cap, and a zero interval would cut every turn.
+fn clamp_chronicle_config(mut config: ChronicleConfig) -> ChronicleConfig {
+    const MAX_CONTEXT_TOKEN_BUDGET: usize = 32_000;
+    const MAX_LIST_ENTRIES: usize = 100;
+    const MAX_EXPAND_MESSAGES: i64 = 500;
+    const MAX_MESSAGES_PER_CHECKPOINT: i64 = 5_000;
+
+    config.interval_messages = config.interval_messages.max(1);
+    config.interval_token_fraction = config.interval_token_fraction.clamp(0.01, 0.9);
+    config.recent_window_hours = config.recent_window_hours.max(1);
+    config.max_recent = config.max_recent.clamp(1, MAX_LIST_ENTRIES);
+    config.max_older = config.max_older.min(MAX_LIST_ENTRIES);
+    config.context_token_budget = config
+        .context_token_budget
+        .clamp(200, MAX_CONTEXT_TOKEN_BUDGET);
+    config.expand_message_limit = config.expand_message_limit.clamp(1, MAX_EXPAND_MESSAGES);
+    config.max_messages_per_checkpoint = config
+        .max_messages_per_checkpoint
+        .clamp(1, MAX_MESSAGES_PER_CHECKPOINT);
+    config
 }
 
 use anyhow::Context as _;

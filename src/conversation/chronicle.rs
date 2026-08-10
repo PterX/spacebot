@@ -7,12 +7,13 @@
 //! channel's in-memory history, because the log is what survives restart and
 //! what a later expansion can be resolved against.
 //!
-//! Ordering is `(created_at, id)` everywhere — cut selection, boundary
-//! comparison, and expansion all use it. `created_at` defaults to
-//! `CURRENT_TIMESTAMP`, which SQLite resolves to whole seconds, so `id`
-//! breaks ties. Within a one-second burst the order may not be true arrival
-//! order, but it is deterministic and identical for every consumer, which is
-//! what contiguity requires.
+//! Ordering is `conversation_messages.seq` everywhere — cut selection,
+//! boundary comparison, and expansion all use it. `seq` is assigned per
+//! channel at INSERT time, so it is insertion order, not wall-clock order.
+//! That matters because `ConversationLogger` writes are detached tasks: a row
+//! written after a boundary was committed can carry the same whole-second
+//! `created_at` and a lexically smaller id, and under a `(created_at, id)`
+//! key it would sort behind the boundary and never be selected again.
 
 use crate::conversation::history::ConversationMessage;
 use crate::error::Result;
@@ -70,27 +71,27 @@ impl CheckpointKind {
     }
 }
 
-/// One end of a coverage range: a position in the `(created_at, id)` ordering.
+/// One end of a coverage range: a position in the durable per-channel
+/// `conversation_messages.seq` order.
 ///
-/// `message_id` is `None` only for the open start of a channel that had no
-/// logged messages when its chronicle began.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `seq` is assigned at INSERT time, so a message written after a boundary was
+/// committed always sorts after it. That is what makes "everything after the
+/// boundary" exact even though `ConversationLogger` writes are detached tasks
+/// whose wall-clock timestamps can collide within a second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ChronicleBoundary {
-    pub at: DateTime<Utc>,
-    pub message_id: Option<String>,
+    pub seq: i64,
 }
 
 impl ChronicleBoundary {
-    pub fn new(at: DateTime<Utc>, message_id: Option<String>) -> Self {
-        Self { at, message_id }
+    pub fn new(seq: i64) -> Self {
+        Self { seq }
     }
 
-    /// The boundary a channel with no prior chronicle starts from.
-    pub fn origin(at: DateTime<Utc>) -> Self {
-        Self {
-            at,
-            message_id: None,
-        }
+    /// The boundary a channel with no prior chronicle starts from: before the
+    /// first message, which is assigned seq 1.
+    pub fn origin() -> Self {
+        Self { seq: 0 }
     }
 }
 
@@ -108,6 +109,8 @@ pub struct ChronicleCheckpoint {
     pub covers_to_at: DateTime<Utc>,
     pub covers_from_message_id: Option<String>,
     pub covers_to_message_id: Option<String>,
+    pub covers_from_seq: i64,
+    pub covers_to_seq: i64,
     pub message_count: i64,
     pub token_estimate: i64,
     pub rolled_up_into: Option<String>,
@@ -120,7 +123,12 @@ pub struct ChronicleCheckpoint {
 impl ChronicleCheckpoint {
     /// The boundary a following checkpoint must start from.
     pub fn end_boundary(&self) -> ChronicleBoundary {
-        ChronicleBoundary::new(self.covers_to_at, self.covers_to_message_id.clone())
+        ChronicleBoundary::new(self.covers_to_seq)
+    }
+
+    /// The boundary this checkpoint's own coverage opens at.
+    pub fn start_boundary(&self) -> ChronicleBoundary {
+        ChronicleBoundary::new(self.covers_from_seq)
     }
 }
 
@@ -134,6 +142,11 @@ pub struct NewCheckpoint {
     pub summary: String,
     pub covers_from: ChronicleBoundary,
     pub covers_to: ChronicleBoundary,
+    /// Display range for the covered span. Selection uses the boundaries.
+    pub covers_from_at: DateTime<Utc>,
+    pub covers_to_at: DateTime<Utc>,
+    pub covers_from_message_id: Option<String>,
+    pub covers_to_message_id: Option<String>,
     pub message_count: i64,
     pub token_estimate: i64,
     pub rolls_up_from_seq: Option<i64>,
@@ -149,9 +162,12 @@ pub enum CommitOutcome {
     /// boundary no longer joins the last committed checkpoint. The span stays
     /// unsummarized and the next cut covers it.
     Superseded {
-        expected: Option<String>,
-        found: Option<String>,
+        expected: i64,
+        found: i64,
     },
+    /// The write lock could not be taken within the retry budget. The span
+    /// stays unsummarized and the next cut covers it.
+    Busy,
 }
 
 /// Aggregate chronicle state for a channel, used to build the prompt header.
@@ -210,37 +226,99 @@ impl ChronicleStore {
 
     /// Commit a checkpoint, rejecting it if the tail moved underneath it.
     ///
-    /// The start boundary must join the newest checkpoint's end boundary,
-    /// checked inside the transaction that allocates the sequence. A racing
-    /// commit that slips past the check trips the `(channel_id, seq)` or
-    /// `(channel_id, level, covers_to_message_id)` unique index and is
-    /// reported the same way.
+    /// Runs under `BEGIN IMMEDIATE` so the write lock is taken before the
+    /// boundary is read — a deferred transaction would read the boundary, then
+    /// fail on lock upgrade at INSERT time, which SQLite reports as
+    /// `SQLITE_BUSY` rather than a constraint violation. Busy conflicts are
+    /// retried a bounded number of times and then reported as
+    /// [`CommitOutcome::Busy`]; the span simply stays unsummarized.
     pub async fn commit(&self, new: NewCheckpoint) -> Result<CommitOutcome> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|error| anyhow::anyhow!(error))?;
+        const MAX_BUSY_RETRIES: u32 = 4;
+        const BASE_BUSY_DELAY_MS: u64 = 25;
 
+        for attempt in 0..=MAX_BUSY_RETRIES {
+            match self.try_commit(&new).await {
+                Ok(outcome) => return Ok(outcome),
+                Err(error) if is_busy(&error) && attempt < MAX_BUSY_RETRIES => {
+                    let delay = BASE_BUSY_DELAY_MS * 2u64.pow(attempt);
+                    tracing::debug!(
+                        channel_id = %new.channel_id,
+                        attempt,
+                        delay_ms = delay,
+                        "chronicle commit hit a write-lock conflict; retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+                Err(error) if is_busy(&error) => {
+                    tracing::warn!(
+                        channel_id = %new.channel_id,
+                        "chronicle commit gave up after {MAX_BUSY_RETRIES} write-lock conflicts"
+                    );
+                    return Ok(CommitOutcome::Busy);
+                }
+                Err(error) => return Err(anyhow::anyhow!(error).into()),
+            }
+        }
+
+        Ok(CommitOutcome::Busy)
+    }
+
+    async fn try_commit(
+        &self,
+        new: &NewCheckpoint,
+    ) -> std::result::Result<CommitOutcome, sqlx::Error> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await?;
+
+        let outcome = self.commit_in_transaction(new, &mut connection).await;
+
+        match &outcome {
+            Ok(CommitOutcome::Committed(_)) => {
+                sqlx::query("COMMIT").execute(&mut *connection).await?;
+            }
+            _ => {
+                sqlx::query("ROLLBACK").execute(&mut *connection).await.ok();
+            }
+        }
+
+        outcome
+    }
+
+    async fn commit_in_transaction(
+        &self,
+        new: &NewCheckpoint,
+        connection: &mut sqlx::SqliteConnection,
+    ) -> std::result::Result<CommitOutcome, sqlx::Error> {
         let last = sqlx::query(
-            "SELECT seq, covers_to_message_id FROM channel_chronicle_checkpoints \
+            "SELECT covers_to_seq FROM channel_chronicle_checkpoints \
              WHERE channel_id = ? AND level = ? \
              ORDER BY seq DESC LIMIT 1",
         )
         .bind(&new.channel_id)
         .bind(new.level)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(|error| anyhow::anyhow!(error))?;
+        .fetch_optional(&mut *connection)
+        .await?;
 
-        let expected_start: Option<String> = last
+        let expected_start: i64 = last
             .as_ref()
-            .and_then(|row| row.try_get("covers_to_message_id").ok().flatten());
+            .and_then(|row| row.try_get("covers_to_seq").ok())
+            .unwrap_or(0);
 
-        if expected_start != new.covers_from.message_id {
+        if expected_start != new.covers_from.seq {
             return Ok(CommitOutcome::Superseded {
                 expected: expected_start,
-                found: new.covers_from.message_id,
+                found: new.covers_from.seq,
+            });
+        }
+
+        // An empty span would commit a checkpoint that covers nothing and
+        // still advance the boundary.
+        if new.covers_to.seq <= new.covers_from.seq {
+            return Ok(CommitOutcome::Superseded {
+                expected: expected_start,
+                found: new.covers_to.seq,
             });
         }
 
@@ -249,10 +327,9 @@ impl ChronicleStore {
              WHERE channel_id = ?",
         )
         .bind(&new.channel_id)
-        .fetch_one(&mut *transaction)
+        .fetch_one(&mut *connection)
         .await
-        .map(|row| row.try_get("next").unwrap_or(1))
-        .map_err(|error| anyhow::anyhow!(error))?;
+        .map(|row| row.try_get("next").unwrap_or(1))?;
 
         let id = uuid::Uuid::new_v4().to_string();
         let created_at = Utc::now();
@@ -260,9 +337,9 @@ impl ChronicleStore {
         let insert = sqlx::query(
             "INSERT INTO channel_chronicle_checkpoints \
              (id, channel_id, seq, level, kind, title, summary, covers_from_at, covers_to_at, \
-              covers_from_message_id, covers_to_message_id, message_count, token_estimate, \
-              rolls_up_from_seq, rolls_up_to_seq, model, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              covers_from_message_id, covers_to_message_id, covers_from_seq, covers_to_seq, \
+              message_count, token_estimate, rolls_up_from_seq, rolls_up_to_seq, model, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(&new.channel_id)
@@ -271,52 +348,51 @@ impl ChronicleStore {
         .bind(new.kind.as_str())
         .bind(&new.title)
         .bind(&new.summary)
-        .bind(sql_timestamp(new.covers_from.at))
-        .bind(sql_timestamp(new.covers_to.at))
-        .bind(&new.covers_from.message_id)
-        .bind(&new.covers_to.message_id)
+        .bind(sql_timestamp(new.covers_from_at))
+        .bind(sql_timestamp(new.covers_to_at))
+        .bind(&new.covers_from_message_id)
+        .bind(&new.covers_to_message_id)
+        .bind(new.covers_from.seq)
+        .bind(new.covers_to.seq)
         .bind(new.message_count)
         .bind(new.token_estimate)
         .bind(new.rolls_up_from_seq)
         .bind(new.rolls_up_to_seq)
         .bind(&new.model)
         .bind(sql_timestamp(created_at))
-        .execute(&mut *transaction)
+        .execute(&mut *connection)
         .await;
 
         if let Err(error) = insert {
             if is_unique_violation(&error) {
                 return Ok(CommitOutcome::Superseded {
                     expected: expected_start,
-                    found: new.covers_from.message_id,
+                    found: new.covers_from.seq,
                 });
             }
-            return Err(anyhow::anyhow!(error).into());
+            return Err(error);
         }
-
-        transaction
-            .commit()
-            .await
-            .map_err(|error| anyhow::anyhow!(error))?;
 
         Ok(CommitOutcome::Committed(Box::new(ChronicleCheckpoint {
             id,
-            channel_id: new.channel_id,
+            channel_id: new.channel_id.clone(),
             seq: next_seq,
             level: new.level,
             kind: new.kind,
-            title: new.title,
-            summary: new.summary,
-            covers_from_at: new.covers_from.at,
-            covers_to_at: new.covers_to.at,
-            covers_from_message_id: new.covers_from.message_id,
-            covers_to_message_id: new.covers_to.message_id,
+            title: new.title.clone(),
+            summary: new.summary.clone(),
+            covers_from_at: new.covers_from_at,
+            covers_to_at: new.covers_to_at,
+            covers_from_message_id: new.covers_from_message_id.clone(),
+            covers_to_message_id: new.covers_to_message_id.clone(),
+            covers_from_seq: new.covers_from.seq,
+            covers_to_seq: new.covers_to.seq,
             message_count: new.message_count,
             token_estimate: new.token_estimate,
             rolled_up_into: None,
             rolls_up_from_seq: new.rolls_up_from_seq,
             rolls_up_to_seq: new.rolls_up_to_seq,
-            model: new.model,
+            model: new.model.clone(),
             created_at,
         })))
     }
@@ -493,7 +569,7 @@ impl ChronicleStore {
         let latest = self.latest(channel_id, 0).await?;
         let unsummarized = match &latest {
             Some(checkpoint) => {
-                self.count_messages_after(channel_id, &checkpoint.end_boundary())
+                self.count_messages_after(channel_id, checkpoint.end_boundary())
                     .await?
             }
             None => messages.try_get("total").unwrap_or(0),
@@ -514,21 +590,17 @@ impl ChronicleStore {
     pub async fn count_messages_after(
         &self,
         channel_id: &str,
-        boundary: &ChronicleBoundary,
+        boundary: ChronicleBoundary,
     ) -> Result<i64> {
-        let sql = format!(
+        let row = sqlx::query(
             "SELECT COUNT(*) AS total FROM conversation_messages \
-             WHERE channel_id = ?1 AND {}",
-            after_boundary_predicate(boundary)
-        );
-
-        let mut query = sqlx::query(&sql).bind(channel_id);
-        query = bind_boundary(query, boundary);
-
-        let row = query
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|error| anyhow::anyhow!(error))?;
+             WHERE channel_id = ? AND seq > ?",
+        )
+        .bind(channel_id)
+        .bind(boundary.seq)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
 
         Ok(row.try_get("total").unwrap_or(0))
     }
@@ -537,108 +609,77 @@ impl ChronicleStore {
     pub async fn messages_after(
         &self,
         channel_id: &str,
-        boundary: &ChronicleBoundary,
+        boundary: ChronicleBoundary,
         limit: i64,
     ) -> Result<Vec<ConversationMessage>> {
-        let sql = format!(
-            "SELECT id, channel_id, role, sender_name, sender_id, content, metadata, created_at \
+        let rows = sqlx::query(
+            "SELECT id, channel_id, role, sender_name, sender_id, content, metadata, created_at, seq \
              FROM conversation_messages \
-             WHERE channel_id = ?1 AND {} \
-             ORDER BY created_at ASC, id ASC LIMIT ?4",
-            after_boundary_predicate(boundary)
-        );
-
-        let mut query = sqlx::query(&sql).bind(channel_id);
-        query = bind_boundary(query, boundary);
-        query = query.bind(limit);
-
-        let rows = query
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|error| anyhow::anyhow!(error))?;
-
-        Ok(rows.into_iter().map(message_from_row).collect())
-    }
-
-    /// Logged messages inside a checkpoint's coverage, oldest first.
-    ///
-    /// The range is half-open in the same sense the boundaries are:
-    /// `(from, to]`.
-    pub async fn messages_in_range(
-        &self,
-        channel_id: &str,
-        from: &ChronicleBoundary,
-        to: &ChronicleBoundary,
-        limit: i64,
-    ) -> Result<Vec<ConversationMessage>> {
-        let sql = format!(
-            "SELECT id, channel_id, role, sender_name, sender_id, content, metadata, created_at \
-             FROM conversation_messages \
-             WHERE channel_id = ?1 AND {} \
-               AND (datetime(created_at) < datetime(?4) \
-                    OR (datetime(created_at) = datetime(?4) AND id <= ?5)) \
-             ORDER BY created_at ASC, id ASC LIMIT ?6",
-            after_boundary_predicate(from)
-        );
-
-        let mut query = sqlx::query(&sql).bind(channel_id);
-        query = bind_boundary(query, from);
-        query = query
-            .bind(sql_timestamp(to.at))
-            .bind(to.message_id.clone().unwrap_or_default())
-            .bind(limit);
-
-        let rows = query
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|error| anyhow::anyhow!(error))?;
-
-        Ok(rows.into_iter().map(message_from_row).collect())
-    }
-
-    /// The oldest logged message's position, used to open a bootstrap range.
-    pub async fn earliest_message(
-        &self,
-        channel_id: &str,
-    ) -> Result<Option<(DateTime<Utc>, String)>> {
-        let row = sqlx::query(
-            "SELECT id, created_at FROM conversation_messages \
-             WHERE channel_id = ? ORDER BY created_at ASC, id ASC LIMIT 1",
+             WHERE channel_id = ? AND seq > ? \
+             ORDER BY seq ASC LIMIT ?",
         )
         .bind(channel_id)
-        .fetch_optional(&self.pool)
+        .bind(boundary.seq)
+        .bind(limit)
+        .fetch_all(&self.pool)
         .await
         .map_err(|error| anyhow::anyhow!(error))?;
 
-        Ok(row.and_then(|row| {
-            let id: String = row.try_get("id").ok()?;
-            let at: DateTime<Utc> = row.try_get("created_at").ok()?;
-            Some((at, id))
-        }))
+        Ok(rows.into_iter().map(message_from_row).collect())
+    }
+
+    /// Logged messages inside a half-open `(from, to]` seq range, oldest first.
+    ///
+    /// `after` lets a caller page forward through a large checkpoint: pass the
+    /// seq of the last row already read.
+    pub async fn messages_in_range(
+        &self,
+        channel_id: &str,
+        from: ChronicleBoundary,
+        to: ChronicleBoundary,
+        after: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<ConversationMessage>> {
+        let start = from.seq.max(after.unwrap_or(from.seq));
+        let rows = sqlx::query(
+            "SELECT id, channel_id, role, sender_name, sender_id, content, metadata, created_at, seq \
+             FROM conversation_messages \
+             WHERE channel_id = ? AND seq > ? AND seq <= ? \
+             ORDER BY seq ASC LIMIT ?",
+        )
+        .bind(channel_id)
+        .bind(start)
+        .bind(to.seq)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+        Ok(rows.into_iter().map(message_from_row).collect())
+    }
+
+    /// The newest assigned seq for a channel, or 0 when nothing is logged.
+    pub async fn max_seq(&self, channel_id: &str) -> Result<i64> {
+        let row = sqlx::query(
+            "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM conversation_messages \
+             WHERE channel_id = ?",
+        )
+        .bind(channel_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+        Ok(row.try_get("max_seq").unwrap_or(0))
     }
 }
 
-/// SQL predicate selecting rows strictly after a boundary in `(created_at, id)`
-/// order. Parameters 2 and 3 carry the boundary; `bind_boundary` supplies them
-/// in the same order for every call site.
-fn after_boundary_predicate(boundary: &ChronicleBoundary) -> &'static str {
-    if boundary.message_id.is_some() {
-        "(datetime(created_at) > datetime(?2) \
-          OR (datetime(created_at) = datetime(?2) AND id > ?3))"
-    } else {
-        // An open start covers from its timestamp inclusive; the null id is
-        // still bound so positional indexes line up across both forms.
-        "(datetime(created_at) >= datetime(?2) AND ?3 IS NULL)"
-    }
-}
-
-fn bind_boundary<'q>(
-    query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
-    boundary: &ChronicleBoundary,
-) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
-    query
-        .bind(sql_timestamp(boundary.at))
-        .bind(boundary.message_id.clone())
+/// A write-lock conflict. SQLite reports these when a deferred transaction
+/// tries to upgrade, or when another writer holds the lock.
+fn is_busy(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(db)
+        if matches!(db.code().as_deref(), Some("5") | Some("517") | Some("261"))
+            || db.message().contains("database is locked")
+            || db.message().contains("database table is locked"))
 }
 
 fn is_unique_violation(error: &sqlx::Error) -> bool {
@@ -660,6 +701,8 @@ fn checkpoint_from_row(row: sqlx::sqlite::SqliteRow) -> ChronicleCheckpoint {
         covers_to_at: row.try_get("covers_to_at").unwrap_or_else(|_| Utc::now()),
         covers_from_message_id: row.try_get("covers_from_message_id").ok().flatten(),
         covers_to_message_id: row.try_get("covers_to_message_id").ok().flatten(),
+        covers_from_seq: row.try_get("covers_from_seq").unwrap_or(0),
+        covers_to_seq: row.try_get("covers_to_seq").unwrap_or(0),
         message_count: row.try_get("message_count").unwrap_or_default(),
         token_estimate: row.try_get("token_estimate").unwrap_or_default(),
         rolled_up_into: row.try_get("rolled_up_into").ok().flatten(),
@@ -680,72 +723,77 @@ fn message_from_row(row: sqlx::sqlite::SqliteRow) -> ConversationMessage {
         content: row.try_get("content").unwrap_or_default(),
         metadata: row.try_get("metadata").ok(),
         created_at: row.try_get("created_at").unwrap_or_else(|_| Utc::now()),
+        seq: row.try_get("seq").ok().flatten(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversation::history::ConversationLogger;
 
     async fn setup() -> ChronicleStore {
+        // A shared cache is required so the logger's detached writes and the
+        // store see one database, but the name must be unique per test or
+        // every test in the binary would share it.
+        let url = format!(
+            "sqlite:file:chronicle_{}?mode=memory&cache=shared",
+            uuid::Uuid::new_v4().simple()
+        );
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
+            .max_connections(4)
+            .min_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect(&url)
             .await
             .expect("sqlite memory pool");
 
-        sqlx::raw_sql(include_str!(
-            "../../migrations/20260211000002_conversations.sql"
-        ))
-        .execute(&pool)
-        .await
-        .expect("conversations migration");
-        sqlx::raw_sql(include_str!(
-            "../../migrations/20260809000004_session_chronicles.sql"
-        ))
-        .execute(&pool)
-        .await
-        .expect("chronicle migration");
+        for migration in [
+            include_str!("../../migrations/20260211000002_conversations.sql"),
+            include_str!("../../migrations/20260809000004_session_chronicles.sql"),
+            include_str!("../../migrations/20260810000001_conversation_message_seq.sql"),
+        ] {
+            sqlx::raw_sql(migration)
+                .execute(&pool)
+                .await
+                .expect("migration");
+        }
 
         ChronicleStore::new(pool)
     }
 
+    /// Insert a row the way the logger does, letting SQLite assign both the
+    /// timestamp and the sequence.
     async fn insert_message(store: &ChronicleStore, channel: &str, id: &str, at: &str) {
         sqlx::query(
-            "INSERT INTO conversation_messages (id, channel_id, role, content, created_at) \
-             VALUES (?, ?, 'user', 'hello', ?)",
+            "INSERT INTO conversation_messages (id, channel_id, role, content, created_at, seq) \
+             VALUES (?, ?, 'user', 'hello', ?, \
+                COALESCE((SELECT MAX(seq) FROM conversation_messages WHERE channel_id = ?), 0) + 1)",
         )
         .bind(id)
         .bind(channel)
         .bind(at)
+        .bind(channel)
         .execute(&store.pool)
         .await
         .expect("insert message");
     }
 
-    fn boundary(at: &str, id: Option<&str>) -> ChronicleBoundary {
-        ChronicleBoundary::new(
-            DateTime::parse_from_rfc3339(at)
-                .unwrap()
-                .with_timezone(&Utc),
-            id.map(String::from),
-        )
-    }
-
-    fn new_checkpoint(
-        channel: &str,
-        from: ChronicleBoundary,
-        to: ChronicleBoundary,
-        count: i64,
-    ) -> NewCheckpoint {
+    fn new_checkpoint(channel: &str, from: i64, to: i64, count: i64) -> NewCheckpoint {
+        let at = Utc::now();
         NewCheckpoint {
             channel_id: channel.to_string(),
             level: 0,
             kind: CheckpointKind::Interval,
             title: "a span".into(),
             summary: "things happened".into(),
-            covers_from: from,
-            covers_to: to,
+            covers_from: ChronicleBoundary::new(from),
+            covers_to: ChronicleBoundary::new(to),
+            covers_from_at: at,
+            covers_to_at: at,
+            covers_from_message_id: None,
+            covers_to_message_id: None,
             message_count: count,
             token_estimate: 10,
             rolls_up_from_seq: None,
@@ -757,36 +805,26 @@ mod tests {
     #[tokio::test]
     async fn commits_allocate_sequential_boundaries_with_no_gap() {
         let store = setup().await;
-        let first = store
-            .commit(new_checkpoint(
-                "ch",
-                boundary("2026-08-01T00:00:00Z", None),
-                boundary("2026-08-01T01:00:00Z", Some("m10")),
-                10,
-            ))
+        let CommitOutcome::Committed(first) = store
+            .commit(new_checkpoint("ch", 0, 10, 10))
             .await
-            .expect("commit");
-        let CommitOutcome::Committed(first) = first else {
+            .expect("commit")
+        else {
             panic!("first commit should succeed")
         };
         assert_eq!(first.seq, 1);
 
-        let second = store
-            .commit(new_checkpoint(
-                "ch",
-                first.end_boundary(),
-                boundary("2026-08-01T02:00:00Z", Some("m20")),
-                10,
-            ))
+        let CommitOutcome::Committed(second) = store
+            .commit(new_checkpoint("ch", first.covers_to_seq, 20, 10))
             .await
-            .expect("commit");
-        let CommitOutcome::Committed(second) = second else {
+            .expect("commit")
+        else {
             panic!("second commit should succeed")
         };
 
         assert_eq!(second.seq, 2);
         assert_eq!(
-            second.covers_from_message_id, first.covers_to_message_id,
+            second.covers_from_seq, first.covers_to_seq,
             "checkpoint N starts exactly where N-1 ended"
         );
     }
@@ -795,26 +833,15 @@ mod tests {
     async fn stale_cut_is_superseded_and_writes_nothing() {
         let store = setup().await;
         let CommitOutcome::Committed(first) = store
-            .commit(new_checkpoint(
-                "ch",
-                boundary("2026-08-01T00:00:00Z", None),
-                boundary("2026-08-01T01:00:00Z", Some("m10")),
-                10,
-            ))
+            .commit(new_checkpoint("ch", 0, 10, 10))
             .await
             .expect("commit")
         else {
             panic!("expected commit")
         };
 
-        // A cut that started before `first` landed still carries the old start.
         let outcome = store
-            .commit(new_checkpoint(
-                "ch",
-                boundary("2026-08-01T00:00:00Z", None),
-                boundary("2026-08-01T00:30:00Z", Some("m5")),
-                5,
-            ))
+            .commit(new_checkpoint("ch", 0, 5, 5))
             .await
             .expect("commit call should not error");
 
@@ -827,65 +854,127 @@ mod tests {
     #[tokio::test]
     async fn duplicate_commit_yields_one_row() {
         let store = setup().await;
-        let cut = new_checkpoint(
-            "ch",
-            boundary("2026-08-01T00:00:00Z", None),
-            boundary("2026-08-01T01:00:00Z", Some("m10")),
-            10,
-        );
+        let cut = new_checkpoint("ch", 0, 10, 10);
 
-        let first = store.commit(cut.clone()).await.expect("commit");
-        assert!(matches!(first, CommitOutcome::Committed(_)));
-
-        // A retry of the same cut no longer joins the tail it did before.
-        let second = store.commit(cut).await.expect("commit");
-        assert!(matches!(second, CommitOutcome::Superseded { .. }));
+        assert!(matches!(
+            store.commit(cut.clone()).await.expect("commit"),
+            CommitOutcome::Committed(_)
+        ));
+        assert!(matches!(
+            store.commit(cut).await.expect("commit"),
+            CommitOutcome::Superseded { .. }
+        ));
         assert_eq!(store.list("ch", 0, 10).await.expect("list").len(), 1);
     }
 
     #[tokio::test]
-    async fn boundary_selection_orders_same_second_messages_by_id() {
+    async fn empty_span_is_refused() {
         let store = setup().await;
-        // Three messages sharing a second: the ordering key has to break the
-        // tie the same way for counting and for expansion.
-        insert_message(&store, "ch", "m-a", "2026-08-01 00:00:00").await;
-        insert_message(&store, "ch", "m-b", "2026-08-01 00:00:00").await;
-        insert_message(&store, "ch", "m-c", "2026-08-01 00:00:00").await;
-        insert_message(&store, "ch", "m-d", "2026-08-01 00:00:05").await;
-
-        let after_b = boundary("2026-08-01T00:00:00Z", Some("m-b"));
-        let count = store
-            .count_messages_after("ch", &after_b)
+        let outcome = store
+            .commit(new_checkpoint("ch", 0, 0, 0))
             .await
-            .expect("count");
-        assert_eq!(count, 2, "m-c and m-d follow m-b");
-
-        let messages = store
-            .messages_after("ch", &after_b, 10)
-            .await
-            .expect("messages");
-        let ids: Vec<&str> = messages.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, vec!["m-c", "m-d"]);
+            .expect("commit");
+        assert!(
+            matches!(outcome, CommitOutcome::Superseded { .. }),
+            "a checkpoint covering nothing must not advance the boundary"
+        );
     }
 
+    /// The blocker this ordering key exists for: a detached logger write that
+    /// lands after a checkpoint commits, sharing the same whole second and
+    /// carrying a lexically smaller id, must still be discoverable.
     #[tokio::test]
-    async fn open_start_boundary_selects_everything() {
+    async fn late_same_second_insert_stays_after_a_committed_boundary() {
         let store = setup().await;
-        insert_message(&store, "ch", "m-a", "2026-08-01 00:00:00").await;
-        insert_message(&store, "ch", "m-b", "2026-08-01 00:00:01").await;
+        insert_message(&store, "ch", "zzz-first", "2026-08-01 00:00:00").await;
+        insert_message(&store, "ch", "yyy-second", "2026-08-01 00:00:00").await;
 
-        let origin = ChronicleBoundary::origin(
-            DateTime::parse_from_rfc3339("2026-08-01T00:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-        );
-        assert_eq!(
-            store
-                .count_messages_after("ch", &origin)
-                .await
-                .expect("count"),
-            2
-        );
+        let tail = store.max_seq("ch").await.expect("max seq");
+        let CommitOutcome::Committed(checkpoint) = store
+            .commit(new_checkpoint("ch", 0, tail, 2))
+            .await
+            .expect("commit")
+        else {
+            panic!("expected commit")
+        };
+
+        // Same whole second, id sorts below BOTH covered rows. Under
+        // (created_at, id) ordering this row would be lost forever.
+        insert_message(&store, "ch", "aaa-late", "2026-08-01 00:00:00").await;
+
+        let uncovered = store
+            .count_messages_after("ch", checkpoint.end_boundary())
+            .await
+            .expect("count");
+        assert_eq!(uncovered, 1, "the late row must remain discoverable");
+
+        let found = store
+            .messages_after("ch", checkpoint.end_boundary(), 10)
+            .await
+            .expect("messages");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "aaa-late");
+    }
+
+    /// The same guarantee through the real logger, whose writes are detached
+    /// and whose timestamps come from CURRENT_TIMESTAMP.
+    #[tokio::test]
+    async fn logger_writes_after_a_boundary_are_never_stranded() {
+        let store = setup().await;
+        let logger = ConversationLogger::new(store.pool.clone());
+        let channel: crate::ChannelId = std::sync::Arc::from("ch");
+
+        logger.log_user_message(&channel, "jamie", "u1", "first", &Default::default());
+        wait_for_message_count(&store, "ch", 1).await;
+
+        let tail = store.max_seq("ch").await.expect("max seq");
+        let CommitOutcome::Committed(checkpoint) = store
+            .commit(new_checkpoint("ch", 0, tail, 1))
+            .await
+            .expect("commit")
+        else {
+            panic!("expected commit")
+        };
+
+        // Several writes in the same second, after the boundary committed.
+        for index in 0..5 {
+            logger.log_user_message(
+                &channel,
+                "jamie",
+                "u1",
+                &format!("late {index}"),
+                &Default::default(),
+            );
+        }
+        wait_for_message_count(&store, "ch", 6).await;
+
+        let uncovered = store
+            .count_messages_after("ch", checkpoint.end_boundary())
+            .await
+            .expect("count");
+        assert_eq!(uncovered, 5, "every late write stays after the boundary");
+    }
+
+    async fn wait_for_message_count(store: &ChronicleStore, channel: &str, want: i64) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let row = sqlx::query(
+                "SELECT COUNT(*) AS total FROM conversation_messages WHERE channel_id = ?",
+            )
+            .bind(channel)
+            .fetch_one(&store.pool)
+            .await
+            .expect("count");
+            let total: i64 = row.try_get("total").unwrap_or(0);
+            if total >= want {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "logger writes did not land: wanted {want}, saw {total}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]
@@ -895,25 +984,24 @@ mod tests {
             insert_message(&store, "ch", id, &format!("2026-08-01 00:00:0{index}")).await;
         }
 
-        let first_range = (
-            ChronicleBoundary::origin(
-                DateTime::parse_from_rfc3339("2026-08-01T00:00:00Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
-            ),
-            boundary("2026-08-01T00:00:02Z", Some("m3")),
-        );
-        let second_range = (
-            first_range.1.clone(),
-            boundary("2026-08-01T00:00:04Z", Some("m5")),
-        );
-
         let first = store
-            .messages_in_range("ch", &first_range.0, &first_range.1, 100)
+            .messages_in_range(
+                "ch",
+                ChronicleBoundary::new(0),
+                ChronicleBoundary::new(3),
+                None,
+                100,
+            )
             .await
             .expect("range");
         let second = store
-            .messages_in_range("ch", &second_range.0, &second_range.1, 100)
+            .messages_in_range(
+                "ch",
+                ChronicleBoundary::new(3),
+                ChronicleBoundary::new(5),
+                None,
+                100,
+            )
             .await
             .expect("range");
 
@@ -921,10 +1009,33 @@ mod tests {
         let second_ids: Vec<&str> = second.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(first_ids, vec!["m1", "m2", "m3"]);
         assert_eq!(second_ids, vec!["m4", "m5"]);
-        assert!(
-            first_ids.iter().all(|id| !second_ids.contains(id)),
-            "ranges must not overlap"
-        );
+        assert!(first_ids.iter().all(|id| !second_ids.contains(id)));
+    }
+
+    /// Every message in a large span is reachable by paging forward.
+    #[tokio::test]
+    async fn range_pagination_reaches_the_end_of_a_large_span() {
+        let store = setup().await;
+        for index in 0..25 {
+            insert_message(&store, "ch", &format!("m{index:03}"), "2026-08-01 00:00:00").await;
+        }
+
+        let to = ChronicleBoundary::new(store.max_seq("ch").await.expect("max"));
+        let mut cursor: Option<i64> = None;
+        let mut seen = Vec::new();
+        loop {
+            let page = store
+                .messages_in_range("ch", ChronicleBoundary::new(0), to, cursor, 10)
+                .await
+                .expect("page");
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().and_then(|message| message.seq);
+            seen.extend(page.into_iter().map(|message| message.id));
+        }
+
+        assert_eq!(seen.len(), 25, "pagination reaches every covered message");
     }
 
     #[tokio::test]
@@ -939,22 +1050,12 @@ mod tests {
         assert_eq!(empty.unsummarized_messages, 4);
 
         store
-            .commit(new_checkpoint(
-                "ch",
-                ChronicleBoundary::origin(
-                    DateTime::parse_from_rfc3339("2026-08-01T00:00:00Z")
-                        .unwrap()
-                        .with_timezone(&Utc),
-                ),
-                boundary("2026-08-01T00:00:02Z", Some("m3")),
-                3,
-            ))
+            .commit(new_checkpoint("ch", 0, 3, 3))
             .await
             .expect("commit");
 
         let stats = store.stats("ch").await.expect("stats");
         assert_eq!(stats.checkpoint_count, 1);
-        assert_eq!(stats.interval_count, 1);
         assert_eq!(stats.total_messages, 4);
         assert_eq!(stats.unsummarized_messages, 1);
     }

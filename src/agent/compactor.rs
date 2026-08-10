@@ -25,6 +25,10 @@ pub struct Compactor {
     is_compacting: Arc<RwLock<bool>>,
     /// Model override from conversation settings.
     model_override: Option<String>,
+    /// Shared with the chronicler. Rolling compaction rewrites the head, so a
+    /// chronicle cut spawned before a mode switch must be able to see that and
+    /// decline to trim on top of it.
+    fence: Arc<crate::agent::chronicle::HistoryFence>,
 }
 
 impl Compactor {
@@ -34,6 +38,7 @@ impl Compactor {
         deps: AgentDeps,
         history: Arc<RwLock<Vec<Message>>>,
         model_override: Option<String>,
+        fence: Arc<crate::agent::chronicle::HistoryFence>,
     ) -> Self {
         Self {
             channel_id,
@@ -41,6 +46,7 @@ impl Compactor {
             history,
             is_compacting: Arc::new(RwLock::new(false)),
             model_override,
+            fence,
         }
     }
 
@@ -129,6 +135,7 @@ impl Compactor {
         };
 
         let history = self.history.clone();
+        let fence = self.fence.clone();
         let is_compacting = self.is_compacting.clone();
         let channel_id = self.channel_id.clone();
         let deps = self.deps.clone();
@@ -154,6 +161,7 @@ impl Compactor {
                 &channel_id,
                 fraction,
                 model_override,
+                &fence,
             )
             .await;
 
@@ -194,6 +202,8 @@ impl Compactor {
 
         let removed: Vec<Message> = history.drain(..remove_count).collect();
         drop(removed);
+        self.fence.note_head_mutation();
+        self.fence.rebase_turns(remove_count);
 
         // Insert a marker at the beginning
         let prompt_engine = self.deps.runtime_config.prompts.load();
@@ -220,6 +230,7 @@ async fn run_compaction(
     channel_id: &ChannelId,
     fraction: f32,
     model_override: Option<String>,
+    fence: &Arc<crate::agent::chronicle::HistoryFence>,
 ) -> Result<usize> {
     // 1. Read and remove the oldest messages from history
     let (removed_messages, remove_count) = {
@@ -232,6 +243,8 @@ async fn run_compaction(
             return Ok(0);
         }
         let removed: Vec<Message> = hist.drain(..remove_count).collect();
+        fence.note_head_mutation();
+        fence.rebase_turns(remove_count);
         (removed, remove_count)
     };
 
@@ -282,6 +295,7 @@ async fn run_compaction(
         let mut hist = history.write().await;
         let summary_message = format!("[Compaction Summary]: {summary}");
         hist.insert(0, Message::from(summary_message));
+        fence.note_head_mutation();
     }
 
     Ok(remove_count)
@@ -458,6 +472,11 @@ fn estimate_assistant_content_chars(content: &AssistantContent) -> usize {
             .sum(),
         AssistantContent::Image(_) => 500,
     }
+}
+
+/// Render messages into a human-readable transcript for a summarizer.
+pub fn render_messages_for_summary(messages: &[Message]) -> String {
+    render_messages_as_transcript(messages)
 }
 
 /// Render messages into a human-readable transcript for the compaction LLM.

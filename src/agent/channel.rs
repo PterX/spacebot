@@ -993,14 +993,24 @@ impl Channel {
         let compactor_model = resolved_settings
             .resolve_model("compactor")
             .map(String::from);
+        // One fence shared by both monitors: a mode switch must not leave a
+        // rolling compaction and an in-flight chronicle cut mutating the same
+        // head independently.
+        let history_fence = Arc::new(crate::agent::chronicle::HistoryFence::new());
         let compactor = Compactor::new(
             id.clone(),
             deps.clone(),
             history.clone(),
             compactor_model.clone(),
+            history_fence.clone(),
         );
-        let chronicler =
-            Chronicler::new(id.clone(), deps.clone(), history.clone(), compactor_model);
+        let chronicler = Chronicler::new(
+            id.clone(),
+            deps.clone(),
+            history.clone(),
+            compactor_model,
+            history_fence,
+        );
 
         let state = ChannelState {
             channel_id: id.clone(),
@@ -2211,11 +2221,15 @@ impl Channel {
             direct_mode,
         )?;
 
-        prompt_engine.maybe_append_tool_use_enforcement(
+        let system_prompt = prompt_engine.maybe_append_tool_use_enforcement(
             system_prompt,
             tool_use_enforcement.as_ref(),
             &model_name,
-        )
+        )?;
+        self.chronicler.fence().record_prompt_tokens(
+            crate::agent::compactor::estimate_text_tokens(&system_prompt),
+        );
+        Ok(system_prompt)
     }
 
     /// Handle an incoming message by running the channel's LLM agent loop.
@@ -2969,11 +2983,15 @@ impl Channel {
             direct_mode,
         )?;
 
-        prompt_engine.maybe_append_tool_use_enforcement(
+        let system_prompt = prompt_engine.maybe_append_tool_use_enforcement(
             system_prompt,
             tool_use_enforcement.as_ref(),
             &model_name,
-        )
+        )?;
+        self.chronicler.fence().record_prompt_tokens(
+            crate::agent::compactor::estimate_text_tokens(&system_prompt),
+        );
+        Ok(system_prompt)
     }
 
     /// Register per-turn tools, run the LLM agentic loop, and clean up.

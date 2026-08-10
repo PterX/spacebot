@@ -34,29 +34,189 @@ use uuid::Uuid;
 /// A channel needs its latest exchange to act at all.
 const MIN_RETAINED_MESSAGES: usize = 4;
 
-/// Extra live messages kept beyond the uncovered count when trimming.
-///
-/// `ConversationLogger` writes are fire-and-forget, so the durable log can lag
-/// the in-memory history by a few messages. Retaining a margin means a lagging
-/// write can never cause a live message to be dropped before its checkpoint
-/// covers it. Over-retention costs a few raw turns of context; under-retention
-/// loses them outright, so the margin errs toward keeping.
-const TRIM_SAFETY_MARGIN: usize = 8;
+/// Share of the context window held back for the channel's own response when
+/// deciding whether the request is too large. Matches the fork pre-compaction
+/// reserve so the two budgets do not disagree.
+const RESPONSE_RESERVE_FRACTION: f32 = 0.15;
 
 /// Prior checkpoints handed to a cut as narrative context, newest last.
 const NARRATIVE_CONTEXT_CHECKPOINTS: i64 = 3;
 
+/// A completed turn's position in the live history, paired with how far the
+/// durable log had advanced at that moment.
+///
+/// `durable_seq` is read after the turn, and `ConversationLogger` writes are
+/// detached, so it can lag what the turn actually produced. Lagging low is the
+/// safe direction: it makes the trim keep more, never less.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnBoundary {
+    pub live_len: usize,
+    pub durable_seq: i64,
+}
+
+/// Serializes every structural mutation of one channel's live history, and
+/// lets a long-running summarizer detect that the world moved under it.
+///
+/// Both compaction modes share one of these. Without it, a chronicle cut
+/// spawned before a mode switch and a rolling compaction started after it can
+/// each drain the same head: the chronicle's private generation counter never
+/// saw the rolling drain, so its post-commit trim would cut a second time.
+#[derive(Debug)]
+pub struct HistoryFence {
+    /// Bumped by every head mutation, from either mode.
+    generation: AtomicU64,
+    /// Bumped whenever the channel observes a different compaction mode.
+    mode_epoch: AtomicU64,
+    /// Held across any head mutation and any cut commit, so emergency
+    /// truncation and a regular cut can never interleave.
+    mutation: tokio::sync::Mutex<()>,
+    /// The last mode the channel observed: 1 chronicle, 0 rolling.
+    mode_flag: AtomicU64,
+    /// Estimated tokens of the most recently rendered system prompt. The
+    /// context monitor budgets against the whole request, not just history.
+    prompt_tokens: AtomicU64,
+    /// Live-history lengths recorded at completed turn boundaries, oldest
+    /// first. Trimming only ever lands on one of these.
+    turns: std::sync::Mutex<Vec<TurnBoundary>>,
+}
+
+impl Default for HistoryFence {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HistoryFence {
+    pub fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            mode_epoch: AtomicU64::new(0),
+            mutation: tokio::sync::Mutex::new(()),
+            mode_flag: AtomicU64::new(0),
+            prompt_tokens: AtomicU64::new(0),
+            turns: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// A snapshot to validate against before committing or trimming.
+    pub fn snapshot(&self) -> FenceSnapshot {
+        FenceSnapshot {
+            generation: self.generation.load(Ordering::Acquire),
+            mode_epoch: self.mode_epoch.load(Ordering::Acquire),
+        }
+    }
+
+    pub fn matches(&self, snapshot: FenceSnapshot) -> bool {
+        self.generation.load(Ordering::Acquire) == snapshot.generation
+            && self.mode_epoch.load(Ordering::Acquire) == snapshot.mode_epoch
+    }
+
+    /// Record that the head changed. Any in-flight cut holding an older
+    /// snapshot will decline to trim.
+    pub fn note_head_mutation(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Record the mode the channel just observed, bumping the epoch when it
+    /// differs from the last one. Work spawned under the previous mode is
+    /// thereby invalidated.
+    pub fn observe_mode(&self, chronicle: bool) {
+        let want = u64::from(chronicle);
+        let current = self.mode_flag.load(Ordering::Acquire);
+        if current != want {
+            self.mode_flag.store(want, Ordering::Release);
+            self.mode_epoch.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Record what the last rendered system prompt cost. Everything above the
+    /// message array — identity, skills, working memory, the chronicle view,
+    /// any backfill — is in that number.
+    pub fn record_prompt_tokens(&self, tokens: usize) {
+        self.prompt_tokens.store(tokens as u64, Ordering::Release);
+    }
+
+    pub fn prompt_tokens(&self) -> usize {
+        self.prompt_tokens.load(Ordering::Acquire) as usize
+    }
+
+    /// Exclusive access for the duration of a head mutation or a commit.
+    pub async fn lock_mutation(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.mutation.lock().await
+    }
+
+    /// Record a completed turn's live-history length and durable watermark.
+    pub fn record_turn(&self, live_len: usize, durable_seq: i64) {
+        let Ok(mut turns) = self.turns.lock() else {
+            return;
+        };
+        if turns
+            .last()
+            .is_some_and(|last| last.live_len == live_len && last.durable_seq == durable_seq)
+        {
+            return;
+        }
+        turns.push(TurnBoundary {
+            live_len,
+            durable_seq,
+        });
+        // Bounded: only the newest boundaries can ever be a trim target.
+        const MAX_TRACKED_TURNS: usize = 512;
+        if turns.len() > MAX_TRACKED_TURNS {
+            let excess = turns.len() - MAX_TRACKED_TURNS;
+            turns.drain(..excess);
+        }
+    }
+
+    /// How many live entries a checkpoint covering up to `durable_seq` may
+    /// safely drop: the largest recorded turn boundary whose durable watermark
+    /// the checkpoint already covers.
+    ///
+    /// Returning a turn boundary rather than a count is what keeps a
+    /// tool-heavy turn intact — those entries never reach the durable log, so
+    /// counting durable rows would silently drop them.
+    pub fn droppable_prefix(&self, covered_through: i64) -> usize {
+        let Ok(turns) = self.turns.lock() else {
+            return 0;
+        };
+        turns
+            .iter()
+            .filter(|turn| turn.durable_seq <= covered_through)
+            .map(|turn| turn.live_len)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Shift recorded boundaries down after `dropped` entries left the front,
+    /// and forget any that the drop consumed.
+    pub fn rebase_turns(&self, dropped: usize) {
+        let Ok(mut turns) = self.turns.lock() else {
+            return;
+        };
+        turns.retain(|turn| turn.live_len > dropped);
+        for turn in turns.iter_mut() {
+            turn.live_len -= dropped;
+        }
+    }
+}
+
+/// The fence state a cut captured when it started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FenceSnapshot {
+    pub generation: u64,
+    pub mode_epoch: u64,
+}
+
 /// Why `check_and_chronicle` acted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChronicleAction {
-    /// The first checkpoint for a channel that entered chronicle mode with
-    /// more history than one interval can summarize.
+    /// Entering chronicle mode with a backlog larger than one cut can read.
     Bootstrap,
     /// The message or token interval elapsed.
     Interval,
     /// Context pressure forced a cut early.
     Pressure,
-    /// Emergency truncation dropped the span without summarizing it.
+    /// Emergency truncation dropped live context without summarizing it.
     Emergency,
 }
 
@@ -67,9 +227,9 @@ pub struct Chronicler {
     history: Arc<RwLock<Vec<Message>>>,
     store: ChronicleStore,
     model_override: Option<String>,
-    /// Bumped on every structural head mutation of the live history. A cut
-    /// that finishes after the generation moved skips its trim.
-    generation: Arc<AtomicU64>,
+    /// Shared with the rolling compactor so a mode switch cannot leave two
+    /// summarizers mutating the same head.
+    fence: Arc<HistoryFence>,
     /// One in-flight cut per channel.
     cutting: Arc<AtomicBool>,
 }
@@ -80,6 +240,7 @@ impl Chronicler {
         deps: AgentDeps,
         history: Arc<RwLock<Vec<Message>>>,
         model_override: Option<String>,
+        fence: Arc<HistoryFence>,
     ) -> Self {
         let store = ChronicleStore::new(deps.sqlite_pool.clone());
         Self {
@@ -88,7 +249,7 @@ impl Chronicler {
             history,
             store,
             model_override,
-            generation: Arc::new(AtomicU64::new(0)),
+            fence,
             cutting: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -97,14 +258,19 @@ impl Chronicler {
         &self.store
     }
 
+    pub fn fence(&self) -> &Arc<HistoryFence> {
+        &self.fence
+    }
+
     fn config(&self) -> ChronicleConfig {
         self.deps.runtime_config.compaction.load().chronicle
     }
 
     /// Decide whether to cut a checkpoint, and start one if so.
     ///
-    /// Called after each turn, in place of the rolling compactor's threshold
-    /// check. Emergency truncation runs synchronously; everything else spawns.
+    /// Returns `None` when nothing happened — including when emergency
+    /// truncation found nothing it could drop, so a channel sitting on an
+    /// oversized retained message does not report an emergency every turn.
     pub async fn check_and_chronicle(&self) -> Result<Option<ChronicleAction>> {
         let config = self.config();
         let compaction = **self.deps.runtime_config.compaction.load();
@@ -114,11 +280,24 @@ impl Chronicler {
             let history = self.history.read().await;
             estimate_history_tokens(&history)
         };
-        let usage = live_tokens as f32 / context_window.max(1) as f32;
+
+        // Thresholds apply to the whole request, not just history: the system
+        // prompt carries identity, skills, working memory and the chronicle
+        // view, and the response needs room of its own. Measuring history
+        // alone lets a channel sit "safe" while its actual request is over.
+        let response_reserve = (context_window as f32 * RESPONSE_RESERVE_FRACTION) as usize;
+        let request_tokens = live_tokens
+            .saturating_add(self.fence.prompt_tokens())
+            .saturating_add(response_reserve);
+        let usage = request_tokens as f32 / context_window.max(1) as f32;
 
         if usage >= compaction.emergency_threshold {
-            self.emergency_truncate().await?;
-            return Ok(Some(ChronicleAction::Emergency));
+            // Emergency shares the mutation lock with cuts, so it can never
+            // interleave with one that is mid-commit.
+            return Ok(self
+                .emergency_truncate()
+                .await?
+                .then_some(ChronicleAction::Emergency));
         }
 
         if self.cutting.load(Ordering::Acquire) {
@@ -128,16 +307,12 @@ impl Chronicler {
         let latest = self.store.latest(&self.channel_id, 0).await?;
         let boundary = match &latest {
             Some(checkpoint) => checkpoint.end_boundary(),
-            None => match self.store.earliest_message(&self.channel_id).await? {
-                Some((at, _)) => ChronicleBoundary::origin(at),
-                // Nothing logged yet: nothing to chronicle.
-                None => return Ok(None),
-            },
+            None => ChronicleBoundary::origin(),
         };
 
         let uncovered = self
             .store
-            .count_messages_after(&self.channel_id, &boundary)
+            .count_messages_after(&self.channel_id, boundary)
             .await?;
         if uncovered == 0 {
             return Ok(None);
@@ -147,19 +322,12 @@ impl Chronicler {
             (context_window as f32 * config.interval_token_fraction).max(1.0) as usize;
 
         let action = if latest.is_none() && uncovered > config.max_messages_per_checkpoint {
-            // Entering chronicle mode on a channel whose backlog is larger than
-            // one cut can read. A smaller backlog needs no special handling —
-            // the first interval cut simply covers all of it.
-            Some(ChronicleAction::Bootstrap)
+            ChronicleAction::Bootstrap
         } else if usage >= compaction.background_threshold {
-            Some(ChronicleAction::Pressure)
+            ChronicleAction::Pressure
         } else if uncovered >= config.interval_messages as i64 || live_tokens >= interval_tokens {
-            Some(ChronicleAction::Interval)
+            ChronicleAction::Interval
         } else {
-            None
-        };
-
-        let Some(action) = action else {
             return Ok(None);
         };
 
@@ -198,9 +366,11 @@ impl Chronicler {
             deps: self.deps.clone(),
             store: self.store.clone(),
             history: self.history.clone(),
-            generation: self.generation.clone(),
+            fence: self.fence.clone(),
             model_override: self.model_override.clone(),
             config,
+            // Captured before the LLM call; re-checked before commit and trim.
+            entry: self.fence.snapshot(),
         };
         let cutting = self.cutting.clone();
 
@@ -213,24 +383,32 @@ impl Chronicler {
         });
     }
 
-    /// Drop the oldest half of the live history without summarizing it, and
-    /// record a checkpoint marking the discarded span.
+    /// Drop live history without summarizing it, and record a checkpoint
+    /// marking the discarded span.
     ///
-    /// This is the one checkpoint whose summary does not describe its
-    /// contents, and it says so. Recording it keeps coverage contiguous, so
-    /// the gap is visible in the chronicle rather than silent.
-    async fn emergency_truncate(&self) -> Result<()> {
-        let (removed, retained_live) = {
+    /// Returns whether anything was actually dropped. At the retention floor
+    /// there is nothing to drop and nothing to report.
+    async fn emergency_truncate(&self) -> Result<bool> {
+        let _guard = self.fence.lock_mutation().await;
+
+        let (removed, covered_through) = {
             let mut history = self.history.write().await;
             let total = history.len();
             if total <= MIN_RETAINED_MESSAGES {
-                return Ok(());
+                tracing::debug!(
+                    channel_id = %self.channel_id,
+                    total,
+                    "emergency threshold reached at the retention floor; nothing to drop"
+                );
+                return Ok(false);
             }
             let remove_count = (total / 2).min(total - MIN_RETAINED_MESSAGES);
             history.drain(..remove_count);
-            self.generation.fetch_add(1, Ordering::AcqRel);
+            self.fence.note_head_mutation();
+            self.fence.rebase_turns(remove_count);
             (remove_count, history.len())
         };
+        let _ = covered_through;
 
         tracing::warn!(
             channel_id = %self.channel_id,
@@ -241,36 +419,32 @@ impl Chronicler {
         let latest = self.store.latest(&self.channel_id, 0).await?;
         let from = match &latest {
             Some(checkpoint) => checkpoint.end_boundary(),
-            None => match self.store.earliest_message(&self.channel_id).await? {
-                Some((at, _)) => ChronicleBoundary::origin(at),
-                None => return Ok(()),
-            },
+            None => ChronicleBoundary::origin(),
         };
 
+        // Cover only what the truncation actually discarded. The live entries
+        // still in context must stay uncovered so a later interval cut can
+        // summarize them properly.
+        let retained_live = self.history.read().await.len();
         let messages = self
             .store
             .messages_after(
                 &self.channel_id,
-                &from,
+                from,
                 self.config().max_messages_per_checkpoint,
             )
             .await?;
-
-        // Cover only the part of the log the truncation actually discarded.
-        // The messages still in live context have to stay uncovered so a later
-        // interval cut can summarize them properly — marking them
-        // "not summarized" here would advance the boundary past them and lose
-        // that chance. The live-to-log mapping is approximate, so this errs
-        // toward covering less.
         let covered = messages.len().saturating_sub(retained_live);
         let Some(last) = covered.checked_sub(1).and_then(|index| messages.get(index)) else {
             tracing::debug!(
                 channel_id = %self.channel_id,
                 "emergency truncation covered no logged span; the tail stays for the next cut"
             );
-            return Ok(());
+            return Ok(true);
         };
-        let to = ChronicleBoundary::new(last.created_at, Some(last.id.clone()));
+        let Some(to_seq) = last.seq else {
+            return Ok(true);
+        };
 
         let outcome = self
             .store
@@ -282,11 +456,18 @@ impl Chronicler {
                 summary: format!(
                     "Context reached the emergency threshold and {removed} live messages were \
                      dropped without summarization. {covered} logged messages in this span were \
-                     not summarized; use the chronicle tool to expand this range if the detail \
-                     is needed."
+                     not summarized; expand this range with the chronicle tool if the detail is \
+                     needed."
                 ),
                 covers_from: from,
-                covers_to: to,
+                covers_to: ChronicleBoundary::new(to_seq),
+                covers_from_at: messages
+                    .first()
+                    .map(|message| message.created_at)
+                    .unwrap_or_else(Utc::now),
+                covers_to_at: last.created_at,
+                covers_from_message_id: None,
+                covers_to_message_id: Some(last.id.clone()),
                 message_count: covered as i64,
                 token_estimate: 0,
                 rolls_up_from_seq: None,
@@ -299,7 +480,7 @@ impl Chronicler {
             emit_checkpoint_event(&self.deps, &self.channel_id, &checkpoint);
         }
 
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -309,9 +490,10 @@ struct CutContext {
     deps: AgentDeps,
     store: ChronicleStore,
     history: Arc<RwLock<Vec<Message>>>,
-    generation: Arc<AtomicU64>,
+    fence: Arc<HistoryFence>,
     model_override: Option<String>,
     config: ChronicleConfig,
+    entry: FenceSnapshot,
 }
 
 impl CutContext {
@@ -320,7 +502,7 @@ impl CutContext {
             .store
             .messages_after(
                 &self.channel_id,
-                &from,
+                from,
                 self.config.max_messages_per_checkpoint,
             )
             .await?;
@@ -328,15 +510,47 @@ impl CutContext {
         let Some(last) = messages.last() else {
             return Ok(());
         };
-        let to = ChronicleBoundary::new(last.created_at, Some(last.id.clone()));
-        let generation_at_cut = self.generation.load(Ordering::Acquire);
+        let Some(to_seq) = last.seq else {
+            tracing::warn!(
+                channel_id = %self.channel_id,
+                "skipping cut: tail message has no durable sequence"
+            );
+            return Ok(());
+        };
+        let to = ChronicleBoundary::new(to_seq);
+
+        // Live entries this cut will drop. Tool calls and tool results never
+        // reach the durable log, so summarizing only the durable rows would
+        // discard a tool-heavy turn unsummarized. They go into the prompt.
+        let droppable = self.fence.droppable_prefix(to_seq);
+        let discarded_live: Vec<Message> = {
+            let history = self.history.read().await;
+            history
+                .iter()
+                .take(droppable.min(history.len()))
+                .cloned()
+                .collect()
+        };
 
         let narrative = self
             .store
             .list(&self.channel_id, 0, NARRATIVE_CONTEXT_CHECKPOINTS)
             .await?;
 
-        let (title, summary, model) = self.summarize(kind, &messages, &narrative).await;
+        let (title, summary, model) = self
+            .summarize(kind, &messages, &discarded_live, &narrative)
+            .await;
+
+        // Serialize against emergency truncation and any other head mutation
+        // for the whole commit-and-trim window.
+        let _guard = self.fence.lock_mutation().await;
+        if !self.fence.matches(self.entry) {
+            tracing::info!(
+                channel_id = %self.channel_id,
+                "discarding chronicle cut: the mode or history head changed while it ran"
+            );
+            return Ok(());
+        }
 
         let outcome = self
             .store
@@ -348,6 +562,13 @@ impl CutContext {
                 summary: summary.clone(),
                 covers_from: from,
                 covers_to: to,
+                covers_from_at: messages
+                    .first()
+                    .map(|message| message.created_at)
+                    .unwrap_or_else(Utc::now),
+                covers_to_at: last.created_at,
+                covers_from_message_id: None,
+                covers_to_message_id: Some(last.id.clone()),
                 message_count: messages.len() as i64,
                 token_estimate: estimate_text_tokens(&summary) as i64,
                 rolls_up_from_seq: None,
@@ -361,17 +582,23 @@ impl CutContext {
             CommitOutcome::Superseded { expected, found } => {
                 tracing::info!(
                     channel_id = %self.channel_id,
-                    ?expected,
-                    ?found,
+                    expected,
+                    found,
                     "chronicle cut superseded; span stays unsummarized for the next cut"
+                );
+                return Ok(());
+            }
+            CommitOutcome::Busy => {
+                tracing::warn!(
+                    channel_id = %self.channel_id,
+                    "chronicle cut could not take the write lock; span stays unsummarized"
                 );
                 return Ok(());
             }
         };
 
         emit_checkpoint_event(&self.deps, &self.channel_id, &checkpoint);
-        self.trim_live_history(&checkpoint, generation_at_cut)
-            .await?;
+        self.trim_live_history(&checkpoint).await;
 
         tracing::info!(
             channel_id = %self.channel_id,
@@ -386,31 +613,15 @@ impl CutContext {
     /// Produce the checkpoint's title and summary.
     ///
     /// Prior summaries are supplied as narrative context so the entry reads as
-    /// a continuation, but the model is told to describe only the new span —
-    /// no checkpoint is ever regenerated from another checkpoint's text.
+    /// a continuation, but the model is told to describe only the new span.
     async fn summarize(
         &self,
         kind: CheckpointKind,
         messages: &[ConversationMessage],
+        discarded_live: &[Message],
         narrative: &[ChronicleCheckpoint],
     ) -> (String, String, Option<String>) {
         let fallback_title = range_title(messages);
-
-        // A bootstrap cut can inherit the rolling compactor's summary head
-        // rather than paying for an LLM pass over history it cannot fully read.
-        if kind == CheckpointKind::Bootstrap
-            && let Some(existing) = self.rolling_summary_head().await
-        {
-            return (
-                format!("Prior history — {fallback_title}"),
-                format!(
-                    "Carried over from rolling compaction when this channel entered chronicle \
-                     mode. {existing}"
-                ),
-                None,
-            );
-        }
-
         let prompt_engine = self.deps.runtime_config.prompts.load();
         let preamble = match prompt_engine.render_static("chronicle_checkpoint") {
             Ok(preamble) => preamble,
@@ -442,7 +653,7 @@ impl CutContext {
             self.deps.event_tx.clone(),
         );
 
-        let prompt = build_cut_prompt(kind, messages, narrative);
+        let prompt = build_cut_prompt(kind, messages, discarded_live, narrative);
         let mut cut_history = Vec::new();
         let response = hook.prompt_once(&agent, &mut cut_history, &prompt).await;
 
@@ -462,72 +673,46 @@ impl CutContext {
         }
     }
 
-    /// The rolling compactor's summary head, if this channel was running in
-    /// rolling mode before the switch.
-    async fn rolling_summary_head(&self) -> Option<String> {
-        let history = self.history.read().await;
-        let first = history.first()?;
-        let Message::User { content } = first else {
-            return None;
-        };
-        for item in content.iter() {
-            if let rig::message::UserContent::Text(text) = item
-                && let Some(stripped) = text.text.strip_prefix("[Compaction Summary]: ")
-            {
-                return Some(stripped.trim().to_string());
-            }
-        }
-        None
-    }
-
-    /// Drop live messages the chronicle now covers.
+    /// Drop live entries the chronicle now covers, up to a recorded turn
+    /// boundary.
     ///
-    /// The live history and the durable log are not indexed against each
-    /// other, so the retained count is derived from what the log says is
-    /// uncovered, plus a margin for fire-and-forget write lag. Skipped
-    /// entirely when the head moved while the cut was running — the
-    /// checkpoint stays valid either way, and the next trim catches up.
-    async fn trim_live_history(
-        &self,
-        checkpoint: &ChronicleCheckpoint,
-        generation_at_cut: u64,
-    ) -> Result<()> {
-        let uncovered = self
-            .store
-            .count_messages_after(&self.channel_id, &checkpoint.end_boundary())
-            .await? as usize;
-        let retain = uncovered
-            .saturating_add(TRIM_SAFETY_MARGIN)
-            .max(MIN_RETAINED_MESSAGES);
+    /// Trimming lands only on a turn boundary whose durable watermark the
+    /// checkpoint already covers, so a turn's tool traffic is never split and
+    /// nothing is dropped that the checkpoint did not summarize. Caller holds
+    /// the mutation lock.
+    async fn trim_live_history(&self, checkpoint: &ChronicleCheckpoint) {
+        let droppable = self.fence.droppable_prefix(checkpoint.covers_to_seq);
+        if droppable == 0 {
+            return;
+        }
 
         let mut history = self.history.write().await;
-        if self.generation.load(Ordering::Acquire) != generation_at_cut {
+        if !self.fence.matches(self.entry) {
             tracing::debug!(
                 channel_id = %self.channel_id,
                 seq = checkpoint.seq,
-                "skipping chronicle trim: live history changed generation during the cut"
+                "skipping chronicle trim: history changed during the cut"
             );
-            return Ok(());
+            return;
         }
 
-        let total = history.len();
-        if total <= retain {
-            return Ok(());
+        let floor = history.len().saturating_sub(MIN_RETAINED_MESSAGES);
+        let remove = droppable.min(floor);
+        if remove == 0 {
+            return;
         }
 
-        let remove = total - retain;
         history.drain(..remove);
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.fence.note_head_mutation();
+        self.fence.rebase_turns(remove);
 
         tracing::debug!(
             channel_id = %self.channel_id,
             seq = checkpoint.seq,
             removed = remove,
             retained = history.len(),
-            "trimmed live history to the chronicle boundary"
+            "trimmed live history to a covered turn boundary"
         );
-
-        Ok(())
     }
 }
 
@@ -611,6 +796,7 @@ fn truncate_title(title: &str) -> String {
 fn build_cut_prompt(
     kind: CheckpointKind,
     messages: &[ConversationMessage],
+    discarded_live: &[Message],
     narrative: &[ChronicleCheckpoint],
 ) -> String {
     let mut prompt = String::new();
@@ -634,14 +820,31 @@ fn build_cut_prompt(
 
     if kind == CheckpointKind::Bootstrap {
         prompt.push_str(
-            "## Note\n\nThis channel is entering chronicle mode with existing history. The \
-             transcript below may be the tail of a longer past; summarize what is here and do \
-             not speculate about what came before.\n\n",
+            "## Note\n\nThis channel is entering chronicle mode with a backlog larger than one \
+             checkpoint can read. The transcript below is the oldest readable slice of it, not \
+             the whole past. Summarize exactly what is here and do not speculate about what came \
+             before or after it.\n\n",
         );
     }
 
     prompt.push_str("## New span to summarize\n\n");
     prompt.push_str(&render_log_transcript(messages));
+
+    // Tool calls and tool results are never persisted to the conversation log,
+    // so a tool-heavy turn would otherwise be dropped from live context with
+    // nothing recorded about it anywhere.
+    if !discarded_live.is_empty() {
+        let working = crate::agent::compactor::render_messages_for_summary(discarded_live);
+        if !working.trim().is_empty() {
+            prompt.push_str(
+                "\n## Working detail being dropped from live context\n\n\
+                 These are the tool calls and intermediate steps behind the span above. They are \
+                 not stored anywhere else — capture their outcomes.\n\n",
+            );
+            prompt.push_str(&working);
+        }
+    }
+
     prompt
 }
 
@@ -721,23 +924,46 @@ fn compose_view(
     recent: &[ChronicleCheckpoint],
     budget_tokens: usize,
 ) -> String {
-    let header = render_header(stats, older.len() + recent.len());
     let entries: Vec<&ChronicleCheckpoint> = older.iter().chain(recent.iter()).collect();
 
-    // Collapse oldest-first until the whole section fits.
+    // Collapse oldest-first, then drop oldest-first. Collapsing alone is not
+    // enough: a long index of collapsed one-liners can still exceed the budget,
+    // and the budget has to be an upper bound on what the prompt carries.
     let mut collapsed_upto = 0usize;
+    let mut dropped = 0usize;
     loop {
-        let body = render_entries(&entries, collapsed_upto);
-        if estimate_text_tokens(&header) + estimate_text_tokens(&body) <= budget_tokens
-            || collapsed_upto >= entries.len()
-        {
+        let shown = &entries[dropped..];
+        let header = render_header(stats, shown.len(), dropped);
+        let body = render_entries(shown, collapsed_upto.saturating_sub(dropped));
+        let total = estimate_text_tokens(&header) + estimate_text_tokens(&body);
+
+        if total <= budget_tokens {
             return format!("{header}\n{body}");
         }
-        collapsed_upto += 1;
+        if collapsed_upto < entries.len() {
+            collapsed_upto += 1;
+            continue;
+        }
+        if dropped + 1 < entries.len() {
+            dropped += 1;
+            continue;
+        }
+
+        // Everything collapsed and only one entry left: the header plus a
+        // single line is the floor. Report it rather than silently exceeding.
+        let header = render_header(stats, shown.len(), dropped);
+        let body = render_entries(shown, 0);
+        if estimate_text_tokens(&header) + estimate_text_tokens(&body) > budget_tokens {
+            tracing::debug!(
+                budget_tokens,
+                "chronicle view floor exceeds its budget; rendering the header and one entry"
+            );
+        }
+        return format!("{header}\n{body}");
     }
 }
 
-fn render_header(stats: &ChronicleStats, shown: usize) -> String {
+fn render_header(stats: &ChronicleStats, shown: usize, omitted: usize) -> String {
     let mut header = String::from("## Session Chronicle\n\n");
 
     let age = match (stats.first_message_at, stats.last_message_at) {
@@ -755,12 +981,20 @@ fn render_header(stats: &ChronicleStats, shown: usize) -> String {
     };
 
     header.push_str(&format!(
-        "{age} {} messages logged, {} checkpoints ({} shown below). \
-         {} messages since the last checkpoint are still in raw context.\n\n\
+        "{age} {} messages logged, {} checkpoints ({} shown below{}). \
+         {} messages since the last checkpoint are in raw context below this prompt.\n\n\
          Checkpoints below are summaries, not the transcript. Use the `chronicle` tool to list \
          the full checkpoint index or open one; a branch can expand any checkpoint back into raw \
          messages.\n",
-        stats.total_messages, stats.checkpoint_count, shown, stats.unsummarized_messages,
+        stats.total_messages,
+        stats.checkpoint_count,
+        shown,
+        if omitted > 0 {
+            format!(", {omitted} older not shown — list them with the chronicle tool")
+        } else {
+            String::new()
+        },
+        stats.unsummarized_messages,
     ));
 
     header
@@ -814,6 +1048,8 @@ mod tests {
             covers_to_at: at,
             covers_from_message_id: None,
             covers_to_message_id: Some(format!("m{seq}")),
+            covers_from_seq: seq * 10,
+            covers_to_seq: seq * 10 + 10,
             message_count: 10,
             token_estimate: 20,
             rolled_up_into: None,
@@ -887,15 +1123,17 @@ mod tests {
             .map(|seq| checkpoint(seq, &format!("Span {seq}"), &body))
             .collect();
 
-        let mut previous = usize::MAX;
+        // More budget must never render less: measure how many entries keep
+        // their full body, which is what the budget actually buys.
+        let mut previous_full = 0usize;
         for budget in [200usize, 800, 2000, 8000, 40_000] {
             let rendered = compose_view(&stats(), &[], &entries, budget);
-            let collapsed = rendered.matches("collapsed").count();
+            let full = rendered.matches(&body).count();
             assert!(
-                collapsed <= previous,
-                "a larger budget must not collapse more entries"
+                full >= previous_full,
+                "budget {budget} rendered fewer full entries than a smaller one"
             );
-            previous = collapsed;
+            previous_full = full;
         }
     }
 
@@ -943,6 +1181,7 @@ mod tests {
             created_at: DateTime::parse_from_rfc3339("2026-08-01T10:11:12Z")
                 .unwrap()
                 .with_timezone(&Utc),
+            seq: Some(1),
         };
         let rendered = render_log_transcript(std::slice::from_ref(&message));
         assert!(rendered.contains("2026-08-01 10:11:12"));
@@ -953,7 +1192,7 @@ mod tests {
     #[test]
     fn cut_prompt_marks_prior_checkpoints_as_context_only() {
         let narrative = vec![checkpoint(1, "Earlier", "earlier things")];
-        let prompt = build_cut_prompt(CheckpointKind::Interval, &[], &narrative);
+        let prompt = build_cut_prompt(CheckpointKind::Interval, &[], &[], &narrative);
         assert!(prompt.contains("Story so far"));
         assert!(prompt.contains("Do not restate them"));
         assert!(prompt.contains("New span to summarize"));
@@ -961,8 +1200,168 @@ mod tests {
 
     #[test]
     fn bootstrap_prompt_warns_about_truncated_past() {
-        let prompt = build_cut_prompt(CheckpointKind::Bootstrap, &[], &[]);
-        assert!(prompt.contains("entering chronicle mode with existing history"));
+        let prompt = build_cut_prompt(CheckpointKind::Bootstrap, &[], &[], &[]);
+        assert!(prompt.contains("backlog larger than one checkpoint can read"));
+    }
+
+    // ---- HistoryFence: the lifecycle/race surface ----
+
+    #[test]
+    fn trimming_lands_only_on_a_covered_turn_boundary() {
+        let fence = HistoryFence::new();
+        // Turn 1 produced 2 live entries and reached durable seq 2.
+        fence.record_turn(2, 2);
+        // Turn 2 was tool-heavy: 14 live entries, but only 2 more durable rows.
+        fence.record_turn(16, 4);
+
+        // A checkpoint covering only through seq 2 may drop turn 1 alone. The
+        // tool-heavy turn is not yet summarized, so none of it may go.
+        assert_eq!(fence.droppable_prefix(2), 2);
+        // Once seq 4 is covered, the whole tool-heavy turn may go together.
+        assert_eq!(fence.droppable_prefix(4), 16);
+        // A boundary before any recorded turn drops nothing.
+        assert_eq!(fence.droppable_prefix(1), 0);
+    }
+
+    #[test]
+    fn rebasing_forgets_consumed_turns_and_shifts_the_rest() {
+        let fence = HistoryFence::new();
+        fence.record_turn(2, 2);
+        fence.record_turn(6, 4);
+        fence.record_turn(10, 6);
+
+        fence.rebase_turns(6);
+
+        // The first two boundaries were consumed by the drop; the third shifts.
+        assert_eq!(fence.droppable_prefix(6), 4);
+        assert_eq!(fence.droppable_prefix(4), 0);
+    }
+
+    /// A rolling compaction drain must invalidate an in-flight chronicle cut,
+    /// or the cut trims a head that no longer means what it did.
+    #[test]
+    fn a_head_mutation_from_either_mode_invalidates_an_in_flight_cut() {
+        let fence = HistoryFence::new();
+        let cut = fence.snapshot();
+        assert!(fence.matches(cut));
+
+        // Rolling compaction drains the shared vector.
+        fence.note_head_mutation();
+        assert!(
+            !fence.matches(cut),
+            "a drain from the other mode must invalidate the cut"
+        );
+    }
+
+    /// Switching modes while a summarizer is in flight must invalidate it even
+    /// if nothing touched the head in the meantime.
+    #[test]
+    fn a_mode_switch_invalidates_an_in_flight_cut() {
+        let fence = HistoryFence::new();
+        fence.observe_mode(true);
+        let cut = fence.snapshot();
+        assert!(fence.matches(cut));
+
+        // Same mode observed again: not an epoch change.
+        fence.observe_mode(true);
+        assert!(fence.matches(cut));
+
+        fence.observe_mode(false);
+        assert!(
+            !fence.matches(cut),
+            "chronicle -> rolling must invalidate the pending cut"
+        );
+
+        // And back again is another epoch.
+        let after_rolling = fence.snapshot();
+        fence.observe_mode(true);
+        assert!(!fence.matches(after_rolling));
+    }
+
+    /// Emergency truncation and a cut commit both take the mutation lock, so
+    /// they cannot interleave.
+    #[tokio::test]
+    async fn the_mutation_lock_serializes_emergency_and_cuts() {
+        let fence = Arc::new(HistoryFence::new());
+        let held = fence.lock_mutation().await;
+
+        let contender = fence.clone();
+        let task = tokio::spawn(async move {
+            let _guard = contender.lock_mutation().await;
+            true
+        });
+
+        // While the first holder has it, the contender cannot proceed.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !task.is_finished(),
+            "the lock must exclude a second mutator"
+        );
+
+        drop(held);
+        assert!(task.await.expect("contender"), "released lock lets it run");
+    }
+
+    #[test]
+    fn recorded_turns_are_bounded() {
+        let fence = HistoryFence::new();
+        for index in 0..2_000usize {
+            fence.record_turn(index + 1, index as i64 + 1);
+        }
+        // The newest boundary is still reachable; memory is not unbounded.
+        assert_eq!(fence.droppable_prefix(2_000), 2_000);
+    }
+
+    /// The monitor budgets the whole request. A channel whose history looks
+    /// safe on its own can still be over once the prompt and the response
+    /// reserve are counted.
+    #[test]
+    fn request_budget_counts_the_prompt_and_the_response_reserve() {
+        let fence = HistoryFence::new();
+        let context_window = 100_000usize;
+        let live_tokens = 60_000usize;
+        let reserve = (context_window as f32 * RESPONSE_RESERVE_FRACTION) as usize;
+
+        // History alone is 60% — comfortably under an 80% background trigger.
+        assert!((live_tokens as f32 / context_window as f32) < 0.80);
+
+        fence.record_prompt_tokens(12_000);
+        let request = live_tokens + fence.prompt_tokens() + reserve;
+        assert!(
+            (request as f32 / context_window as f32) >= 0.80,
+            "prompt plus reserve must push this request over the threshold"
+        );
+
+        // With no prompt recorded yet the reserve alone still applies.
+        let bare = HistoryFence::new();
+        assert_eq!(bare.prompt_tokens(), 0);
+    }
+
+    // ---- Context assembly under a hard budget ----
+
+    /// The budget is an upper bound, not a hint: collapse first, then drop,
+    /// and say how many were dropped.
+    #[test]
+    fn view_never_exceeds_its_budget_and_discloses_omissions() {
+        let body = "z".repeat(4_000);
+        let entries: Vec<ChronicleCheckpoint> = (1..=12)
+            .map(|seq| checkpoint(seq, &format!("Span {seq}"), &body))
+            .collect();
+
+        for budget in [300usize, 600, 1_500, 4_000] {
+            let rendered = compose_view(&stats(), &[], &entries, budget);
+            assert!(
+                estimate_text_tokens(&rendered) <= budget,
+                "budget {budget} exceeded: {} tokens",
+                estimate_text_tokens(&rendered)
+            );
+            if rendered.contains("not shown") {
+                assert!(
+                    rendered.contains("chronicle tool"),
+                    "dropped entries must be discoverable"
+                );
+            }
+        }
     }
 
     async fn store_with_two_checkpoints() -> ChronicleStore {
@@ -985,11 +1384,18 @@ mod tests {
         .execute(&pool)
         .await
         .expect("chronicle migration");
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20260810000001_conversation_message_seq.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("seq migration");
 
         for index in 0..6 {
             sqlx::query(
-                "INSERT INTO conversation_messages (id, channel_id, role, content, created_at) \
-                 VALUES (?, 'ch', 'user', 'hello', ?)",
+                "INSERT INTO conversation_messages (id, channel_id, role, content, created_at, seq) \
+                 VALUES (?, 'ch', 'user', 'hello', ?, \
+                    COALESCE((SELECT MAX(seq) FROM conversation_messages WHERE channel_id = 'ch'), 0) + 1)",
             )
             .bind(format!("m{index}"))
             .bind(format!("2026-08-01 00:00:0{index}"))
@@ -1005,15 +1411,15 @@ mod tests {
                 .with_timezone(&Utc)
         };
 
-        let mut from = ChronicleBoundary::origin(at("2026-08-01T00:00:00Z"));
-        for (seq, (to_at, to_id)) in [
-            ("2026-08-01T00:00:02Z", "m2"),
-            ("2026-08-01T00:00:05Z", "m5"),
+        let mut from = ChronicleBoundary::origin();
+        for (seq, (to_at, to_id, to_seq)) in [
+            ("2026-08-01T00:00:02Z", "m2", 3i64),
+            ("2026-08-01T00:00:05Z", "m5", 6i64),
         ]
         .iter()
         .enumerate()
         {
-            let to = ChronicleBoundary::new(at(to_at), Some((*to_id).to_string()));
+            let to = ChronicleBoundary::new(*to_seq);
             store
                 .commit(NewCheckpoint {
                     channel_id: "ch".into(),
@@ -1021,8 +1427,12 @@ mod tests {
                     kind: CheckpointKind::Interval,
                     title: format!("Span {}", seq + 1),
                     summary: format!("Summary of span {}", seq + 1),
-                    covers_from: from.clone(),
-                    covers_to: to.clone(),
+                    covers_from: from,
+                    covers_to: to,
+                    covers_from_at: at("2026-08-01T00:00:00Z"),
+                    covers_to_at: at(to_at),
+                    covers_from_message_id: None,
+                    covers_to_message_id: Some((*to_id).to_string()),
                     message_count: 3,
                     token_estimate: 5,
                     rolls_up_from_seq: None,
@@ -1074,38 +1484,6 @@ mod tests {
                 .expect("view")
                 .is_none()
         );
-    }
-
-    /// Emergency truncation must not stamp "not summarized" on messages that
-    /// are still in live context — doing so would advance the boundary past
-    /// them and rob the next interval cut of the chance to summarize them.
-    #[test]
-    fn emergency_coverage_excludes_messages_still_in_live_context() {
-        // 20 logged messages uncovered, 12 still live after the drain.
-        let logged = 20usize;
-        let retained_live = 12usize;
-        let covered = logged.saturating_sub(retained_live);
-        assert_eq!(covered, 8, "only the discarded span is covered");
-
-        // When the log has not caught up with the live history, nothing is
-        // safely coverable and the cut is skipped rather than over-reaching.
-        let lagging_log = 9usize;
-        assert_eq!(lagging_log.saturating_sub(retained_live), 0);
-    }
-
-    /// Bootstrap is for a backlog larger than one cut can read. A busy but new
-    /// channel gets an ordinary interval checkpoint.
-    #[test]
-    fn bootstrap_threshold_tracks_what_one_cut_can_read() {
-        let config = ChronicleConfig::default();
-        let busy_new_channel = config.interval_messages as i64 + 5;
-        assert!(
-            busy_new_channel <= config.max_messages_per_checkpoint,
-            "a burst past the interval is still an ordinary first cut"
-        );
-
-        let legacy_backlog = config.max_messages_per_checkpoint + 1;
-        assert!(legacy_backlog > config.max_messages_per_checkpoint);
     }
 
     /// Checkpoints outside the recent window still appear, so a session that
