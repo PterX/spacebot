@@ -132,7 +132,9 @@ Cron and autonomy channels (`ChannelKind::Cron`, `ChannelKind::Autonomy`, `src/a
 
 A channel switching to chronicle mode with no checkpoints gets a **bootstrap** checkpoint before its first interval cut. Its range is `[earliest logged message, now]`, and its summary is, in order of preference: the live `[Compaction Summary]` head if the rolling compactor left one in memory; otherwise an LLM summary of the last `history_backfill_count` messages; otherwise a placeholder stating that history prior to this point was not chronicled.
 
-This makes coverage total from the first cut and stops the first real checkpoint from trying to summarize three weeks in one call. Legacy channels stay readable either way — `conversation_messages` is untouched by any of this, and a channel switched back to rolling mode simply stops consulting the checkpoint table while the rows remain.
+This makes coverage total from the first cut and stops the first real checkpoint from trying to summarize three weeks in one call. Legacy channels stay readable either way — `conversation_messages` is untouched by any of this.
+
+Switching **back** to rolling needs more care than "stop consulting the checkpoint table", because chronicle mode has already trimmed the checkpointed ranges out of live history. Dropping the view on the switch would leave the next prompt holding only the uncheckpointed tail, silently discarding everything the checkpoints covered. So the view is not gated on the mode: a channel that has ever chronicled keeps rendering its chronicle, and the mode governs only whether *new* checkpoints are cut. Rolling compaction then resumes on the live tail, and the two coexist — a rolling summary at the head of history, a chronicle section in the system prompt — until the channel is switched back or the checkpoints are pruned. No history conversion step is performed, and none is needed.
 
 ---
 

@@ -98,6 +98,9 @@ coding = "anthropic/claude-sonnet-4-20250514"
 # Context compaction. `mode` selects how a channel sheds history:
 #   "rolling"   — one summary at the head of history, rewritten under pressure
 #   "chronicle" — append-only interval checkpoints, persisted per channel
+# Switching back to "rolling" stops new checkpoints being cut but keeps
+# rendering the ones already committed, so history the chronicle trimmed out of
+# live context stays visible.
 [defaults.compaction]
 mode = "rolling"
 background_threshold = 0.80    # background summarization
@@ -273,7 +276,7 @@ Most config values are hot-reloaded when their files change. Spacebot watches `c
 |---------|----------|-------|
 | Model routing | Yes | Next LLM call uses the new model |
 | Compaction thresholds | Yes | Next compaction check uses new thresholds |
-| Compaction `mode` and chronicle settings | Yes | Next turn uses the new monitor; existing checkpoints are kept either way |
+| Compaction `mode` and chronicle settings | Yes | Next turn uses the new monitor. Existing checkpoints are kept and still rendered into the prompt even after switching back to `rolling`, so context the chronicle already trimmed from live history is not lost |
 | `max_turns` | Yes | Next channel message uses new limit |
 | `context_window` | Yes | Next compaction/worker check uses new size |
 | `max_concurrent_branches` | Yes | Next branch spawn checks new limit |
