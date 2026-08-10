@@ -99,12 +99,51 @@ During a run it can:
 - **Execute ready tasks** — tasks the user has approved. Uses execution tools directly (shell, file, browser) with no forced delegation. Workers available for genuine parallelism.
 - **Create new tasks** — identifies follow-on work and adds it to `pending_approval`. The agent proposes; the user decides.
 - **Update task metadata** — priority, blockers, progress notes.
+- **Record what it notices** — the channel holds `memory_save` and `memory_recall` directly (it does not branch, so there is no persistence branch behind it). Findings are written as they are found, not batched at the end, because a run can time out and lose them.
+
+Recording is licensed, not quota'd. A run that genuinely learned nothing records nothing, and the briefing says so in as many words. An agent told to always produce an observation will produce one — restating what it was already given, or narrating its own activity as a discovery — and manufactured memories are worse than none, because they degrade every future recall that has to sift past them.
 
 What it **cannot** do:
-- Reply to users (no `reply` tool)
+- Hold a conversation. There is no `reply` tool: the channel has no inbound turn to answer, and a user who replies to something it sent is answered by the normal user channel for that conversation. Delivery to a configured target is not conversation — see **Reaching Out** below.
 - Execute tasks that are still in `pending_approval`
 - Create cron jobs
 - Spawn other autonomy channels
+
+---
+
+## The Empty Instance
+
+A fresh instance has no tasks, no goals, and no history. The default outcome is a run that surveys nothing, concludes "nothing new here", and exits — and because nothing changed, the next wake reaches the same conclusion. An agent that idles until someone gives it work is not autonomous; it is a queue consumer with a timer.
+
+The survey already knows when it came back empty, so the briefing branches on it rather than leaving the agent to notice. The template is already conditional on wake events, run history, goals, workers, and level; empty state is one more branch, and it fires deterministically. That matters more than it sounds: routing this through a skill the agent chooses to invoke reintroduces the exact failure being fixed, because the run that fails to reach for the skill is indistinguishable from the run that had nothing to do.
+
+The empty branch is built on one claim: **on an empty instance, learning the user and the system is the highest-value work available, not filler while waiting for real work.**
+
+- **Read what is actually here.** The workspace, registered projects, whatever the user has already done. A cloned repository is a statement of intent.
+- **Record what it learns**, under the rules above.
+- **Find capability gaps** via `spacebot_docs` — features that fit what the user appears to be doing and that they have not set up.
+- **Ask one good question.** If there is a single thing the user could say that would unlock the most, ask that.
+
+The last one is the point. A question that gets answered converts an empty instance into a non-empty one and compounds into every later run. Ten manufactured observations compound into nothing. When the empty branch is deciding what is worth doing, one good question outranks a full survey of an empty system.
+
+`spacebot_docs` is currently registered only on the branch and cortex tool servers (`create_branch_tool_server`, `create_cortex_tool_server`), not in `add_direct_mode_tools` — which is what the autonomy channel receives, and it does not branch. It has to be added there before any of this is reachable.
+
+---
+
+## Reaching Out
+
+At `suggest` and above, a run may send to the home channel ([`home-channel.md`](home-channel.md)). This is the one place autonomous work becomes visible to a human without them going looking, so the bar is deliberately high — an agent that reports in every interval gets muted, and a muted agent is worth less than a silent one.
+
+Send when:
+
+- It needs something only the user can provide — a decision, access, a credential, missing context that blocks otherwise-ready work.
+- It found something time-sensitive, where waiting until the user next opens a channel has a cost.
+
+Do not send to report activity. "Here is what I did this run" is what run history is for, and it is visible on demand rather than pushed.
+
+Every send is journaled into the transcript as the agent's own turn, so the next run can see that it already raised something and decide against repeating it. That judgment is the primary control; the content-key backstop exists for loops, not for taste. An unanswered question asked twice in a week is a worse outcome than one asked once and left standing.
+
+With the dial at `observe`, or with no home channel configured, this section does not apply — findings are recorded and nothing is sent.
 
 ---
 
