@@ -107,7 +107,7 @@ pub(super) async fn status(State(state): State<Arc<ApiState>>) -> Json<StatusRes
     path = "/restart",
     responses(
         (status = 200, body = RestartResponse),
-        (status = 503, description = "Daemon lifecycle control not available"),
+        (status = 503, body = RestartResponse, description = "Daemon lifecycle control not available"),
     ),
     tag = "system",
 )]

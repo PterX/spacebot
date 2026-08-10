@@ -2175,7 +2175,9 @@ export const api = {
 	},
 	restart: async () => {
 		const response = await fetch(`${getApiBase()}/restart`, { method: "POST" });
-		if (!response.ok) {
+		// 503 carries a typed RestartResponse ({ status: "unavailable" }) so the
+		// UI can show its unavailable-state message instead of a generic error.
+		if (!response.ok && response.status !== 503) {
 			throw new Error(`API error: ${response.status}`);
 		}
 		return response.json() as Promise<RestartResponse>;

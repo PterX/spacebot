@@ -58,6 +58,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/agents/autonomy/ceiling": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Set the instance-wide autonomy ceiling.
+         * @description Persists to the top-level `[autonomy]` table in config.toml, then stores
+         *     the new level into the shared ArcSwap so every agent picks it up
+         *     immediately. Returns the resulting fleet snapshot.
+         */
+        put: operations["update_autonomy_ceiling"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/agents/autonomy/fleet": {
         parameters: {
             query?: never;
@@ -731,6 +753,62 @@ export interface paths {
         put?: never;
         /** Upload skill files (zip archives or directories) from the user's computer. */
         post: operations["upload_skill"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/wakes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List wake definitions for an agent, virtual interval survey first. */
+        get: operations["list_wakes"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/wakes/{wake_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Tune a wake definition. Built-in rows accept enabled, instructions, and
+         *     min_level but keep their name; the virtual interval survey rejects all
+         *     writes.
+         */
+        put: operations["update_wake"];
+        post?: never;
+        /** Delete a user-owned wake definition. */
+        delete: operations["delete_wake"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/wakes/{wake_id}/fire": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Manually test-fire a wake through the authenticated API. */
+        post: operations["fire_wake"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2834,11 +2912,16 @@ export interface components {
              */
             task_number?: number | null;
         };
+        AutonomyCeilingUpdateRequest: {
+            ceiling: components["schemas"]["AutonomyLevel"];
+        };
         AutonomyCurrentRun: {
             started_at: string;
         };
         AutonomyFleetResponse: {
             agents: components["schemas"]["AutonomyStatusResponse"][];
+            /** @description Instance-wide autonomy ceiling applied to every agent. */
+            ceiling: components["schemas"]["AutonomyLevel"];
         };
         /**
          * @description How much the autonomy channel may do without a user present.
@@ -2898,6 +2981,11 @@ export interface components {
             ] | null;
             agent_id: string;
             current_run?: null | components["schemas"]["AutonomyCurrentRun"];
+            /**
+             * @description The agent's dial capped by the instance ceiling — what the agent
+             *     actually runs at.
+             */
+            effective_level: components["schemas"]["AutonomyLevel"];
             /** Format: int64 */
             interval_secs: number;
             /** @description When the most recent finished run started. */
@@ -4785,6 +4873,35 @@ export interface components {
             fired: boolean;
             message: string;
         };
+        WakeItem: {
+            builtin: boolean;
+            enabled: boolean;
+            id: string;
+            instructions: string;
+            last_fired_at?: string | null;
+            min_level: components["schemas"]["AutonomyLevel"];
+            name: string;
+            /** @description "schedule", "webhook", or "event". */
+            trigger_kind: string;
+            /**
+             * @description Human-readable trigger summary: the cron expression, "every 15m",
+             *     the event name, or "webhook".
+             */
+            trigger_label: string;
+            /** @description Derived from live config rather than a `wake_defs` row; read-only. */
+            virtual: boolean;
+            /** @description Public ingress path, webhook wakes only. */
+            webhook_url?: string | null;
+        };
+        WakeUpdateRequest: {
+            enabled?: boolean | null;
+            instructions?: string | null;
+            min_level?: null | components["schemas"]["AutonomyLevel"];
+            name?: string | null;
+        };
+        WakesResponse: {
+            wakes: components["schemas"]["WakeItem"][];
+        };
         WarmupSection: {
             eager_embedding_load: boolean;
             enabled: boolean;
@@ -5178,6 +5295,43 @@ export interface operations {
             };
             /** @description Agent not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_autonomy_ceiling: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AutonomyCeilingUpdateRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AutonomyFleetResponse"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -6882,6 +7036,185 @@ export interface operations {
             };
         };
     };
+    list_wakes: {
+        parameters: {
+            query: {
+                agent_id: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WakesResponse"];
+                };
+            };
+            /** @description Agent not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_wake: {
+        parameters: {
+            query: {
+                agent_id: string;
+            };
+            header?: never;
+            path: {
+                /** @description Wake definition id */
+                wake_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WakeUpdateRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WakeItem"];
+                };
+            };
+            /** @description Virtual wake, or a rename of a built-in wake */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Agent or wake not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_wake: {
+        parameters: {
+            query: {
+                agent_id: string;
+            };
+            header?: never;
+            path: {
+                /** @description Wake definition id */
+                wake_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Wake deleted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Virtual or built-in wake */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Agent or wake not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Config-owned wake */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    fire_wake: {
+        parameters: {
+            query: {
+                agent_id: string;
+            };
+            header?: never;
+            path: {
+                /** @description Wake definition id */
+                wake_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Wake event queued */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Virtual wake */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Agent or wake not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     get_warmup_status: {
         parameters: {
             query?: {
@@ -8144,6 +8477,13 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Goal store not initialized */
             503: {
                 headers: {
@@ -8222,6 +8562,13 @@ export interface operations {
             };
             /** @description Goal not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Internal server error */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -9695,7 +10042,9 @@ export interface operations {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["RestartResponse"];
+                };
             };
         };
     };

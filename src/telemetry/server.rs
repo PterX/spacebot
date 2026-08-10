@@ -43,9 +43,13 @@ pub async fn start_metrics_server(
     let handle = tokio::spawn(async move {
         let mut shutdown_rx = shutdown_rx;
         let shutdown_signal = async move {
-            let _ = shutdown_rx
+            if shutdown_rx
                 .wait_for(|state| *state != crate::lifecycle::LifecycleState::Running)
-                .await;
+                .await
+                .is_err()
+            {
+                tracing::debug!("lifecycle sender dropped; shutting down metrics server");
+            }
         };
 
         if let Err(error) = axum::serve(listener, app)

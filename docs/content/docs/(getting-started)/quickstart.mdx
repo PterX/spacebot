@@ -146,7 +146,7 @@ spacebot restart -f -d  # restart in foreground with debug
 
 Logs go to `~/.spacebot/agents/{id}/data/logs/` in daemon mode, or stderr in foreground mode.
 
-Restarts re-exec the daemon with its original environment — they don't pick up new environment variables or a rebuilt service definition. Use a full stop + start (or `systemctl restart` under systemd) for that. Agents can also restart the daemon themselves via the `restart` tool, and the dashboard has a Restart button under Settings → Updates.
+An in-place restart re-execs the daemon with its original environment, so it doesn't pick up new environment variables or a rebuilt service definition. The stop + start fallback launches a fresh process and does pick those up — as does an explicit `spacebot stop && spacebot start` or `systemctl restart` under systemd. Agents can also restart the daemon themselves via the `restart` tool, and the dashboard has a Restart button under Settings → Updates.
 
 ## Identity files
 

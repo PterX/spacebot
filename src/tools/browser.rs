@@ -653,7 +653,7 @@ impl BrowserState {
     /// or never run at all before a restart re-exec — and orphan Chromium.
     /// Persistent profile directories are preserved; temp profiles are removed.
     pub async fn shutdown(&mut self) {
-        let Some(mut browser) = self.browser.take() else {
+        let Some(browser) = self.browser.take() else {
             return;
         };
         let handler_task = self._handler_task.take();
@@ -662,28 +662,44 @@ impl BrowserState {
         self.active_target = None;
         self.invalidate_snapshot();
 
-        // Close gracefully before aborting the handler so chromiumoxide does
-        // not fall back to force-killing the child.
-        match tokio::time::timeout(std::time::Duration::from_secs(5), browser.close()).await {
-            Ok(Ok(_)) => tracing::debug!("browser closed for daemon shutdown"),
-            Ok(Err(error)) => tracing::debug!(%error, "failed to close browser at shutdown"),
-            Err(_) => tracing::debug!("browser close timed out after 5s at shutdown"),
-        }
+        let remove_dir = if self.persistent_profile {
+            None
+        } else {
+            user_data_dir
+        };
+        close_browser_resources(browser, handler_task, remove_dir).await;
+    }
+}
 
-        if let Some(task) = handler_task {
-            task.abort();
-        }
+/// Close a browser process gracefully, abort its handler task, then remove the
+/// given profile directory. Shared by [`BrowserState::shutdown`] (awaited
+/// inline at daemon teardown) and [`Drop`] (spawned, best-effort) so the two
+/// paths cannot drift on timeout or ordering.
+async fn close_browser_resources(
+    mut browser: Browser,
+    handler_task: Option<JoinHandle<()>>,
+    remove_dir: Option<PathBuf>,
+) {
+    // Close gracefully before aborting the handler so chromiumoxide does not
+    // fall back to force-killing the child.
+    match tokio::time::timeout(std::time::Duration::from_secs(5), browser.close()).await {
+        Ok(Ok(_)) => tracing::debug!("browser closed gracefully"),
+        Ok(Err(error)) => tracing::debug!(%error, "failed to close browser"),
+        Err(_) => tracing::debug!("browser close timed out after 5s"),
+    }
 
-        if !self.persistent_profile
-            && let Some(dir) = user_data_dir
-            && let Err(error) = tokio::fs::remove_dir_all(&dir).await
-        {
-            tracing::debug!(
-                path = %dir.display(),
-                %error,
-                "failed to clean up browser user data dir at shutdown"
-            );
-        }
+    if let Some(task) = handler_task {
+        task.abort();
+    }
+
+    if let Some(dir) = remove_dir
+        && let Err(error) = tokio::fs::remove_dir_all(&dir).await
+    {
+        tracing::debug!(
+            path = %dir.display(),
+            %error,
+            "failed to clean up browser user data dir"
+        );
     }
 }
 
@@ -700,39 +716,14 @@ impl Drop for BrowserState {
         let handler_task = self._handler_task.take();
         let user_data_dir = self.user_data_dir.take();
 
-        // Close browser gracefully before cleaning up temp directory.
-        // This prevents chromiumoxide's force-kill which causes core dumps.
-        // We bundle close → abort → cleanup into a single spawned task to avoid races.
-        if let Some(mut browser) = browser
-            && let Some(task) = handler_task
-            && let Some(dir) = user_data_dir
+        if let Some(browser) = browser
             && let Ok(handle) = tokio::runtime::Handle::try_current()
         {
-            handle.spawn(async move {
-                // Close browser first (with timeout to avoid hanging)
-                let close_result =
-                    tokio::time::timeout(std::time::Duration::from_secs(5), browser.close()).await;
-
-                match close_result {
-                    Ok(Ok(_)) => tracing::debug!("Browser closed gracefully"),
-                    Ok(Err(error)) => {
-                        tracing::debug!(%error, "Failed to close browser during drop")
-                    }
-                    Err(_) => tracing::debug!("Browser close timed out after 5s"),
-                }
-
-                // Abort handler task after close completes or times out
-                task.abort();
-
-                // Then clean up temp directory
-                if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
-                    tracing::debug!(
-                        path = %dir.display(),
-                        %error,
-                        "Failed to clean up browser user data dir"
-                    );
-                }
-            });
+            handle.spawn(close_browser_resources(
+                browser,
+                handler_task,
+                user_data_dir,
+            ));
         }
         // Note: if no runtime is available, we can't close async -
         // chromiumoxide will force-kill on drop, which is acceptable

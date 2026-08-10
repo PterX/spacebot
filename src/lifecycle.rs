@@ -114,7 +114,7 @@ impl LifecycleHandle {
                 INTENT_RESTART => LifecycleState::Restart,
                 _ => return,
             };
-            let _ = tx.send(state);
+            tx.send(state).ok();
         });
     }
 }
@@ -217,13 +217,35 @@ impl PendingRestart {
     pub fn take(instance_dir: &Path) -> Option<Self> {
         let path = Self::path(instance_dir);
         let content = std::fs::read_to_string(&path).ok()?;
-        let _ = std::fs::remove_file(&path);
+        if let Err(error) = std::fs::remove_file(&path) {
+            tracing::warn!(
+                %error,
+                path = %path.display(),
+                "failed to remove pending_restart.json; it may replay on next boot"
+            );
+        }
         match serde_json::from_str(&content) {
             Ok(pending) => Some(pending),
             Err(error) => {
                 tracing::warn!(%error, "discarding unreadable pending_restart.json");
                 None
             }
+        }
+    }
+
+    /// Remove any persisted marker without reading it. Used when a shutdown
+    /// supersedes an armed restart, so the marker can't announce a restart
+    /// that never happened on a later boot.
+    pub fn discard(instance_dir: &Path) {
+        let path = Self::path(instance_dir);
+        if let Err(error) = std::fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                %error,
+                path = %path.display(),
+                "failed to remove superseded pending_restart.json"
+            );
         }
     }
 }
@@ -315,6 +337,27 @@ mod tests {
         assert_eq!(taken.adapter.as_deref(), Some("discord"));
         assert!(!PendingRestart::path(dir.path()).exists());
         assert!(PendingRestart::take(dir.path()).is_none());
+    }
+
+    #[test]
+    fn discard_removes_marker_and_tolerates_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending = PendingRestart {
+            agent_id: "main".into(),
+            conversation_id: "discord:123".into(),
+            adapter: None,
+            target: None,
+            reason: "superseded".into(),
+            requested_at: chrono::Utc::now(),
+            source: "tool".into(),
+        };
+        pending.write(dir.path()).unwrap();
+
+        PendingRestart::discard(dir.path());
+        assert!(!PendingRestart::path(dir.path()).exists());
+
+        // No marker present is not an error.
+        PendingRestart::discard(dir.path());
     }
 
     #[test]

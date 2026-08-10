@@ -360,9 +360,13 @@ pub async fn start_http_server(
         let mut shutdown = shutdown_rx;
         if let Err(error) = axum::serve(listener, app)
             .with_graceful_shutdown(async move {
-                let _ = shutdown
+                if shutdown
                     .wait_for(|state| *state != crate::lifecycle::LifecycleState::Running)
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!("lifecycle sender dropped; shutting down HTTP server");
+                }
             })
             .await
         {

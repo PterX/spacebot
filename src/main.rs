@@ -330,10 +330,7 @@ fn cmd_restart(
     // in-place re-exec of the already-daemonized process cannot do — use the
     // stop-then-start path for that, and when nothing is running yet.
     if foreground || spacebot::daemon::is_running(&paths).is_none() {
-        cmd_stop_if_running(&paths);
-        let restart_spec =
-            spacebot::lifecycle::RestartSpec::capture(config_path.as_deref(), debug, foreground);
-        return cmd_start(config_path, debug, foreground, restart_spec);
+        return stop_then_start(config_path, debug, foreground, &paths);
     }
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -348,6 +345,10 @@ fn cmd_restart(
             eprintln!("spacebot restarted (pid {pid})");
             Ok(())
         }
+        RestartOutcome::Rejected { message } => {
+            eprintln!("restart rejected: {message}");
+            std::process::exit(1);
+        }
         RestartOutcome::Unconfirmed => {
             eprintln!("restart requested, but no restarted daemon responded within 30 seconds");
             eprintln!("check `spacebot status`");
@@ -355,19 +356,28 @@ fn cmd_restart(
         }
         RestartOutcome::Unsupported => {
             // The running daemon predates the in-place restart command.
-            cmd_stop_if_running(&paths);
-            let restart_spec = spacebot::lifecycle::RestartSpec::capture(
-                config_path.as_deref(),
-                debug,
-                foreground,
-            );
-            cmd_start(config_path, debug, foreground, restart_spec)
+            stop_then_start(config_path, debug, foreground, &paths)
         }
     }
 }
 
+/// Stop any running daemon, then start fresh. The fallback restart path when
+/// an in-place re-exec is not possible.
+fn stop_then_start(
+    config_path: Option<std::path::PathBuf>,
+    debug: bool,
+    foreground: bool,
+    paths: &spacebot::daemon::DaemonPaths,
+) -> anyhow::Result<()> {
+    cmd_stop_if_running(paths);
+    let restart_spec =
+        spacebot::lifecycle::RestartSpec::capture(config_path.as_deref(), debug, foreground);
+    cmd_start(config_path, debug, foreground, restart_spec)
+}
+
 enum RestartOutcome {
     Confirmed { pid: u32 },
+    Rejected { message: String },
     Unconfirmed,
     Unsupported,
 }
@@ -382,6 +392,7 @@ async fn request_daemon_restart(paths: &spacebot::daemon::DaemonPaths) -> Restar
 
     match send_command(paths, IpcCommand::Restart).await {
         Ok(IpcResponse::Ok) => {}
+        Ok(IpcResponse::Error { message }) => return RestartOutcome::Rejected { message },
         // An older daemon fails to parse the command and drops the connection
         // without responding.
         _ => return RestartOutcome::Unsupported,
@@ -798,6 +809,14 @@ async fn run(
 
     tracing::info!("starting spacebot");
     tracing::info!(instance_dir = %config.instance_dir.display(), "configuration loaded");
+
+    // SIGTERM stream for orchestrated stops (docker stop, systemctl stop).
+    // Installed before agent initialization: that window includes database
+    // migrations and model warmup, and a SIGTERM under the default disposition
+    // would kill the process with no teardown at all. Signals arriving during
+    // startup are buffered by the stream and picked up by the main loop.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("failed to install SIGTERM handler")?;
 
     // Start the IPC server for stop/restart/status commands
     let (lifecycle, mut shutdown_rx) = spacebot::lifecycle::LifecycleHandle::new();
@@ -1436,11 +1455,11 @@ async fn run(
         }
     }
 
-    // SIGTERM stream for orchestrated stops (docker stop, systemctl stop).
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("failed to install SIGTERM handler")?;
-
-    // Main event loop: route inbound messages to agent channels
+    // Main event loop: route inbound messages to agent channels. The break
+    // reason is recorded per arm: only a lifecycle-driven break may carry
+    // Restart. An operator signal (SIGTERM, Ctrl-C) always means exit, even
+    // when it races an armed restart whose channel value has already flipped.
+    let mut final_state = spacebot::lifecycle::LifecycleState::Exit;
     loop {
         // Poll the inbound stream if it exists, otherwise yield a never-resolving future
         let inbound_next = async {
@@ -1914,8 +1933,13 @@ async fn run(
                     }
                 }
             }
-            _ = shutdown_rx.wait_for(|state| *state != spacebot::lifecycle::LifecycleState::Running) => {
+            state = shutdown_rx.wait_for(|state| *state != spacebot::lifecycle::LifecycleState::Running) => {
                 tracing::info!("lifecycle signal received via IPC/API");
+                // A dropped sender can't happen while `lifecycle` is alive in
+                // this scope; treat it as a plain exit if it somehow does.
+                final_state = state
+                    .map(|state| *state)
+                    .unwrap_or(spacebot::lifecycle::LifecycleState::Exit);
                 break;
             }
             _ = tokio::signal::ctrl_c() => {
@@ -1929,9 +1953,6 @@ async fn run(
         }
     }
 
-    // Signal-triggered breaks leave the channel at Running; both mean exit.
-    let final_state = *shutdown_rx.borrow();
-
     // Graceful shutdown
     drop(active_channels);
 
@@ -1942,14 +1963,28 @@ async fn run(
 
     messaging_manager.shutdown().await;
 
+    // Close shared browsers inline — their Drop-spawned cleanup task would
+    // race the process exit (or never run before an exec) and orphan Chromium
+    // on every restart. Shutdowns run concurrently, each bounded so a stuck
+    // browser (or a tool call still holding the lock) can't stall teardown
+    // past the restart confirmation window.
+    futures::future::join_all(agents.iter().filter_map(|(agent_id, agent)| {
+        let shared_browser = agent.deps.runtime_config.shared_browser.clone()?;
+        let agent_id = agent_id.clone();
+        Some(async move {
+            let teardown = async { shared_browser.lock().await.shutdown().await };
+            if tokio::time::timeout(std::time::Duration::from_secs(10), teardown)
+                .await
+                .is_err()
+            {
+                tracing::warn!(%agent_id, "shared browser teardown timed out after 10s");
+            }
+        })
+    }))
+    .await;
+
     for (agent_id, agent) in agents {
         tracing::info!(%agent_id, "shutting down agent");
-        // Close shared browsers inline — their Drop-spawned cleanup task would
-        // race the process exit (or never run before an exec) and orphan
-        // Chromium on every restart.
-        if let Some(shared_browser) = &agent.deps.runtime_config.shared_browser {
-            shared_browser.lock().await.shutdown().await;
-        }
         agent.deps.mcp_manager.disconnect_all().await;
         agent.db.close().await;
     }
@@ -1972,9 +2007,17 @@ async fn run(
         // handles) closes atomically, and startup re-runs from main() as if
         // launched fresh. Only returns on failure.
         let error = restart_spec.exec();
+        // In background mode stderr is redirected away, so the log file is the
+        // only place this failure can be diagnosed.
+        tracing::error!(%error, exe = %restart_spec.exe.display(), "restart exec failed");
         eprintln!("restart exec failed: {error}");
         std::process::exit(1);
     }
+
+    // A restart may have been superseded by this shutdown after the restart
+    // tool already persisted its marker; drop it so the next boot doesn't
+    // announce a restart that never happened.
+    spacebot::lifecycle::PendingRestart::discard(&config.instance_dir);
 
     // Force exit — detached tasks (e.g. the serenity gateway client) may keep
     // the tokio runtime alive after all owned resources have been cleaned up.
