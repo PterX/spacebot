@@ -5,6 +5,8 @@ use crate::{BranchId, ChannelId, WorkerId};
 use serde::Serialize;
 use sqlx::{Row as _, SqlitePool};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Persists conversation messages (user and assistant) to SQLite.
 ///
@@ -13,6 +15,36 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct ConversationLogger {
     pool: SqlitePool,
+    /// Detached writes that have been spawned but not yet landed.
+    ///
+    /// Callers that need an exact durable watermark — the chronicle records one
+    /// at every turn boundary — must know when the turn's own rows are visible.
+    /// Reading `MAX(seq)` while writes are still in flight would under-report
+    /// and make trimming lag a turn behind forever.
+    pending_writes: Arc<PendingWrites>,
+}
+
+/// Tracks in-flight fire-and-forget writes so a caller can wait them out.
+#[derive(Debug, Default)]
+pub struct PendingWrites {
+    count: AtomicUsize,
+    drained: tokio::sync::Notify,
+}
+
+impl PendingWrites {
+    fn begin(&self) {
+        self.count.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn finish(&self) {
+        if self.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.drained.notify_waiters();
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        self.count.load(Ordering::Acquire) == 0
+    }
 }
 
 /// A persisted conversation message.
@@ -34,7 +66,43 @@ pub struct ConversationMessage {
 
 impl ConversationLogger {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            pending_writes: Arc::new(PendingWrites::default()),
+        }
+    }
+
+    /// Wait until every write spawned before this call has landed.
+    ///
+    /// Bounded: a stuck write must not stall a turn, so this gives up and the
+    /// caller falls back to whatever watermark is visible, which is the safe
+    /// direction (it keeps more live history, never less).
+    pub async fn wait_for_pending_writes(&self, timeout: std::time::Duration) -> bool {
+        if self.pending_writes.is_idle() {
+            return true;
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        while !self.pending_writes.is_idle() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                tracing::debug!("timed out waiting for conversation writes to drain");
+                return false;
+            }
+            let notified = self.pending_writes.drained.notified();
+            if self.pending_writes.is_idle() {
+                return true;
+            }
+            if tokio::time::timeout(
+                remaining.min(std::time::Duration::from_millis(25)),
+                notified,
+            )
+            .await
+            .is_err()
+            {
+                continue;
+            }
+        }
+        true
     }
 
     /// Log a user message. Fire-and-forget.
@@ -54,7 +122,10 @@ impl ConversationLogger {
         let content = content.to_string();
         let metadata_json = serde_json::to_string(metadata).ok();
 
+        let pending = self.pending_writes.clone();
+        pending.begin();
         tokio::spawn(async move {
+            let _finish = PendingWriteGuard(pending);
             if let Err(error) = sqlx::query(
                 "INSERT INTO conversation_messages \
                  (id, channel_id, role, sender_name, sender_id, content, metadata, seq) \
@@ -92,7 +163,10 @@ impl ConversationLogger {
         let channel_id = channel_id.to_string();
         let content = content.to_string();
 
+        let pending = self.pending_writes.clone();
+        pending.begin();
         tokio::spawn(async move {
+            let _finish = PendingWriteGuard(pending);
             if let Err(error) = sqlx::query(
                 "INSERT INTO conversation_messages (id, channel_id, role, sender_name, content, seq) \
                  VALUES (?, ?, 'system', 'system', ?, \
@@ -137,7 +211,10 @@ impl ConversationLogger {
         // Pack tool_calls into the metadata JSON if present.
         let metadata_json = tool_calls_json.map(|tc| format!(r#"{{"tool_calls":{tc}}}"#));
 
+        let pending = self.pending_writes.clone();
+        pending.begin();
         tokio::spawn(async move {
+            let _finish = PendingWriteGuard(pending);
             if let Err(error) = sqlx::query(
                 "INSERT INTO conversation_messages \
                  (id, channel_id, role, sender_name, content, metadata, seq) \
@@ -269,6 +346,59 @@ impl ConversationLogger {
             messages.reverse();
         }
         Ok(messages)
+    }
+}
+
+/// Pagination cursor for the channel timeline.
+///
+/// Timestamp alone is not a total order at SQLite's one-second resolution, so
+/// the item id breaks ties. Both timeline sources apply it identically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimelineCursor {
+    pub timestamp: String,
+    pub id: String,
+}
+
+impl TimelineCursor {
+    /// Parse the wire form `"<rfc3339>|<id>"`. A bare timestamp is accepted so
+    /// a client mid-upgrade still paginates, just without the tiebreak.
+    pub fn parse(value: &str) -> Self {
+        match value.split_once('|') {
+            Some((timestamp, id)) => Self {
+                timestamp: timestamp.to_string(),
+                id: id.to_string(),
+            },
+            None => Self {
+                timestamp: value.to_string(),
+                // Sorts below every real id, so a legacy cursor keeps the old
+                // strictly-older-second behaviour rather than skipping rows.
+                id: String::new(),
+            },
+        }
+    }
+
+    pub fn encode(timestamp: &str, id: &str) -> String {
+        format!("{timestamp}|{id}")
+    }
+}
+
+/// The id a timeline item paginates by.
+pub fn timeline_item_id(item: &TimelineItem) -> &str {
+    match item {
+        TimelineItem::Message { id, .. }
+        | TimelineItem::BranchRun { id, .. }
+        | TimelineItem::WorkerRun { id, .. }
+        | TimelineItem::ToolCallRun { id, .. }
+        | TimelineItem::Checkpoint { id, .. } => id,
+    }
+}
+
+/// Decrements the in-flight counter however the spawned write exits.
+struct PendingWriteGuard(Arc<PendingWrites>);
+
+impl Drop for PendingWriteGuard {
+    fn drop(&mut self) {
+        self.0.finish();
     }
 }
 
@@ -783,10 +913,15 @@ impl ProcessRunLogger {
         &self,
         channel_id: &str,
         limit: i64,
-        before: Option<&str>,
+        before: Option<TimelineCursor>,
     ) -> crate::error::Result<Vec<TimelineItem>> {
+        // Composite cursor: SQLite timestamps are whole seconds, so a
+        // timestamp-only `<` cursor silently skips every peer sharing the
+        // boundary second. `(timestamp, id)` is a total order, and both the
+        // message/branch/worker union and the checkpoint query use it.
         let before_clause = if before.is_some() {
-            "AND datetime(timestamp) < datetime(?3)"
+            "AND (datetime(timestamp) < datetime(?3) \
+                  OR (datetime(timestamp) = datetime(?3) AND id < ?4))"
         } else {
             ""
         };
@@ -807,13 +942,13 @@ impl ProcessRunLogger {
                        NULL, NULL, task, result, status, \
                        started_at AS timestamp, completed_at \
                 FROM worker_runs WHERE channel_id = ?1 \
-            ) WHERE 1=1 {before_clause} ORDER BY timestamp DESC LIMIT ?2"
+            ) WHERE 1=1 {before_clause} ORDER BY timestamp DESC, id DESC LIMIT ?2"
         );
 
         let mut query = sqlx::query(&query_str).bind(channel_id).bind(limit);
 
-        if let Some(before_ts) = before {
-            query = query.bind(before_ts);
+        if let Some(cursor) = &before {
+            query = query.bind(&cursor.timestamp).bind(&cursor.id);
         }
 
         let rows = query
@@ -940,7 +1075,7 @@ impl ProcessRunLogger {
         // separately and merged. Each source returns up to `limit` rows, which
         // is what makes the merged newest-`limit` slice the correct page.
         let checkpoints = crate::conversation::chronicle::ChronicleStore::new(self.pool.clone())
-            .list_for_timeline(channel_id, limit, before)
+            .list_for_timeline(channel_id, limit, before.as_ref())
             .await?;
         items.extend(checkpoints.into_iter().map(|checkpoint| {
             (
@@ -964,7 +1099,12 @@ impl ProcessRunLogger {
         // Both sources arrive newest-first. A stable sort by the shared key
         // leaves an unchecked timeline in exactly the order it already had and
         // slots checkpoints into place; the page is then the newest `limit`.
-        items.sort_by_key(|(timestamp, _)| std::cmp::Reverse(*timestamp));
+        items.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| timeline_item_id(&right.1).cmp(timeline_item_id(&left.1)))
+        });
         items.truncate(limit as usize);
         let mut items: Vec<TimelineItem> = items.into_iter().map(|(_, item)| item).collect();
         items.reverse();
@@ -1176,7 +1316,7 @@ pub struct WorkerDetailRow {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProcessRunLogger, TimelineItem};
+    use super::{ProcessRunLogger, TimelineCursor, TimelineItem, timeline_item_id};
 
     async fn setup_worker_runs_table() -> sqlx::SqlitePool {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -1443,6 +1583,75 @@ mod tests {
             shape,
             vec!["message:m1", "message:m2", "checkpoint:1", "message:m3"],
             "a checkpoint sits inline after the messages it covers"
+        );
+    }
+
+    /// A page boundary landing among same-second peers must not skip any of
+    /// them. Timestamp-only cursors did exactly that.
+    #[tokio::test]
+    async fn timeline_pagination_does_not_skip_same_second_peers() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        for migration in [
+            include_str!("../../migrations/20260211000002_conversations.sql"),
+            include_str!("../../migrations/20260213000003_process_runs.sql"),
+            include_str!("../../migrations/20260809000004_session_chronicles.sql"),
+            include_str!("../../migrations/20260810000001_conversation_message_seq.sql"),
+        ] {
+            sqlx::raw_sql(migration)
+                .execute(&pool)
+                .await
+                .expect("migration");
+        }
+
+        // Five messages sharing one whole second.
+        for index in 0..5 {
+            sqlx::query(
+                "INSERT INTO conversation_messages (id, channel_id, role, content, created_at, seq) \
+                 VALUES (?, 'ch', 'user', 'hi', '2026-08-01 00:00:00', ?)",
+            )
+            .bind(format!("msg-{index}"))
+            .bind(index + 1)
+            .execute(&pool)
+            .await
+            .expect("insert");
+        }
+
+        let logger = ProcessRunLogger::new(pool);
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<TimelineCursor> = None;
+
+        // Page two at a time through a block that shares a timestamp.
+        for _ in 0..5 {
+            let page = logger
+                .load_channel_timeline("ch", 2, cursor.clone())
+                .await
+                .expect("page");
+            if page.is_empty() {
+                break;
+            }
+            let oldest = page.first().expect("oldest");
+            let (timestamp, id) = match oldest {
+                TimelineItem::Message { created_at, id, .. } => (created_at.clone(), id.clone()),
+                other => panic!("unexpected item: {other:?}"),
+            };
+            cursor = Some(TimelineCursor::parse(&TimelineCursor::encode(
+                &timestamp, &id,
+            )));
+            for item in &page {
+                seen.push(timeline_item_id(item).to_string());
+            }
+        }
+
+        seen.sort();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            5,
+            "every same-second message must be reachable by paging: {seen:?}"
         );
     }
 

@@ -37,7 +37,28 @@ const MIN_RETAINED_MESSAGES: usize = 4;
 /// Share of the context window held back for the channel's own response when
 /// deciding whether the request is too large. Matches the fork pre-compaction
 /// reserve so the two budgets do not disagree.
-const RESPONSE_RESERVE_FRACTION: f32 = 0.15;
+pub const RESPONSE_RESERVE_FRACTION: f32 = 0.15;
+
+/// Estimate what a turn's request will cost, in tokens.
+///
+/// This is deliberately not called a total-request budget. It covers the
+/// rendered system prompt, the live history, the incoming user message, and a
+/// response reserve — everything this layer can measure. It does **not** cover
+/// serialized tool schemas: those are assembled inside Rig's `ToolServer` at
+/// call time and are not exposed to the caller, so a channel with many tools
+/// will send more than this number says. Treat it as a lower bound.
+pub fn estimate_request_tokens(
+    prompt_tokens: usize,
+    history: &[Message],
+    incoming_text: &str,
+    context_window: usize,
+) -> usize {
+    let response_reserve = (context_window as f32 * RESPONSE_RESERVE_FRACTION) as usize;
+    prompt_tokens
+        .saturating_add(estimate_history_tokens(history))
+        .saturating_add(estimate_text_tokens(incoming_text))
+        .saturating_add(response_reserve)
+}
 
 /// Prior checkpoints handed to a cut as narrative context, newest last.
 const NARRATIVE_CONTEXT_CHECKPOINTS: i64 = 3;
@@ -674,46 +695,69 @@ impl CutContext {
     }
 
     /// Drop live entries the chronicle now covers, up to a recorded turn
-    /// boundary.
-    ///
-    /// Trimming lands only on a turn boundary whose durable watermark the
-    /// checkpoint already covers, so a turn's tool traffic is never split and
-    /// nothing is dropped that the checkpoint did not summarize. Caller holds
-    /// the mutation lock.
+    /// boundary. Caller holds the mutation lock.
     async fn trim_live_history(&self, checkpoint: &ChronicleCheckpoint) {
-        let droppable = self.fence.droppable_prefix(checkpoint.covers_to_seq);
-        if droppable == 0 {
-            return;
-        }
-
-        let mut history = self.history.write().await;
-        if !self.fence.matches(self.entry) {
-            tracing::debug!(
-                channel_id = %self.channel_id,
-                seq = checkpoint.seq,
-                "skipping chronicle trim: history changed during the cut"
-            );
-            return;
-        }
-
-        let floor = history.len().saturating_sub(MIN_RETAINED_MESSAGES);
-        let remove = droppable.min(floor);
-        if remove == 0 {
-            return;
-        }
-
-        history.drain(..remove);
-        self.fence.note_head_mutation();
-        self.fence.rebase_turns(remove);
-
-        tracing::debug!(
-            channel_id = %self.channel_id,
-            seq = checkpoint.seq,
-            removed = remove,
-            retained = history.len(),
-            "trimmed live history to a covered turn boundary"
-        );
+        trim_live_history_to_boundary(
+            &self.channel_id,
+            &self.fence,
+            &self.history,
+            self.entry,
+            checkpoint,
+        )
+        .await;
     }
+}
+
+/// Drop live entries a checkpoint covers, landing only on a recorded turn
+/// boundary.
+///
+/// Trimming lands on a turn boundary whose durable watermark the checkpoint
+/// already covers, so a turn's tool traffic is never split and nothing is
+/// dropped that the checkpoint did not summarize. A fence mismatch means
+/// another mutator moved the head while the cut ran; the checkpoint stays
+/// valid and the next trim catches up.
+///
+/// Free-standing so it can be driven directly, exactly as production runs it.
+pub(crate) async fn trim_live_history_to_boundary(
+    channel_id: &ChannelId,
+    fence: &Arc<HistoryFence>,
+    history: &Arc<RwLock<Vec<Message>>>,
+    entry: FenceSnapshot,
+    checkpoint: &ChronicleCheckpoint,
+) -> usize {
+    let droppable = fence.droppable_prefix(checkpoint.covers_to_seq);
+    if droppable == 0 {
+        return 0;
+    }
+
+    let mut history = history.write().await;
+    if !fence.matches(entry) {
+        tracing::debug!(
+            channel_id = %channel_id,
+            seq = checkpoint.seq,
+            "skipping chronicle trim: history changed during the cut"
+        );
+        return 0;
+    }
+
+    let floor = history.len().saturating_sub(MIN_RETAINED_MESSAGES);
+    let remove = droppable.min(floor);
+    if remove == 0 {
+        return 0;
+    }
+
+    history.drain(..remove);
+    fence.note_head_mutation();
+    fence.rebase_turns(remove);
+
+    tracing::debug!(
+        channel_id = %channel_id,
+        seq = checkpoint.seq,
+        removed = remove,
+        retained = history.len(),
+        "trimmed live history to a covered turn boundary"
+    );
+    remove
 }
 
 fn emit_checkpoint_event(
@@ -1335,6 +1379,72 @@ mod tests {
         // With no prompt recorded yet the reserve alone still applies.
         let bare = HistoryFence::new();
         assert_eq!(bare.prompt_tokens(), 0);
+    }
+
+    /// The production trim path end-to-end against a real store: commit a
+    /// checkpoint, then trim to the turn boundary it covers. This drives
+    /// `CutContext::trim_live_history` rather than the fence primitive, which
+    /// is what a previous revision left unwired.
+    #[tokio::test]
+    async fn cut_context_trims_live_history_to_the_covered_turn_boundary() {
+        let store = store_with_two_checkpoints().await;
+        let fence = Arc::new(HistoryFence::new());
+
+        // 10 live entries across two turns; the second is tool-heavy.
+        let history = Arc::new(RwLock::new(
+            (0..10)
+                .map(|index| Message::from(format!("entry {index}")))
+                .collect::<Vec<_>>(),
+        ));
+        fence.record_turn(3, 3);
+        fence.record_turn(10, 6);
+
+        let checkpoint = store
+            .latest("ch", 0)
+            .await
+            .expect("latest")
+            .expect("a checkpoint exists");
+        assert_eq!(checkpoint.covers_to_seq, 6);
+
+        let entry = fence.snapshot();
+        trim_live_history_to_boundary(&Arc::from("ch"), &fence, &history, entry, &checkpoint).await;
+
+        let remaining = history.read().await.len();
+        assert_eq!(
+            remaining, 4,
+            "the whole covered prefix goes, down to the retention floor"
+        );
+    }
+
+    /// A head mutation from the other mode during the cut must abort the trim.
+    #[tokio::test]
+    async fn trim_is_abandoned_when_the_head_moved_during_the_cut() {
+        let store = store_with_two_checkpoints().await;
+        let fence = Arc::new(HistoryFence::new());
+        let history = Arc::new(RwLock::new(
+            (0..10)
+                .map(|index| Message::from(format!("entry {index}")))
+                .collect::<Vec<_>>(),
+        ));
+        fence.record_turn(10, 6);
+
+        let checkpoint = store
+            .latest("ch", 0)
+            .await
+            .expect("latest")
+            .expect("checkpoint");
+
+        let entry = fence.snapshot();
+
+        // Rolling compaction drains the head while the cut was summarizing.
+        fence.note_head_mutation();
+
+        trim_live_history_to_boundary(&Arc::from("ch"), &fence, &history, entry, &checkpoint).await;
+        assert_eq!(
+            history.read().await.len(),
+            10,
+            "a stale cut must not trim on top of another mutator"
+        );
     }
 
     // ---- Context assembly under a hard budget ----

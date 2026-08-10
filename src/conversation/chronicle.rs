@@ -482,22 +482,25 @@ impl ChronicleStore {
         &self,
         channel_id: &str,
         limit: i64,
-        before: Option<&str>,
+        before: Option<&crate::conversation::history::TimelineCursor>,
     ) -> Result<Vec<ChronicleCheckpoint>> {
+        // Same composite cursor the message union uses, so a page boundary
+        // landing among same-second peers cannot skip a checkpoint.
         let before_clause = if before.is_some() {
-            "AND datetime(created_at) < datetime(?3)"
+            "AND (datetime(created_at) < datetime(?3) \
+                  OR (datetime(created_at) = datetime(?3) AND id < ?4))"
         } else {
             ""
         };
         let sql = format!(
             "SELECT * FROM channel_chronicle_checkpoints \
              WHERE channel_id = ?1 {before_clause} \
-             ORDER BY created_at DESC LIMIT ?2"
+             ORDER BY created_at DESC, id DESC LIMIT ?2"
         );
 
         let mut query = sqlx::query(&sql).bind(channel_id).bind(limit);
-        if let Some(before) = before {
-            query = query.bind(before);
+        if let Some(cursor) = before {
+            query = query.bind(&cursor.timestamp).bind(&cursor.id);
         }
 
         let rows = query
@@ -626,6 +629,37 @@ impl ChronicleStore {
         .map_err(|error| anyhow::anyhow!(error))?;
 
         Ok(rows.into_iter().map(message_from_row).collect())
+    }
+
+    /// The newest logged messages after a boundary, returned oldest-first.
+    ///
+    /// A resumed channel wants the *end* of its uncovered tail, not the start:
+    /// the oldest uncovered rows are the ones a checkpoint will summarize next,
+    /// while the newest are the live conversation. The rows are selected
+    /// newest-first and reversed so the caller still renders chronologically.
+    pub async fn newest_messages_after(
+        &self,
+        channel_id: &str,
+        boundary: ChronicleBoundary,
+        limit: i64,
+    ) -> Result<Vec<ConversationMessage>> {
+        let rows = sqlx::query(
+            "SELECT id, channel_id, role, sender_name, sender_id, content, metadata, created_at, seq \
+             FROM conversation_messages \
+             WHERE channel_id = ? AND seq > ? \
+             ORDER BY seq DESC LIMIT ?",
+        )
+        .bind(channel_id)
+        .bind(boundary.seq)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+        let mut messages: Vec<ConversationMessage> =
+            rows.into_iter().map(message_from_row).collect();
+        messages.reverse();
+        Ok(messages)
     }
 
     /// Logged messages inside a half-open `(from, to]` seq range, oldest first.
@@ -1036,6 +1070,26 @@ mod tests {
         }
 
         assert_eq!(seen.len(), 25, "pagination reaches every covered message");
+    }
+
+    /// Restart wants the newest uncovered messages, rendered oldest-first.
+    #[tokio::test]
+    async fn newest_tail_keeps_the_end_of_the_span_in_chronological_order() {
+        let store = setup().await;
+        for index in 1..=6 {
+            insert_message(&store, "ch", &format!("m{index}"), "2026-08-01 00:00:00").await;
+        }
+
+        let tail = store
+            .newest_messages_after("ch", ChronicleBoundary::new(0), 3)
+            .await
+            .expect("tail");
+        let ids: Vec<&str> = tail.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["m4", "m5", "m6"],
+            "the newest three, still in chronological order"
+        );
     }
 
     #[tokio::test]

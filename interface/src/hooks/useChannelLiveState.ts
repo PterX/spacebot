@@ -860,7 +860,9 @@ export function useChannelLiveState(channels: ChannelInfo[]) {
 
 			const oldestItem = state.timeline[0];
 			if (!oldestItem) return prev;
-			const before = itemTimestamp(oldestItem);
+			// Composite cursor: SQLite timestamps are whole seconds, so paging on
+			// the timestamp alone skips every peer sharing the boundary second.
+			const before = `${itemTimestamp(oldestItem)}|${oldestItem.id}`;
 
 			// Mark as loading, then kick off the fetch outside setState
 			setTimeout(() => {

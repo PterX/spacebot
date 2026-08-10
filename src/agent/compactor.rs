@@ -136,6 +136,7 @@ impl Compactor {
 
         let history = self.history.clone();
         let fence = self.fence.clone();
+        let entry = fence.snapshot();
         let is_compacting = self.is_compacting.clone();
         let channel_id = self.channel_id.clone();
         let deps = self.deps.clone();
@@ -162,6 +163,7 @@ impl Compactor {
                 fraction,
                 model_override,
                 &fence,
+                entry,
             )
             .await;
 
@@ -192,6 +194,9 @@ impl Compactor {
     /// Only fires at 95%+ context usage. Removes the oldest half of messages and
     /// inserts a marker. Fast and synchronous.
     async fn emergency_truncate(&self) -> Result<()> {
+        // The same lock the chronicle takes. Without it a rolling drain can
+        // interleave with a chronicle commit/trim across a mode switch.
+        let _guard = self.fence.lock_mutation().await;
         let mut history = self.history.write().await;
         let total = history.len();
         if total <= 2 {
@@ -231,9 +236,11 @@ async fn run_compaction(
     fraction: f32,
     model_override: Option<String>,
     fence: &Arc<crate::agent::chronicle::HistoryFence>,
+    entry: crate::agent::chronicle::FenceSnapshot,
 ) -> Result<usize> {
     // 1. Read and remove the oldest messages from history
     let (removed_messages, remove_count) = {
+        let _guard = fence.lock_mutation().await;
         let mut hist = history.write().await;
         let total = hist.len();
         let remove_count = ((total as f32 * fraction) as usize)
@@ -290,8 +297,20 @@ async fn run_compaction(
         }
     };
 
-    // 4. Insert the summary at the beginning of the channel's history
+    // 4. Insert the summary at the beginning of the channel's history.
+    //
+    // The mode may have switched to chronicle while this summarizer ran. Its
+    // legacy summary must not land on a head the chronicle now owns, so the
+    // fence is re-checked under the same lock the chronicle uses.
     {
+        let _guard = fence.lock_mutation().await;
+        if !fence.matches(entry) {
+            tracing::info!(
+                channel_id = %channel_id,
+                "discarding rolling compaction summary: the mode or head changed while it ran"
+            );
+            return Ok(remove_count);
+        }
         let mut hist = history.write().await;
         let summary_message = format!("[Compaction Summary]: {summary}");
         hist.insert(0, Message::from(summary_message));

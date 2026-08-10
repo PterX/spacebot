@@ -215,11 +215,19 @@ render_chronicle_view(channel_id, now, budget_tokens):
 
 Defaults: `recent_window` 24h, `max_recent` 8, `context_token_budget` 2000. All chronicle tuning is clamped at load: an unbounded budget or list size would let configuration defeat the cap it exists to enforce.
 
-The budget is a hard upper bound, not a hint. Collapsing every entry to a title is not sufficient — a long index of one-liners can still exceed it — so after collapsing, entries are dropped oldest-first and the header reports how many are not shown and that the `chronicle` tool can list them. The header itself never collapses.
+The chronicle *section* is a hard upper bound. Collapsing every entry to a title is not sufficient — a long index of one-liners can still exceed the budget — so after collapsing, entries are dropped oldest-first and the header reports how many are not shown and that the `chronicle` tool can list them. The header itself never collapses.
+
+The turn's *whole request* is a different matter, and the honest position is narrower. Before sending, the channel estimates system prompt + live history + the incoming user message + a response reserve, and warns when that exceeds the window. It cannot include serialized tool schemas: Rig assembles those inside its `ToolServer` at call time and does not expose them to the caller. So the estimate is a lower bound, not an enforced cap, and it warns rather than blocking a turn the provider may still serve. Calling this "hard total-request enforcement" would be false.
 
 ### Restart
 
-A restarting channel in chronicle mode must reconstruct *checkpoint view + raw uncovered tail*. Loading the last `history_backfill_count` rows unconditionally duplicates messages the checkpoints already cover and silently omits an uncovered tail longer than that limit, while the chronicle header claims all of it is in context. The resume path instead queries strictly after the latest level-0 boundary; when the tail exceeds the limit the omission is stated in the injected transcript rather than left implicit.
+A restarting channel in chronicle mode must reconstruct *checkpoint view + raw uncovered tail*. Loading the last `history_backfill_count` rows unconditionally duplicates messages the checkpoints already cover and silently omits an uncovered tail longer than that limit, while the chronicle header claims all of it is in context.
+
+The resume path queries strictly after the latest level-0 boundary and keeps the **newest** end of that tail — the oldest uncovered rows are what the next checkpoint will summarize, while the newest are the conversation being resumed. They are returned oldest-first so the rendered transcript stays chronological, and when the tail exceeds the limit the injected text says which messages are missing and where they sit.
+
+### Timeline pagination
+
+The portal timeline pages on a composite `(timestamp, id)` cursor. SQLite timestamps are whole seconds, so a timestamp-only cursor drops every peer sharing the boundary second — and because SQL applies `LIMIT` before the checkpoint/message merge, the underlying `ORDER BY` has to tie-break too or the page is non-deterministic and the cursor cannot advance at all. A bare timestamp is still accepted from older clients, degrading to the previous behaviour rather than erroring.
 
 ## Surfaces
 
@@ -401,9 +409,12 @@ Phases 1-5 are the end-to-end vertical slice: durable schema, lifecycle, assembl
 
 ### Status
 
-Phases 1-5 are implemented and on by config (`compaction.mode = "chronicle"`); the default stays `rolling`. Phases 6-8 are not built. Two consequences of 6 being absent are worth stating plainly rather than discovering later:
+Phases 1-5 are implemented and reachable by config (`compaction.mode = "chronicle"`); the default stays `rolling`. Phase 6 (rollups) is not built. Two consequences worth stating rather than discovering:
 
-- **No rollups exist yet**, so `level` is always 0 and `rolled_up_into` is always null. The schema, the `list_before_seq` selection, the `Rollup` label in both renderers, and the "rolled up" badge are all in place and inert; they light up when phase 6 writes level-1 rows. Until then a very long session's older checkpoints degrade by collapsing to titles under the token budget, which keeps them navigable but not summarized in-context.
-- **`max_older` bounds the older list.** Checkpoints beyond it are absent from the prompt view entirely — reachable through the `chronicle` tool, which reads the table directly, but not rendered. That is the gap rollups close.
+- **No rollups exist yet**, so `level` is always 0 and `rolled_up_into` always null. The schema, the `list_before_seq` selection, the `Rollup` label in both renderers, and the badge are in place and inert.
+- **`max_older` bounds the older list.** Checkpoints beyond it are absent from the prompt view — reachable through the `chronicle` tool, which reads the table directly, but not rendered. That is the gap rollups close.
 
-Phases 7-8 are independent of 1-6 and of each other in the same way: phase 7 stands alone against today's rolling compactor, since the notes table and the contract have no dependency on checkpoints, and only the summarizer fold in phase 8 requires the chronicle to exist.
+Known limits, stated plainly rather than implied away:
+
+- The request estimate is a lower bound; tool schemas are not measurable at this layer (see above).
+- Lifecycle coverage drives the trim path and the fence directly. It does not spin up a real `Channel` with a full `AgentDeps`, so end-to-end `check_and_chronicle` → `CutContext::run` → commit, process death mid-cut, and a genuinely concurrent two-commit race are covered by their component paths rather than by an integration test.

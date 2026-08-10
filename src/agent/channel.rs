@@ -1128,7 +1128,18 @@ impl Channel {
     /// Called after every turn. Both monitors are non-blocking: the LLM work
     /// happens on a spawned task, and only emergency truncation is synchronous.
     async fn maintain_context(&self) {
-        let result = if self.uses_chronicle() {
+        let chronicle = self.uses_chronicle();
+
+        // Resolving the mode is also how a switch is detected: a different mode
+        // bumps the epoch, which invalidates any cut still running under the
+        // previous one before it can commit or trim.
+        self.chronicler.fence().observe_mode(chronicle);
+
+        if chronicle {
+            self.record_turn_boundary().await;
+        }
+
+        let result = if chronicle {
             self.chronicler.check_and_chronicle().await.map(|_| ())
         } else {
             self.compactor.check_and_compact().await.map(|_| ())
@@ -1137,6 +1148,42 @@ impl Channel {
         if let Err(error) = result {
             tracing::warn!(channel_id = %self.id, %error, "context maintenance check failed");
         }
+    }
+
+    /// Pair the live history length with the durable sequence that covers it.
+    ///
+    /// The chronicle trims only to one of these, so a turn's tool traffic is
+    /// never split off from the durable rows that summarize it. The turn's own
+    /// writes are fire-and-forget, so they are drained first — reading the
+    /// watermark early would place this boundary a turn behind and the trim
+    /// would never catch up.
+    async fn record_turn_boundary(&self) {
+        const WRITE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+        let drained = self
+            .state
+            .conversation_logger
+            .wait_for_pending_writes(WRITE_DRAIN_TIMEOUT)
+            .await;
+
+        let live_len = self.state.history.read().await.len();
+        let durable_seq = match self.chronicler.store().max_seq(&self.id).await {
+            Ok(seq) => seq,
+            Err(error) => {
+                tracing::warn!(channel_id = %self.id, %error, "failed to read durable watermark");
+                return;
+            }
+        };
+
+        if !drained {
+            tracing::debug!(
+                channel_id = %self.id,
+                durable_seq,
+                "recording a turn boundary before writes drained; the trim will keep more"
+            );
+        }
+
+        self.chronicler.fence().record_turn(live_len, durable_seq);
     }
 
     /// The bounded chronicle view for this channel's system prompt.
@@ -3167,6 +3214,33 @@ impl Channel {
             guard.clone()
         };
         let history_len_before = history.len();
+
+        // ── Pre-send budget check ──
+        //
+        // Context maintenance runs *after* a turn, so a large incoming message
+        // can push this request over the window before compaction ever sees it.
+        // Checking here catches that. The estimate excludes serialized tool
+        // schemas — Rig assembles those inside the `ToolServer` at call time and
+        // does not expose them — so it is a lower bound, and this warns rather
+        // than blocking a turn the model may still be able to serve.
+        {
+            let context_window = **self.deps.runtime_config.context_window.load();
+            let estimated = crate::agent::chronicle::estimate_request_tokens(
+                crate::agent::compactor::estimate_text_tokens(system_prompt),
+                &history,
+                user_text,
+                context_window,
+            );
+            if estimated > context_window {
+                tracing::warn!(
+                    channel_id = %self.id,
+                    estimated,
+                    context_window,
+                    "request exceeds the context window before tool schemas are counted; \
+                     compaction will run after this turn"
+                );
+            }
+        }
 
         // ── Prompt snapshot capture (fire-and-forget) ──
         self.maybe_capture_snapshot(system_prompt, user_text, &history);

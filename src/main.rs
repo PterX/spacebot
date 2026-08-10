@@ -132,25 +132,30 @@ async fn resume_chronicle_tail(
         .count_messages_after(&channel.id, boundary)
         .await
         .ok()?;
-    // Read one extra so a truncated tail is detectable.
+    // Keep the newest end of the tail: the oldest uncovered rows are what the
+    // next checkpoint will summarize, while the newest are the conversation the
+    // channel is actually resuming. Returned oldest-first so the rendered
+    // transcript stays chronological.
     let mut messages = store
-        .messages_after(&channel.id, boundary, limit)
+        .newest_messages_after(&channel.id, boundary, limit)
         .await
         .ok()?;
 
     if uncovered > messages.len() as i64 {
+        let omitted = uncovered - messages.len() as i64;
         tracing::warn!(
             conversation_id = %conversation_id,
             uncovered,
             loaded = messages.len(),
+            omitted,
             "chronicle raw tail exceeds the backfill limit; the oldest uncovered messages are \
              omitted from the resumed context"
         );
-        let omitted = uncovered - messages.len() as i64;
         if let Some(first) = messages.first_mut() {
             first.content = format!(
-                "[{omitted} older uncovered message(s) omitted from this resumed session — \
-                 expand them with the chronicle tool.]\n{}",
+                "[{omitted} older message(s) from this session are not shown here. They sit \
+                 after the last checkpoint but before the messages below — expand them with the \
+                 chronicle tool.]\n{}",
                 first.content
             );
         }
