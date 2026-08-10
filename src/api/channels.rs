@@ -181,7 +181,7 @@ pub(super) async fn list_channels(
     params(
         ("channel_id" = String, Query, description = "Channel ID"),
         ("limit" = i64, Query, description = "Maximum number of messages to return (default: 20, max: 100)"),
-        ("before" = Option<String>, Query, description = "Pagination cursor for fetching older messages"),
+        ("before" = Option<String>, Query, description = "Pagination cursor for fetching older messages, as \"<rfc3339>|<item id>\". A bare timestamp is accepted for older clients but can skip same-second items."),
     ),
     responses(
         (status = 200, body = MessagesResponse),
@@ -200,7 +200,14 @@ pub(super) async fn channel_messages(
     for pool in pools.values() {
         let logger = ProcessRunLogger::new(pool.clone());
         match logger
-            .load_channel_timeline(&query.channel_id, fetch_limit, query.before.as_deref())
+            .load_channel_timeline(
+                &query.channel_id,
+                fetch_limit,
+                query
+                    .before
+                    .as_deref()
+                    .map(crate::conversation::history::TimelineCursor::parse),
+            )
             .await
         {
             Ok(items) if !items.is_empty() => {
@@ -785,6 +792,32 @@ pub(super) async fn inspect_prompt(
         .await
         .unwrap_or_default();
 
+    // ── Render the session chronicle view (chronicle mode only) ──
+    let compaction = **rc.compaction.load();
+    let session_chronicle = if compaction.mode == crate::config::CompactionMode::Chronicle
+        && !channel_state.kind.self_exits()
+    {
+        let store =
+            crate::conversation::ChronicleStore::new(channel_state.deps.sqlite_pool.clone());
+        crate::agent::chronicle::render_chronicle_view(
+            &store,
+            &query.channel_id,
+            chrono::Utc::now(),
+            compaction.chronicle,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                %error,
+                channel_id = %query.channel_id,
+                "failed to render chronicle view for prompt inspection"
+            );
+            None
+        })
+    } else {
+        None
+    };
+
     // ── Render the full system prompt ──
     let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
     let system_prompt = prompt_engine
@@ -803,6 +836,7 @@ pub(super) async fn inspect_prompt(
             adapter_prompt,
             project_context,
             None, // backfill_transcript — only set during channel initialization
+            session_chronicle,
             empty_to_none(working_memory),
             empty_to_none(channel_activity_map),
             empty_to_none(participant_context),

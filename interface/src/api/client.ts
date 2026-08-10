@@ -181,6 +181,22 @@ export interface BranchStartedEvent {
 	description: string;
 }
 
+export interface ChronicleCheckpointEvent {
+	type: "chronicle_checkpoint";
+	agent_id: string;
+	channel_id: string;
+	checkpoint_id: string;
+	seq: number;
+	level: number;
+	kind: string;
+	title: string;
+	summary: string;
+	covers_from: string;
+	covers_to: string;
+	message_count: number;
+	created_at: string;
+}
+
 export interface BranchCompletedEvent {
 	type: "branch_completed";
 	agent_id: string;
@@ -280,6 +296,7 @@ export type ApiEvent =
 	| WorkerCompletedEvent
 	| BranchStartedEvent
 	| BranchCompletedEvent
+	| ChronicleCheckpointEvent
 	| ToolStartedEvent
 	| ToolCompletedEvent
 	| ToolOutputEvent
@@ -325,6 +342,21 @@ export interface TimelineWorkerRun {
 	status: string;
 	started_at: string;
 	completed_at: string | null;
+}
+
+export interface TimelineCheckpoint {
+	type: "checkpoint";
+	id: string;
+	seq: number;
+	level: number;
+	kind: string;
+	title: string;
+	summary: string;
+	covers_from: string;
+	covers_to: string;
+	message_count: number;
+	rolled_up_into?: string | null;
+	created_at: string;
 }
 
 // Note: TimelineItem is re-exported from types.ts as a union type

@@ -160,6 +160,21 @@ pub fn classify_broadcast_recv_result<T>(
     }
 }
 
+/// The committed checkpoint carried by [`ProcessEvent::ChronicleCheckpoint`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChronicleCheckpointPayload {
+    pub checkpoint_id: String,
+    pub seq: i64,
+    pub level: i64,
+    pub kind: String,
+    pub title: String,
+    pub summary: String,
+    pub covers_from: String,
+    pub covers_to: String,
+    pub message_count: i64,
+    pub created_at: String,
+}
+
 /// Events sent between processes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -238,6 +253,17 @@ pub enum ProcessEvent {
         agent_id: AgentId,
         channel_id: ChannelId,
         threshold_reached: f32,
+    },
+    /// A session chronicle checkpoint was committed for a channel.
+    ///
+    /// Carries the whole record so the timeline can render it without a
+    /// refetch, the same way worker and branch events carry their results.
+    /// Boxed because that record is far larger than any other variant's
+    /// payload and would otherwise set the size of every `ProcessEvent`.
+    ChronicleCheckpoint {
+        agent_id: AgentId,
+        channel_id: ChannelId,
+        checkpoint: Box<ChronicleCheckpointPayload>,
     },
     StatusUpdate {
         agent_id: AgentId,

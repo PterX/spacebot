@@ -185,9 +185,23 @@ pub fn runtime_snapshot_value(agent_id: &str, runtime_config: &RuntimeConfig) ->
             "history_backfill_count": **runtime_config.history_backfill_count.load(),
         },
         "compaction": {
+            "mode": match compaction.mode {
+                crate::config::CompactionMode::Chronicle => "chronicle",
+                crate::config::CompactionMode::Rolling => "rolling",
+            },
             "background_threshold": compaction.background_threshold,
             "aggressive_threshold": compaction.aggressive_threshold,
             "emergency_threshold": compaction.emergency_threshold,
+            "chronicle": {
+                "interval_messages": compaction.chronicle.interval_messages,
+                "interval_token_fraction": compaction.chronicle.interval_token_fraction,
+                "recent_window_hours": compaction.chronicle.recent_window_hours,
+                "max_recent": compaction.chronicle.max_recent,
+                "max_older": compaction.chronicle.max_older,
+                "context_token_budget": compaction.chronicle.context_token_budget,
+                "expand_message_limit": compaction.chronicle.expand_message_limit,
+                "max_messages_per_checkpoint": compaction.chronicle.max_messages_per_checkpoint,
+            },
         },
         "memory_persistence": {
             "enabled": memory_persistence.enabled,

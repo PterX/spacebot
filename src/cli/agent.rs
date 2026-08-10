@@ -389,6 +389,7 @@ fn config_rows(config: AgentConfigResponse) -> Vec<Vec<String>> {
         config.tuning.history_backfill_count.to_string(),
     );
 
+    push("compaction.mode", config.compaction.mode.clone());
     push(
         "compaction.background_threshold",
         config.compaction.background_threshold.to_string(),
@@ -400,6 +401,39 @@ fn config_rows(config: AgentConfigResponse) -> Vec<Vec<String>> {
     push(
         "compaction.emergency_threshold",
         config.compaction.emergency_threshold.to_string(),
+    );
+    let chronicle = &config.compaction.chronicle;
+    push(
+        "compaction.chronicle.interval_messages",
+        chronicle.interval_messages.to_string(),
+    );
+    push(
+        "compaction.chronicle.interval_token_fraction",
+        chronicle.interval_token_fraction.to_string(),
+    );
+    push(
+        "compaction.chronicle.recent_window_hours",
+        chronicle.recent_window_hours.to_string(),
+    );
+    push(
+        "compaction.chronicle.max_recent",
+        chronicle.max_recent.to_string(),
+    );
+    push(
+        "compaction.chronicle.max_older",
+        chronicle.max_older.to_string(),
+    );
+    push(
+        "compaction.chronicle.context_token_budget",
+        chronicle.context_token_budget.to_string(),
+    );
+    push(
+        "compaction.chronicle.expand_message_limit",
+        chronicle.expand_message_limit.to_string(),
+    );
+    push(
+        "compaction.chronicle.max_messages_per_checkpoint",
+        chronicle.max_messages_per_checkpoint.to_string(),
     );
 
     push(

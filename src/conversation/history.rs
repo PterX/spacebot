@@ -5,6 +5,8 @@ use crate::{BranchId, ChannelId, WorkerId};
 use serde::Serialize;
 use sqlx::{Row as _, SqlitePool};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Persists conversation messages (user and assistant) to SQLite.
 ///
@@ -13,6 +15,36 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct ConversationLogger {
     pool: SqlitePool,
+    /// Detached writes that have been spawned but not yet landed.
+    ///
+    /// Callers that need an exact durable watermark — the chronicle records one
+    /// at every turn boundary — must know when the turn's own rows are visible.
+    /// Reading `MAX(seq)` while writes are still in flight would under-report
+    /// and make trimming lag a turn behind forever.
+    pending_writes: Arc<PendingWrites>,
+}
+
+/// Tracks in-flight fire-and-forget writes so a caller can wait them out.
+#[derive(Debug, Default)]
+pub struct PendingWrites {
+    count: AtomicUsize,
+    drained: tokio::sync::Notify,
+}
+
+impl PendingWrites {
+    fn begin(&self) {
+        self.count.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn finish(&self) {
+        if self.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.drained.notify_waiters();
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        self.count.load(Ordering::Acquire) == 0
+    }
 }
 
 /// A persisted conversation message.
@@ -26,11 +58,51 @@ pub struct ConversationMessage {
     pub content: String,
     pub metadata: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Monotonic per-channel insertion order. Rows written before the
+    /// migration that introduced it are backfilled; only a row that somehow
+    /// escaped both is `None`.
+    pub seq: Option<i64>,
 }
 
 impl ConversationLogger {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            pending_writes: Arc::new(PendingWrites::default()),
+        }
+    }
+
+    /// Wait until every write spawned before this call has landed.
+    ///
+    /// Bounded: a stuck write must not stall a turn, so this gives up and the
+    /// caller falls back to whatever watermark is visible, which is the safe
+    /// direction (it keeps more live history, never less).
+    pub async fn wait_for_pending_writes(&self, timeout: std::time::Duration) -> bool {
+        if self.pending_writes.is_idle() {
+            return true;
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        while !self.pending_writes.is_idle() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                tracing::debug!("timed out waiting for conversation writes to drain");
+                return false;
+            }
+            let notified = self.pending_writes.drained.notified();
+            if self.pending_writes.is_idle() {
+                return true;
+            }
+            if tokio::time::timeout(
+                remaining.min(std::time::Duration::from_millis(25)),
+                notified,
+            )
+            .await
+            .is_err()
+            {
+                continue;
+            }
+        }
+        true
     }
 
     /// Log a user message. Fire-and-forget.
@@ -50,10 +122,15 @@ impl ConversationLogger {
         let content = content.to_string();
         let metadata_json = serde_json::to_string(metadata).ok();
 
+        let pending = self.pending_writes.clone();
+        pending.begin();
         tokio::spawn(async move {
+            let _finish = PendingWriteGuard(pending);
             if let Err(error) = sqlx::query(
-                "INSERT INTO conversation_messages (id, channel_id, role, sender_name, sender_id, content, metadata) \
-                 VALUES (?, ?, 'user', ?, ?, ?, ?)"
+                "INSERT INTO conversation_messages \
+                 (id, channel_id, role, sender_name, sender_id, content, metadata, seq) \
+                 VALUES (?, ?, 'user', ?, ?, ?, ?, \
+                    COALESCE((SELECT MAX(seq) FROM conversation_messages WHERE channel_id = ?), 0) + 1)"
             )
             .bind(&id)
             .bind(&channel_id)
@@ -61,6 +138,7 @@ impl ConversationLogger {
             .bind(&sender_id)
             .bind(&content)
             .bind(&metadata_json)
+            .bind(&channel_id)
             .execute(&pool)
             .await
             {
@@ -85,14 +163,19 @@ impl ConversationLogger {
         let channel_id = channel_id.to_string();
         let content = content.to_string();
 
+        let pending = self.pending_writes.clone();
+        pending.begin();
         tokio::spawn(async move {
+            let _finish = PendingWriteGuard(pending);
             if let Err(error) = sqlx::query(
-                "INSERT INTO conversation_messages (id, channel_id, role, sender_name, content) \
-                 VALUES (?, ?, 'system', 'system', ?)",
+                "INSERT INTO conversation_messages (id, channel_id, role, sender_name, content, seq) \
+                 VALUES (?, ?, 'system', 'system', ?, \
+                    COALESCE((SELECT MAX(seq) FROM conversation_messages WHERE channel_id = ?), 0) + 1)",
             )
             .bind(&id)
             .bind(&channel_id)
             .bind(&content)
+            .bind(&channel_id)
             .execute(&pool)
             .await
             {
@@ -128,16 +211,22 @@ impl ConversationLogger {
         // Pack tool_calls into the metadata JSON if present.
         let metadata_json = tool_calls_json.map(|tc| format!(r#"{{"tool_calls":{tc}}}"#));
 
+        let pending = self.pending_writes.clone();
+        pending.begin();
         tokio::spawn(async move {
+            let _finish = PendingWriteGuard(pending);
             if let Err(error) = sqlx::query(
-                "INSERT INTO conversation_messages (id, channel_id, role, sender_name, content, metadata) \
-                 VALUES (?, ?, 'assistant', ?, ?, ?)",
+                "INSERT INTO conversation_messages \
+                 (id, channel_id, role, sender_name, content, metadata, seq) \
+                 VALUES (?, ?, 'assistant', ?, ?, ?, \
+                    COALESCE((SELECT MAX(seq) FROM conversation_messages WHERE channel_id = ?), 0) + 1)",
             )
             .bind(&id)
             .bind(&channel_id)
             .bind(&sender_name)
             .bind(&content)
             .bind(&metadata_json)
+            .bind(&channel_id)
             .execute(&pool)
             .await
             {
@@ -153,7 +242,7 @@ impl ConversationLogger {
         limit: i64,
     ) -> crate::error::Result<Vec<ConversationMessage>> {
         let rows = sqlx::query(
-            "SELECT id, channel_id, role, sender_name, sender_id, content, metadata, created_at \
+            "SELECT id, channel_id, role, sender_name, sender_id, content, metadata, created_at, seq \
              FROM conversation_messages \
              WHERE channel_id = ? \
              ORDER BY created_at DESC \
@@ -178,6 +267,7 @@ impl ConversationLogger {
                 created_at: row
                     .try_get("created_at")
                     .unwrap_or_else(|_| chrono::Utc::now()),
+                seq: row.try_get("seq").ok().flatten(),
             })
             .collect();
 
@@ -201,7 +291,7 @@ impl ConversationLogger {
         oldest_first: bool,
     ) -> crate::error::Result<Vec<ConversationMessage>> {
         let mut sql = String::from(
-            "SELECT id, channel_id, role, sender_name, sender_id, content, metadata, created_at \
+            "SELECT id, channel_id, role, sender_name, sender_id, content, metadata, created_at, seq \
              FROM conversation_messages \
              WHERE channel_id = ?",
         );
@@ -247,6 +337,7 @@ impl ConversationLogger {
                 created_at: row
                     .try_get("created_at")
                     .unwrap_or_else(|_| chrono::Utc::now()),
+                seq: row.try_get("seq").ok().flatten(),
             })
             .collect();
 
@@ -255,6 +346,59 @@ impl ConversationLogger {
             messages.reverse();
         }
         Ok(messages)
+    }
+}
+
+/// Pagination cursor for the channel timeline.
+///
+/// Timestamp alone is not a total order at SQLite's one-second resolution, so
+/// the item id breaks ties. Both timeline sources apply it identically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimelineCursor {
+    pub timestamp: String,
+    pub id: String,
+}
+
+impl TimelineCursor {
+    /// Parse the wire form `"<rfc3339>|<id>"`. A bare timestamp is accepted so
+    /// a client mid-upgrade still paginates, just without the tiebreak.
+    pub fn parse(value: &str) -> Self {
+        match value.split_once('|') {
+            Some((timestamp, id)) => Self {
+                timestamp: timestamp.to_string(),
+                id: id.to_string(),
+            },
+            None => Self {
+                timestamp: value.to_string(),
+                // Sorts below every real id, so a legacy cursor keeps the old
+                // strictly-older-second behaviour rather than skipping rows.
+                id: String::new(),
+            },
+        }
+    }
+
+    pub fn encode(timestamp: &str, id: &str) -> String {
+        format!("{timestamp}|{id}")
+    }
+}
+
+/// The id a timeline item paginates by.
+pub fn timeline_item_id(item: &TimelineItem) -> &str {
+    match item {
+        TimelineItem::Message { id, .. }
+        | TimelineItem::BranchRun { id, .. }
+        | TimelineItem::WorkerRun { id, .. }
+        | TimelineItem::ToolCallRun { id, .. }
+        | TimelineItem::Checkpoint { id, .. } => id,
+    }
+}
+
+/// Decrements the in-flight counter however the spawned write exits.
+struct PendingWriteGuard(Arc<PendingWrites>);
+
+impl Drop for PendingWriteGuard {
+    fn drop(&mut self) {
+        self.0.finish();
     }
 }
 
@@ -295,6 +439,21 @@ pub enum TimelineItem {
         status: String,
         started_at: String,
         completed_at: Option<String>,
+    },
+    /// A session chronicle checkpoint, placed inline at the point the
+    /// conversation reached it. Authored by neither the user nor the agent.
+    Checkpoint {
+        id: String,
+        seq: i64,
+        level: i64,
+        kind: String,
+        title: String,
+        summary: String,
+        covers_from: String,
+        covers_to: String,
+        message_count: i64,
+        rolled_up_into: Option<String>,
+        created_at: String,
     },
 }
 
@@ -754,10 +913,15 @@ impl ProcessRunLogger {
         &self,
         channel_id: &str,
         limit: i64,
-        before: Option<&str>,
+        before: Option<TimelineCursor>,
     ) -> crate::error::Result<Vec<TimelineItem>> {
+        // Composite cursor: SQLite timestamps are whole seconds, so a
+        // timestamp-only `<` cursor silently skips every peer sharing the
+        // boundary second. `(timestamp, id)` is a total order, and both the
+        // message/branch/worker union and the checkpoint query use it.
         let before_clause = if before.is_some() {
-            "AND datetime(timestamp) < datetime(?3)"
+            "AND (datetime(timestamp) < datetime(?3) \
+                  OR (datetime(timestamp) = datetime(?3) AND id < ?4))"
         } else {
             ""
         };
@@ -778,13 +942,13 @@ impl ProcessRunLogger {
                        NULL, NULL, task, result, status, \
                        started_at AS timestamp, completed_at \
                 FROM worker_runs WHERE channel_id = ?1 \
-            ) WHERE 1=1 {before_clause} ORDER BY timestamp DESC LIMIT ?2"
+            ) WHERE 1=1 {before_clause} ORDER BY timestamp DESC, id DESC LIMIT ?2"
         );
 
         let mut query = sqlx::query(&query_str).bind(channel_id).bind(limit);
 
-        if let Some(before_ts) = before {
-            query = query.bind(before_ts);
+        if let Some(cursor) = &before {
+            query = query.bind(&cursor.timestamp).bind(&cursor.id);
         }
 
         let rows = query
@@ -792,102 +956,176 @@ impl ProcessRunLogger {
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
 
-        let mut items: Vec<TimelineItem> = rows
+        // Each entry carries the timestamp of the row it came from. Tool calls
+        // expanded out of a message share that message's key, so the stable
+        // merge below cannot separate them from the message they belong to.
+        let mut items: Vec<(chrono::DateTime<chrono::Utc>, TimelineItem)> = rows
             .into_iter()
-            .filter_map(|row| -> Option<Vec<TimelineItem>> {
-                let item_type: String = row.try_get("item_type").ok()?;
-                match item_type.as_str() {
-                    "message" => {
-                        let metadata_json: Option<String> = row.try_get("metadata").ok().flatten();
-                        let metadata_value = metadata_json
-                            .as_deref()
-                            .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok());
-                        let attachments = metadata_value
-                            .as_ref()
-                            .and_then(|v| v.get("attachments").cloned())
-                            .and_then(|a| {
-                                serde_json::from_value::<
-                                    Vec<crate::agent::channel_attachments::SavedAttachmentMeta>,
-                                >(a)
-                                .ok()
-                            })
-                            .unwrap_or_default();
+            .filter_map(
+                |row| -> Option<Vec<(chrono::DateTime<chrono::Utc>, TimelineItem)>> {
+                    let item_type: String = row.try_get("item_type").ok()?;
+                    // Sorts last, so an undecodable row is dropped by
+                    // truncate first instead of displacing a real newest item.
+                    // Keying it at `now()` would also disagree with the
+                    // rendered `created_at`, which falls back to empty.
+                    let row_timestamp = row
+                        .try_get::<chrono::DateTime<chrono::Utc>, _>("timestamp")
+                        .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+                    match item_type.as_str() {
+                        "message" => {
+                            let metadata_json: Option<String> =
+                                row.try_get("metadata").ok().flatten();
+                            let metadata_value = metadata_json.as_deref().and_then(|json| {
+                                serde_json::from_str::<serde_json::Value>(json).ok()
+                            });
+                            let attachments = metadata_value
+                                .as_ref()
+                                .and_then(|v| v.get("attachments").cloned())
+                                .and_then(|a| {
+                                    serde_json::from_value::<
+                                        Vec<crate::agent::channel_attachments::SavedAttachmentMeta>,
+                                    >(a)
+                                    .ok()
+                                })
+                                .unwrap_or_default();
 
-                        // Expand tool calls stored in message metadata into ToolCallRun items.
-                        let tool_call_items: Vec<TimelineItem> = metadata_value
-                            .as_ref()
-                            .and_then(|v| v.get("tool_calls"))
-                            .and_then(|tc| {
-                                serde_json::from_value::<Vec<crate::api::ChannelToolCallEntry>>(
-                                    tc.clone(),
-                                )
-                                .ok()
-                            })
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|tc| TimelineItem::ToolCallRun {
-                                id: tc.id,
-                                tool_name: tc.tool_name,
-                                args: tc.args,
-                                result: tc.result,
-                                status: tc.status,
-                                started_at: tc.started_at,
-                                completed_at: tc.completed_at,
-                            })
-                            .collect();
+                            // Expand tool calls stored in message metadata into ToolCallRun items.
+                            let tool_call_items: Vec<TimelineItem> = metadata_value
+                                .as_ref()
+                                .and_then(|v| v.get("tool_calls"))
+                                .and_then(|tc| {
+                                    serde_json::from_value::<Vec<crate::api::ChannelToolCallEntry>>(
+                                        tc.clone(),
+                                    )
+                                    .ok()
+                                })
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|tc| TimelineItem::ToolCallRun {
+                                    id: tc.id,
+                                    tool_name: tc.tool_name,
+                                    args: tc.args,
+                                    result: tc.result,
+                                    status: tc.status,
+                                    started_at: tc.started_at,
+                                    completed_at: tc.completed_at,
+                                })
+                                .collect();
 
-                        let message = TimelineItem::Message {
-                            id: row.try_get("id").unwrap_or_default(),
-                            role: row.try_get("role").unwrap_or_default(),
-                            sender_name: row.try_get("sender_name").ok().flatten(),
-                            sender_id: row.try_get("sender_id").ok().flatten(),
-                            content: row.try_get("content").unwrap_or_default(),
-                            created_at: row
-                                .try_get::<chrono::DateTime<chrono::Utc>, _>("timestamp")
-                                .map(|t| t.to_rfc3339())
-                                .unwrap_or_default(),
-                            attachments,
-                        };
+                            let message = TimelineItem::Message {
+                                id: row.try_get("id").unwrap_or_default(),
+                                role: row.try_get("role").unwrap_or_default(),
+                                sender_name: row.try_get("sender_name").ok().flatten(),
+                                sender_id: row.try_get("sender_id").ok().flatten(),
+                                content: row.try_get("content").unwrap_or_default(),
+                                created_at: row
+                                    .try_get::<chrono::DateTime<chrono::Utc>, _>("timestamp")
+                                    .map(|t| t.to_rfc3339())
+                                    .unwrap_or_default(),
+                                attachments,
+                            };
 
-                        // Tool calls come before the message they belong to.
-                        let mut result = tool_call_items;
-                        result.push(message);
-                        Some(result)
+                            // Tool calls come before the message they belong to.
+                            let mut result = tool_call_items;
+                            result.push(message);
+                            Some(
+                                result
+                                    .into_iter()
+                                    .map(|item| (row_timestamp, item))
+                                    .collect(),
+                            )
+                        }
+                        "branch_run" => Some(vec![(
+                            row_timestamp,
+                            TimelineItem::BranchRun {
+                                id: row.try_get("id").unwrap_or_default(),
+                                description: row.try_get("description").unwrap_or_default(),
+                                conclusion: row.try_get("conclusion").ok(),
+                                started_at: row
+                                    .try_get::<chrono::DateTime<chrono::Utc>, _>("timestamp")
+                                    .map(|t| t.to_rfc3339())
+                                    .unwrap_or_default(),
+                                completed_at: row
+                                    .try_get::<chrono::DateTime<chrono::Utc>, _>("completed_at")
+                                    .ok()
+                                    .map(|t| t.to_rfc3339()),
+                            },
+                        )]),
+                        "worker_run" => Some(vec![(
+                            row_timestamp,
+                            TimelineItem::WorkerRun {
+                                id: row.try_get("id").unwrap_or_default(),
+                                task: row.try_get("task").unwrap_or_default(),
+                                result: row.try_get("result").ok(),
+                                status: row.try_get("status").unwrap_or_default(),
+                                started_at: row
+                                    .try_get::<chrono::DateTime<chrono::Utc>, _>("timestamp")
+                                    .map(|t| t.to_rfc3339())
+                                    .unwrap_or_default(),
+                                completed_at: row
+                                    .try_get::<chrono::DateTime<chrono::Utc>, _>("completed_at")
+                                    .ok()
+                                    .map(|t| t.to_rfc3339()),
+                            },
+                        )]),
+                        _ => None,
                     }
-                    "branch_run" => Some(vec![TimelineItem::BranchRun {
-                        id: row.try_get("id").unwrap_or_default(),
-                        description: row.try_get("description").unwrap_or_default(),
-                        conclusion: row.try_get("conclusion").ok(),
-                        started_at: row
-                            .try_get::<chrono::DateTime<chrono::Utc>, _>("timestamp")
-                            .map(|t| t.to_rfc3339())
-                            .unwrap_or_default(),
-                        completed_at: row
-                            .try_get::<chrono::DateTime<chrono::Utc>, _>("completed_at")
-                            .ok()
-                            .map(|t| t.to_rfc3339()),
-                    }]),
-                    "worker_run" => Some(vec![TimelineItem::WorkerRun {
-                        id: row.try_get("id").unwrap_or_default(),
-                        task: row.try_get("task").unwrap_or_default(),
-                        result: row.try_get("result").ok(),
-                        status: row.try_get("status").unwrap_or_default(),
-                        started_at: row
-                            .try_get::<chrono::DateTime<chrono::Utc>, _>("timestamp")
-                            .map(|t| t.to_rfc3339())
-                            .unwrap_or_default(),
-                        completed_at: row
-                            .try_get::<chrono::DateTime<chrono::Utc>, _>("completed_at")
-                            .ok()
-                            .map(|t| t.to_rfc3339()),
-                    }]),
-                    _ => None,
-                }
-            })
+                },
+            )
             .flatten()
             .collect();
 
-        // Reverse to chronological order
+        // Chronicle checkpoints live in their own table, so they are fetched
+        // separately and merged. Each source returns up to `limit` rows, which
+        // is what makes the merged newest-`limit` slice the correct page.
+        let checkpoints = crate::conversation::chronicle::ChronicleStore::new(self.pool.clone())
+            .list_for_timeline(channel_id, limit, before.as_ref())
+            .await?;
+        items.extend(checkpoints.into_iter().map(|checkpoint| {
+            (
+                checkpoint.created_at,
+                TimelineItem::Checkpoint {
+                    id: checkpoint.id,
+                    seq: checkpoint.seq,
+                    level: checkpoint.level,
+                    kind: checkpoint.kind.as_str().to_string(),
+                    title: checkpoint.title,
+                    summary: checkpoint.summary,
+                    covers_from: checkpoint.covers_from_at.to_rfc3339(),
+                    covers_to: checkpoint.covers_to_at.to_rfc3339(),
+                    message_count: checkpoint.message_count,
+                    rolled_up_into: checkpoint.rolled_up_into,
+                    created_at: checkpoint.created_at.to_rfc3339(),
+                },
+            )
+        }));
+
+        // Both sources arrive newest-first. A stable sort by the shared key
+        // leaves an unchecked timeline in exactly the order it already had and
+        // slots checkpoints into place; the page is then the newest `limit`.
+        items.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| timeline_item_id(&right.1).cmp(timeline_item_id(&left.1)))
+        });
+        // Truncate on a group boundary. A message row expands into its tool
+        // calls plus the message, all sharing one sort key; cutting inside that
+        // group leaves orphan tool-call entries whose parent message was
+        // dropped. Walk back to the start of a straddled group instead.
+        if items.len() > limit as usize {
+            let mut cut = limit as usize;
+            if cut > 0 {
+                let boundary_key = items[cut - 1].0;
+                if items.get(cut).is_some_and(|(key, _)| *key == boundary_key) {
+                    while cut > 0 && items[cut - 1].0 == boundary_key {
+                        cut -= 1;
+                    }
+                }
+            }
+            items.truncate(cut);
+        }
+        let mut items: Vec<TimelineItem> = items.into_iter().map(|(_, item)| item).collect();
         items.reverse();
         Ok(items)
     }
@@ -1103,7 +1341,7 @@ pub struct WorkerDetailRow {
 
 #[cfg(test)]
 mod tests {
-    use super::ProcessRunLogger;
+    use super::{ProcessRunLogger, TimelineCursor, TimelineItem, timeline_item_id};
 
     async fn setup_worker_runs_table() -> sqlx::SqlitePool {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -1277,6 +1515,233 @@ mod tests {
             .expect("fetch");
         let result: String = sqlx::Row::try_get(&row, "result").expect("result");
         assert_eq!(result, "Worker cancelled: user requested");
+    }
+
+    #[tokio::test]
+    async fn timeline_places_checkpoints_between_the_messages_they_follow() {
+        use crate::conversation::chronicle::{
+            CheckpointKind, ChronicleBoundary, ChronicleStore, NewCheckpoint,
+        };
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        for migration in [
+            include_str!("../../migrations/20260211000002_conversations.sql"),
+            include_str!("../../migrations/20260213000003_process_runs.sql"),
+            include_str!("../../migrations/20260809000004_session_chronicles.sql"),
+            include_str!("../../migrations/20260810000001_conversation_message_seq.sql"),
+        ] {
+            sqlx::raw_sql(migration)
+                .execute(&pool)
+                .await
+                .expect("migration");
+        }
+
+        for (id, at) in [
+            ("m1", "2026-08-01 00:00:01"),
+            ("m2", "2026-08-01 00:00:02"),
+            ("m3", "2026-08-01 00:00:09"),
+        ] {
+            sqlx::query(
+                "INSERT INTO conversation_messages (id, channel_id, role, content, created_at, seq) \
+                 VALUES (?, 'ch', 'user', 'hi', ?, \
+                    COALESCE((SELECT MAX(seq) FROM conversation_messages WHERE channel_id = 'ch'), 0) + 1)",
+            )
+            .bind(id)
+            .bind(at)
+            .execute(&pool)
+            .await
+            .expect("insert message");
+        }
+
+        let at = |value: &str| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        ChronicleStore::new(pool.clone())
+            .commit(NewCheckpoint {
+                channel_id: "ch".into(),
+                level: 0,
+                kind: CheckpointKind::Interval,
+                title: "Opening span".into(),
+                summary: "They greeted each other twice.".into(),
+                covers_from: ChronicleBoundary::origin(),
+                covers_to: ChronicleBoundary::new(2),
+                covers_from_at: at("2026-08-01T00:00:01Z"),
+                covers_to_at: at("2026-08-01T00:00:02Z"),
+                covers_from_message_id: None,
+                covers_to_message_id: Some("m2".into()),
+                message_count: 2,
+                token_estimate: 5,
+                rolls_up_from_seq: None,
+                rolls_up_to_seq: None,
+                model: None,
+            })
+            .await
+            .expect("commit");
+        // The commit stamps `created_at` at wall-clock now; pin it between m2
+        // and m3 so its timeline position is deterministic.
+        sqlx::query("UPDATE channel_chronicle_checkpoints SET created_at = '2026-08-01 00:00:05'")
+            .execute(&pool)
+            .await
+            .expect("pin commit time");
+
+        let items = ProcessRunLogger::new(pool)
+            .load_channel_timeline("ch", 20, None)
+            .await
+            .expect("timeline");
+
+        let shape: Vec<String> = items
+            .iter()
+            .map(|item| match item {
+                TimelineItem::Message { id, .. } => format!("message:{id}"),
+                TimelineItem::Checkpoint { seq, .. } => format!("checkpoint:{seq}"),
+                other => format!("other:{other:?}"),
+            })
+            .collect();
+
+        assert_eq!(
+            shape,
+            vec!["message:m1", "message:m2", "checkpoint:1", "message:m3"],
+            "a checkpoint sits inline after the messages it covers"
+        );
+    }
+
+    /// A page boundary landing among same-second peers must not skip any of
+    /// them. Timestamp-only cursors did exactly that.
+    #[tokio::test]
+    async fn timeline_pagination_does_not_skip_same_second_peers() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        for migration in [
+            include_str!("../../migrations/20260211000002_conversations.sql"),
+            include_str!("../../migrations/20260213000003_process_runs.sql"),
+            include_str!("../../migrations/20260809000004_session_chronicles.sql"),
+            include_str!("../../migrations/20260810000001_conversation_message_seq.sql"),
+        ] {
+            sqlx::raw_sql(migration)
+                .execute(&pool)
+                .await
+                .expect("migration");
+        }
+
+        // Five messages sharing one whole second.
+        for index in 0..5 {
+            sqlx::query(
+                "INSERT INTO conversation_messages (id, channel_id, role, content, created_at, seq) \
+                 VALUES (?, 'ch', 'user', 'hi', '2026-08-01 00:00:00', ?)",
+            )
+            .bind(format!("msg-{index}"))
+            .bind(index + 1)
+            .execute(&pool)
+            .await
+            .expect("insert");
+        }
+
+        let logger = ProcessRunLogger::new(pool);
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<TimelineCursor> = None;
+
+        // Page two at a time through a block that shares a timestamp.
+        for _ in 0..5 {
+            let page = logger
+                .load_channel_timeline("ch", 2, cursor.clone())
+                .await
+                .expect("page");
+            if page.is_empty() {
+                break;
+            }
+            let oldest = page.first().expect("oldest");
+            let (timestamp, id) = match oldest {
+                TimelineItem::Message { created_at, id, .. } => (created_at.clone(), id.clone()),
+                other => panic!("unexpected item: {other:?}"),
+            };
+            cursor = Some(TimelineCursor::parse(&TimelineCursor::encode(
+                &timestamp, &id,
+            )));
+            for item in &page {
+                seen.push(timeline_item_id(item).to_string());
+            }
+        }
+
+        seen.sort();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            5,
+            "every same-second message must be reachable by paging: {seen:?}"
+        );
+    }
+
+    /// Truncating a page must not leave tool calls whose parent message was
+    /// dropped: they share one sort key and are inserted as a group.
+    #[test]
+    fn page_truncation_never_orphans_tool_calls() {
+        // Newest-first, as the merge produces: two tool calls then their
+        // message, all sharing one key, followed by an older message.
+        let key_new = chrono::DateTime::<chrono::Utc>::MIN_UTC + chrono::Duration::seconds(10);
+        let key_old = chrono::DateTime::<chrono::Utc>::MIN_UTC;
+        let mut items = vec![
+            (key_new, tool_call_item("tc-1")),
+            (key_new, tool_call_item("tc-2")),
+            (key_new, message_item("msg-new")),
+            (key_old, message_item("msg-old")),
+        ];
+
+        // A limit of 2 lands inside the group; the whole group must go.
+        let limit = 2usize;
+        if items.len() > limit {
+            let mut cut = limit;
+            if cut > 0 {
+                let boundary_key = items[cut - 1].0;
+                if items.get(cut).is_some_and(|(key, _)| *key == boundary_key) {
+                    while cut > 0 && items[cut - 1].0 == boundary_key {
+                        cut -= 1;
+                    }
+                }
+            }
+            items.truncate(cut);
+        }
+
+        let kept: Vec<&str> = items
+            .iter()
+            .map(|(_, item)| timeline_item_id(item))
+            .collect();
+        assert!(
+            !kept.contains(&"tc-1") && !kept.contains(&"tc-2"),
+            "tool calls must not outlive their message: {kept:?}"
+        );
+    }
+
+    fn tool_call_item(id: &str) -> TimelineItem {
+        TimelineItem::ToolCallRun {
+            id: id.to_string(),
+            tool_name: "shell".into(),
+            args: "{}".into(),
+            result: None,
+            status: "completed".into(),
+            started_at: String::new(),
+            completed_at: None,
+        }
+    }
+
+    fn message_item(id: &str) -> TimelineItem {
+        TimelineItem::Message {
+            id: id.to_string(),
+            role: "user".into(),
+            sender_name: None,
+            sender_id: None,
+            content: "hi".into(),
+            created_at: String::new(),
+            attachments: Vec::new(),
+        }
     }
 
     #[tokio::test]

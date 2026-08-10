@@ -7,6 +7,7 @@ pub mod channel_attachments;
 pub mod channel_dispatch;
 pub mod channel_history;
 pub mod channel_prompt;
+pub mod chronicle;
 pub mod compactor;
 pub mod cortex;
 pub mod cortex_chat;

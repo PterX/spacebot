@@ -11,10 +11,12 @@ use crate::agent::channel_history::{
 use crate::agent::channel_prompt::{
     MAX_RETRIGGERS_PER_TURN, RETRIGGER_DEBOUNCE_MS, RETRIGGER_MAX_TURNS, TemporalContext,
 };
+use crate::agent::chronicle::Chronicler;
 use crate::agent::compactor::Compactor;
 use crate::agent::process_control::ControlActionResult;
 use crate::agent::status::{StatusBlock, SystemInfo};
 use crate::agent::worker::Worker;
+use crate::config::CompactionMode;
 use crate::conversation::settings::{
     DelegationMode, MemoryMode, ResolvedConversationSettings, ResponseMode,
 };
@@ -824,6 +826,10 @@ pub struct Channel {
     pub conversation_context: Option<String>,
     /// Context monitor that triggers background compaction.
     pub compactor: Compactor,
+    /// Context monitor for chronicle mode. Only one of the two acts per turn,
+    /// selected by `CompactionConfig::mode`; short-lived system channels always
+    /// use the compactor.
+    pub chronicler: Chronicler,
     /// Count of user messages since last memory persistence branch.
     message_count: usize,
     /// When the last memory persistence branch was triggered.
@@ -984,13 +990,26 @@ impl Channel {
         let process_run_logger = ProcessRunLogger::new(deps.sqlite_pool.clone());
         let channel_store = ChannelStore::new(deps.sqlite_pool.clone());
 
+        let compactor_model = resolved_settings
+            .resolve_model("compactor")
+            .map(String::from);
+        // One fence shared by both monitors: a mode switch must not leave a
+        // rolling compaction and an in-flight chronicle cut mutating the same
+        // head independently.
+        let history_fence = Arc::new(crate::agent::chronicle::HistoryFence::new());
         let compactor = Compactor::new(
             id.clone(),
             deps.clone(),
             history.clone(),
-            resolved_settings
-                .resolve_model("compactor")
-                .map(String::from),
+            compactor_model.clone(),
+            history_fence.clone(),
+        );
+        let chronicler = Chronicler::new(
+            id.clone(),
+            deps.clone(),
+            history.clone(),
+            compactor_model,
+            history_fence,
         );
 
         let state = ChannelState {
@@ -1070,6 +1089,7 @@ impl Channel {
             source_adapter: None,
             conversation_context: None,
             compactor,
+            chronicler,
             message_count: 0,
             last_persistence_at: std::time::Instant::now(),
             memory_persistence_branches: HashSet::new(),
@@ -1094,6 +1114,110 @@ impl Channel {
     }
 
     /// Set the backfill transcript for injection into the system prompt.
+    /// Whether this channel sheds history through the chronicle.
+    ///
+    /// Cron and autonomy channels self-exit once their work settles, so
+    /// chronicling them costs an LLM call for a story nobody will read.
+    fn uses_chronicle(&self) -> bool {
+        self.deps.runtime_config.compaction.load().mode == CompactionMode::Chronicle
+            && !self.state.kind.self_exits()
+    }
+
+    /// Run whichever context monitor this channel is configured for.
+    ///
+    /// Called after every turn. Both monitors are non-blocking: the LLM work
+    /// happens on a spawned task, and only emergency truncation is synchronous.
+    async fn maintain_context(&self) {
+        let chronicle = self.uses_chronicle();
+
+        // Resolving the mode is also how a switch is detected: a different mode
+        // bumps the epoch, which invalidates any cut still running under the
+        // previous one before it can commit or trim.
+        self.chronicler.fence().observe_mode(chronicle);
+
+        if chronicle {
+            self.record_turn_boundary().await;
+        }
+
+        let result = if chronicle {
+            self.chronicler.check_and_chronicle().await.map(|_| ())
+        } else {
+            self.compactor.check_and_compact().await.map(|_| ())
+        };
+
+        if let Err(error) = result {
+            tracing::warn!(channel_id = %self.id, %error, "context maintenance check failed");
+        }
+    }
+
+    /// Pair the live history length with the durable sequence that covers it.
+    ///
+    /// The chronicle trims only to one of these, so a turn's tool traffic is
+    /// never split off from the durable rows that summarize it. The turn's own
+    /// writes are fire-and-forget, so they are drained first — reading the
+    /// watermark early would place this boundary a turn behind and the trim
+    /// would never catch up.
+    async fn record_turn_boundary(&self) {
+        const WRITE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+        let drained = self
+            .state
+            .conversation_logger
+            .wait_for_pending_writes(WRITE_DRAIN_TIMEOUT)
+            .await;
+
+        let live_len = self.state.history.read().await.len();
+        let durable_seq = match self.chronicler.store().max_seq(&self.id).await {
+            Ok(seq) => seq,
+            Err(error) => {
+                tracing::warn!(channel_id = %self.id, %error, "failed to read durable watermark");
+                return;
+            }
+        };
+
+        if !drained {
+            tracing::debug!(
+                channel_id = %self.id,
+                durable_seq,
+                "recording a turn boundary before writes drained; the trim will keep more"
+            );
+        }
+
+        self.chronicler.fence().record_turn(live_len, durable_seq);
+    }
+
+    /// The bounded chronicle view for this channel's system prompt.
+    ///
+    /// Recomputed from durable state each turn, so a restarted channel renders
+    /// the same section the running one did.
+    async fn render_session_chronicle(&self) -> Option<String> {
+        // Deliberately not gated on the current mode. Chronicle mode trims
+        // checkpointed ranges out of live history; if switching to rolling also
+        // stopped rendering those checkpoints, everything they covered would
+        // vanish from the prompt and the channel would resume from only the
+        // uncheckpointed tail. A channel that has ever chronicled keeps its
+        // chronicle view — cutting new checkpoints is what the mode governs.
+        if self.state.kind.self_exits() {
+            return None;
+        }
+
+        let config = self.deps.runtime_config.compaction.load().chronicle;
+        match crate::agent::chronicle::render_chronicle_view(
+            self.chronicler.store(),
+            &self.id,
+            chrono::Utc::now(),
+            config,
+        )
+        .await
+        {
+            Ok(view) => view,
+            Err(error) => {
+                tracing::warn!(channel_id = %self.id, %error, "failed to render session chronicle");
+                None
+            }
+        }
+    }
+
     pub fn set_backfill_transcript(&mut self, transcript: String) {
         self.backfill_transcript = Some(transcript);
     }
@@ -1969,9 +2093,7 @@ impl Channel {
                     });
                 }
             }
-            if let Err(error) = self.compactor.check_and_compact().await {
-                tracing::warn!(channel_id = %self.id, %error, "compaction check failed");
-            }
+            self.maintain_context().await;
             // Both Observe and MentionOnly keep passive memory capture.
             self.message_count += message_count;
             self.check_memory_persistence().await;
@@ -2076,10 +2198,7 @@ impl Channel {
         {
             self.record_decision_event(turn_result.reply_text.as_deref(), None);
         }
-        // Check compaction
-        if let Err(error) = self.compactor.check_and_compact().await {
-            tracing::warn!(channel_id = %self.id, %error, "compaction check failed");
-        }
+        self.maintain_context().await;
 
         // Increment message counter for memory persistence
         self.message_count += message_count;
@@ -2176,6 +2295,7 @@ impl Channel {
             adapter_prompt,
             project_context,
             self.backfill_transcript.clone(),
+            self.render_session_chronicle().await,
             empty_to_none(working_memory),
             empty_to_none(channel_activity_map),
             empty_to_none(participant_context),
@@ -2183,11 +2303,15 @@ impl Channel {
             direct_mode,
         )?;
 
-        prompt_engine.maybe_append_tool_use_enforcement(
+        let system_prompt = prompt_engine.maybe_append_tool_use_enforcement(
             system_prompt,
             tool_use_enforcement.as_ref(),
             &model_name,
-        )
+        )?;
+        self.chronicler.fence().record_prompt_tokens(
+            crate::agent::compactor::estimate_text_tokens(&system_prompt),
+        );
+        Ok(system_prompt)
     }
 
     /// Handle an incoming message by running the channel's LLM agent loop.
@@ -2439,9 +2563,7 @@ impl Channel {
                         content: OneOrMany::one(UserContent::text(&user_text)),
                     });
                 }
-                if let Err(error) = self.compactor.check_and_compact().await {
-                    tracing::warn!(channel_id = %self.id, %error, "compaction check failed");
-                }
+                self.maintain_context().await;
                 // Both Observe and MentionOnly keep passive memory capture.
                 self.message_count += 1;
                 self.check_memory_persistence().await;
@@ -2625,10 +2747,7 @@ impl Channel {
             }
         }
 
-        // Check context size and trigger compaction if needed
-        if let Err(error) = self.compactor.check_and_compact().await {
-            tracing::warn!(channel_id = %self.id, %error, "compaction check failed");
-        }
+        self.maintain_context().await;
 
         // Increment message counter and spawn memory persistence branch if threshold reached
         if !is_retrigger {
@@ -2982,6 +3101,7 @@ impl Channel {
             adapter_prompt,
             project_context,
             self.backfill_transcript.clone(),
+            self.render_session_chronicle().await,
             empty_to_none(working_memory),
             empty_to_none(channel_activity_map),
             empty_to_none(participant_context),
@@ -2989,11 +3109,15 @@ impl Channel {
             direct_mode,
         )?;
 
-        prompt_engine.maybe_append_tool_use_enforcement(
+        let system_prompt = prompt_engine.maybe_append_tool_use_enforcement(
             system_prompt,
             tool_use_enforcement.as_ref(),
             &model_name,
-        )
+        )?;
+        self.chronicler.fence().record_prompt_tokens(
+            crate::agent::compactor::estimate_text_tokens(&system_prompt),
+        );
+        Ok(system_prompt)
     }
 
     /// Register per-turn tools, run the LLM agentic loop, and clean up.
@@ -3176,6 +3300,33 @@ impl Channel {
             guard.clone()
         };
         let history_len_before = history.len();
+
+        // ── Pre-send budget check ──
+        //
+        // Context maintenance runs *after* a turn, so a large incoming message
+        // can push this request over the window before compaction ever sees it.
+        // Checking here catches that. The estimate excludes serialized tool
+        // schemas — Rig assembles those inside the `ToolServer` at call time and
+        // does not expose them — so it is a lower bound, and this warns rather
+        // than blocking a turn the model may still be able to serve.
+        {
+            let context_window = **self.deps.runtime_config.context_window.load();
+            let estimated = crate::agent::chronicle::estimate_request_tokens(
+                crate::agent::compactor::estimate_text_tokens(system_prompt),
+                &history,
+                user_text,
+                context_window,
+            );
+            if estimated > context_window {
+                tracing::warn!(
+                    channel_id = %self.id,
+                    estimated,
+                    context_window,
+                    "request exceeds the context window before tool schemas are counted; \
+                     compaction will run after this turn"
+                );
+            }
+        }
 
         // ── Prompt snapshot capture (fire-and-forget) ──
         self.maybe_capture_snapshot(system_prompt, user_text, &history);

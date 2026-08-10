@@ -1,0 +1,11 @@
+Walk this channel's session chronicle — the durable, append-only record of what happened before the recent messages you can still see.
+
+Long sessions carry only a bounded window of checkpoints in your context. This tool reaches the rest.
+
+- `list` — the checkpoint index: sequence number, title, covered time range, message count. Start here.
+- `open` — one checkpoint's full summary, when the index entry isn't enough.
+- `expand` — the raw messages a checkpoint covers, when the summary genuinely isn't enough. Only available to branches; it returns transcript, not conclusions.
+
+Use it when the conversation refers to something outside what you can see: an earlier decision, a commitment made weeks ago, why something was set up the way it is. Reach for `expand` sparingly — the summary is usually the answer, and raw transcript is expensive.
+
+Scoped to this channel. Reading a different one is `channel_recall`, which only branches have — if you need another channel's history, branch for it rather than reaching for a tool you were not given.

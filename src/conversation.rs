@@ -2,6 +2,7 @@
 
 pub mod channel_settings;
 pub mod channels;
+pub mod chronicle;
 pub mod context;
 pub mod history;
 pub mod participants;
@@ -11,6 +12,10 @@ pub mod worker_transcript;
 
 pub use channel_settings::ChannelSettingsStore;
 pub use channels::ChannelStore;
+pub use chronicle::{
+    CheckpointKind, ChronicleBoundary, ChronicleCheckpoint, ChronicleStats, ChronicleStore,
+    CommitOutcome, NewCheckpoint,
+};
 pub use history::{
     ConversationLogger, ProcessRunLogger, TimelineItem, WorkerDetailRow, WorkerRunRow,
 };
