@@ -287,21 +287,21 @@ async fn run_compaction(
     Ok(remove_count)
 }
 
-/// Share of the context window pre-compaction holds back for the fork's system
-/// prompt and the model's response. Forked history is budgeted against what
-/// remains, so a fork that fits still has room to make its first call.
-const FORK_CONTEXT_RESERVE: f32 = 0.30;
+/// Share of the context window pre-compaction holds back for the fork's
+/// response. The rest of the window covers the fork's prompt input — system
+/// prompt, task, and history.
+const FORK_RESPONSE_RESERVE: f32 = 0.15;
 
 /// Messages pre-compaction never drops. A fork needs its most recent exchange
 /// to be able to act at all, so the budget yields to it rather than the
 /// reverse.
 const FORK_MIN_RETAINED_MESSAGES: usize = 4;
 
-/// Tokens available to a forked history, once the fork's own prompt and
-/// response capacity is reserved.
-fn forked_history_budget(context_window: usize) -> usize {
-    let reserve = (context_window as f32 * FORK_CONTEXT_RESERVE) as usize;
-    context_window.saturating_sub(reserve)
+/// Tokens available to a forked history, once the prompt the caller is about
+/// to attach and room for a response are both reserved.
+fn forked_history_budget(context_window: usize, prompt_tokens: usize) -> usize {
+    let response_reserve = (context_window as f32 * FORK_RESPONSE_RESERVE) as usize;
+    context_window.saturating_sub(response_reserve.saturating_add(prompt_tokens))
 }
 
 fn forked_compaction_marker(removed_total: usize) -> String {
@@ -326,6 +326,12 @@ fn forked_compaction_marker_tokens(removed_total: usize) -> usize {
 /// their first LLM call, so a large parent history doesn't start the fork's
 /// life in overflow recovery. Returns the number of messages removed.
 ///
+/// `prompt_tokens` is what the caller is about to attach alongside this
+/// history — its rendered system prompt (skills and ambient memory included)
+/// and the task or user message. Callers measure it with
+/// [`estimate_text_tokens`], so the budget reflects the real first call rather
+/// than an assumed prompt size.
+///
 /// The most recent [`FORK_MIN_RETAINED_MESSAGES`] messages are preserved even
 /// when they alone exceed the budget — a single oversized tool result can
 /// outweigh the whole window, and dropping it would strip the fork of the
@@ -334,8 +340,9 @@ pub fn precompact_forked_history(
     history: &mut Vec<Message>,
     context_window: usize,
     fraction: f32,
+    prompt_tokens: usize,
 ) -> usize {
-    let budget = forked_history_budget(context_window);
+    let budget = forked_history_budget(context_window, prompt_tokens);
     let mut removed_total = 0usize;
 
     // Re-estimate after each drain: one fractional cut isn't guaranteed to
@@ -359,6 +366,7 @@ pub fn precompact_forked_history(
         tracing::warn!(
             retained_tokens,
             budget,
+            prompt_tokens,
             retained_messages = history.len(),
             "forked history exceeds its budget at the retention floor; the fork \
              may enter context-overflow recovery"
@@ -369,6 +377,13 @@ pub fn precompact_forked_history(
         history.insert(0, Message::from(forked_compaction_marker(removed_total)));
     }
     removed_total
+}
+
+/// Estimate the token count of prompt text with the same chars/4 heuristic
+/// [`estimate_history_tokens`] uses. Rounds up, so a budget built on it never
+/// understates what the prompt will occupy.
+pub fn estimate_text_tokens(text: &str) -> usize {
+    text.len().div_ceil(4)
 }
 
 /// Estimate token count for a history using chars/4 heuristic.
@@ -534,23 +549,30 @@ mod tests {
     }
 
     #[test]
+    fn estimate_text_tokens_rounds_up() {
+        assert_eq!(estimate_text_tokens(""), 0);
+        assert_eq!(estimate_text_tokens("abcd"), 1);
+        assert_eq!(estimate_text_tokens("abcde"), 2);
+    }
+
+    #[test]
     fn precompact_noop_under_budget() {
         let mut history: Vec<Message> = (0..10).map(|_| text_message(100)).collect();
-        let removed = precompact_forked_history(&mut history, 200_000, 0.50);
+        let removed = precompact_forked_history(&mut history, 200_000, 0.50, 0);
         assert_eq!(removed, 0);
         assert_eq!(history.len(), 10);
     }
 
     #[test]
     fn precompact_drains_until_under_budget() {
-        // 40 messages of 4000 chars ≈ 40k tokens against a 20k window: a
-        // single 50% cut leaves ~20k, still over budget, so the loop must run
+        // 40 messages of 4000 chars = 40k tokens against a 20k window: a
+        // single 50% cut leaves 20k, still over budget, so the loop must run
         // more than once.
         let mut history: Vec<Message> = (0..40).map(|_| text_message(4000)).collect();
-        let removed = precompact_forked_history(&mut history, 20_000, 0.50);
+        let removed = precompact_forked_history(&mut history, 20_000, 0.50, 0);
         assert!(removed > 20, "one fractional cut is not enough: {removed}");
         // The marker is part of what the fork carries, so it counts too.
-        assert!(estimate_history_tokens(&history) <= forked_history_budget(20_000));
+        assert!(estimate_history_tokens(&history) <= forked_history_budget(20_000, 0));
         // Marker inserted once, at the front.
         let front = match &history[0] {
             Message::User { content } => format!("{content:?}"),
@@ -561,44 +583,50 @@ mod tests {
     }
 
     #[test]
-    fn precompact_reserves_prompt_and_response_capacity() {
-        // A history that fits the raw window but not the budget still gets
-        // trimmed: the fork needs room for its own prompt and response.
-        let budget = forked_history_budget(20_000);
-        assert!(budget < 20_000, "reserve must hold something back");
+    fn precompact_budget_tracks_the_measured_prompt() {
+        // 15k tokens of history in a 20k window. It fits once only the
+        // response is reserved, and stops fitting when the caller reports a
+        // 4k-token preamble — the same history, budgeted against the real
+        // first call.
+        let history: Vec<Message> = (0..10).map(|_| text_message(6_000)).collect();
+        assert_eq!(estimate_history_tokens(&history), 15_000);
 
-        let mut history: Vec<Message> = (0..10).map(|_| text_message(7_000)).collect();
-        let estimated = estimate_history_tokens(&history);
-        assert!(estimated < 20_000 && estimated > budget, "{estimated}");
+        let mut without_prompt = history.clone();
+        assert_eq!(
+            precompact_forked_history(&mut without_prompt, 20_000, 0.50, 0),
+            0
+        );
 
-        let removed = precompact_forked_history(&mut history, 20_000, 0.50);
-        assert!(removed > 0);
-        assert!(estimate_history_tokens(&history) <= budget);
+        let mut with_prompt = history;
+        let removed = precompact_forked_history(&mut with_prompt, 20_000, 0.50, 4_000);
+        assert!(removed > 0, "a 4k preamble must push this history over");
+        assert!(estimate_history_tokens(&with_prompt) <= forked_history_budget(20_000, 4_000));
     }
 
     #[test]
     fn precompact_noop_at_exact_budget() {
-        // 7 messages of 4000 chars = 7000 tokens, exactly the budget for a
-        // 10k window. Sitting on the line is not over it.
-        let mut history: Vec<Message> = (0..7).map(|_| text_message(4000)).collect();
+        // 8 messages of 4000 chars = 8000 tokens, exactly the budget for a
+        // 10k window with a 500-token prompt. Sitting on the line is not over
+        // it.
+        let mut history: Vec<Message> = (0..8).map(|_| text_message(4000)).collect();
         assert_eq!(
             estimate_history_tokens(&history),
-            forked_history_budget(10_000)
+            forked_history_budget(10_000, 500)
         );
 
-        let removed = precompact_forked_history(&mut history, 10_000, 0.50);
+        let removed = precompact_forked_history(&mut history, 10_000, 0.50, 500);
         assert_eq!(removed, 0);
-        assert_eq!(history.len(), 7);
+        assert_eq!(history.len(), 8);
     }
 
     #[test]
     fn precompact_trims_one_token_over_budget() {
-        let budget = forked_history_budget(10_000);
-        let mut history: Vec<Message> = (0..7).map(|_| text_message(4000)).collect();
+        let budget = forked_history_budget(10_000, 500);
+        let mut history: Vec<Message> = (0..8).map(|_| text_message(4000)).collect();
         history.push(text_message(4));
         assert_eq!(estimate_history_tokens(&history), budget + 1);
 
-        let removed = precompact_forked_history(&mut history, 10_000, 0.50);
+        let removed = precompact_forked_history(&mut history, 10_000, 0.50, 500);
         assert!(removed > 0);
         assert!(estimate_history_tokens(&history) <= budget);
     }
@@ -608,7 +636,7 @@ mod tests {
         // A handful of giant messages that can never fit the budget: the
         // loop must stop at the floor instead of spinning or emptying.
         let mut history: Vec<Message> = (0..6).map(|_| text_message(100_000)).collect();
-        let removed = precompact_forked_history(&mut history, 10_000, 0.50);
+        let removed = precompact_forked_history(&mut history, 10_000, 0.50, 0);
         assert_eq!(
             history.len(),
             FORK_MIN_RETAINED_MESSAGES + 1,
@@ -625,7 +653,7 @@ mod tests {
         let mut history: Vec<Message> = (0..12).map(|_| text_message(2_000)).collect();
         history.push(text_message(400_000));
 
-        let removed = precompact_forked_history(&mut history, 10_000, 0.50);
+        let removed = precompact_forked_history(&mut history, 10_000, 0.50, 0);
         assert_eq!(
             history.len(),
             FORK_MIN_RETAINED_MESSAGES + 1,
@@ -634,5 +662,21 @@ mod tests {
         assert!(removed > 0);
         let last = history.last().unwrap();
         assert!(estimate_history_tokens(std::slice::from_ref(last)) > 10_000);
+    }
+
+    #[test]
+    fn precompact_handles_prompt_larger_than_the_window() {
+        // A preamble that alone outgrows the window leaves no budget at all.
+        // The fork still keeps its floor rather than being emptied.
+        assert_eq!(forked_history_budget(10_000, 20_000), 0);
+
+        let mut history: Vec<Message> = (0..10).map(|_| text_message(1_000)).collect();
+        let removed = precompact_forked_history(&mut history, 10_000, 0.50, 20_000);
+        assert_eq!(removed, 6);
+        assert_eq!(
+            history.len(),
+            FORK_MIN_RETAINED_MESSAGES + 1,
+            "marker + floor"
+        );
     }
 }

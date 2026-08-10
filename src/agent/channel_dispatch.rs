@@ -748,10 +748,16 @@ async fn spawn_worker_inner(
         WorkerHistoryMode::Fork => {
             let mut history = state.history.read().await.clone();
             let context_window = **state.deps.runtime_config.context_window.load();
+            // The preamble is fully rendered by now — skills and ambient
+            // memory included — so the fork is budgeted against what the
+            // worker's first call actually leaves for history.
+            let prompt_tokens = crate::agent::compactor::estimate_text_tokens(&system_prompt)
+                + crate::agent::compactor::estimate_text_tokens(task);
             let removed = crate::agent::compactor::precompact_forked_history(
                 &mut history,
                 context_window,
                 0.50,
+                prompt_tokens,
             );
             if removed > 0 {
                 tracing::info!(

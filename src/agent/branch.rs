@@ -106,7 +106,7 @@ impl Branch {
 
         // Pre-flight context check: if the forked history is already large,
         // compact before we even make the first LLM call.
-        self.maybe_compact_history();
+        self.maybe_compact_history(&prompt);
 
         let routing = self.deps.runtime_config.routing.load();
         let model_name = self
@@ -279,14 +279,18 @@ impl Branch {
         Ok(conclusion)
     }
 
-    /// Compact history down to the fork's token budget, dropping the oldest
+    /// Compact history down to what the context window has left once this
+    /// branch's own preamble and prompt are accounted for, dropping the oldest
     /// half of the messages at a time until it fits.
-    fn maybe_compact_history(&mut self) {
+    fn maybe_compact_history(&mut self, prompt: &str) {
         let context_window = **self.deps.runtime_config.context_window.load();
+        let prompt_tokens = crate::agent::compactor::estimate_text_tokens(&self.system_prompt)
+            + crate::agent::compactor::estimate_text_tokens(prompt);
         let removed = crate::agent::compactor::precompact_forked_history(
             &mut self.history,
             context_window,
             0.50,
+            prompt_tokens,
         );
         if removed > 0 {
             tracing::info!(
