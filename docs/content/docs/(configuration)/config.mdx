@@ -95,11 +95,29 @@ coding = "anthropic/claude-sonnet-4-20250514"
 [defaults.routing.fallbacks]
 "anthropic/claude-sonnet-4-20250514" = ["anthropic/claude-haiku-4.5-20250514"]
 
-# Context compaction thresholds (fraction of context_window).
+# Context compaction. `mode` selects how a channel sheds history:
+#   "rolling"   — one summary at the head of history, rewritten under pressure
+#   "chronicle" — append-only interval checkpoints, persisted per channel
+# Switching back to "rolling" stops new checkpoints being cut but keeps
+# rendering the ones already committed, so history the chronicle trimmed out of
+# live context stays visible.
 [defaults.compaction]
+mode = "rolling"
 background_threshold = 0.80    # background summarization
 aggressive_threshold = 0.85    # aggressive summarization
 emergency_threshold = 0.95     # drop oldest 50%, no LLM
+
+# Session chronicle tuning. Only read when mode = "chronicle"; the thresholds
+# above still apply, as a floor that forces a cut early.
+[defaults.compaction.chronicle]
+interval_messages = 40           # messages since the last checkpoint before cutting
+interval_token_fraction = 0.12   # or this share of the context window, whichever first
+recent_window_hours = 24         # how far back checkpoints render in full
+max_recent = 8                   # checkpoints rendered in full
+max_older = 12                   # older checkpoints listed, collapsed first under budget
+context_token_budget = 2000      # token budget for the whole chronicle section
+expand_message_limit = 100       # raw messages a single `chronicle expand` returns
+max_messages_per_checkpoint = 400 # raw messages one checkpoint may summarize
 
 # Cortex (system observer) settings.
 [defaults.cortex]
@@ -258,6 +276,7 @@ Most config values are hot-reloaded when their files change. Spacebot watches `c
 |---------|----------|-------|
 | Model routing | Yes | Next LLM call uses the new model |
 | Compaction thresholds | Yes | Next compaction check uses new thresholds |
+| Compaction `mode` and chronicle settings | Yes | Next turn uses the new monitor. Existing checkpoints are kept and still rendered into the prompt even after switching back to `rolling`, so context the chronicle already trimmed from live history is not lost |
 | `max_turns` | Yes | Next channel message uses new limit |
 | `context_window` | Yes | Next compaction/worker check uses new size |
 | `max_concurrent_branches` | Yes | Next branch spawn checks new limit |

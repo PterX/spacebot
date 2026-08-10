@@ -506,6 +506,22 @@ pub enum ApiEvent {
         read: bool,
         dismissed: bool,
     },
+    /// A session chronicle checkpoint was committed. Carries only the index
+    /// entry; the timeline load returns the full record.
+    ChronicleCheckpoint {
+        agent_id: String,
+        channel_id: String,
+        checkpoint_id: String,
+        seq: i64,
+        level: i64,
+        kind: String,
+        title: String,
+        summary: String,
+        covers_from: String,
+        covers_to: String,
+        message_count: i64,
+        created_at: String,
+    },
     /// A line of live output from a running tool (e.g. shell stdout/stderr).
     /// Ephemeral — for frontend live display only. The full output is in ToolCompleted.
     ToolOutput {
@@ -666,6 +682,28 @@ impl ApiState {
                                         task: task.clone(),
                                         worker_type: worker_type.clone(),
                                         interactive: *interactive,
+                                    })
+                                    .ok();
+                            }
+                            ProcessEvent::ChronicleCheckpoint {
+                                channel_id,
+                                checkpoint,
+                                ..
+                            } => {
+                                api_tx
+                                    .send(ApiEvent::ChronicleCheckpoint {
+                                        agent_id: agent_id.clone(),
+                                        channel_id: channel_id.to_string(),
+                                        checkpoint_id: checkpoint.checkpoint_id.clone(),
+                                        seq: checkpoint.seq,
+                                        level: checkpoint.level,
+                                        kind: checkpoint.kind.clone(),
+                                        title: checkpoint.title.clone(),
+                                        summary: checkpoint.summary.clone(),
+                                        covers_from: checkpoint.covers_from.clone(),
+                                        covers_to: checkpoint.covers_to.clone(),
+                                        message_count: checkpoint.message_count,
+                                        created_at: checkpoint.created_at.clone(),
                                     })
                                     .ok();
                             }

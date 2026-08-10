@@ -171,6 +171,7 @@ pub(super) async fn events_sse(
                             ApiEvent::NotificationCreated { .. } => "notification_created",
                             ApiEvent::NotificationUpdated { .. } => "notification_updated",
                             ApiEvent::ToolOutput { .. } => "tool_output",
+                            ApiEvent::ChronicleCheckpoint { .. } => "chronicle_checkpoint",
                         };
                         yield Ok(axum::response::sse::Event::default()
                             .event(event_type)

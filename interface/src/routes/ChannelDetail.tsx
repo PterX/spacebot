@@ -6,6 +6,7 @@ import {
 	type ChannelInfo,
 	type TimelineItem,
 	type TimelineBranchRun,
+	type TimelineCheckpoint,
 	type TimelineWorkerRun,
 	type TranscriptStep,
 } from "@/api/client";
@@ -409,6 +410,76 @@ function WorkerRunItem({
 	);
 }
 
+/** Range label for a checkpoint's coverage, collapsed when it's a single day. */
+function coverageRange(from: string, to: string): string {
+	const start = new Date(from);
+	const end = new Date(to);
+	const date = (value: Date) => value.toLocaleDateString(undefined, {month: "short", day: "numeric"});
+	const time = (value: Date) =>
+		value.toLocaleTimeString(undefined, {hour: "2-digit", minute: "2-digit"});
+	return start.toDateString() === end.toDateString()
+		? `${date(start)} · ${time(start)}–${time(end)}`
+		: `${date(start)} ${time(start)} → ${date(end)} ${time(end)}`;
+}
+
+/**
+ * A chronicle checkpoint, rendered inline where the conversation reached it.
+ * Deliberately unlike the message rows on either side: this was authored by
+ * neither the user nor the agent.
+ */
+function CheckpointItem({item}: {item: TimelineCheckpoint}) {
+	const [expanded, setExpanded] = useState(false);
+	const emergency = item.kind === "emergency";
+
+	return (
+		<div className="flex gap-3 px-3 py-2">
+			<span className="flex-shrink-0 pt-0.5 text-tiny text-ink-faint">
+				{formatTimestamp(new Date(item.created_at).getTime())}
+			</span>
+			<div className="min-w-0 flex-1">
+				<button
+					type="button"
+					onClick={() => setExpanded((value) => !value)}
+					className={`w-full rounded-md border border-dashed px-3 py-2 text-left transition-colors ${
+						emergency
+							? "border-status-error/30 bg-status-error/5 hover:bg-status-error/10"
+							: "border-ink-faint/25 bg-app-dark-box/40 hover:bg-app-dark-box/60"
+					}`}
+				>
+					<div className="flex min-w-0 items-baseline gap-2">
+						<span
+							className={`flex-shrink-0 text-tiny font-medium uppercase tracking-wide ${
+								emergency ? "text-status-error/80" : "text-ink-faint"
+							}`}
+						>
+							{item.level > 0 ? "Rollup" : "Checkpoint"} #{item.seq}
+						</span>
+						<span className="min-w-0 flex-1 truncate text-sm text-ink-dull">
+							{item.title}
+						</span>
+						<span className="flex-shrink-0 text-tiny leading-5 text-ink-faint">
+							{expanded ? "▾" : "▸"}
+						</span>
+					</div>
+					<div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-tiny text-ink-faint">
+						<span>{coverageRange(item.covers_from, item.covers_to)}</span>
+						<span>{item.message_count} messages</span>
+						{item.kind !== "interval" && <span>{item.kind}</span>}
+						{item.rolled_up_into && <span>rolled up</span>}
+					</div>
+				</button>
+				{expanded && (
+					<div className="mt-1 rounded-md border border-ink-faint/10 bg-app-dark-box/30 px-3 py-2">
+						<div className="text-sm text-ink-dull">
+							<Markdown className="break-words">{item.summary}</Markdown>
+						</div>
+					</div>
+				)}
+			</div>
+		</div>
+	);
+}
+
 function TimelineEntry({
 	item,
 	liveWorkers,
@@ -476,6 +547,8 @@ function TimelineEntry({
 				<WorkerRunItem item={item as TimelineWorkerRun} agentId={agentId} />
 			);
 		}
+		case "checkpoint":
+			return <CheckpointItem item={item as TimelineCheckpoint} />;
 	}
 }
 

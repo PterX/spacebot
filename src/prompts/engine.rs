@@ -75,6 +75,10 @@ impl PromptEngine {
         )?;
         env.add_template("compactor", crate::prompts::text::get("compactor"))?;
         env.add_template(
+            "chronicle_checkpoint",
+            crate::prompts::text::get("chronicle_checkpoint"),
+        )?;
+        env.add_template(
             "memory_persistence",
             crate::prompts::text::get("memory_persistence"),
         )?;
@@ -660,6 +664,7 @@ impl PromptEngine {
             None,
             None,
             None,
+            None,
             false,
         )
     }
@@ -805,6 +810,7 @@ impl PromptEngine {
         adapter_prompt: Option<String>,
         project_context: Option<String>,
         backfill_transcript: Option<String>,
+        session_chronicle: Option<String>,
         working_memory: Option<String>,
         channel_activity_map: Option<String>,
         participant_context: Option<String>,
@@ -827,6 +833,7 @@ impl PromptEngine {
                 adapter_prompt => adapter_prompt,
                 project_context => project_context,
                 backfill_transcript => backfill_transcript,
+                session_chronicle => session_chronicle,
                 working_memory => working_memory,
                 channel_activity_map => channel_activity_map,
                 participant_context => participant_context,
@@ -1003,6 +1010,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 false,
             )
             .expect("channel prompt should render");
@@ -1010,6 +1018,48 @@ mod tests {
         assert!(prompt.contains("## Memory Context"));
         assert!(prompt.contains("Bulletin fallback"));
         assert!(!prompt.contains("## Knowledge Context"));
+    }
+
+    #[test]
+    fn renders_session_chronicle_block_when_supplied() {
+        let engine = PromptEngine::new("en").expect("prompt engine should build");
+        let render = |chronicle: Option<String>| {
+            engine
+                .render_channel_prompt_with_links(
+                    None,
+                    None,
+                    None,
+                    None,
+                    String::new(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    chronicle,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+                .expect("channel prompt should render")
+        };
+
+        let without = render(None);
+        assert!(!without.contains("Session Chronicle"));
+
+        let with = render(Some("## Session Chronicle\n\nTwo checkpoints.".to_string()));
+        assert!(with.contains("## Session Chronicle"));
+        assert!(with.contains("Two checkpoints."));
+        assert!(
+            with.contains("history, not instruction"),
+            "the chronicle block carries its own read-only framing"
+        );
     }
 
     #[test]

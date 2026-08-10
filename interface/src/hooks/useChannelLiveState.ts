@@ -4,6 +4,7 @@ import {
 	api,
 	type BranchCompletedEvent,
 	type BranchStartedEvent,
+	type ChronicleCheckpointEvent,
 	type InboundMessageEvent,
 	type OutboundMessageDeltaEvent,
 	type OutboundMessageEvent,
@@ -86,6 +87,7 @@ function itemTimestamp(item: TimelineItem): string {
 		case "branch_run": return item.started_at;
 		case "worker_run": return item.started_at;
 		case "tool_call_run": return item.started_at;
+		case "checkpoint": return item.created_at;
 	}
 }
 
@@ -549,6 +551,46 @@ export function useChannelLiveState(channels: ChannelInfo[]) {
 		}
 	}, [updateItem]);
 
+	// A checkpoint carries its whole record, so it lands in the timeline without
+	// a refetch. Duplicate ids are ignored — the same checkpoint can arrive over
+	// SSE and again in a history page loaded around the same moment.
+	const handleChronicleCheckpoint = useCallback((data: unknown) => {
+		const event = data as ChronicleCheckpointEvent;
+		setLiveStates((prev) => {
+			const existing = getOrCreate(prev, event.channel_id);
+			if (
+				existing.timeline.some(
+					(item) => item.type === "checkpoint" && item.id === event.checkpoint_id,
+				)
+			) {
+				return prev;
+			}
+			return {
+				...prev,
+				[event.channel_id]: {
+					...existing,
+					timeline: [
+						...existing.timeline,
+						{
+							type: "checkpoint",
+							id: event.checkpoint_id,
+							seq: event.seq,
+							level: event.level,
+							kind: event.kind,
+							title: event.title,
+							summary: event.summary,
+							covers_from: event.covers_from,
+							covers_to: event.covers_to,
+							message_count: event.message_count,
+							rolled_up_into: null,
+							created_at: event.created_at,
+						},
+					],
+				},
+			};
+		});
+	}, []);
+
 	const handleBranchStarted = useCallback((data: unknown) => {
 		const event = data as BranchStartedEvent;
 
@@ -818,7 +860,9 @@ export function useChannelLiveState(channels: ChannelInfo[]) {
 
 			const oldestItem = state.timeline[0];
 			if (!oldestItem) return prev;
-			const before = itemTimestamp(oldestItem);
+			// Composite cursor: SQLite timestamps are whole seconds, so paging on
+			// the timestamp alone skips every peer sharing the boundary second.
+			const before = `${itemTimestamp(oldestItem)}|${oldestItem.id}`;
 
 			// Mark as loading, then kick off the fetch outside setState
 			setTimeout(() => {
@@ -863,6 +907,7 @@ export function useChannelLiveState(channels: ChannelInfo[]) {
 		worker_idle: handleWorkerIdle,
 		worker_completed: handleWorkerCompleted,
 		branch_started: handleBranchStarted,
+		chronicle_checkpoint: handleChronicleCheckpoint,
 		branch_completed: handleBranchCompleted,
 		tool_started: handleToolStarted,
 		tool_completed: handleToolCompleted,

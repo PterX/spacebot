@@ -1601,8 +1601,11 @@ fn signal_from_event(event: ProcessEvent) -> Option<Signal> {
             channel_id,
             status: "idle".to_string(),
         },
-        // UI-only events — no cortex signal needed.
-        ProcessEvent::OpenCodeSessionCreated { .. }
+        // UI-only events — no cortex signal needed. Chronicle checkpoints are
+        // durable and reachable through the timeline and the chronicle tool,
+        // so they do not also need a slot in the signal buffer.
+        ProcessEvent::ChronicleCheckpoint { .. }
+        | ProcessEvent::OpenCodeSessionCreated { .. }
         | ProcessEvent::OpenCodePartUpdated { .. }
         | ProcessEvent::WorkerInitialResult { .. }
         | ProcessEvent::WorkerText { .. }

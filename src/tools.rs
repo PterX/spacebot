@@ -38,6 +38,7 @@ pub mod browser;
 pub mod browser_detection;
 pub mod cancel;
 pub mod channel_recall;
+pub mod chronicle;
 pub mod config_inspect;
 pub mod cron;
 pub mod email_search;
@@ -104,6 +105,9 @@ pub use browser::{
 pub use cancel::{CancelArgs, CancelError, CancelOutput, CancelTool};
 pub use channel_recall::{
     ChannelRecallArgs, ChannelRecallError, ChannelRecallOutput, ChannelRecallTool,
+};
+pub use chronicle::{
+    ChronicleArgs, ChronicleCapability, ChronicleError, ChronicleOutput, ChronicleTool,
 };
 pub use config_inspect::{
     ConfigInspectArgs, ConfigInspectError, ConfigInspectOutput, ConfigInspectTool,
@@ -479,6 +483,9 @@ pub async fn add_channel_tools(
 ) -> Result<(), rig::tool::server::ToolServerError> {
     let conversation_id = conversation_id.into();
     let channel_kind = state.kind;
+    let chronicle_channel_id = state.channel_id.to_string();
+    let chronicle_pool = state.deps.sqlite_pool.clone();
+    let compaction = **state.deps.runtime_config.compaction.load();
     let autonomy_run = state.autonomy_run.clone();
 
     if allow_direct_reply {
@@ -606,6 +613,21 @@ pub async fn add_channel_tools(
     {
         handle.add_tool(AutonomyCompleteTool::new(run)).await?;
     }
+
+    // Chronicle index. The channel gets metadata access only — expanding a
+    // checkpoint into raw transcript is a branch's job, so raw history never
+    // lands in the channel's context.
+    if compaction.mode == crate::config::CompactionMode::Chronicle && !channel_kind.self_exits() {
+        handle
+            .add_tool(ChronicleTool::new(
+                crate::conversation::ChronicleStore::new(chronicle_pool),
+                chronicle_channel_id,
+                ChronicleCapability::Metadata,
+                compaction.chronicle.expand_message_limit,
+            ))
+            .await?;
+    }
+
     Ok(())
 }
 
@@ -851,6 +873,7 @@ pub async fn remove_channel_tools(
     remove_optional_tool(handle, SkillsSearchTool::NAME).await;
     remove_optional_tool(handle, InstallSkillTool::NAME).await;
     remove_optional_tool(handle, RestartTool::NAME).await;
+    remove_optional_tool(handle, ChronicleTool::NAME).await;
     Ok(())
 }
 
@@ -981,6 +1004,22 @@ pub fn create_branch_tool_server(
             runtime_config.workspace_dir.clone(),
             sandbox,
         ));
+
+    // Branches carry the expand capability: raw transcript is curated here and
+    // reaches the channel as a conclusion, never as rows. Scoped to the
+    // forking channel — cross-channel reads stay with `channel_recall`.
+    let compaction = **runtime_config.compaction.load();
+    if compaction.mode == crate::config::CompactionMode::Chronicle
+        && let Some(channel_state) = &state
+        && !channel_state.kind.self_exits()
+    {
+        server = server.tool(ChronicleTool::new(
+            crate::conversation::ChronicleStore::new(channel_state.deps.sqlite_pool.clone()),
+            channel_state.channel_id.to_string(),
+            ChronicleCapability::Expand,
+            compaction.chronicle.expand_message_limit,
+        ));
+    }
 
     // Goal mutation follows user direction: conversation branches act on a
     // live user turn, while persistence and ingestion passes process derived
