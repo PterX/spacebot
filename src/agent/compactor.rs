@@ -287,47 +287,86 @@ async fn run_compaction(
     Ok(remove_count)
 }
 
-/// Compact a forked history in place when it already crowds the context
-/// window: drop the oldest `fraction` of messages and insert a marker so the
+/// Share of the context window pre-compaction holds back for the fork's system
+/// prompt and the model's response. Forked history is budgeted against what
+/// remains, so a fork that fits still has room to make its first call.
+const FORK_CONTEXT_RESERVE: f32 = 0.30;
+
+/// Messages pre-compaction never drops. A fork needs its most recent exchange
+/// to be able to act at all, so the budget yields to it rather than the
+/// reverse.
+const FORK_MIN_RETAINED_MESSAGES: usize = 4;
+
+/// Tokens available to a forked history, once the fork's own prompt and
+/// response capacity is reserved.
+fn forked_history_budget(context_window: usize) -> usize {
+    let reserve = (context_window as f32 * FORK_CONTEXT_RESERVE) as usize;
+    context_window.saturating_sub(reserve)
+}
+
+fn forked_compaction_marker(removed_total: usize) -> String {
+    format!(
+        "[Forked context compacted: {removed_total} older messages removed to stay within context limits. \
+         Continue with the information available.]"
+    )
+}
+
+/// Upper bound on what the marker itself costs, counted against the budget so
+/// the notice can't push a fork back over the line it was just trimmed to.
+fn forked_compaction_marker_tokens(removed_total: usize) -> usize {
+    if removed_total == 0 {
+        return 0;
+    }
+    forked_compaction_marker(removed_total).len().div_ceil(4)
+}
+
+/// Compact a forked history in place until it fits the fork's token budget:
+/// drop the oldest `fraction` of messages at a time and insert a marker so the
 /// fork knows material was removed. Used by branch and worker forks before
 /// their first LLM call, so a large parent history doesn't start the fork's
 /// life in overflow recovery. Returns the number of messages removed.
+///
+/// The most recent [`FORK_MIN_RETAINED_MESSAGES`] messages are preserved even
+/// when they alone exceed the budget — a single oversized tool result can
+/// outweigh the whole window, and dropping it would strip the fork of the
+/// context it was forked for.
 pub fn precompact_forked_history(
     history: &mut Vec<Message>,
     context_window: usize,
     fraction: f32,
 ) -> usize {
+    let budget = forked_history_budget(context_window);
     let mut removed_total = 0usize;
 
     // Re-estimate after each drain: one fractional cut isn't guaranteed to
-    // land under budget when a few large messages dominate the history. The
-    // floor of 4 retained messages bounds the loop; a history that still
-    // exceeds the budget at the floor is left for overflow recovery.
-    loop {
-        let estimated = estimate_history_tokens(history);
-        let usage = estimated as f32 / context_window.max(1) as f32;
-        if usage < 0.70 {
-            break;
-        }
-
+    // land under budget when a few large messages dominate the history.
+    while estimate_history_tokens(history) + forked_compaction_marker_tokens(removed_total) > budget
+    {
         let total = history.len();
-        if total <= 4 {
+        if total <= FORK_MIN_RETAINED_MESSAGES {
             break;
         }
 
         let remove_count = ((total as f32 * fraction) as usize)
             .max(1)
-            .min(total.saturating_sub(2));
+            .min(total - FORK_MIN_RETAINED_MESSAGES);
         history.drain(..remove_count);
         removed_total += remove_count;
     }
 
-    if removed_total > 0 {
-        let marker = format!(
-            "[Forked context compacted: {removed_total} older messages removed to stay within context limits. \
-             Continue with the information available.]"
+    let retained_tokens = estimate_history_tokens(history);
+    if retained_tokens + forked_compaction_marker_tokens(removed_total) > budget {
+        tracing::warn!(
+            retained_tokens,
+            budget,
+            retained_messages = history.len(),
+            "forked history exceeds its budget at the retention floor; the fork \
+             may enter context-overflow recovery"
         );
-        history.insert(0, Message::from(marker));
+    }
+
+    if removed_total > 0 {
+        history.insert(0, Message::from(forked_compaction_marker(removed_total)));
     }
     removed_total
 }
@@ -505,13 +544,13 @@ mod tests {
     #[test]
     fn precompact_drains_until_under_budget() {
         // 40 messages of 4000 chars ≈ 40k tokens against a 20k window: a
-        // single 50% cut leaves ~20k (still ≥70%), so the loop must run
+        // single 50% cut leaves ~20k, still over budget, so the loop must run
         // more than once.
         let mut history: Vec<Message> = (0..40).map(|_| text_message(4000)).collect();
         let removed = precompact_forked_history(&mut history, 20_000, 0.50);
         assert!(removed > 20, "one fractional cut is not enough: {removed}");
-        let estimated = estimate_history_tokens(&history);
-        assert!((estimated as f32) < 20_000.0 * 0.70);
+        // The marker is part of what the fork carries, so it counts too.
+        assert!(estimate_history_tokens(&history) <= forked_history_budget(20_000));
         // Marker inserted once, at the front.
         let front = match &history[0] {
             Message::User { content } => format!("{content:?}"),
@@ -522,12 +561,78 @@ mod tests {
     }
 
     #[test]
+    fn precompact_reserves_prompt_and_response_capacity() {
+        // A history that fits the raw window but not the budget still gets
+        // trimmed: the fork needs room for its own prompt and response.
+        let budget = forked_history_budget(20_000);
+        assert!(budget < 20_000, "reserve must hold something back");
+
+        let mut history: Vec<Message> = (0..10).map(|_| text_message(7_000)).collect();
+        let estimated = estimate_history_tokens(&history);
+        assert!(estimated < 20_000 && estimated > budget, "{estimated}");
+
+        let removed = precompact_forked_history(&mut history, 20_000, 0.50);
+        assert!(removed > 0);
+        assert!(estimate_history_tokens(&history) <= budget);
+    }
+
+    #[test]
+    fn precompact_noop_at_exact_budget() {
+        // 7 messages of 4000 chars = 7000 tokens, exactly the budget for a
+        // 10k window. Sitting on the line is not over it.
+        let mut history: Vec<Message> = (0..7).map(|_| text_message(4000)).collect();
+        assert_eq!(
+            estimate_history_tokens(&history),
+            forked_history_budget(10_000)
+        );
+
+        let removed = precompact_forked_history(&mut history, 10_000, 0.50);
+        assert_eq!(removed, 0);
+        assert_eq!(history.len(), 7);
+    }
+
+    #[test]
+    fn precompact_trims_one_token_over_budget() {
+        let budget = forked_history_budget(10_000);
+        let mut history: Vec<Message> = (0..7).map(|_| text_message(4000)).collect();
+        history.push(text_message(4));
+        assert_eq!(estimate_history_tokens(&history), budget + 1);
+
+        let removed = precompact_forked_history(&mut history, 10_000, 0.50);
+        assert!(removed > 0);
+        assert!(estimate_history_tokens(&history) <= budget);
+    }
+
+    #[test]
     fn precompact_stops_at_retention_floor() {
         // A handful of giant messages that can never fit the budget: the
         // loop must stop at the floor instead of spinning or emptying.
         let mut history: Vec<Message> = (0..6).map(|_| text_message(100_000)).collect();
         let removed = precompact_forked_history(&mut history, 10_000, 0.50);
-        assert!(history.len() >= 4);
+        assert_eq!(
+            history.len(),
+            FORK_MIN_RETAINED_MESSAGES + 1,
+            "marker + floor"
+        );
+        assert_eq!(removed, 2);
+    }
+
+    #[test]
+    fn precompact_keeps_oversized_recent_message() {
+        // One recent message larger than the entire window: dropping the rest
+        // can't bring the fork under budget, and the message itself is the
+        // context the fork was created for, so it survives.
+        let mut history: Vec<Message> = (0..12).map(|_| text_message(2_000)).collect();
+        history.push(text_message(400_000));
+
+        let removed = precompact_forked_history(&mut history, 10_000, 0.50);
+        assert_eq!(
+            history.len(),
+            FORK_MIN_RETAINED_MESSAGES + 1,
+            "marker + floor"
+        );
         assert!(removed > 0);
+        let last = history.last().unwrap();
+        assert!(estimate_history_tokens(std::slice::from_ref(last)) > 10_000);
     }
 }

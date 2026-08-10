@@ -892,6 +892,16 @@ impl ReflectionSignal {
     fn is_set(&self) -> bool {
         self.turn_work || self.workers.iter().any(|(_, success)| *success)
     }
+
+    /// Record a completed worker for the next reflection pass. Repeat
+    /// completions for the same worker are ignored so a retriggered event
+    /// can't queue the same transcript twice.
+    fn record_worker(&mut self, worker_id: WorkerId, success: bool) {
+        if self.workers.iter().any(|(id, _)| *id == worker_id) {
+            return;
+        }
+        self.workers.push((worker_id, success));
+    }
 }
 
 /// RAII guard that records `message_handling_duration_seconds` when dropped,
@@ -3998,9 +4008,7 @@ impl Channel {
             .lock()
             .expect("reflection signal lock");
         let was_set = signal.is_set();
-        if !signal.workers.iter().any(|(id, _)| *id == worker_id) {
-            signal.workers.push((worker_id, success));
-        }
+        signal.record_worker(worker_id, success);
         if !was_set && signal.is_set() {
             tracing::debug!(
                 channel_id = %self.id,
@@ -4368,7 +4376,7 @@ fn is_dm_conversation_id(conv_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ObserveModeFallbackState, branch_working_memory_event_summary,
+        ObserveModeFallbackState, ReflectionSignal, branch_working_memory_event_summary,
         classify_conversational_event_summary, compute_listen_mode_invocation, decision_user_id,
         extract_decision_summary_from_reply, format_conversational_event_summary,
         is_dm_conversation_id, recv_channel_event, should_process_event_for_channel,
@@ -4401,6 +4409,63 @@ mod tests {
             metadata: message_metadata,
             formatted_author: None,
         }
+    }
+
+    #[test]
+    fn reflection_signal_records_failed_workers_without_firing() {
+        let mut signal = ReflectionSignal::default();
+        let failed = uuid::Uuid::new_v4();
+        signal.record_worker(failed, false);
+
+        assert_eq!(signal.workers, vec![(failed, false)]);
+        assert!(
+            !signal.is_set(),
+            "a failure on its own has no lesson to reflect on"
+        );
+    }
+
+    #[test]
+    fn reflection_signal_carries_failed_predecessors_of_a_success() {
+        let mut signal = ReflectionSignal::default();
+        let first_failure = uuid::Uuid::new_v4();
+        let second_failure = uuid::Uuid::new_v4();
+        let success = uuid::Uuid::new_v4();
+        signal.record_worker(first_failure, false);
+        signal.record_worker(second_failure, false);
+        signal.record_worker(success, true);
+
+        assert!(signal.is_set());
+        assert_eq!(
+            signal.workers,
+            vec![
+                (first_failure, false),
+                (second_failure, false),
+                (success, true),
+            ],
+            "reflection needs the failed attempts that preceded the success"
+        );
+    }
+
+    #[test]
+    fn reflection_signal_fires_on_turn_work_alone() {
+        let mut signal = ReflectionSignal::default();
+        assert!(!signal.is_set());
+        signal.turn_work = true;
+        assert!(signal.is_set());
+    }
+
+    #[test]
+    fn reflection_signal_ignores_repeat_completions() {
+        let mut signal = ReflectionSignal::default();
+        let worker = uuid::Uuid::new_v4();
+        signal.record_worker(worker, false);
+        signal.record_worker(worker, true);
+
+        assert_eq!(
+            signal.workers,
+            vec![(worker, false)],
+            "the first completion is the terminal one"
+        );
     }
 
     #[tokio::test]

@@ -279,8 +279,8 @@ impl Branch {
         Ok(conclusion)
     }
 
-    /// Compact history if approaching context window limit.
-    /// Removes the oldest 50% of messages when usage exceeds 70%.
+    /// Compact history down to the fork's token budget, dropping the oldest
+    /// half of the messages at a time until it fits.
     fn maybe_compact_history(&mut self) {
         let context_window = **self.deps.runtime_config.context_window.load();
         let removed = crate::agent::compactor::precompact_forked_history(
