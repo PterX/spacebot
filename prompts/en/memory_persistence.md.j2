@@ -86,7 +86,7 @@ These workers completed since the last reflection pass:
 - `{{ worker_id }}`
 {% endfor %}
 
-Before deciding, pull their transcripts with `worker_inspect` — the lesson usually lives in what a worker tried, not in the summary it returned to the channel. A worker that succeeded after several failed approaches is the strongest signal there is a procedure worth writing down. Also check `worker_inspect` without an id for failed predecessors of the same task: the trials that make a procedure worth keeping are often in the run that didn't succeed just before the one that did.
+Before deciding, pull their transcripts with `worker_inspect` — the lesson usually lives in what a worker tried, not in the summary it returned to the channel. A worker that succeeded after failed attempts — its own retries or a failed run listed above — is the strongest signal there is a procedure worth writing down. If the trail extends past this list, `worker_inspect` without an id shows older runs.
 {% endif %}
 
 If something is worth keeping, follow this order strictly:

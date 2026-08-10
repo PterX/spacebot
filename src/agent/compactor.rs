@@ -297,28 +297,39 @@ pub fn precompact_forked_history(
     context_window: usize,
     fraction: f32,
 ) -> usize {
-    let estimated = estimate_history_tokens(history);
-    let usage = estimated as f32 / context_window.max(1) as f32;
-    if usage < 0.70 {
-        return 0;
+    let mut removed_total = 0usize;
+
+    // Re-estimate after each drain: one fractional cut isn't guaranteed to
+    // land under budget when a few large messages dominate the history. The
+    // floor of 4 retained messages bounds the loop; a history that still
+    // exceeds the budget at the floor is left for overflow recovery.
+    loop {
+        let estimated = estimate_history_tokens(history);
+        let usage = estimated as f32 / context_window.max(1) as f32;
+        if usage < 0.70 {
+            break;
+        }
+
+        let total = history.len();
+        if total <= 4 {
+            break;
+        }
+
+        let remove_count = ((total as f32 * fraction) as usize)
+            .max(1)
+            .min(total.saturating_sub(2));
+        history.drain(..remove_count);
+        removed_total += remove_count;
     }
 
-    let total = history.len();
-    if total <= 4 {
-        return 0;
+    if removed_total > 0 {
+        let marker = format!(
+            "[Forked context compacted: {removed_total} older messages removed to stay within context limits. \
+             Continue with the information available.]"
+        );
+        history.insert(0, Message::from(marker));
     }
-
-    let remove_count = ((total as f32 * fraction) as usize)
-        .max(1)
-        .min(total.saturating_sub(2));
-    history.drain(..remove_count);
-
-    let marker = format!(
-        "[Forked context compacted: {remove_count} older messages removed to stay within context limits. \
-         Continue with the information available.]"
-    );
-    history.insert(0, Message::from(marker));
-    remove_count
+    removed_total
 }
 
 /// Estimate token count for a history using chars/4 heuristic.
@@ -473,4 +484,50 @@ pub enum CompactionAction {
     Aggressive,
     /// Emergency truncation (no LLM, drop oldest 50%).
     EmergencyTruncate,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_message(size: usize) -> Message {
+        Message::from("x".repeat(size))
+    }
+
+    #[test]
+    fn precompact_noop_under_budget() {
+        let mut history: Vec<Message> = (0..10).map(|_| text_message(100)).collect();
+        let removed = precompact_forked_history(&mut history, 200_000, 0.50);
+        assert_eq!(removed, 0);
+        assert_eq!(history.len(), 10);
+    }
+
+    #[test]
+    fn precompact_drains_until_under_budget() {
+        // 40 messages of 4000 chars ≈ 40k tokens against a 20k window: a
+        // single 50% cut leaves ~20k (still ≥70%), so the loop must run
+        // more than once.
+        let mut history: Vec<Message> = (0..40).map(|_| text_message(4000)).collect();
+        let removed = precompact_forked_history(&mut history, 20_000, 0.50);
+        assert!(removed > 20, "one fractional cut is not enough: {removed}");
+        let estimated = estimate_history_tokens(&history);
+        assert!((estimated as f32) < 20_000.0 * 0.70);
+        // Marker inserted once, at the front.
+        let front = match &history[0] {
+            Message::User { content } => format!("{content:?}"),
+            other => format!("{other:?}"),
+        };
+        assert!(front.contains("Forked context compacted"));
+        assert!(!format!("{:?}", &history[1]).contains("Forked context compacted"));
+    }
+
+    #[test]
+    fn precompact_stops_at_retention_floor() {
+        // A handful of giant messages that can never fit the budget: the
+        // loop must stop at the floor instead of spinning or emptying.
+        let mut history: Vec<Message> = (0..6).map(|_| text_message(100_000)).collect();
+        let removed = precompact_forked_history(&mut history, 10_000, 0.50);
+        assert!(history.len() >= 4);
+        assert!(removed > 0);
+    }
 }

@@ -756,20 +756,24 @@ pub struct Channel {
 }
 
 /// What accumulated between skill-reflection passes: whether a turn crossed
-/// the tool-iteration threshold, and which workers completed successfully.
-/// Drained by the persistence branch that performs the reflection.
+/// the tool-iteration threshold, and which workers completed since the last
+/// pass. Drained by the persistence branch that performs the reflection.
+///
+/// Failed completions are collected too — their transcripts are where the
+/// trials live — but only successful ones make the signal fire: an
+/// unresolved failure alone has nothing to teach.
 #[derive(Debug, Default, Clone)]
 struct ReflectionSignal {
     /// A channel turn crossed `min_tool_iterations` tool calls.
     turn_work: bool,
-    /// Workers that completed successfully since the last reflection pass,
-    /// in completion order.
-    worker_ids: Vec<WorkerId>,
+    /// Workers that completed since the last reflection pass, in completion
+    /// order, with whether each succeeded.
+    workers: Vec<(WorkerId, bool)>,
 }
 
 impl ReflectionSignal {
     fn is_set(&self) -> bool {
-        self.turn_work || !self.worker_ids.is_empty()
+        self.turn_work || self.workers.iter().any(|(_, success)| *success)
     }
 }
 
@@ -3421,16 +3425,20 @@ impl Channel {
 
                 run_logger.log_worker_completed(*worker_id, result, *success);
 
-                // A worker finishing real work successfully is a reflection
-                // signal: the session likely produced a reusable lesson.
-                if *success {
+                // Every completion is recorded for the next reflection pass —
+                // failed transcripts carry the trials — but only success
+                // fires the signal: a worker finishing real work successfully
+                // means the session likely produced a reusable lesson.
+                {
                     let reflection = self.deps.runtime_config.skills_config.load().reflection;
                     if reflection.enabled {
-                        self.mark_reflection_worker(*worker_id);
-                        // A worker can finish after the last user turn; check
-                        // now so reflection doesn't sit pending until the next
-                        // inbound message.
-                        self.check_memory_persistence().await;
+                        self.mark_reflection_worker(*worker_id, *success);
+                        if *success {
+                            // A worker can finish after the last user turn;
+                            // check now so reflection doesn't sit pending
+                            // until the next inbound message.
+                            self.check_memory_persistence().await;
+                        }
                     }
                 }
 
@@ -3754,9 +3762,11 @@ impl Channel {
         }
     }
 
-    /// Record a successfully completed worker for the next reflection pass,
-    /// which pulls its transcript via `worker_inspect`.
-    fn mark_reflection_worker(&self, worker_id: WorkerId) {
+    /// Record a completed worker for the next reflection pass, which pulls
+    /// its transcript via `worker_inspect`. Failed workers are recorded too
+    /// — their transcripts carry the trials — but don't fire the signal by
+    /// themselves.
+    fn mark_reflection_worker(&self, worker_id: WorkerId, success: bool) {
         if self.id.starts_with("cron") {
             return;
         }
@@ -3765,10 +3775,10 @@ impl Channel {
             .lock()
             .expect("reflection signal lock");
         let was_set = signal.is_set();
-        if !signal.worker_ids.contains(&worker_id) {
-            signal.worker_ids.push(worker_id);
+        if !signal.workers.iter().any(|(id, _)| *id == worker_id) {
+            signal.workers.push((worker_id, success));
         }
-        if !was_set {
+        if !was_set && signal.is_set() {
             tracing::debug!(
                 channel_id = %self.id,
                 %worker_id,
@@ -3865,13 +3875,13 @@ impl Channel {
         self.message_count = 0;
         self.last_persistence_at = std::time::Instant::now();
 
-        // Snapshot the completed-worker ids for the reflection pass; the
+        // Snapshot the completed workers for the reflection pass; the
         // signal itself is only cleared once the branch actually spawns.
-        let reflection_worker_ids: Vec<WorkerId> = if reflection_due {
+        let reflection_workers: Vec<(WorkerId, bool)> = if reflection_due {
             self.reflection_signal
                 .lock()
                 .expect("reflection signal lock")
-                .worker_ids
+                .workers
                 .clone()
         } else {
             Vec::new()
@@ -3881,7 +3891,7 @@ impl Channel {
             &self.state,
             &self.deps,
             reflection_due,
-            &reflection_worker_ids,
+            &reflection_workers,
         )
         .await
         {

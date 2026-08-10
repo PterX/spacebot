@@ -220,7 +220,7 @@ pub(crate) async fn spawn_memory_persistence_branch(
     state: &ChannelState,
     deps: &AgentDeps,
     skill_reflection: bool,
-    reflection_worker_ids: &[crate::WorkerId],
+    reflection_workers: &[(crate::WorkerId, bool)],
 ) -> std::result::Result<BranchId, AgentError> {
     let contract_state = Arc::new(MemoryPersistenceContractState::default());
 
@@ -228,9 +228,12 @@ pub(crate) async fn spawn_memory_persistence_branch(
     let routing = deps.runtime_config.routing.load();
     let model_name = routing.resolve(ProcessType::Branch, None).to_string();
     let tool_use_enforcement = deps.runtime_config.tool_use_enforcement.load();
-    let reflection_worker_ids: Vec<String> = reflection_worker_ids
+    let reflection_worker_ids: Vec<String> = reflection_workers
         .iter()
-        .map(|id| id.to_string())
+        .map(|(id, success)| {
+            let status = if *success { "succeeded" } else { "failed" };
+            format!("{id} — {status}")
+        })
         .collect();
     let system_prompt = prompt_engine
         .render_memory_persistence_prompt(skill_reflection, &reflection_worker_ids)
