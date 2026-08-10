@@ -560,6 +560,18 @@ fn classify_chunk_prompt_result(
             );
             Ok(())
         }
+        // The chunk signalled its terminal outcome, so the loop stopped before
+        // the trailing LLM call. The caller verifies the outcome was recorded.
+        Err(PromptError::PromptCancelled { reason, .. })
+            if SpacebotHook::is_memory_persistence_complete_reason(&reason) =>
+        {
+            tracing::debug!(
+                file = %filename,
+                chunk = %format!("{chunk_number}/{total_chunks}"),
+                "chunk processed"
+            );
+            Ok(())
+        }
         Err(PromptError::MaxTurnsError { .. }) => {
             tracing::warn!(
                 file = %filename,

@@ -135,8 +135,10 @@ impl Compactor {
         };
 
         let history = self.history.clone();
-        let fence = self.fence.clone();
-        let entry = fence.snapshot();
+        let guard = CompactionGuard {
+            entry: self.fence.snapshot(),
+            fence: self.fence.clone(),
+        };
         let is_compacting = self.is_compacting.clone();
         let channel_id = self.channel_id.clone();
         let deps = self.deps.clone();
@@ -162,8 +164,7 @@ impl Compactor {
                 &channel_id,
                 fraction,
                 model_override,
-                &fence,
-                entry,
+                &guard,
             )
             .await;
 
@@ -226,8 +227,18 @@ impl Compactor {
     }
 }
 
+/// The shared fence plus the snapshot a compaction captured when it started.
+///
+/// Carried together because they are only meaningful as a pair: the snapshot
+/// is what the fence is checked against before the summary lands.
+#[derive(Debug)]
+struct CompactionGuard {
+    fence: Arc<crate::agent::chronicle::HistoryFence>,
+    entry: crate::agent::chronicle::FenceSnapshot,
+}
+
 /// Run the actual compaction: summarize via LLM, extract memories, swap summary into history.
-#[tracing::instrument(skip(deps, compactor_prompt, history), fields(agent_id = %deps.agent_id))]
+#[tracing::instrument(skip(deps, compactor_prompt, history, guard), fields(agent_id = %deps.agent_id))]
 async fn run_compaction(
     deps: &AgentDeps,
     compactor_prompt: &str,
@@ -235,9 +246,10 @@ async fn run_compaction(
     channel_id: &ChannelId,
     fraction: f32,
     model_override: Option<String>,
-    fence: &Arc<crate::agent::chronicle::HistoryFence>,
-    entry: crate::agent::chronicle::FenceSnapshot,
+    guard: &CompactionGuard,
 ) -> Result<usize> {
+    let CompactionGuard { fence, entry } = guard;
+    let entry = *entry;
     // 1. Read and remove the oldest messages from history
     let (removed_messages, remove_count) = {
         let _guard = fence.lock_mutation().await;
