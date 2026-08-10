@@ -52,9 +52,15 @@ interface AutonomyDialCardProps {
 	status: AutonomyStatus | undefined;
 	onUpdate: (update: AutonomyUpdate) => void;
 	agentName?: string;
+	onClearHome?: () => void;
 }
 
-export function AutonomyDialCard({status, onUpdate, agentName}: AutonomyDialCardProps) {
+export function AutonomyDialCard({
+	status,
+	onUpdate,
+	agentName,
+	onClearHome,
+}: AutonomyDialCardProps) {
 	const [advancedOpen, setAdvancedOpen] = useState(false);
 	const now = useNow(1000);
 
@@ -65,6 +71,7 @@ export function AutonomyDialCard({status, onUpdate, agentName}: AutonomyDialCard
 
 	const selected = LEVELS.find((l) => l.key === level) ?? LEVELS[0];
 	const isOff = level === "off";
+	const home = status?.home_channel ?? null;
 
 	return (
 		<Card variant="dark">
@@ -237,6 +244,22 @@ export function AutonomyDialCard({status, onUpdate, agentName}: AutonomyDialCard
 									/>
 								))}
 							</div>
+						</div>
+
+						<div className="flex items-center justify-between">
+							<div className="min-w-0">
+								<p className="text-sm text-ink-dull">Home channel</p>
+								<p className="truncate text-tiny text-ink-faint">
+									{home
+										? `Proactive messages go to ${home.target}${
+												home.explicit ? "" : " — adopted on first run"
+											}`
+										: "Not set — findings are recorded instead of sent"}
+								</p>
+							</div>
+							{home && onClearHome ? (
+								<FilterButton label="Clear" active={false} onClick={onClearHome} />
+							) : null}
 						</div>
 
 						<div className="flex items-center justify-between">

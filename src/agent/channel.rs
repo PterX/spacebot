@@ -2604,9 +2604,36 @@ impl Channel {
             self.retrigger_count = 0;
             self.message_count += 1;
             self.check_memory_persistence().await;
+            self.claim_home_channel_if_unset().await;
         }
 
         Ok(())
+    }
+
+    /// A fresh instance has no home, which is when proactive behavior most
+    /// wants one. The first conversation to complete a turn adopts it, and
+    /// says so — the destination is never a default the user discovers by
+    /// receiving something unexpected.
+    async fn claim_home_channel_if_unset(&mut self) {
+        if self.state.kind != ChannelKind::User {
+            return;
+        }
+        let is_portal = self.current_adapter() == Some("portal");
+        let Some(target) =
+            crate::commands::control::adopt_home_channel(&self.deps, &self.id, is_portal).await
+        else {
+            return;
+        };
+
+        self.send_builtin_text(
+            format!(
+                "heads up: nothing was set as my home channel, so i've taken this chat \
+                 ({target}). anything i bring up on my own lands here. use /sethome \
+                 elsewhere to move it."
+            ),
+            "home-adopted",
+        )
+        .await;
     }
 
     /// Build the rendered available channels fragment for cross-channel awareness.

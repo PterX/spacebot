@@ -44,6 +44,15 @@ pub struct AutonomyCurrentRun {
     pub started_at: String,
 }
 
+/// Where this agent's proactive messages go when no wake overrides it.
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct HomeChannelStatus {
+    /// Canonical `adapter:target` string.
+    pub target: String,
+    /// Set deliberately, rather than adopted on the first completed turn.
+    pub explicit: bool,
+}
+
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AutonomyStatusResponse {
     pub agent_id: String,
@@ -64,6 +73,9 @@ pub struct AutonomyStatusResponse {
     /// The in-flight run, when one is active.
     pub current_run: Option<AutonomyCurrentRun>,
     pub pending_wake_events: i64,
+    /// Resolved home channel, or `null` when the agent has nowhere to speak
+    /// on its own.
+    pub home_channel: Option<HomeChannelStatus>,
 }
 
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]
@@ -146,6 +158,17 @@ async fn build_status(
         next_run_at,
         current_run,
         pending_wake_events,
+        home_channel: deps
+            .runtime_config
+            .settings
+            .load()
+            .as_ref()
+            .as_ref()
+            .and_then(|settings| settings.home_channel())
+            .map(|home| HomeChannelStatus {
+                target: home.target,
+                explicit: home.explicit,
+            }),
     })
 }
 
@@ -293,6 +316,47 @@ pub(super) async fn update_autonomy_ceiling(
     tracing::info!(ceiling = %request.ceiling, "instance autonomy ceiling updated via API");
 
     autonomy_fleet(State(state)).await
+}
+
+/// Clear an agent's home channel, returning it to sending nothing on its own.
+///
+/// There is no set-from-here counterpart: a home is claimed from the chat that
+/// should receive it, so the only action this surface can offer is giving it
+/// up.
+#[utoipa::path(
+    delete,
+    path = "/agents/autonomy/home",
+    params(AutonomyStatusQuery),
+    responses(
+        (status = 200, body = AutonomyStatusResponse),
+        (status = 404, description = "Agent not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "autonomy",
+)]
+pub(super) async fn clear_home_channel(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<AutonomyStatusQuery>,
+) -> Result<Json<AutonomyStatusResponse>, StatusCode> {
+    let deps = agent_deps(&state, &query.agent_id)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let settings = deps
+        .runtime_config
+        .settings
+        .load()
+        .as_ref()
+        .clone()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    settings.clear_home_channel().map_err(|error| {
+        tracing::warn!(%error, agent_id = %query.agent_id, "failed to clear home channel");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    tracing::info!(agent_id = %query.agent_id, "home channel cleared via API");
+
+    autonomy_status(State(state), Query(query)).await
 }
 
 /// List recent autonomy runs, newest first. Scoped to one agent when

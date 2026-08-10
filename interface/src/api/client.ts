@@ -1142,6 +1142,15 @@ export interface AutonomyStatus {
 	next_run_at: string | null;
 	current_run: AutonomyCurrentRun | null;
 	pending_wake_events: number;
+	/** Where proactive messages go, or null when the agent has nowhere to speak on its own. */
+	home_channel: HomeChannelStatus | null;
+}
+
+export interface HomeChannelStatus {
+	/** Canonical `adapter:target` string. */
+	target: string;
+	/** Set deliberately, rather than adopted on the first completed turn. */
+	explicit: boolean;
 }
 
 export interface AutonomyFleetResponse {
@@ -1847,6 +1856,17 @@ export const api = {
 			throw new Error(`API error: ${response.status}`);
 		}
 		return response.json() as Promise<AutonomyFleetResponse>;
+	},
+
+	clearHomeChannel: async (agentId: string) => {
+		const response = await fetch(
+			`${getApiBase()}/agents/autonomy/home?agent_id=${encodeURIComponent(agentId)}`,
+			{ method: "DELETE" },
+		);
+		if (!response.ok) {
+			throw new Error(`API error: ${response.status}`);
+		}
+		return response.json() as Promise<AutonomyStatus>;
 	},
 
 	autonomyRuns: (agentId?: string, limit?: number) => {

@@ -131,6 +131,7 @@ pub fn api_router() -> OpenApiRouter<Arc<ApiState>> {
         .routes(routes!(autonomy::autonomy_status))
         .routes(routes!(autonomy::autonomy_fleet))
         .routes(routes!(autonomy::update_autonomy_ceiling))
+        .routes(routes!(autonomy::clear_home_channel))
         .routes(routes!(autonomy::autonomy_runs))
         // Wake routes
         .routes(routes!(wakes::list_wakes))

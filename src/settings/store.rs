@@ -205,6 +205,13 @@ impl SettingsStore {
         self.set_raw(HOME_CHANNEL_EXPLICIT_KEY, "true")
     }
 
+    /// Drop the home channel, returning the instance to sending nothing on
+    /// its own.
+    pub fn clear_home_channel(&self) -> Result<()> {
+        self.set_raw(HOME_CHANNEL_KEY, "")?;
+        self.set_raw(HOME_CHANNEL_EXPLICIT_KEY, "false")
+    }
+
     /// Adopt `target` as the home channel only when nothing has claimed it.
     /// Returns whether the value was taken. An implicit home never overwrites
     /// an explicit one, and never overwrites another implicit one — first run

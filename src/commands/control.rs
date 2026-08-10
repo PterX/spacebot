@@ -265,6 +265,44 @@ async fn conversation_broadcast_target(
         .ok_or_else(|| "couldn't resolve this chat's delivery address".to_string())
 }
 
+/// Claim a conversation as the home channel on behalf of first-run adoption,
+/// returning the canonical target when this conversation actually took it.
+///
+/// Unlike [`set_home_channel`] this never displaces an existing home, and it
+/// is silent about every reason it might decline — the caller only cares
+/// whether it now owns the home and therefore owes the user an announcement.
+pub(crate) async fn adopt_home_channel(
+    deps: &crate::AgentDeps,
+    conversation_id: &str,
+    is_portal: bool,
+) -> Option<String> {
+    let settings = deps.runtime_config.settings.load().as_ref().clone()?;
+    if settings.home_channel().is_some() {
+        return None;
+    }
+
+    let target = conversation_broadcast_target(deps, conversation_id, is_portal)
+        .await
+        .ok()?
+        .to_string();
+
+    match settings.adopt_home_channel(&target) {
+        Ok(true) => {
+            tracing::info!(
+                agent = %deps.agent_id,
+                home_channel = %target,
+                "adopted home channel on first completed turn"
+            );
+            Some(target)
+        }
+        Ok(false) => None,
+        Err(error) => {
+            tracing::warn!(%error, "failed to adopt home channel");
+            None
+        }
+    }
+}
+
 /// Set a conversation as the instance's home channel, returning the reply.
 ///
 /// Shared by `/sethome` and the `set_home_channel` tool so both entry points

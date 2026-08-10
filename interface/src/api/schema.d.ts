@@ -97,6 +97,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/agents/autonomy/home": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Clear an agent's home channel, returning it to sending nothing on its own.
+         * @description There is no set-from-here counterpart: a home is claimed from the chat that
+         *     should receive it, so the only action this surface can offer is giving it
+         *     up.
+         */
+        delete: operations["clear_home_channel"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/agents/autonomy/runs": {
         parameters: {
             query?: never;
@@ -1924,6 +1946,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/providers/default-models": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_provider_default_models"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/providers/openai/browser-oauth/start": {
         parameters: {
             query?: never;
@@ -2986,6 +3024,7 @@ export interface components {
              *     actually runs at.
              */
             effective_level: components["schemas"]["AutonomyLevel"];
+            home_channel?: null | components["schemas"]["HomeChannelStatus"];
             /** Format: int64 */
             interval_secs: number;
             /** @description When the most recent finished run started. */
@@ -3681,6 +3720,13 @@ export interface components {
             /** Format: int64 */
             hour: number;
         };
+        /** @description Where this agent's proactive messages go when no wake overrides it. */
+        HomeChannelStatus: {
+            /** @description Set deliberately, rather than adopted on the first completed turn. */
+            explicit: boolean;
+            /** @description Canonical `adapter:target` string. */
+            target: string;
+        };
         IdentityResponse: {
             identity?: string | null;
             role?: string | null;
@@ -3953,7 +3999,11 @@ export interface components {
             notifications: components["schemas"]["Notification"][];
         };
         OpenAiOAuthBrowserStartRequest: {
-            model: string;
+            /**
+             * @description Model to apply after sign-in. Omitted or empty means the backend's
+             *     default for the ChatGPT OAuth provider.
+             */
+            model?: string | null;
         };
         OpenAiOAuthBrowserStartResponse: {
             message: string;
@@ -4209,6 +4259,14 @@ export interface components {
             deployment?: string | null;
             message: string;
             success: boolean;
+        };
+        ProviderDefaultModelsResponse: {
+            /** @description Default model applied by the ChatGPT device OAuth flow. */
+            chatgpt_oauth: string;
+            /** @description Default model per provider id, from the backend routing defaults. */
+            defaults: {
+                [key: string]: string;
+            };
         };
         ProviderModelTestRequest: {
             api_key: string;
@@ -5380,6 +5438,41 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["AutonomyFleetResponse"];
                 };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    clear_home_channel: {
+        parameters: {
+            query: {
+                agent_id: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AutonomyStatusResponse"];
+                };
+            };
+            /** @description Agent not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Internal server error */
             500: {
@@ -9881,6 +9974,25 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    get_provider_default_models: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderDefaultModelsResponse"];
+                };
             };
         };
     };
