@@ -682,6 +682,7 @@ impl PromptEngine {
         max_tasks_per_run: u32,
         warn_minutes: u64,
         claim_unowned: bool,
+        instance_is_empty: bool,
     ) -> Result<String> {
         self.render(
             "autonomy_channel",
@@ -696,6 +697,7 @@ impl PromptEngine {
                 max_tasks_per_run => max_tasks_per_run,
                 warn_minutes => warn_minutes,
                 claim_unowned => claim_unowned,
+                instance_is_empty => instance_is_empty,
             },
         )
     }
@@ -1081,6 +1083,7 @@ mod tests {
                 2,
                 8,
                 true,
+                false,
             )
             .expect("observe prompt should render");
         assert!(observe.contains("You are Iris."));
@@ -1106,12 +1109,17 @@ mod tests {
                 1,
                 1,
                 false,
+                true,
             )
             .expect("act prompt should render");
         assert!(act.contains("Scheduled interval — no wake events pending."));
         assert!(act.contains("Execute ready tasks"));
         assert!(act.contains("up to 1 task this run"));
         assert!(!act.contains("claim unowned tasks"));
+        // An empty instance gets cold-start guidance instead of a bare survey.
+        assert!(act.contains("There are no tasks and no goals."));
+        assert!(act.contains("spacebot_docs"));
+        assert!(act.contains("Do not invent tasks to look busy."));
 
         // An unrecognized level falls back to observe-only rules.
         let unknown = engine
@@ -1126,9 +1134,13 @@ mod tests {
                 1,
                 1,
                 false,
+                false,
             )
             .expect("unknown level prompt should render");
         assert!(unknown.contains("Treat this run as observe: survey and summarize only."));
+        // Recording is instructed at every level; cold-start guidance is not.
+        assert!(unknown.contains("Record what you notice as you go"));
+        assert!(!unknown.contains("There are no tasks and no goals."));
     }
 
     #[test]

@@ -668,6 +668,11 @@ pub async fn add_direct_mode_tools(
         .add_tool(MemorySaveTool::new(state.deps.memory_search.clone()))
         .await?;
 
+    // Self-documentation lookup, for reasoning about capabilities the user
+    // has not set up yet. Direct-mode channels do not branch, so without this
+    // the docs are unreachable to them.
+    handle.add_tool(SpacebotDocsTool::new()).await?;
+
     let rc = &state.deps.runtime_config;
     let workspace = rc.workspace_dir.clone();
     let sandbox = state.deps.sandbox.clone();
