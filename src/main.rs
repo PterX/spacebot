@@ -175,6 +175,17 @@ fn forward_sse_event(
                 })
                 .ok();
         }
+        // Portal has no ephemeral surface; command replies render as
+        // ordinary messages instead of disappearing.
+        spacebot::OutboundResponse::Ephemeral { text, .. } => {
+            api_event_tx
+                .send(spacebot::api::ApiEvent::OutboundMessage {
+                    agent_id: agent_id.to_string(),
+                    channel_id: channel_id.to_string(),
+                    text: text.clone(),
+                })
+                .ok();
+        }
         _ => {}
     }
 }
@@ -871,6 +882,10 @@ async fn run(
     let bindings: Arc<ArcSwap<Vec<spacebot::config::Binding>>> =
         Arc::new(ArcSwap::from_pointee(config.bindings.clone()));
     api_state.set_bindings(bindings.clone()).await;
+    let authority_defaults: Arc<ArcSwap<spacebot::commands::access::AdapterAuthorityDefaults>> =
+        Arc::new(ArcSwap::from_pointee(
+            spacebot::commands::access::AdapterAuthorityDefaults::from_config(&config),
+        ));
     let default_agent_id = config.default_agent_id().to_string();
 
     // Set the config path on the API state for config.toml writes
@@ -945,6 +960,7 @@ async fn run(
             mattermost_permissions,
             signal_permissions,
             bindings.clone(),
+            authority_defaults.clone(),
             Some(messaging_manager.clone()),
             llm_manager.clone(),
             agent_links.clone(),
@@ -963,6 +979,7 @@ async fn run(
             None, // mattermost_permissions
             None, // signal_permissions
             bindings.clone(),
+            authority_defaults.clone(),
             None,
             llm_manager.clone(),
             agent_links.clone(),
@@ -1307,7 +1324,16 @@ async fn run(
         tokio::select! {
             Some(mut message) = inbound_next, if agents_initialized => {
                 let mut binding_settings: Option<spacebot::conversation::ConversationSettings> = None;
+                let mut binding_authority: Option<Vec<String>> = None;
                 let agent_id = if let Some(existing) = message.agent_id.as_ref() {
+                    // Preassigned agent (portal sends set `agent_id` up
+                    // front): the binding scan still runs so binding-level
+                    // settings and authority apply to this scope.
+                    let current_bindings = bindings.load();
+                    if let Some(binding) = spacebot::config::matched_binding(&current_bindings, &message) {
+                        binding_settings = binding.settings.clone();
+                        binding_authority = binding.authority.clone();
+                    }
                     existing.clone()
                 } else {
                     let current_bindings = bindings.load();
@@ -1320,12 +1346,47 @@ async fn run(
                         continue;
                     };
                     binding_settings = matched_settings;
+                    binding_authority = spacebot::config::matched_binding_authority(&current_bindings, &message);
                     message.agent_id = Some(resolved.clone());
                     resolved
                 };
 
                 let conversation_id = message.conversation_id.clone();
                 let channel_key = ActiveChannelKey::new(agent_id.to_string(), conversation_id.clone());
+
+                // Slash-command dispatch, in the messaging layer before the
+                // channel queue. Control commands execute on the control
+                // plane without creating an inbound message, so they land
+                // even while the channel is mid-turn; Agent commands are
+                // rewritten to structured Command content and forwarded.
+                if let Some(agent) = agents.get(&agent_id) {
+                    let turn_active = {
+                        let channel_ref: spacebot::ChannelId = Arc::from(conversation_id.as_str());
+                        match agent.deps.process_control_registry.channel_handle(&channel_ref).await {
+                            Some(handle) => handle.turn_active(),
+                            None => false,
+                        }
+                    };
+                    let authority_snapshot = authority_defaults.load();
+                    let scope = spacebot::commands::dispatch::DispatchScope {
+                        binding_authority: binding_authority.as_deref(),
+                        adapter_defaults: &authority_snapshot,
+                        binding_settings: binding_settings.as_ref(),
+                        turn_active,
+                    };
+                    match spacebot::commands::dispatch::dispatch_inbound(
+                        &mut message,
+                        scope,
+                        &agent.deps,
+                        &messaging_manager,
+                    )
+                    .await
+                    {
+                        spacebot::commands::dispatch::Dispatch::Handled => continue,
+                        spacebot::commands::dispatch::Dispatch::Forward
+                        | spacebot::commands::dispatch::Dispatch::ForwardCommand => {}
+                    }
+                }
 
                 // Find or create a channel for this conversation
                 if !active_channels.contains_key(&channel_key) {
@@ -1744,6 +1805,7 @@ async fn run(
                                             new_mattermost_permissions,
                                             new_signal_permissions,
                                             bindings.clone(),
+                                            authority_defaults.clone(),
                                             Some(messaging_manager.clone()),
                                             new_llm_manager.clone(),
                                             agent_links.clone(),
@@ -2396,7 +2458,6 @@ async fn initialize_agents(
                 slack_permissions.clone().ok_or_else(|| {
                     anyhow::anyhow!("slack permissions not initialized when slack is enabled")
                 })?,
-                slack_config.commands.clone(),
             ) {
                 Ok(adapter) => {
                     new_messaging_manager.register(adapter).await;
@@ -2431,7 +2492,6 @@ async fn initialize_agents(
                 &instance.bot_token,
                 &instance.app_token,
                 perms,
-                instance.commands.clone(),
             ) {
                 Ok(adapter) => {
                     new_messaging_manager.register(adapter).await;

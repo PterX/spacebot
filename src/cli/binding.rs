@@ -45,6 +45,9 @@ pub enum BindingCommand {
         /// Allow DMs from a user ID (repeatable)
         #[arg(long = "dm-user")]
         dm_allowed_users: Vec<String>,
+        /// User ID allowed to run authority-gated slash commands (repeatable)
+        #[arg(long = "authority")]
+        authority: Vec<String>,
     },
     /// Update a binding. The binding is matched by the positional args and
     /// original selector flags; the updated binding is written exactly as the
@@ -99,6 +102,9 @@ pub enum BindingCommand {
         /// Allowed DM user ID for the updated binding (repeatable, omit to clear)
         #[arg(long = "dm-user")]
         dm_allowed_users: Vec<String>,
+        /// Authority user ID for the updated binding (repeatable, omit to clear)
+        #[arg(long = "authority")]
+        authority: Vec<String>,
     },
     /// Delete a binding matched by agent, channel, and selector flags
     Delete {
@@ -187,6 +193,7 @@ pub async fn run(ctx: &super::Context, binding_cmd: BindingCommand) -> anyhow::R
             channel_ids,
             require_mention,
             dm_allowed_users,
+            authority,
         } => {
             let mut body = serde_json::json!({
                 "agent_id": agent_id,
@@ -194,6 +201,7 @@ pub async fn run(ctx: &super::Context, binding_cmd: BindingCommand) -> anyhow::R
                 "channel_ids": channel_ids,
                 "require_mention": require_mention,
                 "dm_allowed_users": dm_allowed_users,
+                "authority": authority,
             });
             set_optional(&mut body, "adapter", &adapter);
             set_optional(&mut body, "guild_id", &guild_id);
@@ -234,6 +242,7 @@ pub async fn run(ctx: &super::Context, binding_cmd: BindingCommand) -> anyhow::R
             channel_ids,
             require_mention,
             dm_allowed_users,
+            authority,
         } => {
             let mut body = serde_json::json!({
                 "original_agent_id": agent_id,
@@ -243,6 +252,7 @@ pub async fn run(ctx: &super::Context, binding_cmd: BindingCommand) -> anyhow::R
                 "channel_ids": channel_ids,
                 "require_mention": require_mention,
                 "dm_allowed_users": dm_allowed_users,
+                "authority": authority,
             });
             set_optional(&mut body, "original_adapter", &adapter);
             set_optional(&mut body, "original_guild_id", &guild_id);

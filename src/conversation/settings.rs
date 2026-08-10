@@ -138,6 +138,37 @@ pub enum ResponseMode {
     MentionOnly,
 }
 
+impl ResponseMode {
+    /// Atomic-cell encoding, for sharing the live mode across tasks. Values
+    /// must round-trip with [`from_u8`](Self::from_u8).
+    pub fn to_u8(self) -> u8 {
+        match self {
+            ResponseMode::Active => 0,
+            ResponseMode::Observe => 1,
+            ResponseMode::MentionOnly => 2,
+        }
+    }
+
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            1 => ResponseMode::Observe,
+            2 => ResponseMode::MentionOnly,
+            _ => ResponseMode::Active,
+        }
+    }
+
+    /// The serde string form ("active" / "observe" / "mention_only"), used
+    /// by the settings stores to JSON-patch the persisted `response_mode`
+    /// field without rewriting the whole settings row.
+    pub fn as_setting_str(self) -> anyhow::Result<String> {
+        let value = serde_json::to_value(self)?;
+        value
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("response mode did not serialize to a string"))
+    }
+}
+
 /// Worker context settings control what context workers receive when spawned.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct WorkerContextMode {

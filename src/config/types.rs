@@ -1972,6 +1972,12 @@ pub struct Binding {
     pub require_mention: bool,
     /// User IDs allowed to DM the bot through this binding.
     pub dm_allowed_users: Vec<String>,
+    /// User IDs allowed to run authority-gated slash commands in scopes
+    /// matched by this binding. `None` (key omitted) falls back to the
+    /// adapter-instance default; `Some(vec![])` (explicit `authority = []`)
+    /// opens commands to everyone this binding admits, even when the
+    /// adapter default is restricted.
+    pub authority: Option<Vec<String>>,
     /// Default conversation settings for channels matched by this binding.
     pub settings: Option<crate::conversation::ConversationSettings>,
 }
@@ -2676,6 +2682,28 @@ pub fn resolve_agent_for_message(
     Some((std::sync::Arc::from(default_agent_id), None))
 }
 
+/// The binding that routes `message`, matched on routing criteria only.
+/// Uses the same first-match-wins scan as [`resolve_agent_for_message`], so
+/// the result is always the binding that actually routed the message.
+pub fn matched_binding<'a>(
+    bindings: &'a [Binding],
+    message: &crate::InboundMessage,
+) -> Option<&'a Binding> {
+    bindings
+        .iter()
+        .find(|binding| binding.matches_route(message))
+}
+
+/// Authority list of the binding that routes `message`, for slash-command
+/// access checks. `None` when no binding matched or the matched binding
+/// omits `authority` — both fall back to the adapter default downstream.
+pub fn matched_binding_authority(
+    bindings: &[Binding],
+    message: &crate::InboundMessage,
+) -> Option<Vec<String>> {
+    matched_binding(bindings, message).and_then(|binding| binding.authority.clone())
+}
+
 // ---------------------------------------------------------------------------
 // Messaging platform configs
 // ---------------------------------------------------------------------------
@@ -2701,6 +2729,8 @@ pub struct DiscordConfig {
     pub instances: Vec<DiscordInstanceConfig>,
     /// User IDs allowed to DM the bot. If empty, DMs are ignored entirely.
     pub dm_allowed_users: Vec<String>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
     /// Whether to process messages from other bots (self-messages are always ignored).
     pub allow_bot_messages: bool,
 }
@@ -2712,6 +2742,8 @@ pub struct DiscordInstanceConfig {
     pub token: String,
     /// User IDs allowed to DM this bot instance.
     pub dm_allowed_users: Vec<String>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
     /// Whether this bot instance processes messages from other bots.
     pub allow_bot_messages: bool,
 }
@@ -2723,6 +2755,7 @@ impl std::fmt::Debug for DiscordInstanceConfig {
             .field("enabled", &self.enabled)
             .field("token", &"[REDACTED]")
             .field("dm_allowed_users", &self.dm_allowed_users)
+            .field("authority", &self.authority)
             .field("allow_bot_messages", &self.allow_bot_messages)
             .finish()
     }
@@ -2735,6 +2768,7 @@ impl std::fmt::Debug for DiscordConfig {
             .field("token", &"[REDACTED]")
             .field("instances", &self.instances)
             .field("dm_allowed_users", &self.dm_allowed_users)
+            .field("authority", &self.authority)
             .field("allow_bot_messages", &self.allow_bot_messages)
             .finish()
     }
@@ -2761,20 +2795,6 @@ impl SystemSecrets for DiscordConfig {
     }
 }
 
-/// A single slash command definition for the Slack adapter.
-///
-/// Maps a Slack slash command (e.g. `/ask`) to a target agent.
-/// Commands not listed here are acknowledged but produce a "not configured" reply.
-#[derive(Debug, Clone)]
-pub struct SlackCommandConfig {
-    /// The slash command string exactly as Slack sends it, e.g. `"/ask"`.
-    pub command: String,
-    /// ID of the agent that should handle this command.
-    pub agent_id: String,
-    /// Short description shown in Slack's command autocomplete hint (optional).
-    pub description: Option<String>,
-}
-
 #[derive(Clone)]
 pub struct SlackConfig {
     pub enabled: bool,
@@ -2784,8 +2804,8 @@ pub struct SlackConfig {
     pub instances: Vec<SlackInstanceConfig>,
     /// User IDs allowed to DM the bot. If empty, DMs are ignored entirely.
     pub dm_allowed_users: Vec<String>,
-    /// Slash command definitions. If empty, all slash commands are ignored.
-    pub commands: Vec<SlackCommandConfig>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -2796,8 +2816,8 @@ pub struct SlackInstanceConfig {
     pub app_token: String,
     /// User IDs allowed to DM this app instance.
     pub dm_allowed_users: Vec<String>,
-    /// Slash command definitions for this app instance.
-    pub commands: Vec<SlackCommandConfig>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
 }
 
 impl std::fmt::Debug for SlackInstanceConfig {
@@ -2808,7 +2828,7 @@ impl std::fmt::Debug for SlackInstanceConfig {
             .field("bot_token", &"[REDACTED]")
             .field("app_token", &"[REDACTED]")
             .field("dm_allowed_users", &self.dm_allowed_users)
-            .field("commands", &self.commands)
+            .field("authority", &self.authority)
             .finish()
     }
 }
@@ -2821,7 +2841,7 @@ impl std::fmt::Debug for SlackConfig {
             .field("app_token", &"[REDACTED]")
             .field("instances", &self.instances)
             .field("dm_allowed_users", &self.dm_allowed_users)
-            .field("commands", &self.commands)
+            .field("authority", &self.authority)
             .finish()
     }
 }
@@ -2865,6 +2885,8 @@ pub struct TelegramConfig {
     pub instances: Vec<TelegramInstanceConfig>,
     /// User IDs allowed to DM the bot. If empty, DMs are ignored entirely.
     pub dm_allowed_users: Vec<String>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -2874,6 +2896,8 @@ pub struct TelegramInstanceConfig {
     pub token: String,
     /// User IDs allowed to DM this bot instance.
     pub dm_allowed_users: Vec<String>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
 }
 
 impl std::fmt::Debug for TelegramInstanceConfig {
@@ -2883,6 +2907,7 @@ impl std::fmt::Debug for TelegramInstanceConfig {
             .field("enabled", &self.enabled)
             .field("token", &"[REDACTED]")
             .field("dm_allowed_users", &self.dm_allowed_users)
+            .field("authority", &self.authority)
             .finish()
     }
 }
@@ -2894,6 +2919,7 @@ impl std::fmt::Debug for TelegramConfig {
             .field("token", &"[REDACTED]")
             .field("instances", &self.instances)
             .field("dm_allowed_users", &self.dm_allowed_users)
+            .field("authority", &self.authority)
             .finish()
     }
 }
@@ -2937,6 +2963,8 @@ pub struct EmailConfig {
     pub poll_interval_secs: u64,
     pub folders: Vec<String>,
     pub allowed_senders: Vec<String>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
     pub max_body_bytes: usize,
     pub max_attachment_bytes: usize,
     pub instances: Vec<EmailInstanceConfig>,
@@ -2962,6 +2990,8 @@ pub struct EmailInstanceConfig {
     pub poll_interval_secs: u64,
     pub folders: Vec<String>,
     pub allowed_senders: Vec<String>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
     pub max_body_bytes: usize,
     pub max_attachment_bytes: usize,
 }
@@ -2986,6 +3016,7 @@ impl std::fmt::Debug for EmailInstanceConfig {
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("folders", &self.folders)
             .field("allowed_senders", &"[REDACTED]")
+            .field("authority", &self.authority)
             .field("max_body_bytes", &self.max_body_bytes)
             .field("max_attachment_bytes", &self.max_attachment_bytes)
             .finish()
@@ -3011,6 +3042,7 @@ impl std::fmt::Debug for EmailConfig {
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("folders", &self.folders)
             .field("allowed_senders", &"[REDACTED]")
+            .field("authority", &self.authority)
             .field("max_body_bytes", &self.max_body_bytes)
             .field("max_attachment_bytes", &self.max_attachment_bytes)
             .finish()
@@ -3076,6 +3108,8 @@ pub struct TwitchConfig {
     pub instances: Vec<TwitchInstanceConfig>,
     /// Channels to join (without the # prefix).
     pub channels: Vec<String>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
     /// Optional prefix that triggers the bot (e.g. "!ask"). If empty, all messages are processed.
     pub trigger_prefix: Option<String>,
 }
@@ -3091,6 +3125,8 @@ pub struct TwitchInstanceConfig {
     pub refresh_token: Option<String>,
     /// Channels to join (without the # prefix).
     pub channels: Vec<String>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
     /// Optional prefix that triggers the bot for this instance.
     pub trigger_prefix: Option<String>,
 }
@@ -3112,6 +3148,7 @@ impl std::fmt::Debug for TwitchInstanceConfig {
                 &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field("channels", &self.channels)
+            .field("authority", &self.authority)
             .field("trigger_prefix", &self.trigger_prefix)
             .finish()
     }
@@ -3125,6 +3162,7 @@ impl std::fmt::Debug for TwitchConfig {
             .field("oauth_token", &"[REDACTED]")
             .field("instances", &self.instances)
             .field("channels", &self.channels)
+            .field("authority", &self.authority)
             .field("trigger_prefix", &self.trigger_prefix)
             .finish()
     }
@@ -3201,6 +3239,8 @@ pub struct SignalConfig {
     pub instances: Vec<SignalInstanceConfig>,
     /// Phone numbers or UUIDs allowed to DM the bot. If empty, DMs are ignored.
     pub dm_allowed_users: Vec<String>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
     /// Group IDs allowed for this adapter. If empty, all groups are blocked
     /// (same as `None` in the permission filter — groups are opt-in only).
     pub group_ids: Vec<String>,
@@ -3221,6 +3261,8 @@ pub struct SignalInstanceConfig {
     pub account: String,
     /// Phone numbers or UUIDs allowed to DM this instance.
     pub dm_allowed_users: Vec<String>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
     /// Group IDs allowed for this instance.
     pub group_ids: Vec<String>,
     /// User IDs allowed to message in Signal groups for this instance.
@@ -3237,6 +3279,7 @@ impl std::fmt::Debug for SignalInstanceConfig {
             .field("http_url", &"[REDACTED]")
             .field("account", &"[REDACTED]")
             .field("dm_allowed_users", &"[REDACTED]")
+            .field("authority", &self.authority)
             .field("group_ids", &self.group_ids)
             .field("group_allowed_users", &"[REDACTED]")
             .field("ignore_stories", &self.ignore_stories)
@@ -3252,6 +3295,7 @@ impl std::fmt::Debug for SignalConfig {
             .field("account", &"[REDACTED]")
             .field("instances", &self.instances)
             .field("dm_allowed_users", &"[REDACTED]")
+            .field("authority", &self.authority)
             .field("group_ids", &self.group_ids)
             .field("group_allowed_users", &"[REDACTED]")
             .field("ignore_stories", &self.ignore_stories)
@@ -3292,6 +3336,8 @@ pub struct MattermostConfig {
     pub team_id: Option<String>,
     pub instances: Vec<MattermostInstanceConfig>,
     pub dm_allowed_users: Vec<String>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
     pub max_attachment_bytes: usize,
 }
 
@@ -3304,6 +3350,7 @@ impl std::fmt::Debug for MattermostConfig {
             .field("team_id", &self.team_id)
             .field("instances", &self.instances)
             .field("dm_allowed_users", &self.dm_allowed_users)
+            .field("authority", &self.authority)
             .field("max_attachment_bytes", &self.max_attachment_bytes)
             .finish()
     }
@@ -3317,6 +3364,8 @@ pub struct MattermostInstanceConfig {
     pub token: String,
     pub team_id: Option<String>,
     pub dm_allowed_users: Vec<String>,
+    /// Default authority list for slash commands on this adapter; binding-level lists take precedence.
+    pub authority: Vec<String>,
     pub max_attachment_bytes: usize,
 }
 
@@ -3360,6 +3409,7 @@ impl std::fmt::Debug for MattermostInstanceConfig {
             .field("token", &"[REDACTED]")
             .field("team_id", &self.team_id)
             .field("dm_allowed_users", &self.dm_allowed_users)
+            .field("authority", &self.authority)
             .field("max_attachment_bytes", &self.max_attachment_bytes)
             .finish()
     }

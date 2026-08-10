@@ -18,9 +18,9 @@ use super::{
     MattermostInstanceConfig, McpServerConfig, McpTransport, MemoryJanitorConfig,
     MemoryPersistenceConfig, MessagingConfig, MetricsConfig, OpenCodeConfig,
     ParticipantContextConfig, ProjectsConfig, ProviderConfig, ReflectionConfig, SignalConfig,
-    SignalInstanceConfig, SkillsConfig, SlackCommandConfig, SlackConfig, SlackInstanceConfig,
-    TelegramConfig, TelegramInstanceConfig, TelemetryConfig, TwitchConfig, TwitchInstanceConfig,
-    WarmupConfig, WebhookConfig, normalize_adapter, validate_named_messaging_adapters,
+    SignalInstanceConfig, SkillsConfig, SlackConfig, SlackInstanceConfig, TelegramConfig,
+    TelegramInstanceConfig, TelemetryConfig, TwitchConfig, TwitchInstanceConfig, WarmupConfig,
+    WebhookConfig, normalize_adapter, validate_named_messaging_adapters,
 };
 use crate::error::{ConfigError, Result};
 
@@ -2096,6 +2096,7 @@ impl Config {
                             );
                         }
                         DiscordInstanceConfig {
+                            authority: instance.authority,
                             name: instance.name,
                             enabled: instance.enabled && token.is_some(),
                             token: token.unwrap_or_default(),
@@ -2114,6 +2115,7 @@ impl Config {
                 }
 
                 Some(DiscordConfig {
+                    authority: d.authority,
                     enabled: d.enabled,
                     token: token.unwrap_or_default(),
                     instances,
@@ -2138,20 +2140,12 @@ impl Config {
                         }
                         let has_credentials = bot_token.is_some() && app_token.is_some();
                         SlackInstanceConfig {
+                            authority: instance.authority,
                             name: instance.name,
                             enabled: instance.enabled && has_credentials,
                             bot_token: bot_token.unwrap_or_default(),
                             app_token: app_token.unwrap_or_default(),
                             dm_allowed_users: instance.dm_allowed_users,
-                            commands: instance
-                                .commands
-                                .into_iter()
-                                .map(|command| SlackCommandConfig {
-                                    command: command.command,
-                                    agent_id: command.agent_id,
-                                    description: command.description,
-                                })
-                                .collect(),
                         }
                     })
                     .collect::<Vec<_>>();
@@ -2168,20 +2162,12 @@ impl Config {
                 }
 
                 Some(SlackConfig {
+                    authority: s.authority,
                     enabled: s.enabled,
                     bot_token: bot_token.unwrap_or_default(),
                     app_token: app_token.unwrap_or_default(),
                     instances,
                     dm_allowed_users: s.dm_allowed_users,
-                    commands: s
-                        .commands
-                        .into_iter()
-                        .map(|c| SlackCommandConfig {
-                            command: c.command,
-                            agent_id: c.agent_id,
-                            description: c.description,
-                        })
-                        .collect(),
                 })
             }),
             telegram: toml.messaging.telegram.and_then(|t| {
@@ -2197,6 +2183,7 @@ impl Config {
                             );
                         }
                         TelegramInstanceConfig {
+                            authority: instance.authority,
                             name: instance.name,
                             enabled: instance.enabled && token.is_some(),
                             token: token.unwrap_or_default(),
@@ -2214,6 +2201,7 @@ impl Config {
                 }
 
                 Some(TelegramConfig {
+                    authority: t.authority,
                     enabled: t.enabled,
                     token: token.unwrap_or_default(),
                     instances,
@@ -2267,6 +2255,7 @@ impl Config {
                             instance.from_name.as_deref().and_then(resolve_env_value);
 
                         EmailInstanceConfig {
+                            authority: instance.authority,
                             name: instance.name,
                             enabled: instance.enabled && has_credentials,
                             imap_host: imap_host.unwrap_or_default(),
@@ -2338,6 +2327,7 @@ impl Config {
                     .or_else(|| email.from_name.as_deref().and_then(resolve_env_value));
 
                 Some(EmailConfig {
+                    authority: email.authority,
                     enabled: email.enabled,
                     imap_host,
                     imap_port: email.imap_port,
@@ -2396,6 +2386,7 @@ impl Config {
                             .as_deref()
                             .and_then(resolve_env_value);
                         TwitchInstanceConfig {
+                            authority: instance.authority,
                             name: instance.name,
                             enabled: instance.enabled && has_credentials,
                             username: username.unwrap_or_default(),
@@ -2436,6 +2427,7 @@ impl Config {
                     .and_then(resolve_env_value)
                     .or_else(|| std::env::var("TWITCH_REFRESH_TOKEN").ok());
                 Some(TwitchConfig {
+                    authority: t.authority,
                     enabled: t.enabled,
                     username: username.unwrap_or_default(),
                     oauth_token: oauth_token.unwrap_or_default(),
@@ -2462,6 +2454,7 @@ impl Config {
                         }
                         let has_credentials = http_url.is_some() && account.is_some();
                         SignalInstanceConfig {
+                            authority: instance.authority,
                             name: instance.name,
                             enabled: instance.enabled && has_credentials,
                             http_url: http_url.unwrap_or_default(),
@@ -2486,6 +2479,7 @@ impl Config {
                 }
 
                 Some(SignalConfig {
+                    authority: s.authority,
                     enabled: s.enabled,
                     http_url: http_url.unwrap_or_default(),
                     account: account.unwrap_or_default(),
@@ -2511,6 +2505,7 @@ impl Config {
                             );
                         }
                         MattermostInstanceConfig {
+                            authority: instance.authority,
                             name: instance.name,
                             enabled: instance.enabled && has_credentials,
                             base_url: base_url.unwrap_or_default(),
@@ -2535,6 +2530,7 @@ impl Config {
                 }
 
                 Some(MattermostConfig {
+                    authority: mm.authority,
                     enabled: mm.enabled,
                     base_url: base_url.unwrap_or_default(),
                     token: token.unwrap_or_default(),
@@ -2594,6 +2590,7 @@ impl Config {
                     cs
                 });
                 Binding {
+                    authority: b.authority,
                     agent_id: b.agent_id,
                     channel: b.channel,
                     adapter: normalize_adapter(b.adapter),
