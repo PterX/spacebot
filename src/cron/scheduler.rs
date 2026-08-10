@@ -13,9 +13,7 @@ use crate::messaging::target::{BroadcastTarget, parse_delivery_target};
 use crate::{AgentDeps, InboundMessage, MessageContent, OutboundResponse, RoutedResponse};
 use chrono::Timelike;
 use chrono_tz::Tz;
-use cron::Schedule;
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use tokio::time::Duration;
@@ -500,7 +498,8 @@ impl Scheduler {
 
                 // Check active hours window
                 if let Some((start, end)) = job.active_hours {
-                    let (current_hour, timezone) = current_hour_and_timezone(&context, &job_id);
+                    let (current_hour, timezone) =
+                        current_hour_and_timezone(&context.deps.runtime_config);
                     let in_window = hour_in_active_window(current_hour, start, end);
                     if !in_window {
                         tracing::debug!(
@@ -908,8 +907,13 @@ fn cron_timezone_label(context: &CronContext) -> String {
     }
 }
 
-fn current_hour_and_timezone(context: &CronContext, cron_id: &str) -> (u8, String) {
-    let timezone = context.deps.runtime_config.cron_timezone.load();
+/// Current hour in the agent's configured cron timezone, falling back to the
+/// system timezone, plus a label for logging. Shared by cron active-hours
+/// gating and the autonomy channel's active-hours check.
+pub(crate) fn current_hour_and_timezone(
+    runtime_config: &crate::config::RuntimeConfig,
+) -> (u8, String) {
+    let timezone = runtime_config.cron_timezone.load();
     match timezone.as_deref() {
         Some(name) => match name.parse::<Tz>() {
             Ok(timezone) => (
@@ -918,8 +922,6 @@ fn current_hour_and_timezone(context: &CronContext, cron_id: &str) -> (u8, Strin
             ),
             Err(error) => {
                 tracing::warn!(
-                    agent_id = %context.deps.agent_id,
-                    cron_id,
                     cron_timezone = %name,
                     %error,
                     "invalid cron timezone in runtime config, falling back to system timezone"
@@ -937,7 +939,7 @@ fn current_hour_and_timezone(context: &CronContext, cron_id: &str) -> (u8, Strin
     }
 }
 
-fn hour_in_active_window(current_hour: u8, start_hour: u8, end_hour: u8) -> bool {
+pub(crate) fn hour_in_active_window(current_hour: u8, start_hour: u8, end_hour: u8) -> bool {
     if start_hour == end_hour {
         return true;
     }
@@ -953,37 +955,9 @@ fn normalize_active_hours(active_hours: Option<(u8, u8)>) -> Option<(u8, u8)> {
     active_hours.filter(|(start, end)| start != end)
 }
 
-fn normalize_cron_expr(cron_expr: Option<String>) -> Result<Option<String>> {
-    let Some(expr) = cron_expr else {
-        return Ok(None);
-    };
-
-    let trimmed = expr.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-
-    let field_count = trimmed.split_whitespace().count();
-    if field_count != 5 {
-        return Err(crate::error::Error::Other(anyhow::anyhow!(
-            "cron expression must have exactly 5 fields (got {field_count}): '{trimmed}'"
-        )));
-    }
-
-    // The `cron` crate uses 7-field expressions (sec min hour dom month dow year).
-    // Users write standard 5-field cron (min hour dom month dow). Convert by
-    // prepending "0" for seconds and appending "*" for year.
-    let expanded = format!("0 {trimmed} *");
-
-    Schedule::from_str(&expanded).map_err(|error| {
-        crate::error::Error::Other(anyhow::anyhow!(
-            "invalid cron expression '{trimmed}': {error}"
-        ))
-    })?;
-
-    // Store the original 5-field form — it's what users and the UI expect.
-    Ok(Some(trimmed.to_string()))
-}
+// Cron expression validation lives in the shared schedule layer; re-exported
+// here for config validation call sites.
+pub(crate) use crate::schedule::normalize_cron_expr;
 
 /// Compute the initial delay for an interval-based cron job, anchored to its
 /// last execution time when available.
@@ -1199,18 +1173,6 @@ async fn claim_run_once_fire(
     Ok(claimed)
 }
 
-/// Expand a 5-field standard cron expression to the 7-field format required by
-/// the `cron` crate: `sec min hour dom month dow year`. If the expression
-/// already has 6+ fields, return it as-is.
-fn expand_cron_expr(expr: &str) -> String {
-    let field_count = expr.split_whitespace().count();
-    if field_count == 5 {
-        format!("0 {expr} *")
-    } else {
-        expr.to_string()
-    }
-}
-
 fn resolve_cron_timezone(context: &CronContext) -> (Option<chrono_tz::Tz>, String) {
     let timezone = context.deps.runtime_config.cron_timezone.load();
     match timezone.as_deref() {
@@ -1236,9 +1198,7 @@ fn next_fire_after(
     cron_expr: &str,
     after_utc: chrono::DateTime<chrono::Utc>,
 ) -> Option<(chrono::DateTime<chrono::Utc>, String)> {
-    // Expand 5-field standard cron to 7-field for the `cron` crate.
-    let expanded = expand_cron_expr(cron_expr);
-    let schedule = match Schedule::from_str(&expanded) {
+    let schedule = match crate::schedule::parse_cron_schedule(cron_expr) {
         Ok(schedule) => schedule,
         Err(error) => {
             tracing::warn!(cron_id = %cron_id, cron_expr, %error, "invalid cron expression");
@@ -1247,18 +1207,9 @@ fn next_fire_after(
     };
 
     let (timezone, timezone_label) = resolve_cron_timezone(context);
-    let next_utc = if let Some(timezone) = timezone {
-        let after_local = after_utc.with_timezone(&timezone);
-        schedule
-            .after(&after_local)
-            .next()?
-            .with_timezone(&chrono::Utc)
-    } else {
-        let after_local = after_utc.with_timezone(&chrono::Local);
-        schedule
-            .after(&after_local)
-            .next()?
-            .with_timezone(&chrono::Utc)
+    let next_utc = match timezone {
+        Some(timezone) => crate::schedule::next_cron_occurrence(&schedule, after_utc, &timezone)?,
+        None => crate::schedule::next_cron_occurrence(&schedule, after_utc, &chrono::Local)?,
     };
 
     Some((next_utc, timezone_label))
@@ -1329,6 +1280,7 @@ async fn run_cron_job(
 
     let (channel, channel_tx) = Channel::new(
         channel_id.clone(),
+        crate::agent::channel::ChannelKind::Cron,
         context.deps.clone(),
         response_tx,
         event_rx,
@@ -1338,6 +1290,7 @@ async fn run_cron_job(
         None, // cron channels don't share live transcript cache
         crate::conversation::settings::ResolvedConversationSettings::default(),
         Some(cron_outcome.clone()),
+        None, // no autonomy run for cron channels
     );
 
     // Hold a control handle so we can cancel outstanding workers on timeout,

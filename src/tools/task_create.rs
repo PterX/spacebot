@@ -134,7 +134,7 @@ impl Tool for TaskCreateTool {
             .task_store
             .create(CreateTaskInput {
                 owner_agent_id: self.agent_id.clone(),
-                assigned_agent_id: self.agent_id.clone(),
+                assigned_agent_id: Some(self.agent_id.clone()),
                 title: args.title,
                 description: args.description,
                 status,
@@ -152,7 +152,7 @@ impl Tool for TaskCreateTool {
             api_state
                 .event_tx
                 .send(crate::api::ApiEvent::TaskUpdated {
-                    agent_id: task.assigned_agent_id.clone(),
+                    agent_id: task.effective_agent_id().to_string(),
                     task_number: task.task_number,
                     status: task.status.to_string(),
                     action: "created".to_string(),
@@ -164,7 +164,7 @@ impl Tool for TaskCreateTool {
                     severity: NotificationSeverity::Info,
                     title: task.title.clone(),
                     body: task.description.clone(),
-                    agent_id: Some(task.assigned_agent_id.clone()),
+                    agent_id: Some(task.effective_agent_id().to_string()),
                     related_entity_type: Some("task".to_string()),
                     related_entity_id: Some(task.task_number.to_string()),
                     action_url: Some(format!("/tasks/{}", task.task_number)),

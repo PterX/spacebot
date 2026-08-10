@@ -333,6 +333,39 @@ struct AgentTurnResult {
     reply_text: Option<String>,
 }
 
+/// What kind of conversation a channel is serving.
+///
+/// Channels behave differently depending on who is on the other end: user
+/// channels are driven by incoming messages, while cron and autonomy channels
+/// are system-initiated runs that do their work and exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelKind {
+    User,
+    Cron,
+    Autonomy,
+}
+
+impl ChannelKind {
+    /// System-initiated channels receive no further user messages after the
+    /// initial prompt, so the event loop exits once all work settles.
+    pub fn self_exits(&self) -> bool {
+        matches!(self, ChannelKind::Cron | ChannelKind::Autonomy)
+    }
+
+    /// System-initiated runs repeat the same procedure on a schedule and
+    /// would grind out noise skills, so they never trigger skill reflection.
+    pub fn suppresses_reflection(&self) -> bool {
+        matches!(self, ChannelKind::Cron | ChannelKind::Autonomy)
+    }
+
+    /// System-initiated channels have no user to send a reset message, so the
+    /// retrigger cap would permanently stall multi-worker jobs. The job
+    /// timeout is the natural bound instead.
+    pub fn caps_retriggers(&self) -> bool {
+        matches!(self, ChannelKind::User)
+    }
+}
+
 /// Shared state that channel tools need to act on the channel.
 ///
 /// Wrapped in Arc and passed to tools (branch, spawn_worker, route, cancel)
@@ -340,6 +373,7 @@ struct AgentTurnResult {
 #[derive(Clone)]
 pub struct ChannelState {
     pub channel_id: ChannelId,
+    pub kind: ChannelKind,
     pub history: Arc<RwLock<Vec<rig::message::Message>>>,
     pub active_branches: Arc<RwLock<HashMap<BranchId, tokio::task::JoinHandle<()>>>>,
     pub active_workers: Arc<RwLock<HashMap<WorkerId, Worker>>>,
@@ -397,6 +431,10 @@ pub struct ChannelState {
     /// router-side control plane can apply a mode change mid-turn; the
     /// channel reads it at every gate instead of its startup snapshot.
     pub response_mode: Arc<std::sync::atomic::AtomicU8>,
+    /// Autonomy run state for the `autonomy_complete` tool. Set only on
+    /// `ChannelKind::Autonomy` channels; the run loop uses it to enforce the
+    /// completion contract before self-exit.
+    pub autonomy_run: Option<crate::agent::autonomy::AutonomyRunHandle>,
 }
 
 impl ChannelState {
@@ -821,6 +859,10 @@ pub struct Channel {
     /// Injected into the system prompt (not into chat history) so the LLM
     /// treats it as read-only context rather than actionable user messages.
     backfill_transcript: Option<String>,
+    /// Retry-prompts sent so far for the autonomy completion contract.
+    /// Autonomy channels must call `autonomy_complete` before self-exit;
+    /// this bounds how many times the run loop nudges them.
+    autonomy_contract_retries: usize,
     /// Handle exposed to the supervision control plane.
     control_handle: ChannelControlHandle,
     /// Per-conversation resolved settings (memory mode, delegation mode, model override).
@@ -877,6 +919,7 @@ impl Channel {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: ChannelId,
+        kind: ChannelKind,
         deps: AgentDeps,
         response_tx: mpsc::Sender<RoutedResponse>,
         event_rx: broadcast::Receiver<ProcessEvent>,
@@ -886,6 +929,7 @@ impl Channel {
         live_worker_transcripts: Option<LiveWorkerTranscripts>,
         resolved_settings: ResolvedConversationSettings,
         cron_outcome: Option<crate::cron::CronOutcome>,
+        autonomy_run: Option<crate::agent::autonomy::AutonomyRunHandle>,
     ) -> (Self, mpsc::Sender<InboundMessage>) {
         let process_id = ProcessId::Channel(id.clone());
         let hook = SpacebotHook::new(
@@ -916,6 +960,7 @@ impl Channel {
 
         let state = ChannelState {
             channel_id: id.clone(),
+            kind,
             history: history.clone(),
             active_branches: active_branches.clone(),
             active_workers: active_workers.clone(),
@@ -944,6 +989,7 @@ impl Channel {
             response_mode: Arc::new(std::sync::atomic::AtomicU8::new(
                 resolved_settings.response_mode.to_u8(),
             )),
+            autonomy_run,
         };
 
         // Each channel gets its own isolated tool server to avoid races between
@@ -1004,6 +1050,7 @@ impl Channel {
             pending_results: Vec::new(),
             send_agent_message_tool,
             backfill_transcript: None,
+            autonomy_contract_retries: 0,
             control_handle,
             resolved_settings,
         };
@@ -1344,19 +1391,76 @@ impl Channel {
         let mut last_lag_warning: Option<std::time::Instant> = None;
 
         loop {
-            // Cron channels have no further user messages after the initial prompt.
-            // Once all workers/branches finish and no retrigger is pending, exit so
-            // the scheduler can flush the reply buffer. Without this the channel
-            // would wait on the broadcast event_rx (which never closes) until the
-            // job timeout kills it.
-            if self.state.cron_outcome.is_some()
+            // Self-exiting channels (cron, autonomy) have no further user messages
+            // after the initial prompt. Once all workers/branches finish and no
+            // retrigger is pending, exit so the caller can flush the reply buffer.
+            // Without this the channel would wait on the broadcast event_rx (which
+            // never closes) until the job timeout kills it.
+            if self.state.kind.self_exits()
                 && self.message_count > 0
                 && !self.pending_retrigger
                 && self.retrigger_deadline.is_none()
                 && self.state.worker_handles.read().await.is_empty()
                 && self.state.active_branches.read().await.is_empty()
             {
-                tracing::info!(channel_id = %self.id, "cron channel finished all work, exiting");
+                // Autonomy runs must record their outcome via autonomy_complete
+                // before exiting. When the call is missing, nudge the LLM with
+                // a retry prompt (same budget as the memory-persistence
+                // contract) before giving up; the run driver records a
+                // fallback summary if the budget is exhausted.
+                if let Some(run) = self.state.autonomy_run.clone()
+                    && !run.completed()
+                    && self.autonomy_contract_retries
+                        < crate::agent::autonomy::AUTONOMY_CONTRACT_MAX_RETRIES
+                {
+                    self.autonomy_contract_retries += 1;
+                    tracing::warn!(
+                        channel_id = %self.id,
+                        attempt = self.autonomy_contract_retries,
+                        "autonomy run missing autonomy_complete call, retrying"
+                    );
+                    let retry_prompt = match self
+                        .deps
+                        .runtime_config
+                        .prompts
+                        .load()
+                        .render_system_autonomy_contract_retry()
+                    {
+                        Ok(text) => text,
+                        Err(error) => {
+                            tracing::error!(
+                                %error,
+                                channel_id = %self.id,
+                                "failed to render autonomy contract retry prompt"
+                            );
+                            break;
+                        }
+                    };
+                    let retry = InboundMessage {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        source: "system".into(),
+                        adapter: None,
+                        conversation_id: self.conversation_id.clone().unwrap_or_else(|| {
+                            crate::agent::autonomy::AUTONOMY_CONVERSATION_ID.to_string()
+                        }),
+                        sender_id: "system".into(),
+                        agent_id: Some(self.deps.agent_id.clone()),
+                        content: crate::MessageContent::Text(retry_prompt),
+                        timestamp: chrono::Utc::now(),
+                        metadata: HashMap::new(),
+                        formatted_author: None,
+                    };
+                    if let Err(error) = self.handle_message(retry).await {
+                        tracing::error!(
+                            %error,
+                            channel_id = %self.id,
+                            "autonomy completion-contract retry failed"
+                        );
+                        break;
+                    }
+                    continue;
+                }
+                tracing::info!(channel_id = %self.id, "self-exiting channel finished all work, exiting");
                 break;
             }
 
@@ -1977,11 +2081,11 @@ impl Channel {
 
         let org_context = self.build_org_context(&prompt_engine);
 
-        let adapter_prompt = if self.state.cron_outcome.is_some() {
-            prompt_engine.render_channel_adapter_prompt("cron")
-        } else {
-            self.current_adapter()
-                .and_then(|adapter| prompt_engine.render_channel_adapter_prompt(adapter))
+        let adapter_prompt = match self.state.kind {
+            ChannelKind::Cron => prompt_engine.render_channel_adapter_prompt("cron"),
+            ChannelKind::User | ChannelKind::Autonomy => self
+                .current_adapter()
+                .and_then(|adapter| prompt_engine.render_channel_adapter_prompt(adapter)),
         };
 
         let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
@@ -1996,6 +2100,8 @@ impl Channel {
             memory_bulletin_text,
             knowledge_synthesis_text,
         ) = self.render_memory_layers().await;
+
+        let active_goals = self.render_active_goals().await;
 
         let routing = rc.routing.load();
         let model_name = routing.resolve(ProcessType::Channel, None).to_string();
@@ -2021,6 +2127,7 @@ impl Channel {
             empty_to_none(working_memory),
             empty_to_none(channel_activity_map),
             empty_to_none(participant_context),
+            active_goals,
             direct_mode,
         )?;
 
@@ -2662,6 +2769,21 @@ impl Channel {
         )
     }
 
+    /// Render the compact active-goals list for the system prompt.
+    ///
+    /// Returns `None` when there are no active goals so injection is skipped
+    /// entirely — goals should cost nothing when unused.
+    async fn render_active_goals(&self) -> Option<String> {
+        match crate::goals::render_active_goals(&self.deps.goal_store).await {
+            Ok(text) if !text.is_empty() => Some(text),
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(channel_id = %self.id, %error, "active goals render failed");
+                None
+            }
+        }
+    }
+
     /// Build pre-rendered project context for prompt injection.
     ///
     /// Delegates to the standalone `build_project_context` function shared
@@ -2724,11 +2846,11 @@ impl Channel {
 
         let org_context = self.build_org_context(&prompt_engine);
 
-        let adapter_prompt = if self.state.cron_outcome.is_some() {
-            prompt_engine.render_channel_adapter_prompt("cron")
-        } else {
-            self.current_adapter()
-                .and_then(|adapter| prompt_engine.render_channel_adapter_prompt(adapter))
+        let adapter_prompt = match self.state.kind {
+            ChannelKind::Cron => prompt_engine.render_channel_adapter_prompt("cron"),
+            ChannelKind::User | ChannelKind::Autonomy => self
+                .current_adapter()
+                .and_then(|adapter| prompt_engine.render_channel_adapter_prompt(adapter)),
         };
 
         let project_context = self.build_project_context(&prompt_engine).await;
@@ -2740,6 +2862,8 @@ impl Channel {
             memory_bulletin_text,
             knowledge_synthesis_text,
         ) = self.render_memory_layers().await;
+
+        let active_goals = self.render_active_goals().await;
 
         let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
         let routing = rc.routing.load();
@@ -2765,6 +2889,7 @@ impl Channel {
             empty_to_none(working_memory),
             empty_to_none(channel_activity_map),
             empty_to_none(participant_context),
+            active_goals,
             direct_mode,
         )?;
 
@@ -2790,7 +2915,10 @@ impl Channel {
     ) -> Result<AgentTurnResult> {
         let skip_flag = crate::tools::new_skip_flag();
         let replied_flag = crate::tools::new_replied_flag();
-        let allow_direct_reply = !self.suppress_plaintext_fallback();
+        // Autonomy runs never talk to users — no reply tool. Output goes to
+        // task state, working memory, and autonomy_complete.
+        let allow_direct_reply =
+            self.state.kind != ChannelKind::Autonomy && !self.suppress_plaintext_fallback();
 
         // Set the originating channel on the delegation tool so task completion
         // notifications route back to this conversation.
@@ -2867,7 +2995,11 @@ impl Channel {
 
         let rc = &self.deps.runtime_config;
         let routing = rc.routing.load();
-        let max_turns = if is_retrigger {
+        let max_turns = if self.state.kind == ChannelKind::Autonomy {
+            // Autonomy runs carry their own turn budget; on exhaustion the
+            // channel behaves like a soft timeout and wraps up.
+            (rc.autonomy.load().max_turns.max(1)) as usize
+        } else if is_retrigger {
             RETRIGGER_MAX_TURNS
         } else {
             **rc.max_turns.load()
@@ -3480,6 +3612,33 @@ impl Channel {
 
                 run_logger.log_worker_completed(*worker_id, result, *success);
 
+                let worker_event = if *success {
+                    crate::wakes::SystemEvent::WorkerCompleted
+                } else {
+                    crate::wakes::SystemEvent::WorkerFailed
+                };
+                // Wake emission writes to SQLite; run it off the event loop so
+                // a slow disk cannot stall channel event handling.
+                let emit_deps = self.deps.clone();
+                let dedupe_key = format!("worker:{worker_id}");
+                let payload = serde_json::json!({
+                    "worker_id": worker_id.to_string(),
+                    "success": *success,
+                    "summary": crate::summarize_first_non_empty_line(
+                        result,
+                        crate::EVENT_SUMMARY_MAX_CHARS,
+                    ),
+                });
+                tokio::spawn(async move {
+                    crate::wakes::emit_system_event(
+                        &emit_deps,
+                        worker_event,
+                        &dedupe_key,
+                        &payload,
+                    )
+                    .await;
+                });
+
                 // A worker finishing real work successfully is a reflection
                 // signal: the session likely produced a reusable lesson.
                 if *success {
@@ -3570,9 +3729,7 @@ impl Channel {
         // Multiple branch/worker completions within the debounce window are
         // coalesced into a single retrigger to prevent message spam.
         if should_retrigger {
-            // Cron channels have no user to send a reset message, so the cap would
-            // permanently stall multi-worker jobs. The job timeout is the natural bound.
-            let cap_applies = self.state.cron_outcome.is_none();
+            let cap_applies = self.state.kind.caps_retriggers();
             if cap_applies && self.retrigger_count >= MAX_RETRIGGERS_PER_TURN {
                 tracing::warn!(
                     channel_id = %self.id,
@@ -3796,10 +3953,10 @@ impl Channel {
     /// Note that this conversation just did substantial work. The next
     /// persistence pass will also reflect on skills, cooldown permitting.
     ///
-    /// Cron conversations never reflect: scheduled runs repeat the same
-    /// procedure on a timer and would grind out noise skills.
+    /// System-initiated conversations (cron, autonomy) never reflect: they
+    /// repeat the same procedure on a schedule and would grind out noise skills.
     fn mark_reflection_signal(&self, source: &'static str) {
-        if self.id.starts_with("cron") {
+        if self.state.kind.suppresses_reflection() {
             return;
         }
         let was_set = self

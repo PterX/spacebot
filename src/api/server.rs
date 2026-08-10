@@ -2,9 +2,10 @@
 
 use super::state::ApiState;
 use super::{
-    activity, agents, attachments, bindings, channels, config, cortex, cron, factory, ingest,
-    links, mcp, memories, messaging, models, notifications, opencode_proxy, portal, projects,
-    providers, secrets, settings, skills, ssh, system, tasks, tools, usage, wiki, workers,
+    activity, agents, attachments, autonomy, bindings, channels, config, cortex, cron, factory,
+    goals, ingest, links, mcp, memories, messaging, models, notifications, opencode_proxy, portal,
+    projects, providers, secrets, settings, skills, ssh, system, tasks, tools, usage, wakes, wiki,
+    workers,
 };
 
 use axum::Json;
@@ -125,6 +126,15 @@ pub fn api_router() -> OpenApiRouter<Arc<ApiState>> {
         .routes(routes!(cron::cron_executions))
         .routes(routes!(cron::trigger_cron))
         .routes(routes!(cron::toggle_cron))
+        // Autonomy routes
+        .routes(routes!(autonomy::autonomy_status))
+        .routes(routes!(autonomy::autonomy_fleet))
+        .routes(routes!(autonomy::update_autonomy_ceiling))
+        .routes(routes!(autonomy::autonomy_runs))
+        // Wake routes
+        .routes(routes!(wakes::list_wakes))
+        .routes(routes!(wakes::update_wake, wakes::delete_wake))
+        .routes(routes!(wakes::fire_wake))
         // Notification routes
         .routes(routes!(notifications::list_notifications))
         .routes(routes!(notifications::unread_count))
@@ -132,6 +142,9 @@ pub fn api_router() -> OpenApiRouter<Arc<ApiState>> {
         .routes(routes!(notifications::dismiss_notification))
         .routes(routes!(notifications::mark_all_read))
         .routes(routes!(notifications::dismiss_read))
+        // Goal routes
+        .routes(routes!(goals::list_goals, goals::create_goal))
+        .routes(routes!(goals::get_goal, goals::update_goal))
         // Task routes
         .routes(routes!(tasks::list_tasks, tasks::create_task))
         .routes(routes!(
@@ -324,6 +337,15 @@ pub async fn start_http_server(
     let app = Router::new()
         // Mount all protected routes
         .merge(protected_routes)
+        // Wake webhook ingress is public: the per-wake token in the path is
+        // the authority boundary, so it bypasses api_auth_middleware. The
+        // route-scoped body limit overrides the global 10 MiB limit so
+        // unauthenticated callers cannot force large buffer allocations.
+        .route(
+            "/hooks/wakes/{token}",
+            axum::routing::post(wakes::webhook_ingress)
+                .layer(DefaultBodyLimit::max(wakes::MAX_WEBHOOK_BODY_BYTES)),
+        )
         // Static file handler for frontend (unprotected)
         .fallback(static_handler)
         .layer(cors)

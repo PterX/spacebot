@@ -64,6 +64,10 @@ pub struct Config {
     /// (their cortex tick never runs maintenance), additive on active-mode
     /// agents.
     pub memory_janitor: MemoryJanitorConfig,
+    /// Instance-wide autonomy ceiling. Every agent runs at
+    /// `min(ceiling, agent level)` — the ceiling caps the per-agent dial
+    /// without overwriting it. `Act` (the default) applies no cap.
+    pub autonomy_ceiling: AutonomyLevel,
 }
 
 /// Instance-wide memory maintenance scheduler.
@@ -642,6 +646,7 @@ pub struct DefaultsConfig {
     pub coalesce: CoalesceConfig,
     pub ingestion: IngestionConfig,
     pub cortex: CortexConfig,
+    pub autonomy: AutonomyConfig,
     pub warmup: WarmupConfig,
     pub skills: SkillsConfig,
     pub participant_context: ParticipantContextConfig,
@@ -680,6 +685,7 @@ impl std::fmt::Debug for DefaultsConfig {
             .field("coalesce", &self.coalesce)
             .field("ingestion", &self.ingestion)
             .field("cortex", &self.cortex)
+            .field("autonomy", &self.autonomy)
             .field("warmup", &self.warmup)
             .field("participant_context", &self.participant_context)
             .field("browser", &self.browser)
@@ -1233,6 +1239,156 @@ impl CortexConfig {
     }
 }
 
+/// How much the autonomy channel may do without a user present.
+///
+/// The dial is cumulative: each level includes everything below it.
+/// `Off` disables the autonomy channel entirely; `Act` additionally allows
+/// executing user-approved `ready` tasks.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AutonomyLevel {
+    #[default]
+    Off,
+    Observe,
+    Suggest,
+    Act,
+}
+
+impl AutonomyLevel {
+    pub const ALL: [AutonomyLevel; 4] = [
+        AutonomyLevel::Off,
+        AutonomyLevel::Observe,
+        AutonomyLevel::Suggest,
+        AutonomyLevel::Act,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AutonomyLevel::Off => "off",
+            AutonomyLevel::Observe => "observe",
+            AutonomyLevel::Suggest => "suggest",
+            AutonomyLevel::Act => "act",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(AutonomyLevel::Off),
+            "observe" => Some(AutonomyLevel::Observe),
+            "suggest" => Some(AutonomyLevel::Suggest),
+            "act" => Some(AutonomyLevel::Act),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for AutonomyLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Autonomy channel configuration. See `docs/design-docs/autonomy.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutonomyConfig {
+    /// What the autonomy channel may do. `Off` disables it.
+    pub level: AutonomyLevel,
+    /// How often the channel wakes without wake events, in seconds.
+    pub interval_secs: u64,
+    /// UTC-hour window (start, end) outside of which wakes are suppressed.
+    /// Evaluated in the agent's cron timezone, like cron active hours.
+    pub active_hours: Option<(u8, u8)>,
+    /// Turn budget per run.
+    pub max_turns: u32,
+    /// Maximum tasks to work on per wake.
+    pub max_tasks_per_run: u32,
+    /// Hard wall-clock timeout for a run. Should rarely fire — the soft
+    /// warning at `warn_secs` asks the channel to wrap up first.
+    pub timeout_secs: u64,
+    /// When to inject the soft "wrap up" warning into the run.
+    pub warn_secs: u64,
+    /// How many past run summaries to surface on wake.
+    pub run_history_count: u32,
+    /// Whether this agent picks up tasks with no assigned agent.
+    pub claim_unowned: bool,
+}
+
+impl Default for AutonomyConfig {
+    fn default() -> Self {
+        Self {
+            level: AutonomyLevel::Off,
+            interval_secs: 1800,
+            active_hours: None,
+            max_turns: 20,
+            max_tasks_per_run: 2,
+            timeout_secs: 600,
+            warn_secs: 480,
+            run_history_count: 5,
+            claim_unowned: true,
+        }
+    }
+}
+
+impl AutonomyConfig {
+    /// Validate the invariants from autonomy.md, clamping `warn_secs` to
+    /// `timeout_secs - 60` when it does not fire before the hard timeout.
+    /// `scope` names the config path (e.g. "defaults.autonomy") so load
+    /// errors point at the offending section.
+    pub fn validated(mut self, scope: &str) -> Result<Self> {
+        if self.interval_secs < 60 {
+            return Err(ConfigError::Invalid(format!(
+                "{scope}.interval_secs must be >= 60, got {}",
+                self.interval_secs
+            ))
+            .into());
+        }
+        if self.timeout_secs > self.interval_secs {
+            return Err(ConfigError::Invalid(format!(
+                "{scope}.timeout_secs ({}) must be <= interval_secs ({})",
+                self.timeout_secs, self.interval_secs
+            ))
+            .into());
+        }
+        if self.max_tasks_per_run < 1 {
+            return Err(
+                ConfigError::Invalid(format!("{scope}.max_tasks_per_run must be >= 1")).into(),
+            );
+        }
+        if let Some((start, end)) = self.active_hours
+            && (start > 23 || end > 23)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "{scope}.active_hours hours must be 0-23, got [{start}, {end}]"
+            ))
+            .into());
+        }
+        if self.warn_secs >= self.timeout_secs {
+            let clamped = self.timeout_secs.saturating_sub(60);
+            tracing::warn!(
+                scope,
+                warn_secs = self.warn_secs,
+                timeout_secs = self.timeout_secs,
+                clamped,
+                "autonomy warn_secs must be < timeout_secs, clamping"
+            );
+            self.warn_secs = clamped;
+        }
+        Ok(self)
+    }
+}
+
 fn validate_unit_interval_f32(name: &str, value: f32) -> Result<()> {
     if !value.is_finite() || !(0.0..=1.0).contains(&value) {
         return Err(ConfigError::Invalid(format!(
@@ -1434,6 +1590,7 @@ pub struct AgentConfig {
     pub coalesce: Option<CoalesceConfig>,
     pub ingestion: Option<IngestionConfig>,
     pub cortex: Option<CortexConfig>,
+    pub autonomy: Option<AutonomyConfig>,
     pub warmup: Option<WarmupConfig>,
     pub skills: Option<SkillsConfig>,
     pub browser: Option<BrowserConfig>,
@@ -1451,6 +1608,8 @@ pub struct AgentConfig {
     pub projects: Option<ProjectsConfig>,
     /// Cron job definitions for this agent.
     pub cron: Vec<CronDef>,
+    /// Wake definitions for this agent, reconciled into the wake store.
+    pub wakes: Vec<crate::wakes::WakeConfig>,
 }
 
 /// A cron job definition from config.
@@ -1498,6 +1657,7 @@ pub struct ResolvedAgentConfig {
     pub coalesce: CoalesceConfig,
     pub ingestion: IngestionConfig,
     pub cortex: CortexConfig,
+    pub autonomy: AutonomyConfig,
     pub warmup: WarmupConfig,
     pub skills: SkillsConfig,
     pub browser: BrowserConfig,
@@ -1513,6 +1673,8 @@ pub struct ResolvedAgentConfig {
     /// Number of messages to fetch from the platform when a new channel is created.
     pub history_backfill_count: usize,
     pub cron: Vec<CronDef>,
+    /// Wake definitions for this agent, reconciled into the wake store.
+    pub wakes: Vec<crate::wakes::WakeConfig>,
     /// Tool-use enforcement for preventing models from describing actions instead of calling tools.
     pub tool_use_enforcement: ToolUseEnforcement,
 }
@@ -1531,6 +1693,7 @@ impl Default for DefaultsConfig {
             coalesce: CoalesceConfig::default(),
             ingestion: IngestionConfig::default(),
             cortex: CortexConfig::default(),
+            autonomy: AutonomyConfig::default(),
             warmup: WarmupConfig::default(),
             skills: SkillsConfig::default(),
             participant_context: ParticipantContextConfig::default(),
@@ -1599,6 +1762,7 @@ impl AgentConfig {
             coalesce: self.coalesce.unwrap_or(defaults.coalesce),
             ingestion: self.ingestion.unwrap_or(defaults.ingestion),
             cortex: self.cortex.unwrap_or(defaults.cortex),
+            autonomy: self.autonomy.unwrap_or(defaults.autonomy),
             warmup: self.warmup.unwrap_or(defaults.warmup),
             skills: self.skills.unwrap_or(defaults.skills),
             browser: self
@@ -1620,6 +1784,7 @@ impl AgentConfig {
                 .unwrap_or_else(|| defaults.projects.clone()),
             history_backfill_count: defaults.history_backfill_count,
             cron: self.cron.clone(),
+            wakes: self.wakes.clone(),
             tool_use_enforcement: self
                 .tool_use_enforcement
                 .clone()
@@ -3312,5 +3477,134 @@ mod mattermost_url_tests {
     #[test]
     fn rejects_fragment() {
         assert!(validate_mattermost_url("https://mattermost.example.com/#section").is_err());
+    }
+}
+
+#[cfg(test)]
+mod autonomy_config_validation_tests {
+    use super::{AutonomyConfig, AutonomyLevel};
+
+    #[test]
+    fn autonomy_level_round_trips() {
+        for level in AutonomyLevel::ALL {
+            assert_eq!(AutonomyLevel::parse(level.as_str()), Some(level));
+        }
+        assert_eq!(AutonomyLevel::parse("aggressive"), None);
+        assert_eq!(AutonomyLevel::default(), AutonomyLevel::Off);
+    }
+
+    #[test]
+    fn autonomy_levels_order_by_capability() {
+        assert!(AutonomyLevel::Off < AutonomyLevel::Observe);
+        assert!(AutonomyLevel::Observe < AutonomyLevel::Suggest);
+        assert!(AutonomyLevel::Suggest < AutonomyLevel::Act);
+    }
+
+    #[test]
+    fn autonomy_defaults_pass_validation() {
+        let config = AutonomyConfig::default()
+            .validated("defaults.autonomy")
+            .expect("defaults must validate");
+        assert_eq!(config, AutonomyConfig::default());
+    }
+
+    #[test]
+    fn autonomy_rejects_short_interval() {
+        let error = AutonomyConfig {
+            interval_secs: 59,
+            timeout_secs: 59,
+            warn_secs: 30,
+            ..AutonomyConfig::default()
+        }
+        .validated("defaults.autonomy")
+        .expect_err("interval < 60 must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("defaults.autonomy.interval_secs")
+        );
+    }
+
+    #[test]
+    fn autonomy_rejects_timeout_longer_than_interval() {
+        let error = AutonomyConfig {
+            interval_secs: 300,
+            timeout_secs: 301,
+            ..AutonomyConfig::default()
+        }
+        .validated("agents.main.autonomy")
+        .expect_err("timeout > interval must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("agents.main.autonomy.timeout_secs")
+        );
+    }
+
+    #[test]
+    fn autonomy_allows_timeout_equal_to_interval() {
+        // Back-to-back runs (continuous operation) are valid but intentional.
+        let config = AutonomyConfig {
+            interval_secs: 600,
+            timeout_secs: 600,
+            ..AutonomyConfig::default()
+        }
+        .validated("defaults.autonomy")
+        .expect("timeout == interval is valid");
+        assert_eq!(config.timeout_secs, 600);
+    }
+
+    #[test]
+    fn autonomy_clamps_warn_at_or_past_timeout() {
+        let config = AutonomyConfig {
+            timeout_secs: 600,
+            warn_secs: 600,
+            ..AutonomyConfig::default()
+        }
+        .validated("defaults.autonomy")
+        .expect("warn violation clamps, not errors");
+        assert_eq!(config.warn_secs, 540);
+
+        let config = AutonomyConfig {
+            timeout_secs: 600,
+            warn_secs: 9999,
+            ..AutonomyConfig::default()
+        }
+        .validated("defaults.autonomy")
+        .expect("warn violation clamps, not errors");
+        assert_eq!(config.warn_secs, 540);
+    }
+
+    #[test]
+    fn autonomy_rejects_zero_max_tasks() {
+        let error = AutonomyConfig {
+            max_tasks_per_run: 0,
+            ..AutonomyConfig::default()
+        }
+        .validated("defaults.autonomy")
+        .expect_err("max_tasks_per_run 0 must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("defaults.autonomy.max_tasks_per_run")
+        );
+    }
+
+    #[test]
+    fn autonomy_rejects_out_of_range_active_hours() {
+        let error = AutonomyConfig {
+            active_hours: Some((8, 24)),
+            ..AutonomyConfig::default()
+        }
+        .validated("defaults.autonomy")
+        .expect_err("hour 24 must fail");
+        assert!(error.to_string().contains("active_hours"));
+
+        AutonomyConfig {
+            active_hours: Some((22, 6)),
+            ..AutonomyConfig::default()
+        }
+        .validated("defaults.autonomy")
+        .expect("midnight-wrapping window is valid");
     }
 }

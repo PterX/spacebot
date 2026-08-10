@@ -342,11 +342,14 @@ pub fn spawn_file_watcher(
 
                 if skills_changed {
                     let rt = tokio::runtime::Handle::current();
-                    let skills = rt.block_on(crate::skills::SkillSet::load(
-                        &instance_dir.join("skills"),
-                        &workspace.join("skills"),
-                    ));
-                    runtime_config.reload_skills(skills);
+                    rt.block_on(async {
+                        let skills = crate::skills::SkillSet::load(
+                            &instance_dir.join("skills"),
+                            &workspace.join("skills"),
+                        )
+                        .await;
+                        runtime_config.reload_skills(skills).await;
+                    });
                 }
             }
         }

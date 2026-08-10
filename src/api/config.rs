@@ -54,6 +54,19 @@ pub struct CortexSection {
 }
 
 #[derive(Serialize, Deserialize, Debug, utoipa::ToSchema)]
+pub struct AutonomySection {
+    pub level: crate::config::AutonomyLevel,
+    pub interval_secs: u64,
+    pub active_hours: Option<(u8, u8)>,
+    pub max_turns: u32,
+    pub max_tasks_per_run: u32,
+    pub timeout_secs: u64,
+    pub warn_secs: u64,
+    pub run_history_count: u32,
+    pub claim_unowned: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, utoipa::ToSchema)]
 pub struct WarmupSection {
     pub enabled: bool,
     pub eager_embedding_load: bool,
@@ -119,6 +132,7 @@ pub struct AgentConfigResponse {
     pub tuning: TuningSection,
     pub compaction: CompactionSection,
     pub cortex: CortexSection,
+    pub autonomy: AutonomySection,
     pub warmup: WarmupSection,
     pub coalesce: CoalesceSection,
     pub memory_persistence: MemoryPersistenceSection,
@@ -145,6 +159,8 @@ pub(super) struct AgentConfigUpdateRequest {
     compaction: Option<CompactionUpdate>,
     #[serde(default)]
     cortex: Option<CortexUpdate>,
+    #[serde(default)]
+    autonomy: Option<AutonomyUpdate>,
     #[serde(default)]
     warmup: Option<WarmupUpdate>,
     #[serde(default)]
@@ -207,6 +223,21 @@ pub(super) struct CortexUpdate {
     maintenance_prune_threshold: Option<f32>,
     maintenance_min_age_days: Option<i64>,
     maintenance_merge_similarity_threshold: Option<f32>,
+}
+
+#[derive(Deserialize, Debug, utoipa::ToSchema)]
+pub(super) struct AutonomyUpdate {
+    level: Option<crate::config::AutonomyLevel>,
+    interval_secs: Option<u64>,
+    /// `[start, end]` sets the window; an empty array clears it (always
+    /// active). Omit to leave unchanged.
+    active_hours: Option<Vec<u8>>,
+    max_turns: Option<u32>,
+    max_tasks_per_run: Option<u32>,
+    timeout_secs: Option<u64>,
+    warn_secs: Option<u64>,
+    run_history_count: Option<u32>,
+    claim_unowned: Option<bool>,
 }
 
 #[derive(Deserialize, Debug, utoipa::ToSchema)]
@@ -292,6 +323,7 @@ pub(super) async fn get_agent_config(
     let routing = rc.routing.load();
     let compaction = rc.compaction.load();
     let cortex = rc.cortex.load();
+    let autonomy = **rc.autonomy.load();
     let warmup = rc.warmup.load();
     let coalesce = rc.coalesce.load();
     let memory_persistence = rc.memory_persistence.load();
@@ -338,6 +370,17 @@ pub(super) async fn get_agent_config(
             maintenance_prune_threshold: cortex.maintenance_prune_threshold,
             maintenance_min_age_days: cortex.maintenance_min_age_days,
             maintenance_merge_similarity_threshold: cortex.maintenance_merge_similarity_threshold,
+        },
+        autonomy: AutonomySection {
+            level: autonomy.level,
+            interval_secs: autonomy.interval_secs,
+            active_hours: autonomy.active_hours,
+            max_turns: autonomy.max_turns,
+            max_tasks_per_run: autonomy.max_tasks_per_run,
+            timeout_secs: autonomy.timeout_secs,
+            warn_secs: autonomy.warn_secs,
+            run_history_count: autonomy.run_history_count,
+            claim_unowned: autonomy.claim_unowned,
         },
         warmup: WarmupSection {
             enabled: warmup.enabled,
@@ -461,6 +504,9 @@ pub(super) async fn update_agent_config(
     }
     if let Some(cortex) = &request.cortex {
         update_cortex_table(&mut doc, agent_idx, cortex)?;
+    }
+    if let Some(autonomy) = &request.autonomy {
+        update_autonomy_table(&mut doc, agent_idx, autonomy)?;
     }
     if let Some(warmup) = &request.warmup {
         update_warmup_table(&mut doc, agent_idx, warmup)?;
@@ -768,6 +814,123 @@ fn update_cortex_table(
     if let Some(v) = cortex.maintenance_merge_similarity_threshold {
         validate_maintenance_unit_interval("maintenance_merge_similarity_threshold", v)?;
         table["maintenance_merge_similarity_threshold"] = toml_edit::value(v as f64);
+    }
+    Ok(())
+}
+
+/// Read a `u64` field from a TOML table, treating non-integer or negative
+/// values as absent.
+fn table_u64(table: &toml_edit::Table, key: &str) -> Option<u64> {
+    table.get(key)?.as_integer()?.try_into().ok()
+}
+
+/// Read a `u64` field from the `[defaults.autonomy]` table, if present.
+fn defaults_autonomy_u64(doc: &toml_edit::DocumentMut, key: &str) -> Option<u64> {
+    doc.get("defaults")?
+        .as_table_like()?
+        .get("autonomy")?
+        .as_table_like()?
+        .get(key)?
+        .as_integer()?
+        .try_into()
+        .ok()
+}
+
+fn update_autonomy_table(
+    doc: &mut toml_edit::DocumentMut,
+    agent_idx: usize,
+    autonomy: &AutonomyUpdate,
+) -> Result<(), StatusCode> {
+    // Fallbacks for fields absent from both the patch and the agent table,
+    // mirroring load-time resolution: `[defaults.autonomy]` over built-ins.
+    let built_in = crate::config::AutonomyConfig::default();
+    let default_interval =
+        defaults_autonomy_u64(doc, "interval_secs").unwrap_or(built_in.interval_secs);
+    let default_timeout =
+        defaults_autonomy_u64(doc, "timeout_secs").unwrap_or(built_in.timeout_secs);
+    let default_warn = defaults_autonomy_u64(doc, "warn_secs").unwrap_or(built_in.warn_secs);
+
+    let agent = get_agent_table_mut(doc, agent_idx)?;
+    let table = get_or_create_subtable(agent, "autonomy")?;
+    if let Some(level) = autonomy.level {
+        table["level"] = toml_edit::value(level.as_str());
+    }
+    if let Some(v) = autonomy.interval_secs {
+        table["interval_secs"] = toml_edit::value(to_i64_from_u64("interval_secs", v)?);
+    }
+    if let Some(hours) = &autonomy.active_hours {
+        match hours.as_slice() {
+            [] => {
+                table.remove("active_hours");
+            }
+            [start, end] => {
+                if *start > 23 || *end > 23 {
+                    tracing::warn!(start, end, "autonomy active_hours must be 0-23");
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+                let mut array = toml_edit::Array::new();
+                array.push(i64::from(*start));
+                array.push(i64::from(*end));
+                table["active_hours"] = toml_edit::value(array);
+            }
+            other => {
+                tracing::warn!(
+                    len = other.len(),
+                    "autonomy active_hours must be [start, end] or empty"
+                );
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+    }
+    if let Some(v) = autonomy.max_turns {
+        table["max_turns"] = toml_edit::value(i64::from(v));
+    }
+    if let Some(v) = autonomy.max_tasks_per_run {
+        if v < 1 {
+            tracing::warn!("autonomy max_tasks_per_run must be >= 1");
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        table["max_tasks_per_run"] = toml_edit::value(i64::from(v));
+    }
+    if let Some(v) = autonomy.timeout_secs {
+        table["timeout_secs"] = toml_edit::value(to_i64_from_u64("timeout_secs", v)?);
+    }
+    if let Some(v) = autonomy.warn_secs {
+        table["warn_secs"] = toml_edit::value(to_i64_from_u64("warn_secs", v)?);
+    }
+    if let Some(v) = autonomy.run_history_count {
+        table["run_history_count"] = toml_edit::value(i64::from(v));
+    }
+    if let Some(v) = autonomy.claim_unowned {
+        table["claim_unowned"] = toml_edit::value(v);
+    }
+
+    // Validate the merged result (existing table values plus the patch) so
+    // partial updates are checked in context, mirroring
+    // `AutonomyConfig::validated`. The load path clamps an out-of-range
+    // `warn_secs`; an interactive caller gets an error instead.
+    let interval_secs = table_u64(table, "interval_secs").unwrap_or(default_interval);
+    let timeout_secs = table_u64(table, "timeout_secs").unwrap_or(default_timeout);
+    let warn_secs = table_u64(table, "warn_secs").unwrap_or(default_warn);
+    if interval_secs < 60 {
+        tracing::warn!(interval_secs, "autonomy interval_secs must be >= 60");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if timeout_secs > interval_secs {
+        tracing::warn!(
+            timeout_secs,
+            interval_secs,
+            "autonomy timeout_secs must be <= interval_secs"
+        );
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if warn_secs >= timeout_secs {
+        tracing::warn!(
+            warn_secs,
+            timeout_secs,
+            "autonomy warn_secs must be < timeout_secs"
+        );
+        return Err(StatusCode::BAD_REQUEST);
     }
     Ok(())
 }

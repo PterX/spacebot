@@ -145,7 +145,7 @@ fn emit_task_event(state: &ApiState, task: &crate::tasks::Task, action: &str) {
     state
         .event_tx
         .send(super::state::ApiEvent::TaskUpdated {
-            agent_id: task.assigned_agent_id.clone(),
+            agent_id: task.effective_agent_id().to_string(),
             task_number: task.task_number,
             status: task.status.to_string(),
             action: action.to_string(),
@@ -163,12 +163,53 @@ fn maybe_emit_approval_notification(state: &ApiState, task: &crate::tasks::Task)
         severity: NotificationSeverity::Info,
         title: task.title.clone(),
         body: task.description.clone(),
-        agent_id: Some(task.assigned_agent_id.clone()),
+        agent_id: Some(task.effective_agent_id().to_string()),
         related_entity_type: Some("task".to_string()),
         related_entity_id: Some(task.task_number.to_string()),
         action_url: Some(format!("/tasks/{}", task.task_number)),
         metadata: None,
     });
+}
+
+/// Post-mutation fan-out shared by the task handlers: SSE event, approval
+/// notification, and — when the mutation transitioned the task onto Ready —
+/// a task-approved system event routed to the owning agent's wake queue.
+async fn finish_task_mutation(
+    state: &ApiState,
+    task: &crate::tasks::Task,
+    action: &str,
+    previous_status: Option<crate::tasks::TaskStatus>,
+) {
+    emit_task_event(state, task, action);
+    maybe_emit_approval_notification(state, task);
+
+    let landed_on_ready = task.status == crate::tasks::TaskStatus::Ready
+        && previous_status.is_some_and(|previous| previous != crate::tasks::TaskStatus::Ready);
+    if !landed_on_ready {
+        return;
+    }
+
+    let key: crate::AgentId = Arc::from(task.effective_agent_id());
+    let deps = state.wake_registry.read().await.get(&key).cloned();
+    let Some(deps) = deps else {
+        return;
+    };
+
+    let mut payload = serde_json::json!({
+        "task_number": task.task_number,
+        "title": task.title,
+        "action": action,
+    });
+    if let Some(approved_by) = &task.approved_by {
+        payload["approved_by"] = serde_json::Value::from(approved_by.clone());
+    }
+    crate::wakes::emit_system_event(
+        &deps,
+        crate::wakes::SystemEvent::TaskApproved,
+        &format!("task:{}", task.task_number),
+        &payload,
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -275,7 +316,7 @@ pub(super) async fn create_task(
     let task = store
         .create(crate::tasks::CreateTaskInput {
             owner_agent_id: request.owner_agent_id,
-            assigned_agent_id: assigned,
+            assigned_agent_id: Some(assigned),
             title: request.title,
             description: request.description,
             status,
@@ -291,8 +332,7 @@ pub(super) async fn create_task(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    emit_task_event(&state, &task, "created");
-    maybe_emit_approval_notification(&state, &task);
+    finish_task_mutation(&state, &task, "created", None).await;
     Ok(Json(TaskResponse { task }))
 }
 
@@ -322,8 +362,8 @@ pub(super) async fn update_task(
     let status = parse_status(request.status.as_deref())?;
     let priority = parse_priority(request.priority.as_deref())?;
 
-    let task = store
-        .update(
+    let update = store
+        .update_with_status_transition(
             number,
             crate::tasks::UpdateTaskInput {
                 title: request.title,
@@ -346,9 +386,14 @@ pub(super) async fn update_task(
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    emit_task_event(&state, &task, "updated");
-    maybe_emit_approval_notification(&state, &task);
-    Ok(Json(TaskResponse { task }))
+    finish_task_mutation(
+        &state,
+        &update.task,
+        "updated",
+        Some(update.previous_status),
+    )
+    .await;
+    Ok(Json(TaskResponse { task: update.task }))
 }
 
 /// `DELETE /tasks/{number}` — delete a task.
@@ -393,7 +438,7 @@ pub(super) async fn delete_task(
     state
         .event_tx
         .send(super::state::ApiEvent::TaskUpdated {
-            agent_id: task.assigned_agent_id,
+            agent_id: task.effective_agent_id().to_string(),
             task_number: number,
             status: "deleted".to_string(),
             action: "deleted".to_string(),
@@ -428,8 +473,8 @@ pub(super) async fn approve_task(
 ) -> Result<Json<TaskResponse>, StatusCode> {
     let store = get_task_store(&state)?;
 
-    let task = store
-        .update(
+    let update = store
+        .update_with_status_transition(
             number,
             crate::tasks::UpdateTaskInput {
                 status: Some(crate::tasks::TaskStatus::Ready),
@@ -444,7 +489,13 @@ pub(super) async fn approve_task(
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    emit_task_event(&state, &task, "updated");
+    finish_task_mutation(
+        &state,
+        &update.task,
+        "updated",
+        Some(update.previous_status),
+    )
+    .await;
     // Auto-dismiss any pending task_approval notification for this task.
     if let Some(store) = state.notification_store.load().as_ref().clone()
         && let Err(error) = store
@@ -453,7 +504,7 @@ pub(super) async fn approve_task(
     {
         tracing::warn!(%error, task_number = number, "failed to auto-dismiss approval notification");
     }
-    Ok(Json(TaskResponse { task }))
+    Ok(Json(TaskResponse { task: update.task }))
 }
 
 /// `POST /tasks/{number}/execute` — move a task to ready for execution.
@@ -501,8 +552,8 @@ pub(super) async fn execute_task(
         return Err(StatusCode::CONFLICT);
     }
 
-    let task = store
-        .update(
+    let update = store
+        .update_with_status_transition(
             number,
             crate::tasks::UpdateTaskInput {
                 status: Some(crate::tasks::TaskStatus::Ready),
@@ -517,8 +568,14 @@ pub(super) async fn execute_task(
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    emit_task_event(&state, &task, "updated");
-    Ok(Json(TaskResponse { task }))
+    finish_task_mutation(
+        &state,
+        &update.task,
+        "updated",
+        Some(update.previous_status),
+    )
+    .await;
+    Ok(Json(TaskResponse { task: update.task }))
 }
 
 /// `POST /tasks/{number}/assign` — reassign a task to a different agent.
@@ -558,6 +615,6 @@ pub(super) async fn assign_task(
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    emit_task_event(&state, &task, "updated");
+    finish_task_mutation(&state, &task, "updated", None).await;
     Ok(Json(TaskResponse { task }))
 }
