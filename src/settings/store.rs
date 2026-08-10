@@ -1,7 +1,7 @@
 //! Key-value settings storage (redb).
 
 use crate::error::{Result, SettingsError};
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -131,6 +131,78 @@ impl SettingsStore {
         Ok(value.value().to_string())
     }
 
+    /// Read a key, distinguishing "no such key" from a failed read. Callers
+    /// that fold both into a default lose the difference between an unset
+    /// value and an unreadable store.
+    fn get_optional(&self, key: &str) -> Result<Option<String>> {
+        match self.get_raw(key) {
+            Ok(value) => Ok(Some(value)),
+            Err(crate::error::Error::Settings(boxed))
+                if matches!(*boxed, SettingsError::NotFound { .. }) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Write several keys in one transaction, so fields that are only
+    /// meaningful together cannot be left half-updated by a crash between
+    /// two commits.
+    fn set_many(&self, pairs: &[(&str, &str)]) -> Result<()> {
+        let failed = |key: &str, e: &dyn std::fmt::Display| SettingsError::WriteFailed {
+            key: key.to_string(),
+            details: e.to_string(),
+        };
+        let first = pairs.first().map(|(key, _)| *key).unwrap_or_default();
+
+        let write_txn = self.db.begin_write().map_err(|e| failed(first, &e))?;
+        {
+            let mut table = write_txn
+                .open_table(SETTINGS_TABLE)
+                .map_err(|e| failed(first, &e))?;
+            for (key, value) in pairs {
+                table.insert(*key, *value).map_err(|e| failed(key, &e))?;
+            }
+        }
+        write_txn.commit().map_err(|e| failed(first, &e))?;
+        Ok(())
+    }
+
+    /// Write `pairs` only while `guard_key` holds no non-empty value,
+    /// returning whether the write happened.
+    ///
+    /// The check and the writes share one write transaction, which redb
+    /// serializes — two callers racing to claim the same slot cannot both
+    /// see it empty.
+    fn set_many_if_unset(&self, guard_key: &str, pairs: &[(&str, &str)]) -> Result<bool> {
+        let failed = |key: &str, e: &dyn std::fmt::Display| SettingsError::WriteFailed {
+            key: key.to_string(),
+            details: e.to_string(),
+        };
+
+        let write_txn = self.db.begin_write().map_err(|e| failed(guard_key, &e))?;
+        let claimed = {
+            let mut table = write_txn
+                .open_table(SETTINGS_TABLE)
+                .map_err(|e| failed(guard_key, &e))?;
+            let taken = table
+                .get(guard_key)
+                .map_err(|e| failed(guard_key, &e))?
+                .is_some_and(|value| !value.value().is_empty());
+            if taken {
+                false
+            } else {
+                for (key, value) in pairs {
+                    table.insert(*key, *value).map_err(|e| failed(key, &e))?;
+                }
+                true
+            }
+        };
+        write_txn.commit().map_err(|e| failed(guard_key, &e))?;
+        Ok(claimed)
+    }
+
     /// Set a raw string value by key.
     fn set_raw(&self, key: &str, value: &str) -> Result<()> {
         let write_txn = self
@@ -192,50 +264,73 @@ impl SettingsStore {
     }
 
     /// The instance's home channel, or `None` when unset.
+    ///
+    /// An unreadable store reports "no home", which costs a proactive message
+    /// its destination — the message is recorded instead. Adoption does not
+    /// build on this read, so a failure here cannot displace a stored home.
     pub fn home_channel(&self) -> Option<HomeChannel> {
-        let target = self
-            .get_raw(HOME_CHANNEL_KEY)
-            .ok()
-            .filter(|t| !t.is_empty())?;
-        Some(HomeChannel {
-            target,
-            explicit: matches!(self.get_raw(HOME_CHANNEL_EXPLICIT_KEY), Ok(v) if v == "true"),
-        })
+        let target = match self.get_optional(HOME_CHANNEL_KEY) {
+            Ok(target) => target.filter(|t| !t.is_empty())?,
+            Err(error) => {
+                tracing::warn!(%error, "failed to read home channel; treating as unset");
+                return None;
+            }
+        };
+        let explicit = match self.get_optional(HOME_CHANNEL_EXPLICIT_KEY) {
+            Ok(value) => value.as_deref() == Some("true"),
+            Err(error) => {
+                tracing::warn!(%error, "failed to read home channel provenance");
+                false
+            }
+        };
+        Some(HomeChannel { target, explicit })
     }
 
     /// Set the home channel deliberately, replacing whatever was there.
     pub fn set_home_channel(&self, target: &str) -> Result<()> {
-        self.set_raw(HOME_CHANNEL_KEY, target)?;
-        self.set_raw(HOME_CHANNEL_EXPLICIT_KEY, "true")
+        self.set_many(&[
+            (HOME_CHANNEL_KEY, target),
+            (HOME_CHANNEL_EXPLICIT_KEY, "true"),
+        ])
     }
 
     /// Why the agent is paused, or `None` when it is running normally. A
     /// pause with no stated reason yields an empty string.
+    /// An unreadable store reports paused. A stop the operator asked for
+    /// outranks the agent's availability: resuming is one command away, but
+    /// silently running through an emergency stop is not recoverable.
     pub fn pause_reason(&self) -> Option<String> {
-        matches!(self.get_raw(PAUSED_KEY), Ok(v) if v == "true")
-            .then(|| self.get_raw(PAUSE_REASON_KEY).unwrap_or_default())
+        match self.get_optional(PAUSED_KEY) {
+            Ok(value) => {
+                if value.as_deref() != Some("true") {
+                    return None;
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to read pause state; holding work until it reads");
+                return Some("pause state unreadable".to_string());
+            }
+        }
+        Some(
+            self.get_optional(PAUSE_REASON_KEY)
+                .unwrap_or_default()
+                .unwrap_or_default(),
+        )
     }
 
     /// Hold off on starting new work, or resume. Survives restart so an
     /// emergency stop is not undone by a bounce.
     pub fn set_paused(&self, reason: Option<&str>) -> Result<()> {
         match reason {
-            Some(reason) => {
-                self.set_raw(PAUSE_REASON_KEY, reason)?;
-                self.set_raw(PAUSED_KEY, "true")
-            }
-            None => {
-                self.set_raw(PAUSE_REASON_KEY, "")?;
-                self.set_raw(PAUSED_KEY, "false")
-            }
+            Some(reason) => self.set_many(&[(PAUSE_REASON_KEY, reason), (PAUSED_KEY, "true")]),
+            None => self.set_many(&[(PAUSE_REASON_KEY, ""), (PAUSED_KEY, "false")]),
         }
     }
 
     /// Drop the home channel, returning the instance to sending nothing on
     /// its own.
     pub fn clear_home_channel(&self) -> Result<()> {
-        self.set_raw(HOME_CHANNEL_KEY, "")?;
-        self.set_raw(HOME_CHANNEL_EXPLICIT_KEY, "false")
+        self.set_many(&[(HOME_CHANNEL_KEY, ""), (HOME_CHANNEL_EXPLICIT_KEY, "false")])
     }
 
     /// Adopt `target` as the home channel only when nothing has claimed it.
@@ -243,12 +338,13 @@ impl SettingsStore {
     /// an explicit one, and never overwrites another implicit one — first run
     /// wins until a principal sets it deliberately.
     pub fn adopt_home_channel(&self, target: &str) -> Result<bool> {
-        if self.home_channel().is_some() {
-            return Ok(false);
-        }
-        self.set_raw(HOME_CHANNEL_KEY, target)?;
-        self.set_raw(HOME_CHANNEL_EXPLICIT_KEY, "false")?;
-        Ok(true)
+        self.set_many_if_unset(
+            HOME_CHANNEL_KEY,
+            &[
+                (HOME_CHANNEL_KEY, target),
+                (HOME_CHANNEL_EXPLICIT_KEY, "false"),
+            ],
+        )
     }
 }
 

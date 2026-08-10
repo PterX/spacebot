@@ -56,17 +56,22 @@ pub fn parse_delivery_target(raw: &str) -> Option<BroadcastTarget> {
 /// Never falls back to a recently-seen channel — an unresolvable target is
 /// silence, not a guess, so a private observation cannot land in a group the
 /// agent merely happens to be in.
+///
+/// A wake that names a target has said where its output belongs, and that it
+/// does not belong at home. If that target stops parsing — an adapter rename,
+/// a hand-edited config — the send is recorded, not redirected: the home is
+/// exactly the destination the wake declined.
 pub fn resolve_home_target(
     settings: Option<&crate::settings::SettingsStore>,
     wake_target: Option<&str>,
 ) -> Option<BroadcastTarget> {
-    if let Some(target) = wake_target.and_then(parse_delivery_target) {
-        return Some(target);
+    match wake_target {
+        Some(explicit) => parse_delivery_target(explicit),
+        None => settings?
+            .home_channel()
+            .as_ref()
+            .and_then(|home| parse_delivery_target(&home.target)),
     }
-    settings?
-        .home_channel()
-        .as_ref()
-        .and_then(|home| parse_delivery_target(&home.target))
 }
 
 /// Resolve adapter and broadcast target from a tracked channel.
@@ -1144,10 +1149,11 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_wake_target_falls_through_to_home() {
+    fn unparseable_wake_target_records_rather_than_redirecting_home() {
         let (_dir, store) = store_with_home(Some("discord:111"));
-        let resolved = super::resolve_home_target(Some(&store), Some("no-colon"));
-        assert_eq!(resolved.map(|t| t.to_string()), Some("discord:111".into()));
+        // The wake named somewhere that is not home; a broken name must not
+        // silently become home.
+        assert!(super::resolve_home_target(Some(&store), Some("no-colon")).is_none());
     }
 
     #[test]
@@ -1155,6 +1161,58 @@ mod tests {
         let (_dir, store) = store_with_home(None);
         assert!(super::resolve_home_target(Some(&store), None).is_none());
         assert!(super::resolve_home_target(None, None).is_none());
+    }
+
+    #[test]
+    fn concurrent_adoption_has_exactly_one_winner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = std::sync::Arc::new(
+            crate::settings::SettingsStore::new(&dir.path().join("settings.redb")).expect("store"),
+        );
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let winners: Vec<bool> = (0..8)
+            .map(|i| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .adopt_home_channel(&format!("discord:{i}"))
+                        .expect("adopt")
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().expect("thread"))
+            .collect();
+
+        assert_eq!(
+            winners.iter().filter(|claimed| **claimed).count(),
+            1,
+            "exactly one caller may claim the home"
+        );
+        let home = store.home_channel().expect("home");
+        assert!(!home.explicit);
+        // The stored target belongs to the one caller that reported winning.
+        let winner = winners.iter().position(|claimed| *claimed).expect("winner");
+        assert_eq!(home.target, format!("discord:{winner}"));
+    }
+
+    #[test]
+    fn pause_flag_and_reason_move_together() {
+        let (_dir, store) = store_with_home(None);
+        assert!(store.pause_reason().is_none());
+
+        store.set_paused(Some("deploying")).expect("pause");
+        assert_eq!(store.pause_reason().as_deref(), Some("deploying"));
+
+        // Resuming clears the reason with the flag rather than leaving a
+        // stale one behind for the next pause to inherit.
+        store.set_paused(None).expect("resume");
+        assert!(store.pause_reason().is_none());
+        store.set_paused(Some("")).expect("pause");
+        assert_eq!(store.pause_reason().as_deref(), Some(""));
     }
 
     #[test]

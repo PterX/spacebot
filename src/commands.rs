@@ -8,6 +8,7 @@ pub mod dispatch;
 pub mod native;
 pub mod registry;
 
+pub use access::access_allows;
 pub use registry::{
     AgentAction, ArgSpec, BusyPolicy, COMMANDS, CommandAccess, CommandAvailability,
     CommandCategory, CommandDef, CommandHandler, CommandRegistry, ControlAction, ParseResult,

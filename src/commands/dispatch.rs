@@ -13,7 +13,7 @@
 //! Replies (usage, denials, control output, busy acks) are ephemeral where
 //! the platform supports it and degrade to plain messages elsewhere.
 
-use super::access::{self, AccessContext};
+use super::access::{self, AccessContext, access_allows};
 use super::control::ControlPlane;
 use super::registry::{BusyPolicy, CommandHandler, ControlAction, ParseResult, Surface};
 use crate::messaging::MessagingManager;
@@ -48,6 +48,26 @@ pub struct DispatchScope<'a> {
 
 /// Classify and, where possible, fully handle a slash command. Replies are
 /// sent on spawned tasks so the router loop never blocks on an adapter.
+/// Metadata key carrying the sender's resolved authority to the channel.
+///
+/// Authority resolves here, where the binding and adapter config live, and
+/// travels with the message: everything downstream that must respect it —
+/// the channel's own command path, authority-gated tool registration — reads
+/// this rather than re-deriving a check it has no configuration for. Absent
+/// means no authority, so a path that never passed through the router cannot
+/// inherit one.
+pub const AUTHORITY_METADATA_KEY: &str = "sender_is_authority";
+
+/// Whether the router resolved this sender as holding authority in the scope
+/// the message arrived in.
+pub fn sender_is_authority(message: &InboundMessage) -> bool {
+    message
+        .metadata
+        .get(AUTHORITY_METADATA_KEY)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
 pub async fn dispatch_inbound(
     message: &mut InboundMessage,
     scope: DispatchScope<'_>,
@@ -66,6 +86,27 @@ pub async fn dispatch_inbound(
         _ => return Dispatch::Forward,
     };
 
+    let surface = Surface::from_source(&message.source);
+    let is_authority = {
+        let context = AccessContext {
+            binding_authority: scope.binding_authority,
+            adapter_default: scope.adapter_defaults.for_adapter(message.adapter_key()),
+            sender_id: &message.sender_id,
+            sender_login: message
+                .metadata
+                .get("twitch_user_login")
+                .and_then(|value| value.as_str()),
+        };
+        context.is_authority()
+    };
+    // Stamped before the parse gives up on non-commands: the channel re-parses
+    // raw text on its own command path and registers authority-gated tools per
+    // turn, so both need this on every forwarded message.
+    message.metadata.insert(
+        AUTHORITY_METADATA_KEY.to_string(),
+        serde_json::Value::Bool(is_authority),
+    );
+
     let bot_username = message
         .metadata
         .get("telegram_bot_username")
@@ -79,18 +120,7 @@ pub async fn dispatch_inbound(
         ParseResult::Command(parsed) => parsed,
     };
 
-    let surface = Surface::from_source(&message.source);
-    let context = AccessContext {
-        binding_authority: scope.binding_authority,
-        adapter_default: scope.adapter_defaults.for_adapter(message.adapter_key()),
-        sender_id: &message.sender_id,
-        sender_login: message
-            .metadata
-            .get("twitch_user_login")
-            .and_then(|value| value.as_str()),
-    };
-    let is_authority = context.is_authority();
-    if !context.allows(parsed.def) {
+    if !access_allows(parsed.def, is_authority) {
         reply_ephemeral(
             messaging,
             deps,

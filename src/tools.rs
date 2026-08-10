@@ -480,6 +480,7 @@ pub async fn add_channel_tools(
     current_adapter: Option<String>,
     slack_thread_ts: Option<&str>,
     cron_outcome: Option<crate::cron::CronOutcome>,
+    sender_is_authority: bool,
 ) -> Result<(), rig::tool::server::ToolServerError> {
     let conversation_id = conversation_id.into();
     let channel_kind = state.kind;
@@ -505,8 +506,11 @@ pub async fn add_channel_tools(
             .await?;
     }
     // The home channel is where the agent speaks when no conversation is in
-    // scope, so only a real user conversation can claim it.
-    if channel_kind == crate::agent::channel::ChannelKind::User {
+    // scope, so only a real user conversation can claim it — and only on a
+    // turn driven by someone holding authority. `/sethome` is authority-gated
+    // for the same reason, and a tool the model can be talked into calling
+    // must not be the way around it.
+    if channel_kind == crate::agent::channel::ChannelKind::User && sender_is_authority {
         handle
             .add_tool(SetHomeChannelTool::new(
                 state.deps.clone(),
@@ -641,6 +645,7 @@ pub async fn add_direct_mode_tools(
     current_adapter: Option<String>,
     slack_thread_ts: Option<&str>,
     cron_outcome: Option<crate::cron::CronOutcome>,
+    sender_is_authority: bool,
 ) -> Result<(), rig::tool::server::ToolServerError> {
     // First add all standard channel tools
     add_channel_tools(
@@ -657,6 +662,7 @@ pub async fn add_direct_mode_tools(
         current_adapter.clone(),
         slack_thread_ts,
         cron_outcome,
+        sender_is_authority,
     )
     .await?;
 

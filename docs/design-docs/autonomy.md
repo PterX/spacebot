@@ -43,9 +43,9 @@ The cortex assembles the autonomy channel's context before each wake. It gets:
 - **Task state** — all active tasks: ready, in-progress, backlog, pending_approval. Full detail on each, including all comments.
 - **Goals** — all active goals with descriptions and notes. Background context and direction, not a work queue. See [`goals.md`](goals.md).
 - **Active workers** — what's currently running so it doesn't duplicate work.
-- **Last few run summaries** — the `autonomy_complete` output from its previous runs, with timestamps. This is the primary continuity mechanism.
+- **Its own prior transcript** — the channel's persisted history, where each finished run has compacted to its `autonomy_complete` summary. This is the continuity mechanism; see [Continuity Between Runs](#continuity-between-runs).
 
-The last run summaries are surfaced up front: "Last run (2h ago): enriched tasks X and Y, created tasks Z for backlog." The autonomy channel wakes with spatial awareness of where things stand and what it did recently.
+Continuity arrives as the channel's own history rather than as injected run summaries — the run store stays the queryable index and provenance record, not a second delivery path for the same content. The autonomy channel wakes with spatial awareness of where things stand and what it did recently.
 
 ### The briefing is the system prompt, not a message
 
@@ -193,7 +193,7 @@ wake → survey pending_approval tasks
   → reason about worker findings
   → add_task_comment: synthesised finding + worker_id(s)
   → repeat for next task within turn budget
-  → set_outcome → exit
+  → autonomy_complete → exit
 ```
 
 The autonomy channel system prompt instructs: investigate and comment freely; never execute a task still in `pending_approval`.
@@ -257,7 +257,7 @@ The cortex monitors elapsed time. At `warn_secs`, it injects an addendum into th
 
 ```
 You have approximately 2 minutes remaining in this run.
-Finish your current task, add any final comments, and call set_outcome.
+Finish your current task, add any final comments, and call autonomy_complete.
 Do not start a new task.
 ```
 

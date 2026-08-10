@@ -1362,6 +1362,7 @@ impl Channel {
         def: &'static crate::commands::CommandDef,
         action: crate::commands::ControlAction,
         args: &str,
+        is_authority: bool,
     ) {
         use crate::commands::ControlAction;
 
@@ -1422,13 +1423,11 @@ impl Channel {
                 self.send_builtin_text(reply, def.name).await;
             }
             ControlAction::WhoAmI => {
-                // The channel path has no sender scope to check, so it answers
-                // for the authority the binding already granted to get here.
                 let surface = crate::commands::Surface::from_source(
                     self.current_adapter().unwrap_or("unknown"),
                 );
                 self.send_builtin_text(
-                    crate::commands::control::whoami_text(true, surface),
+                    crate::commands::control::whoami_text(is_authority, surface),
                     def.name,
                 )
                 .await;
@@ -2085,6 +2084,7 @@ impl Channel {
         // Increment message counter for memory persistence
         self.message_count += message_count;
         self.check_memory_persistence().await;
+        self.claim_home_channel_if_unset().await;
 
         Ok(())
     }
@@ -2305,7 +2305,23 @@ impl Channel {
         match &parsed_command {
             crate::commands::ParseResult::Command(cmd) => {
                 if let crate::commands::CommandHandler::Control(action) = cmd.def.handler {
-                    self.handle_control_command(cmd.def, action, &cmd.args)
+                    // The router parses with the receiving bot's username and
+                    // this path does not, so text it declined as addressed to
+                    // another bot still resolves here. Gate on the authority
+                    // it stamped, or `/sethome@otherbot` would run unchecked.
+                    let is_authority = crate::commands::dispatch::sender_is_authority(&message);
+                    if !crate::commands::access_allows(cmd.def, is_authority) {
+                        self.send_builtin_text(
+                            crate::commands::access::denial_text(
+                                cmd.def,
+                                crate::commands::Surface::from_source(&message.source),
+                            ),
+                            cmd.def.name,
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                    self.handle_control_command(cmd.def, action, &cmd.args, is_authority)
                         .await;
                     return Ok(());
                 }
@@ -3024,6 +3040,11 @@ impl Channel {
         // reply() always sends live — cron channels use set_outcome() for delivery.
         let reply_target = crate::tools::ReplyTarget::Live(Box::new(routed_sender.clone()));
 
+        // Tools that change instance-wide state are registered per turn
+        // against the sender driving it, so a non-authority turn never has
+        // them on the table to be talked into calling.
+        let sender_is_authority = crate::commands::dispatch::sender_is_authority(&current_inbound);
+
         match self.resolved_settings.delegation {
             DelegationMode::Standard => {
                 // Current behavior - standard channel tools only
@@ -3041,6 +3062,7 @@ impl Channel {
                     adapter.map(|s| s.to_string()),
                     slack_thread_ts.as_deref(),
                     self.state.cron_outcome.clone(),
+                    sender_is_authority,
                 )
                 .await
                 {
@@ -3064,6 +3086,7 @@ impl Channel {
                     adapter.map(|s| s.to_string()),
                     slack_thread_ts.as_deref(),
                     self.state.cron_outcome.clone(),
+                    sender_is_authority,
                 )
                 .await
                 {
