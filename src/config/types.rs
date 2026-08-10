@@ -667,6 +667,9 @@ pub struct DefaultsConfig {
     pub opencode: OpenCodeConfig,
     /// Worker log mode: "errors_only", "all_separate", or "all_combined".
     pub worker_log_mode: crate::settings::WorkerLogMode,
+    /// Seeds the home channel of an instance that ships pre-configured, in
+    /// `adapter:target` form. Only applied when no home is stored yet.
+    pub home_channel: Option<String>,
     /// Projects workspace management defaults.
     pub projects: ProjectsConfig,
 }
@@ -702,6 +705,7 @@ impl std::fmt::Debug for DefaultsConfig {
             .field("tool_use_enforcement", &self.tool_use_enforcement)
             .field("opencode", &self.opencode)
             .field("worker_log_mode", &self.worker_log_mode)
+            .field("home_channel", &self.home_channel)
             .field("projects", &self.projects)
             .finish()
     }
@@ -1708,6 +1712,7 @@ impl Default for DefaultsConfig {
             tool_use_enforcement: ToolUseEnforcement::default(),
             opencode: OpenCodeConfig::default(),
             worker_log_mode: crate::settings::WorkerLogMode::default(),
+            home_channel: None,
             projects: ProjectsConfig::default(),
         }
     }

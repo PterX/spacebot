@@ -61,6 +61,7 @@ pub mod secret_set;
 pub mod send_agent_message;
 pub mod send_file;
 pub mod send_message_to_another_channel;
+pub mod set_home_channel;
 pub mod set_outcome;
 pub mod set_status;
 pub mod shell;
@@ -153,6 +154,9 @@ pub use send_agent_message::{
 pub use send_file::{SendFileArgs, SendFileError, SendFileOutput, SendFileTool};
 pub use send_message_to_another_channel::{
     SendMessageArgs, SendMessageError, SendMessageOutput, SendMessageTool,
+};
+pub use set_home_channel::{
+    SetHomeChannelArgs, SetHomeChannelError, SetHomeChannelOutput, SetHomeChannelTool,
 };
 pub use set_outcome::{SetOutcomeArgs, SetOutcomeError, SetOutcomeOutput, SetOutcomeTool};
 pub use set_status::{SetStatusArgs, SetStatusError, SetStatusOutput, SetStatusTool, StatusKind};
@@ -497,6 +501,17 @@ pub async fn add_channel_tools(
                 replied_flag.clone(),
                 agent_display_name,
                 state.deps.api_state.clone(),
+            ))
+            .await?;
+    }
+    // The home channel is where the agent speaks when no conversation is in
+    // scope, so only a real user conversation can claim it.
+    if channel_kind == crate::agent::channel::ChannelKind::User {
+        handle
+            .add_tool(SetHomeChannelTool::new(
+                state.deps.clone(),
+                conversation_id.clone(),
+                current_adapter.as_deref() == Some("portal"),
             ))
             .await?;
     }

@@ -49,6 +49,26 @@ pub fn parse_delivery_target(raw: &str) -> Option<BroadcastTarget> {
     })
 }
 
+/// Resolve where an autonomous send should go: an explicit per-wake target
+/// wins, the instance's home channel is the default, and neither resolving
+/// means the caller records instead of sending.
+///
+/// Never falls back to a recently-seen channel — an unresolvable target is
+/// silence, not a guess, so a private observation cannot land in a group the
+/// agent merely happens to be in.
+pub fn resolve_home_target(
+    settings: Option<&crate::settings::SettingsStore>,
+    wake_target: Option<&str>,
+) -> Option<BroadcastTarget> {
+    if let Some(target) = wake_target.and_then(parse_delivery_target) {
+        return Some(target);
+    }
+    settings?
+        .home_channel()
+        .as_ref()
+        .and_then(|home| parse_delivery_target(&home.target))
+}
+
 /// Resolve adapter and broadcast target from a tracked channel.
 pub fn resolve_broadcast_target(channel: &ChannelInfo) -> Option<BroadcastTarget> {
     let adapter = channel.platform.as_str();
@@ -1097,5 +1117,65 @@ mod tests {
         assert!(super::is_valid_instance_name("exactly_twenty_chars"));
         // 21 characters (over boundary)
         assert!(!super::is_valid_instance_name("exactly_twenty_chars_"));
+    }
+
+    fn store_with_home(home: Option<&str>) -> (tempfile::TempDir, crate::settings::SettingsStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            crate::settings::SettingsStore::new(&dir.path().join("settings.redb")).expect("store");
+        if let Some(home) = home {
+            store.set_home_channel(home).expect("set home");
+        }
+        (dir, store)
+    }
+
+    #[test]
+    fn wake_target_wins_over_home() {
+        let (_dir, store) = store_with_home(Some("discord:111"));
+        let resolved = super::resolve_home_target(Some(&store), Some("telegram:222"));
+        assert_eq!(resolved.map(|t| t.to_string()), Some("telegram:222".into()));
+    }
+
+    #[test]
+    fn home_is_the_fallback_when_no_wake_target() {
+        let (_dir, store) = store_with_home(Some("discord:111"));
+        let resolved = super::resolve_home_target(Some(&store), None);
+        assert_eq!(resolved.map(|t| t.to_string()), Some("discord:111".into()));
+    }
+
+    #[test]
+    fn unparseable_wake_target_falls_through_to_home() {
+        let (_dir, store) = store_with_home(Some("discord:111"));
+        let resolved = super::resolve_home_target(Some(&store), Some("no-colon"));
+        assert_eq!(resolved.map(|t| t.to_string()), Some("discord:111".into()));
+    }
+
+    #[test]
+    fn neither_set_resolves_to_nothing() {
+        let (_dir, store) = store_with_home(None);
+        assert!(super::resolve_home_target(Some(&store), None).is_none());
+        assert!(super::resolve_home_target(None, None).is_none());
+    }
+
+    #[test]
+    fn implicit_home_never_overwrites_a_claimed_one() {
+        let (_dir, store) = store_with_home(None);
+
+        assert!(store.adopt_home_channel("discord:111").expect("adopt"));
+        // A second implicit adoption loses to the first — first run wins.
+        assert!(!store.adopt_home_channel("telegram:222").expect("adopt"));
+        let home = store.home_channel().expect("home");
+        assert_eq!(home.target, "discord:111");
+        assert!(!home.explicit);
+
+        // An explicit set replaces it and marks it explicit.
+        store.set_home_channel("telegram:222").expect("set");
+        let home = store.home_channel().expect("home");
+        assert_eq!(home.target, "telegram:222");
+        assert!(home.explicit);
+
+        // And an implicit adoption can never take it back.
+        assert!(!store.adopt_home_channel("discord:333").expect("adopt"));
+        assert_eq!(store.home_channel().expect("home").target, "telegram:222");
     }
 }

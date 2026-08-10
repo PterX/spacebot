@@ -2364,6 +2364,19 @@ async fn initialize_agents(
         if let Err(error) = settings_store.set_worker_log_mode(config.defaults.worker_log_mode) {
             tracing::warn!(%error, agent = %agent_config.id, "failed to set worker_log_mode from config");
         }
+        // Config seeds the home channel; a value set at runtime owns it from
+        // then on and is never clobbered by a reload.
+        if let Some(home) = config.defaults.home_channel.as_deref() {
+            match settings_store.adopt_home_channel(home) {
+                Ok(true) => {
+                    tracing::info!(agent = %agent_config.id, home_channel = %home, "seeded home channel from config")
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(%error, agent = %agent_config.id, "failed to seed home_channel from config")
+                }
+            }
+        }
 
         // Share the instance-level secrets store with this agent.
         if let Some(secrets_store) = bootstrapped_store {

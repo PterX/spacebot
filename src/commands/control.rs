@@ -55,6 +55,7 @@ pub fn status_text(
     channel_model: &str,
     branch_model: &str,
     now_line: &str,
+    home: Option<&crate::settings::HomeChannel>,
 ) -> String {
     format!(
         "status\n\
@@ -64,9 +65,22 @@ pub fn status_text(
          - mode: {}\n\
          - channel model: {channel_model}\n\
          - branch model: {branch_model}\n\
+         - home: {}\n\
          - time: {now_line}",
-        mode_label(mode)
+        mode_label(mode),
+        home_label(home)
     )
+}
+
+/// How `/status` renders the home channel. An implicit home is marked so the
+/// destination is never a silent default the user discovers by receiving
+/// something unexpected.
+fn home_label(home: Option<&crate::settings::HomeChannel>) -> String {
+    match home {
+        Some(home) if home.explicit => home.target.clone(),
+        Some(home) => format!("{} (adopted on first run)", home.target),
+        None => "not set".to_string(),
+    }
 }
 
 /// Everything a control command needs, owned so execution can run in a
@@ -93,7 +107,17 @@ impl ControlPlane {
                 crate::commands::REGISTRY.help_text_for(Some(self.surface), self.is_authority)
             }
             ControlAction::AgentId => self.deps.agent_id.to_string(),
+            ControlAction::SetHome => self.set_home().await,
         }
+    }
+
+    /// The settings store, once the runtime has finished wiring it up.
+    fn settings(&self) -> Option<std::sync::Arc<crate::settings::SettingsStore>> {
+        self.deps.runtime_config.settings.load().as_ref().clone()
+    }
+
+    async fn set_home(&self) -> String {
+        set_home_channel(&self.deps, &self.conversation_id, self.is_portal).await
     }
 
     /// Resolve the conversation's settings the same way channel creation
@@ -169,6 +193,7 @@ impl ControlPlane {
             channel_model,
             branch_model,
             &temporal_context.current_time_line(),
+            self.settings().and_then(|s| s.home_channel()).as_ref(),
         )
     }
 
@@ -207,6 +232,82 @@ impl ControlPlane {
     }
 }
 
+/// Resolve a conversation into the canonical delivery target that reaches it.
+/// Portal conversations have no broadcast address, so they cannot be a home.
+async fn conversation_broadcast_target(
+    deps: &crate::AgentDeps,
+    conversation_id: &str,
+    is_portal: bool,
+) -> std::result::Result<crate::messaging::target::BroadcastTarget, String> {
+    if is_portal {
+        return Err(
+            "the portal isn't a delivery target — set the home from the chat that should \
+             receive proactive messages"
+                .to_string(),
+        );
+    }
+
+    let store = crate::conversation::ChannelStore::new(deps.sqlite_pool.clone());
+    let channel = match store.get(conversation_id).await {
+        Ok(Some(channel)) => channel,
+        Ok(None) => return Err("couldn't resolve this chat's delivery address".to_string()),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                %conversation_id,
+                "failed to load channel while setting home"
+            );
+            return Err("couldn't read this chat's delivery address".to_string());
+        }
+    };
+
+    crate::messaging::target::resolve_broadcast_target(&channel)
+        .ok_or_else(|| "couldn't resolve this chat's delivery address".to_string())
+}
+
+/// Set a conversation as the instance's home channel, returning the reply.
+///
+/// Shared by `/sethome` and the `set_home_channel` tool so both entry points
+/// validate and persist identically. Validation runs here rather than at first
+/// send, so a home the agent cannot reach is rejected while the user is still
+/// looking at the reply.
+pub async fn set_home_channel(
+    deps: &crate::AgentDeps,
+    conversation_id: &str,
+    is_portal: bool,
+) -> String {
+    let target = match conversation_broadcast_target(deps, conversation_id, is_portal).await {
+        Ok(target) => target,
+        Err(message) => return message,
+    };
+
+    if let Some(manager) = deps.messaging_manager.as_ref()
+        && !manager.has_adapter(&target.adapter).await
+    {
+        return format!("no '{}' adapter is running — home not set", target.adapter);
+    }
+
+    let Some(settings) = deps.runtime_config.settings.load().as_ref().clone() else {
+        return "settings storage isn't available — home not set".to_string();
+    };
+
+    let canonical = target.to_string();
+    match settings.set_home_channel(&canonical) {
+        Ok(()) => {
+            tracing::info!(
+                agent = %deps.agent_id,
+                home_channel = %canonical,
+                "home channel set"
+            );
+            format!("home channel set to this chat ({canonical}). proactive messages land here.")
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to persist home channel");
+            "couldn't save the home channel — it's unchanged".to_string()
+        }
+    }
+}
+
 /// Persist the response mode through the stores' atomic field updates,
 /// leaving every other settings field untouched. No settings read happens
 /// here, so concurrent whole-row writers can't be clobbered with stale
@@ -239,6 +340,44 @@ pub(crate) async fn persist_response_mode(
 mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
+
+    fn status_with_home(home: Option<&crate::settings::HomeChannel>) -> String {
+        status_text(
+            "orion",
+            "discord:guild:1",
+            "discord",
+            ResponseMode::Active,
+            "model-a",
+            "model-b",
+            "now",
+            home,
+        )
+    }
+
+    #[test]
+    fn status_reports_an_unset_home() {
+        assert!(status_with_home(None).contains("- home: not set"));
+    }
+
+    #[test]
+    fn status_marks_an_adopted_home_as_implicit() {
+        let home = crate::settings::HomeChannel {
+            target: "discord:123".to_string(),
+            explicit: false,
+        };
+        assert!(
+            status_with_home(Some(&home)).contains("- home: discord:123 (adopted on first run)")
+        );
+    }
+
+    #[test]
+    fn status_reports_an_explicit_home_bare() {
+        let home = crate::settings::HomeChannel {
+            target: "discord:123".to_string(),
+            explicit: true,
+        };
+        assert!(status_with_home(Some(&home)).contains("- home: discord:123\n"));
+    }
 
     async fn memory_pool() -> sqlx::SqlitePool {
         SqlitePoolOptions::new()

@@ -1385,6 +1385,14 @@ impl Channel {
                     channel_model,
                     branch_model,
                     &temporal_context.current_time_line(),
+                    self.deps
+                        .runtime_config
+                        .settings
+                        .load()
+                        .as_ref()
+                        .as_ref()
+                        .and_then(|settings| settings.home_channel())
+                        .as_ref(),
                 );
                 self.send_builtin_text(body, def.name).await;
             }
@@ -1403,6 +1411,13 @@ impl Channel {
             ControlAction::AgentId => {
                 self.send_builtin_text(self.deps.agent_id.to_string(), def.name)
                     .await;
+            }
+            ControlAction::SetHome => {
+                let is_portal = self.current_adapter() == Some("portal");
+                let reply =
+                    crate::commands::control::set_home_channel(&self.deps, &self.id, is_portal)
+                        .await;
+                self.send_builtin_text(reply, def.name).await;
             }
         }
     }

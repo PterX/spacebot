@@ -171,6 +171,8 @@ pub enum ControlAction {
     /// Print the runtime agent id. Deterministic so identity checks bypass
     /// model output drift.
     AgentId,
+    /// Adopt the calling conversation as the instance's home channel.
+    SetHome,
 }
 
 /// Agent-turn commands.
@@ -378,6 +380,17 @@ fn normalize_smart_dashes(args: &str) -> String {
 
 /// The command table. Order within a category is display order in `/help`.
 pub static COMMANDS: &[CommandDef] = &[
+    CommandDef {
+        name: "sethome",
+        description: "set this chat as the home channel",
+        category: CommandCategory::Session,
+        aliases: &[],
+        args: ArgSpec::None,
+        handler: CommandHandler::Control(ControlAction::SetHome),
+        access: CommandAccess::Authority,
+        busy: BusyPolicy::Queue,
+        availability: CommandAvailability::ALL,
+    },
     CommandDef {
         name: "active",
         description: "normal reply mode",

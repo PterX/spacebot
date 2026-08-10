@@ -119,7 +119,7 @@ pub async fn dispatch_inbound(
                 // later /active. The work is a local SQLite roundtrip plus
                 // an in-memory cell update; only the reply delivery goes
                 // over the network, and that stays on a spawned task.
-                ControlAction::SetResponseMode(_) => {
+                ControlAction::SetResponseMode(_) | ControlAction::SetHome => {
                     let reply = plane.execute(action).await;
                     reply_ephemeral(messaging, deps, message, reply);
                 }

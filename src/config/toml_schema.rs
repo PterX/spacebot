@@ -320,6 +320,7 @@ pub(super) struct TomlDefaultsConfig {
     pub(super) user_timezone: Option<String>,
     pub(super) opencode: Option<TomlOpenCodeConfig>,
     pub(super) worker_log_mode: Option<String>,
+    pub(super) home_channel: Option<String>,
     pub(super) projects: Option<TomlProjectsConfig>,
 }
 
