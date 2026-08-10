@@ -98,7 +98,10 @@ fn clamp_chronicle_config(mut config: ChronicleConfig) -> ChronicleConfig {
 
     config.interval_messages = config.interval_messages.max(1);
     config.interval_token_fraction = config.interval_token_fraction.clamp(0.01, 0.9);
-    config.recent_window_hours = config.recent_window_hours.max(1);
+    // Upper bound matters as much as the lower one: `Duration::hours` panics on
+    // out-of-range values, and the window is only ever a lookback.
+    const MAX_RECENT_WINDOW_HOURS: i64 = 8_760; // one year
+    config.recent_window_hours = config.recent_window_hours.clamp(1, MAX_RECENT_WINDOW_HOURS);
     config.max_recent = config.max_recent.clamp(1, MAX_LIST_ENTRIES);
     config.max_older = config.max_older.min(MAX_LIST_ENTRIES);
     config.context_token_budget = config

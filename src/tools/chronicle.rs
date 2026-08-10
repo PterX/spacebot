@@ -131,7 +131,7 @@ impl Tool for ChronicleTool {
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Checkpoints to list (default 20, max 50), or raw messages to expand."
+                        "description": "For \"list\": checkpoints to return (default 20, max 50). For \"expand\": raw messages per page, capped by the configured expand limit."
                     },
                     "after": {
                         "type": "integer",

@@ -221,7 +221,13 @@ impl ChronicleStore {
         .await
         .map_err(|error| anyhow::anyhow!(error))?;
 
-        Ok(row.map(checkpoint_from_row))
+        Ok(row.as_ref().and_then(|row| match checkpoint_from_row(row) {
+            Ok(checkpoint) => Some(checkpoint),
+            Err(error) => {
+                tracing::warn!(%error, "skipping undecodable chronicle checkpoint row");
+                None
+            }
+        }))
     }
 
     /// Commit a checkpoint, rejecting it if the tail moved underneath it.
@@ -416,7 +422,7 @@ impl ChronicleStore {
         .await
         .map_err(|error| anyhow::anyhow!(error))?;
 
-        Ok(rows.into_iter().map(checkpoint_from_row).collect())
+        Ok(checkpoints_from_rows(rows))
     }
 
     /// Checkpoints at a level whose coverage ends at or after `since`, oldest
@@ -444,7 +450,7 @@ impl ChronicleStore {
         .await
         .map_err(|error| anyhow::anyhow!(error))?;
 
-        Ok(rows.into_iter().map(checkpoint_from_row).collect())
+        Ok(checkpoints_from_rows(rows))
     }
 
     /// Checkpoints at a level with a sequence below `before_seq`, oldest first.
@@ -471,7 +477,7 @@ impl ChronicleStore {
         .await
         .map_err(|error| anyhow::anyhow!(error))?;
 
-        Ok(rows.into_iter().map(checkpoint_from_row).collect())
+        Ok(checkpoints_from_rows(rows))
     }
 
     /// Checkpoints for the channel timeline, newest first.
@@ -508,7 +514,7 @@ impl ChronicleStore {
             .await
             .map_err(|error| anyhow::anyhow!(error))?;
 
-        Ok(rows.into_iter().map(checkpoint_from_row).collect())
+        Ok(checkpoints_from_rows(rows))
     }
 
     /// A single checkpoint by sequence number.
@@ -526,7 +532,13 @@ impl ChronicleStore {
         .await
         .map_err(|error| anyhow::anyhow!(error))?;
 
-        Ok(row.map(checkpoint_from_row))
+        Ok(row.as_ref().and_then(|row| match checkpoint_from_row(row) {
+            Ok(checkpoint) => Some(checkpoint),
+            Err(error) => {
+                tracing::warn!(%error, "skipping undecodable chronicle checkpoint row");
+                None
+            }
+        }))
     }
 
     /// A single checkpoint by id, scoped to its channel.
@@ -544,7 +556,13 @@ impl ChronicleStore {
         .await
         .map_err(|error| anyhow::anyhow!(error))?;
 
-        Ok(row.map(checkpoint_from_row))
+        Ok(row.as_ref().and_then(|row| match checkpoint_from_row(row) {
+            Ok(checkpoint) => Some(checkpoint),
+            Err(error) => {
+                tracing::warn!(%error, "skipping undecodable chronicle checkpoint row");
+                None
+            }
+        }))
     }
 
     /// Aggregate state for the prompt header.
@@ -721,30 +739,62 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
         || db.message().contains("UNIQUE constraint failed"))
 }
 
-fn checkpoint_from_row(row: sqlx::sqlite::SqliteRow) -> ChronicleCheckpoint {
+/// Decode a checkpoint row.
+///
+/// Timestamps and ids are not defaulted. A `Utc::now()` fallback on
+/// `covers_*_at` would invent a coverage range pointing at the present, and an
+/// empty-string `id` produces a checkpoint no lookup can resolve — both fail
+/// silently and corrupt the chronicle rather than surfacing a decode problem.
+fn checkpoint_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ChronicleCheckpoint> {
     let kind: String = row.try_get("kind").unwrap_or_else(|_| "interval".into());
-    ChronicleCheckpoint {
-        id: row.try_get("id").unwrap_or_default(),
-        channel_id: row.try_get("channel_id").unwrap_or_default(),
-        seq: row.try_get("seq").unwrap_or_default(),
+    Ok(ChronicleCheckpoint {
+        id: row.try_get("id").map_err(|error| anyhow::anyhow!(error))?,
+        channel_id: row
+            .try_get("channel_id")
+            .map_err(|error| anyhow::anyhow!(error))?,
+        seq: row.try_get("seq").map_err(|error| anyhow::anyhow!(error))?,
         level: row.try_get("level").unwrap_or_default(),
         kind: CheckpointKind::from_db(&kind),
         title: row.try_get("title").unwrap_or_default(),
         summary: row.try_get("summary").unwrap_or_default(),
-        covers_from_at: row.try_get("covers_from_at").unwrap_or_else(|_| Utc::now()),
-        covers_to_at: row.try_get("covers_to_at").unwrap_or_else(|_| Utc::now()),
+        covers_from_at: row
+            .try_get("covers_from_at")
+            .map_err(|error| anyhow::anyhow!(error))?,
+        covers_to_at: row
+            .try_get("covers_to_at")
+            .map_err(|error| anyhow::anyhow!(error))?,
         covers_from_message_id: row.try_get("covers_from_message_id").ok().flatten(),
         covers_to_message_id: row.try_get("covers_to_message_id").ok().flatten(),
         covers_from_seq: row.try_get("covers_from_seq").unwrap_or(0),
-        covers_to_seq: row.try_get("covers_to_seq").unwrap_or(0),
+        covers_to_seq: row
+            .try_get("covers_to_seq")
+            .map_err(|error| anyhow::anyhow!(error))?,
         message_count: row.try_get("message_count").unwrap_or_default(),
         token_estimate: row.try_get("token_estimate").unwrap_or_default(),
         rolled_up_into: row.try_get("rolled_up_into").ok().flatten(),
         rolls_up_from_seq: row.try_get("rolls_up_from_seq").ok().flatten(),
         rolls_up_to_seq: row.try_get("rolls_up_to_seq").ok().flatten(),
         model: row.try_get("model").ok().flatten(),
-        created_at: row.try_get("created_at").unwrap_or_else(|_| Utc::now()),
-    }
+        created_at: row
+            .try_get("created_at")
+            .map_err(|error| anyhow::anyhow!(error))?,
+    })
+}
+
+/// Decode a list of checkpoint rows, dropping and logging any that fail.
+///
+/// A single unreadable row must not take down a prompt render, but it must not
+/// masquerade as a valid checkpoint either.
+fn checkpoints_from_rows(rows: Vec<sqlx::sqlite::SqliteRow>) -> Vec<ChronicleCheckpoint> {
+    rows.iter()
+        .filter_map(|row| match checkpoint_from_row(row) {
+            Ok(checkpoint) => Some(checkpoint),
+            Err(error) => {
+                tracing::warn!(%error, "skipping undecodable chronicle checkpoint row");
+                None
+            }
+        })
+        .collect()
 }
 
 fn message_from_row(row: sqlx::sqlite::SqliteRow) -> ConversationMessage {

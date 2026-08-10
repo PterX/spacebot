@@ -806,7 +806,14 @@ pub(super) async fn inspect_prompt(
             compaction.chronicle,
         )
         .await
-        .unwrap_or_default()
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                %error,
+                channel_id = %query.channel_id,
+                "failed to render chronicle view for prompt inspection"
+            );
+            None
+        })
     } else {
         None
     };

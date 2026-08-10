@@ -3,6 +3,7 @@ import {useQuery} from "@tanstack/react-query";
 import {InlineBranchCard, MessageBubble} from "@spacedrive/ai";
 import {File as FileIcon} from "@phosphor-icons/react";
 import {api, type AttachmentMeta, type TimelineBranchRun, type TimelineCheckpoint, type TimelineItem, type WorkerListItem} from "@/api/client";
+import {Markdown} from "@/components/Markdown";
 import {ToolCall, type ToolCallPair, tryParseJson, isErrorResult} from "@/components/ToolCall";
 import {PortalWorkerCard} from "./PortalWorkerCard";
 import clsx from "clsx";
@@ -39,7 +40,7 @@ function InlineCheckpointCard({item}: {item: TimelineCheckpoint}) {
 			</button>
 			{expanded && (
 				<div className="mt-2 rounded-md border border-app-line/60 px-3 py-2 text-sm text-ink-dull">
-					{item.summary}
+					<Markdown>{item.summary}</Markdown>
 				</div>
 			)}
 		</div>

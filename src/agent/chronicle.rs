@@ -221,6 +221,16 @@ impl HistoryFence {
     }
 }
 
+/// Clears the in-flight cut flag however the spawned task exits, panic
+/// included.
+struct CuttingGuard(Arc<AtomicBool>);
+
+impl Drop for CuttingGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// The fence state a cut captured when it started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FenceSnapshot {
@@ -396,11 +406,15 @@ impl Chronicler {
         let cutting = self.cutting.clone();
 
         tokio::spawn(async move {
+            // Released on unwind too: a panic in summarization would otherwise
+            // leave the flag set for the process lifetime, and the channel
+            // would never cut or trim again — it would just drift into
+            // emergency truncation every turn.
+            let _release = CuttingGuard(cutting);
             let channel_id = cut.channel_id.clone();
             if let Err(error) = cut.run(kind, boundary).await {
                 tracing::error!(channel_id = %channel_id, %error, "chronicle checkpoint failed");
             }
-            cutting.store(false, Ordering::Release);
         });
     }
 
@@ -497,8 +511,31 @@ impl Chronicler {
             })
             .await?;
 
-        if let CommitOutcome::Committed(checkpoint) = outcome {
-            emit_checkpoint_event(&self.deps, &self.channel_id, &checkpoint);
+        match outcome {
+            CommitOutcome::Committed(checkpoint) => {
+                emit_checkpoint_event(&self.deps, &self.channel_id, &checkpoint);
+            }
+            // The drain already happened. Without a checkpoint the discarded
+            // span has nothing describing it, so say so rather than returning
+            // quietly.
+            CommitOutcome::Superseded { expected, found } => {
+                tracing::warn!(
+                    channel_id = %self.channel_id,
+                    expected,
+                    found,
+                    removed,
+                    "emergency truncation dropped live messages but its checkpoint was \
+                     superseded; the span is unmarked until the next cut covers it"
+                );
+            }
+            CommitOutcome::Busy => {
+                tracing::warn!(
+                    channel_id = %self.channel_id,
+                    removed,
+                    "emergency truncation dropped live messages but could not take the write \
+                     lock; the span is unmarked until the next cut covers it"
+                );
+            }
         }
 
         Ok(true)
@@ -930,7 +967,11 @@ pub async fn render_chronicle_view(
         return Ok(None);
     }
 
-    let since = now - Duration::hours(config.recent_window_hours);
+    // A hostile or mistaken config value must not panic the prompt render, so
+    // this is the fallible constructor with the default as a floor.
+    let window = Duration::try_hours(config.recent_window_hours)
+        .unwrap_or_else(|| Duration::hours(ChronicleConfig::default().recent_window_hours));
+    let since = now - window;
     let recent = store
         .list_since(channel_id, 0, since, config.max_recent as i64)
         .await?;
@@ -1445,6 +1486,39 @@ mod tests {
             10,
             "a stale cut must not trim on top of another mutator"
         );
+    }
+
+    /// A panic inside the cut task must still release the in-flight flag, or
+    /// the channel never cuts or trims again.
+    #[tokio::test]
+    async fn a_panicking_cut_releases_the_in_flight_flag() {
+        let cutting = Arc::new(AtomicBool::new(true));
+        let flag = cutting.clone();
+
+        let task = tokio::spawn(async move {
+            let _release = CuttingGuard(flag);
+            panic!("summarization blew up");
+        });
+
+        assert!(task.await.is_err(), "the task should have panicked");
+        assert!(
+            !cutting.load(Ordering::Acquire),
+            "the flag must be cleared on unwind, not just on the happy path"
+        );
+    }
+
+    /// An out-of-range window must not panic the prompt render.
+    #[tokio::test]
+    async fn an_absurd_recent_window_does_not_panic_the_view() {
+        let store = store_with_two_checkpoints().await;
+        let config = ChronicleConfig {
+            recent_window_hours: i64::MAX,
+            ..ChronicleConfig::default()
+        };
+        let view = render_chronicle_view(&store, "ch", Utc::now(), config)
+            .await
+            .expect("view must not fail");
+        assert!(view.is_some(), "the chronicle still renders");
     }
 
     // ---- Context assembly under a hard budget ----

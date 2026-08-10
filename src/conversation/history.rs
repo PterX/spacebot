@@ -964,9 +964,13 @@ impl ProcessRunLogger {
             .filter_map(
                 |row| -> Option<Vec<(chrono::DateTime<chrono::Utc>, TimelineItem)>> {
                     let item_type: String = row.try_get("item_type").ok()?;
+                    // Sorts last, so an undecodable row is dropped by
+                    // truncate first instead of displacing a real newest item.
+                    // Keying it at `now()` would also disagree with the
+                    // rendered `created_at`, which falls back to empty.
                     let row_timestamp = row
                         .try_get::<chrono::DateTime<chrono::Utc>, _>("timestamp")
-                        .unwrap_or_else(|_| chrono::Utc::now());
+                        .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
                     match item_type.as_str() {
                         "message" => {
                             let metadata_json: Option<String> =
@@ -1105,7 +1109,22 @@ impl ProcessRunLogger {
                 .cmp(&left.0)
                 .then_with(|| timeline_item_id(&right.1).cmp(timeline_item_id(&left.1)))
         });
-        items.truncate(limit as usize);
+        // Truncate on a group boundary. A message row expands into its tool
+        // calls plus the message, all sharing one sort key; cutting inside that
+        // group leaves orphan tool-call entries whose parent message was
+        // dropped. Walk back to the start of a straddled group instead.
+        if items.len() > limit as usize {
+            let mut cut = limit as usize;
+            if cut > 0 {
+                let boundary_key = items[cut - 1].0;
+                if items.get(cut).is_some_and(|(key, _)| *key == boundary_key) {
+                    while cut > 0 && items[cut - 1].0 == boundary_key {
+                        cut -= 1;
+                    }
+                }
+            }
+            items.truncate(cut);
+        }
         let mut items: Vec<TimelineItem> = items.into_iter().map(|(_, item)| item).collect();
         items.reverse();
         Ok(items)
@@ -1659,6 +1678,70 @@ mod tests {
             5,
             "every same-second message must be reachable by paging: {seen:?}"
         );
+    }
+
+    /// Truncating a page must not leave tool calls whose parent message was
+    /// dropped: they share one sort key and are inserted as a group.
+    #[test]
+    fn page_truncation_never_orphans_tool_calls() {
+        // Newest-first, as the merge produces: two tool calls then their
+        // message, all sharing one key, followed by an older message.
+        let key_new = chrono::DateTime::<chrono::Utc>::MIN_UTC + chrono::Duration::seconds(10);
+        let key_old = chrono::DateTime::<chrono::Utc>::MIN_UTC;
+        let mut items = vec![
+            (key_new, tool_call_item("tc-1")),
+            (key_new, tool_call_item("tc-2")),
+            (key_new, message_item("msg-new")),
+            (key_old, message_item("msg-old")),
+        ];
+
+        // A limit of 2 lands inside the group; the whole group must go.
+        let limit = 2usize;
+        if items.len() > limit {
+            let mut cut = limit;
+            if cut > 0 {
+                let boundary_key = items[cut - 1].0;
+                if items.get(cut).is_some_and(|(key, _)| *key == boundary_key) {
+                    while cut > 0 && items[cut - 1].0 == boundary_key {
+                        cut -= 1;
+                    }
+                }
+            }
+            items.truncate(cut);
+        }
+
+        let kept: Vec<&str> = items
+            .iter()
+            .map(|(_, item)| timeline_item_id(item))
+            .collect();
+        assert!(
+            !kept.contains(&"tc-1") && !kept.contains(&"tc-2"),
+            "tool calls must not outlive their message: {kept:?}"
+        );
+    }
+
+    fn tool_call_item(id: &str) -> TimelineItem {
+        TimelineItem::ToolCallRun {
+            id: id.to_string(),
+            tool_name: "shell".into(),
+            args: "{}".into(),
+            result: None,
+            status: "completed".into(),
+            started_at: String::new(),
+            completed_at: None,
+        }
+    }
+
+    fn message_item(id: &str) -> TimelineItem {
+        TimelineItem::Message {
+            id: id.to_string(),
+            role: "user".into(),
+            sender_name: None,
+            sender_id: None,
+            content: "hi".into(),
+            created_at: String::new(),
+            attachments: Vec::new(),
+        }
     }
 
     #[tokio::test]

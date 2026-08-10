@@ -1191,7 +1191,13 @@ impl Channel {
     /// Recomputed from durable state each turn, so a restarted channel renders
     /// the same section the running one did.
     async fn render_session_chronicle(&self) -> Option<String> {
-        if !self.uses_chronicle() {
+        // Deliberately not gated on the current mode. Chronicle mode trims
+        // checkpointed ranges out of live history; if switching to rolling also
+        // stopped rendering those checkpoints, everything they covered would
+        // vanish from the prompt and the channel would resume from only the
+        // uncheckpointed tail. A channel that has ever chronicled keeps its
+        // chronicle view — cutting new checkpoints is what the mode governs.
+        if self.state.kind.self_exits() {
             return None;
         }
 
