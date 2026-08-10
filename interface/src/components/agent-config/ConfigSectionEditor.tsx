@@ -226,7 +226,9 @@ export function ConfigSectionEditor({
 					"cortex",
 				] as const;
 				const textSlotValues = textSlotKeys.map((key) => localValues[key] ?? "");
-				const uniformModel = textSlotValues.every((v) => v === textSlotValues[0])
+				const uniformModel = textSlotValues.every(
+					(slotValue) => slotValue === textSlotValues[0],
+				)
 					? textSlotValues[0]
 					: "";
 				const applyModelToAllSlots = (model: string) => {

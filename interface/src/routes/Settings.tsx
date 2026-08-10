@@ -90,8 +90,14 @@ export function Settings() {
 	});
 
 	// Per-provider default models come from the backend routing defaults so the
-	// UI can never drift from what the server would actually apply.
-	const {data: defaultModels} = useQuery({
+	// UI can never drift from what the server would actually apply. The editor
+	// seeds its model field from these, so provider editing stays disabled until
+	// they arrive.
+	const {
+		data: defaultModels,
+		isLoading: defaultModelsLoading,
+		isError: defaultModelsError,
+	} = useQuery({
 		queryKey: ["provider-default-models"],
 		queryFn: api.providerDefaultModels,
 		staleTime: Infinity,
@@ -616,7 +622,16 @@ export function Settings() {
 								</p>
 							</div>
 
-							{isLoading ? (
+							{defaultModelsError && (
+								<div className="mb-4 rounded-md border border-red-500/20 bg-red-500/10 px-4 py-3">
+									<p className="text-sm text-red-400">
+										Couldn't load the provider default models. Editing is
+										disabled until they load — reload the page to try again.
+									</p>
+								</div>
+							)}
+
+							{isLoading || defaultModelsLoading ? (
 								<div className="flex items-center gap-2 text-ink-dull">
 									<div className="h-2 w-2 animate-pulse rounded-full bg-accent" />
 									Loading providers...
@@ -631,6 +646,7 @@ export function Settings() {
 											description={provider.description}
 											configured={isConfigured(provider.id)}
 											defaultModel={defaultModels?.defaults[provider.id] ?? ""}
+											editDisabled={!defaultModels}
 											onEdit={() => {
 												setEditingProvider(provider.id);
 												setKeyInput("");
