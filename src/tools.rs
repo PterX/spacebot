@@ -31,6 +31,7 @@
 //! - branch + worker tool superset plus `spacebot_docs`, `config_inspect`, `spawn_worker`,
 //!   and `restart`
 
+pub mod ask;
 pub mod attachment_recall;
 pub mod autonomy_complete;
 pub mod branch_tool;
@@ -90,6 +91,7 @@ pub mod factory_search_context;
 pub mod factory_update_config;
 pub mod factory_update_identity;
 
+pub use ask::{AskArgs, AskError, AskOptionArg, AskOutput, AskTool};
 pub use attachment_recall::{
     AttachmentRecallArgs, AttachmentRecallError, AttachmentRecallOutput, AttachmentRecallTool,
 };
@@ -497,12 +499,24 @@ pub async fn add_channel_tools(
             .unwrap_or_else(|| state.deps.agent_id.to_string());
         handle
             .add_tool(ReplyTool::new(
-                reply_target,
+                reply_target.clone(),
                 conversation_id.clone(),
                 state.conversation_logger.clone(),
                 state.channel_id.clone(),
                 replied_flag.clone(),
+                agent_display_name.clone(),
+                state.deps.api_state.clone(),
+            ))
+            .await?;
+        handle
+            .add_tool(AskTool::new(
+                crate::questions::QuestionStore::new(state.deps.sqlite_pool.clone()),
+                response_tx.clone(),
+                state.conversation_logger.clone(),
+                state.channel_id.clone(),
+                state.deps.agent_id.to_string(),
                 agent_display_name,
+                replied_flag.clone(),
                 state.deps.api_state.clone(),
             ))
             .await?;
@@ -852,6 +866,7 @@ pub async fn remove_channel_tools(
 ) -> Result<(), rig::tool::server::ToolServerError> {
     if allow_direct_reply {
         handle.remove_tool(ReplyTool::NAME).await?;
+        handle.remove_tool(AskTool::NAME).await?;
     }
     handle.remove_tool(BranchTool::NAME).await?;
     handle.remove_tool(SpawnWorkerTool::NAME).await?;

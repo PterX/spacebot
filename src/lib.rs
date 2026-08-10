@@ -26,6 +26,7 @@ pub mod openai_auth;
 pub mod opencode;
 pub mod projects;
 pub mod prompts;
+pub mod questions;
 pub mod sandbox;
 pub mod schedule;
 pub mod secrets;

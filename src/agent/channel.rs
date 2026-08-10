@@ -133,6 +133,76 @@ fn is_control_command(message: &InboundMessage) -> bool {
     }
 }
 
+/// Enrich an ask-tool interaction with the original question context.
+///
+/// When an inbound `Interaction` has an `action_id` matching the `ask:` prefix,
+/// this looks up the pending question, resolves it, and returns a human-readable
+/// enrichment like `Alice answered "Which environment?": staging`.
+///
+/// Non-ask interactions pass through as-is. Expired or already-resolved questions
+/// get an `(expired)` marker.
+async fn enrich_ask_interaction(
+    pool: &sqlx::SqlitePool,
+    sender_name: &str,
+    action_id: &str,
+    values: &[String],
+) -> String {
+    let (question_id, option_idx) = match crate::tools::ask::parse_ask_custom_id(action_id) {
+        Some(parsed) => parsed,
+        None => {
+            // Not an ask interaction — use standard display
+            if !values.is_empty() {
+                return format!("[interaction: {action_id} → {:?}]", values);
+            }
+            return format!("[interaction: {action_id}]");
+        }
+    };
+
+    let store = crate::questions::QuestionStore::new(pool.clone());
+
+    match store.get(question_id).await {
+        Ok(Some(q)) if q.resolved_at.is_none() => {
+            let answer_labels: Vec<String> = match option_idx {
+                Some(idx) => {
+                    // Button click: use the option at this index
+                    q.options
+                        .get(idx)
+                        .map(|opt| vec![opt.label.clone()])
+                        .unwrap_or_default()
+                }
+                None => {
+                    // Select menu: parse values to get indices
+                    values
+                        .iter()
+                        .filter_map(|value| {
+                            let (_, idx) = crate::tools::ask::parse_ask_custom_id(value)?;
+                            idx.and_then(|i| q.options.get(i).map(|opt| opt.label.clone()))
+                        })
+                        .collect()
+                }
+            };
+
+            if answer_labels.is_empty() {
+                return format!("[interaction: {action_id}] (expired — no matching options)");
+            }
+
+            // Resolve the question so duplicate clicks get the expired path
+            let _ = store.resolve(question_id, &answer_labels).await;
+
+            let labels_str = answer_labels.join(", ");
+            format!("{sender_name} answered \"{}\": {labels_str}", q.question)
+        }
+        Ok(Some(_)) => {
+            // Already resolved
+            format!("[interaction: {action_id}] (expired)")
+        }
+        _ => {
+            // Question not found or store error
+            format!("[interaction: {action_id}] (expired)")
+        }
+    }
+}
+
 fn should_flush_coalesce_buffer_for_event(event: &ProcessEvent) -> bool {
     matches!(
         event,
@@ -1957,8 +2027,19 @@ impl Channel {
                     }
                     // Render interactions and commands as their Display form
                     // so the LLM sees plain text.
-                    crate::MessageContent::Interaction { .. }
-                    | crate::MessageContent::Command { .. } => {
+                    crate::MessageContent::Interaction {
+                        action_id, values, ..
+                    } => {
+                        let text = enrich_ask_interaction(
+                            &self.deps.sqlite_pool,
+                            &sender_name,
+                            action_id,
+                            values,
+                        )
+                        .await;
+                        (text, Vec::new())
+                    }
+                    crate::MessageContent::Command { .. } => {
                         (message.content.to_string(), Vec::new())
                     }
                 };
@@ -2353,9 +2434,16 @@ impl Channel {
             // Render interactions and commands as their Display form so the
             // LLM sees plain text; a Command renders as "/name args" and is
             // dispatched by the same parse below.
-            crate::MessageContent::Interaction { .. } | crate::MessageContent::Command { .. } => {
-                (message.content.to_string(), Vec::new())
+            crate::MessageContent::Interaction {
+                action_id, values, ..
+            } => {
+                let sender = participant_display_name(&message);
+                let raw_text =
+                    enrich_ask_interaction(&self.deps.sqlite_pool, &sender, action_id, values)
+                        .await;
+                (raw_text, Vec::new())
             }
+            crate::MessageContent::Command { .. } => (message.content.to_string(), Vec::new()),
         };
 
         // Save attachments to disk when enabled, capturing bytes for LLM reuse
