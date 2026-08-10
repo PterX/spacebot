@@ -2004,6 +2004,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/restart": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Restart the daemon in place. The response is sent immediately; teardown
+         *     and re-exec begin after the lifecycle grace delay so this response and any
+         *     other in-flight requests can flush.
+         */
+        post: operations["restart"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/secrets": {
         parameters: {
             query?: never;
@@ -4319,6 +4340,9 @@ export interface components {
          * @enum {string}
          */
         ResponseMode: "active" | "observe" | "mention_only";
+        RestartResponse: {
+            status: string;
+        };
         RestoreVersionRequest: {
             author_id?: string;
             author_type?: string;
@@ -10009,6 +10033,34 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    restart: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RestartResponse"];
+                };
+            };
+            /** @description Daemon lifecycle control not available */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RestartResponse"];
+                };
             };
         };
     };

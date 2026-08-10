@@ -903,6 +903,10 @@ export interface UpdateApplyResponse {
 	error?: string;
 }
 
+export interface RestartResponse {
+	status: "restarting" | "already_pending" | "unavailable";
+}
+
 // -- Global Settings Types --
 
 export interface OpenCodePermissions {
@@ -2168,6 +2172,15 @@ export const api = {
 			throw new Error(`API error: ${response.status}`);
 		}
 		return response.json() as Promise<UpdateApplyResponse>;
+	},
+	restart: async () => {
+		const response = await fetch(`${getApiBase()}/restart`, { method: "POST" });
+		// 503 carries a typed RestartResponse ({ status: "unavailable" }) so the
+		// UI can show its unavailable-state message instead of a generic error.
+		if (!response.ok && response.status !== 503) {
+			throw new Error(`API error: ${response.status}`);
+		}
+		return response.json() as Promise<RestartResponse>;
 	},
 
 	// Skills API

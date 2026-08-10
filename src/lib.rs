@@ -15,6 +15,7 @@ pub mod github_copilot_auth;
 pub mod goals;
 pub mod hooks;
 pub mod identity;
+pub mod lifecycle;
 pub mod links;
 pub mod llm;
 pub mod mcp;
@@ -487,6 +488,14 @@ pub struct AgentDeps {
 }
 
 impl AgentDeps {
+    /// Lifecycle handle for daemon restart/shutdown requests. `None` outside
+    /// the daemon runtime (tests, config preview).
+    pub fn lifecycle(&self) -> Option<lifecycle::LifecycleHandle> {
+        self.api_state
+            .as_ref()
+            .and_then(|state| state.lifecycle.load().as_ref().clone())
+    }
+
     pub fn memory_search(&self) -> &Arc<memory::MemorySearch> {
         &self.memory_search
     }

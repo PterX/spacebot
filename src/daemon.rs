@@ -9,7 +9,6 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::watch;
 use tracing_subscriber::fmt::format;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -22,6 +21,7 @@ use std::time::Instant;
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum IpcCommand {
     Shutdown,
+    Restart,
     Status,
 }
 
@@ -30,8 +30,18 @@ pub enum IpcCommand {
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum IpcResponse {
     Ok,
-    Status { pid: u32, uptime_seconds: u64 },
-    Error { message: String },
+    Status {
+        pid: u32,
+        uptime_seconds: u64,
+        /// Per-process nonce. A restart is confirmed by observing this value
+        /// change, since a foreground re-exec keeps the same PID. Optional so
+        /// clients tolerate daemons that predate the field.
+        #[serde(default)]
+        run_id: Option<String>,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// Paths for daemon runtime files, all derived from the instance directory.
@@ -345,11 +355,13 @@ fn build_otlp_provider(telemetry: &TelemetryConfig) -> Option<SdkTracerProvider>
     Some(provider)
 }
 
-/// Start the IPC server. Returns a shutdown receiver that the main event
-/// loop should select on.
+/// Start the IPC server. Lifecycle commands are forwarded to the provided
+/// handle; the main event loop selects on its watch channel.
 pub async fn start_ipc_server(
     paths: &DaemonPaths,
-) -> anyhow::Result<(watch::Receiver<bool>, tokio::task::JoinHandle<()>)> {
+    lifecycle: crate::lifecycle::LifecycleHandle,
+    run_id: String,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     // Ensure the instance directory exists (e.g. on first run)
     if let Some(parent) = paths.socket.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
@@ -367,19 +379,20 @@ pub async fn start_ipc_server(
     let listener = UnixListener::bind(&paths.socket)
         .with_context(|| format!("failed to bind IPC socket: {}", paths.socket.display()))?;
 
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let start_time = Instant::now();
     let socket_path = paths.socket.clone();
 
+    let accept_lifecycle = lifecycle.clone();
     let handle = tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, _address)) => {
-                    let shutdown_tx = shutdown_tx.clone();
+                    let lifecycle = accept_lifecycle.clone();
                     let uptime = start_time.elapsed();
+                    let run_id = run_id.clone();
                     tokio::spawn(async move {
                         if let Err(error) =
-                            handle_ipc_connection(stream, &shutdown_tx, uptime).await
+                            handle_ipc_connection(stream, &lifecycle, uptime, &run_id).await
                         {
                             tracing::warn!(%error, "IPC connection handler failed");
                         }
@@ -394,20 +407,35 @@ pub async fn start_ipc_server(
 
     // Spawn a cleanup task that removes the socket file when the server shuts down
     let cleanup_socket = socket_path.clone();
-    let mut cleanup_rx = shutdown_rx.clone();
+    let mut cleanup_rx = lifecycle.subscribe();
     tokio::spawn(async move {
-        let _ = cleanup_rx.wait_for(|shutdown| *shutdown).await;
-        let _ = std::fs::remove_file(&cleanup_socket);
+        if cleanup_rx
+            .wait_for(|state| *state != crate::lifecycle::LifecycleState::Running)
+            .await
+            .is_err()
+        {
+            tracing::debug!("lifecycle sender dropped before socket cleanup");
+        }
+        if let Err(error) = std::fs::remove_file(&cleanup_socket)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::debug!(
+                %error,
+                path = %cleanup_socket.display(),
+                "failed to remove IPC socket"
+            );
+        }
     });
 
-    Ok((shutdown_rx, handle))
+    Ok(handle)
 }
 
 /// Handle a single IPC client connection.
 async fn handle_ipc_connection(
     stream: UnixStream,
-    shutdown_tx: &watch::Sender<bool>,
+    lifecycle: &crate::lifecycle::LifecycleHandle,
     uptime: std::time::Duration,
+    run_id: &str,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(reader);
@@ -417,15 +445,32 @@ async fn handle_ipc_connection(
     let command: IpcCommand = serde_json::from_str(line.trim())
         .with_context(|| format!("invalid IPC command: {line}"))?;
 
+    // Lifecycle requests only arm a delayed sender that fires after
+    // SHUTDOWN_GRACE, so requesting the transition first still leaves the
+    // whole grace window to flush the acknowledgement before teardown begins.
     let response = match command {
         IpcCommand::Shutdown => {
-            tracing::info!("shutdown requested via IPC");
-            shutdown_tx.send(true).ok();
-            IpcResponse::Ok
+            if lifecycle.request_shutdown("ipc") {
+                IpcResponse::Ok
+            } else {
+                IpcResponse::Error {
+                    message: "a shutdown is already pending".to_string(),
+                }
+            }
+        }
+        IpcCommand::Restart => {
+            if lifecycle.request_restart("ipc") {
+                IpcResponse::Ok
+            } else {
+                IpcResponse::Error {
+                    message: "a shutdown or restart is already pending".to_string(),
+                }
+            }
         }
         IpcCommand::Status => IpcResponse::Status {
             pid: std::process::id(),
             uptime_seconds: uptime.as_secs(),
+            run_id: Some(run_id.to_string()),
         },
     };
 
@@ -521,5 +566,110 @@ mod tests {
 
         assert!(!was_truncated);
         assert_eq!(truncated, "hello");
+    }
+
+    #[test]
+    fn restart_command_roundtrips() {
+        let json = serde_json::to_string(&IpcCommand::Restart).unwrap();
+        assert_eq!(json, r#"{"command":"restart"}"#);
+        assert!(matches!(
+            serde_json::from_str(&json).unwrap(),
+            IpcCommand::Restart
+        ));
+    }
+
+    #[test]
+    fn status_response_tolerates_missing_run_id() {
+        // A daemon predating the run_id field replies without it.
+        let legacy = r#"{"result":"status","pid":42,"uptime_seconds":7}"#;
+        let response: IpcResponse = serde_json::from_str(legacy).unwrap();
+        assert!(matches!(
+            response,
+            IpcResponse::Status {
+                pid: 42,
+                run_id: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn status_response_carries_run_id() {
+        let response = IpcResponse::Status {
+            pid: 1,
+            uptime_seconds: 0,
+            run_id: Some("abc".into()),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            IpcResponse::Status { run_id: Some(id), .. } if id == "abc"
+        ));
+    }
+
+    async fn send_ipc(
+        lifecycle: &crate::lifecycle::LifecycleHandle,
+        command: IpcCommand,
+    ) -> IpcResponse {
+        let (client, server) = UnixStream::pair().unwrap();
+        let lifecycle = lifecycle.clone();
+        let server_task = tokio::spawn(async move {
+            handle_ipc_connection(server, &lifecycle, std::time::Duration::ZERO, "test-run").await
+        });
+
+        let (reader, mut writer) = client.into_split();
+        let mut command_bytes = serde_json::to_vec(&command).unwrap();
+        command_bytes.push(b'\n');
+        writer.write_all(&command_bytes).await.unwrap();
+        writer.flush().await.unwrap();
+
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        server_task.await.unwrap().unwrap();
+        serde_json::from_str(line.trim()).unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ipc_shutdown_acknowledges_and_fires_lifecycle() {
+        let (lifecycle, mut lifecycle_rx) = crate::lifecycle::LifecycleHandle::new();
+
+        let response = send_ipc(&lifecycle, IpcCommand::Shutdown).await;
+        assert!(matches!(response, IpcResponse::Ok));
+
+        lifecycle_rx
+            .wait_for(|state| *state != crate::lifecycle::LifecycleState::Running)
+            .await
+            .unwrap();
+        assert_eq!(
+            *lifecycle_rx.borrow(),
+            crate::lifecycle::LifecycleState::Exit
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ipc_rejected_restart_is_reported_to_client() {
+        let (lifecycle, _lifecycle_rx) = crate::lifecycle::LifecycleHandle::new();
+        assert!(lifecycle.request_shutdown("test"));
+
+        // A restart cannot supersede a pending shutdown; the client must see
+        // the rejection instead of a blind Ok.
+        let response = send_ipc(&lifecycle, IpcCommand::Restart).await;
+        assert!(matches!(response, IpcResponse::Error { .. }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ipc_duplicate_shutdown_is_rejected() {
+        let (lifecycle, _lifecycle_rx) = crate::lifecycle::LifecycleHandle::new();
+
+        assert!(matches!(
+            send_ipc(&lifecycle, IpcCommand::Shutdown).await,
+            IpcResponse::Ok
+        ));
+        assert!(matches!(
+            send_ipc(&lifecycle, IpcCommand::Shutdown).await,
+            IpcResponse::Error { .. }
+        ));
     }
 }
