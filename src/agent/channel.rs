@@ -152,7 +152,7 @@ async fn enrich_ask_interaction(
         None => {
             // Not an ask interaction — use standard display
             if !values.is_empty() {
-                return format!("[interaction: {action_id} → {:?}]", values);
+                return format!("[interaction: {action_id} → {}]", values.join(", "));
             }
             return format!("[interaction: {action_id}]");
         }
@@ -186,8 +186,15 @@ async fn enrich_ask_interaction(
                 return format!("[interaction: {action_id}] (expired — no matching options)");
             }
 
-            // Resolve the question so duplicate clicks get the expired path
-            let _ = store.resolve(question_id, &answer_labels).await;
+            // Resolve the question so duplicate clicks get the expired path.
+            // Failure is non-fatal — the answer still rendered correctly.
+            if let Err(e) = store.resolve(question_id, &answer_labels).await {
+                tracing::warn!(
+                    question_id,
+                    error = %e,
+                    "failed to resolve pending question; duplicate clicks may re-fire"
+                );
+            }
 
             let labels_str = answer_labels.join(", ");
             format!("{sender_name} answered \"{}\": {labels_str}", q.question)

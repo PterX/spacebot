@@ -276,7 +276,7 @@ impl Tool for AskTool {
         tracing::info!(
             question_id = %question_id,
             channel_id = %self.channel_id,
-            question = %question,
+            question_len = question.len(),
             options_count = options.len(),
             multi_select = args.multi_select,
             "ask tool sent question"

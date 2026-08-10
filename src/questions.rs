@@ -60,8 +60,10 @@ pub struct QuestionStore {
     pool: SqlitePool,
 }
 
-fn now_iso() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+/// Timestamp matching SQLite's CURRENT_TIMESTAMP format so comparisons
+/// against `datetime('now', …)` are consistent.
+fn now_sqlite() -> String {
+    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 impl QuestionStore {
@@ -92,6 +94,18 @@ impl QuestionStore {
         .await
         .context("failed to insert pending question")?;
 
+        // Prune expired questions in the background so the table does not
+        // grow unbounded. Failure is non-fatal — the next write retries.
+        let prune_pool = self.pool.clone();
+        tokio::spawn(async move {
+            if let Err(error) = QuestionStore::new(prune_pool)
+                .prune_expired(DEFAULT_QUESTION_TTL_DAYS)
+                .await
+            {
+                tracing::warn!(%error, "background prune of pending_questions failed");
+            }
+        });
+
         Ok(())
     }
 
@@ -121,7 +135,7 @@ impl QuestionStore {
     /// already resolved or not found.
     pub async fn resolve(&self, question_id: &str, answer: &[String]) -> Result<bool> {
         let answer_json = serde_json::to_string(answer).context("failed to serialize answer")?;
-        let now = now_iso();
+        let now = now_sqlite();
 
         let affected = sqlx::query(
             r#"
@@ -175,7 +189,9 @@ fn question_from_row(row: sqlx::sqlite::SqliteRow) -> Result<PendingQuestion> {
     let options: Vec<AskOption> =
         serde_json::from_str(&options_json).context("failed to parse question options")?;
 
-    let answer_json: Option<String> = row.try_get("answer").ok();
+    let answer_json: Option<String> = row
+        .try_get::<Option<String>, _>("answer")
+        .context("failed to read answer")?;
     let answer = match answer_json {
         Some(json) => Some(serde_json::from_str(&json).context("failed to parse question answer")?),
         None => None,
@@ -195,11 +211,15 @@ fn question_from_row(row: sqlx::sqlite::SqliteRow) -> Result<PendingQuestion> {
             .try_get::<i64, _>("multi_select")
             .context("failed to read multi_select")?
             != 0,
-        message_ref: row.try_get("message_ref").ok(),
+        message_ref: row
+            .try_get::<Option<String>, _>("message_ref")
+            .context("failed to read message_ref")?,
         created_at: row
             .try_get("created_at")
             .context("failed to read created_at")?,
-        resolved_at: row.try_get("resolved_at").ok(),
+        resolved_at: row
+            .try_get::<Option<String>, _>("resolved_at")
+            .context("failed to read resolved_at")?,
         answer,
     })
 }
