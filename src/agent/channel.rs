@@ -1361,6 +1361,7 @@ impl Channel {
         &mut self,
         def: &'static crate::commands::CommandDef,
         action: crate::commands::ControlAction,
+        args: &str,
     ) {
         use crate::commands::ControlAction;
 
@@ -1386,13 +1387,10 @@ impl Channel {
                     branch_model,
                     &temporal_context.current_time_line(),
                     self.deps
-                        .runtime_config
-                        .settings
-                        .load()
-                        .as_ref()
-                        .as_ref()
+                        .settings()
                         .and_then(|settings| settings.home_channel())
                         .as_ref(),
+                    self.deps.pause_reason().as_deref(),
                 );
                 self.send_builtin_text(body, def.name).await;
             }
@@ -1418,6 +1416,22 @@ impl Channel {
                     crate::commands::control::set_home_channel(&self.deps, &self.id, is_portal)
                         .await;
                 self.send_builtin_text(reply, def.name).await;
+            }
+            ControlAction::SetPause => {
+                let reply = crate::commands::control::set_pause(&self.deps, args);
+                self.send_builtin_text(reply, def.name).await;
+            }
+            ControlAction::WhoAmI => {
+                // The channel path has no sender scope to check, so it answers
+                // for the authority the binding already granted to get here.
+                let surface = crate::commands::Surface::from_source(
+                    self.current_adapter().unwrap_or("unknown"),
+                );
+                self.send_builtin_text(
+                    crate::commands::control::whoami_text(true, surface),
+                    def.name,
+                )
+                .await;
             }
         }
     }
@@ -2291,7 +2305,8 @@ impl Channel {
         match &parsed_command {
             crate::commands::ParseResult::Command(cmd) => {
                 if let crate::commands::CommandHandler::Control(action) = cmd.def.handler {
-                    self.handle_control_command(cmd.def, action).await;
+                    self.handle_control_command(cmd.def, action, &cmd.args)
+                        .await;
                     return Ok(());
                 }
             }

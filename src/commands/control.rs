@@ -56,9 +56,17 @@ pub fn status_text(
     branch_model: &str,
     now_line: &str,
     home: Option<&crate::settings::HomeChannel>,
+    pause_reason: Option<&str>,
 ) -> String {
+    // A pause overrides everything below it, so it leads.
+    let paused_line = match pause_reason {
+        Some("") => "- paused: yes\n".to_string(),
+        Some(reason) => format!("- paused: yes ({reason})\n"),
+        None => String::new(),
+    };
     format!(
         "status\n\
+         {paused_line}\
          - agent: {agent_id}\n\
          - channel: {channel_id}\n\
          - adapter: {adapter}\n\
@@ -98,8 +106,9 @@ pub struct ControlPlane {
 }
 
 impl ControlPlane {
-    /// Execute a control action and return the reply text.
-    pub async fn execute(&self, action: ControlAction) -> String {
+    /// Execute a control action and return the reply text. `args` carries the
+    /// validated argument string for actions that take one.
+    pub async fn execute(&self, action: ControlAction, args: &str) -> String {
         match action {
             ControlAction::Status => self.status().await,
             ControlAction::SetResponseMode(mode) => self.set_response_mode(mode).await,
@@ -108,12 +117,9 @@ impl ControlPlane {
             }
             ControlAction::AgentId => self.deps.agent_id.to_string(),
             ControlAction::SetHome => self.set_home().await,
+            ControlAction::SetPause => set_pause(&self.deps, args),
+            ControlAction::WhoAmI => whoami_text(self.is_authority, self.surface),
         }
-    }
-
-    /// The settings store, once the runtime has finished wiring it up.
-    fn settings(&self) -> Option<std::sync::Arc<crate::settings::SettingsStore>> {
-        self.deps.runtime_config.settings.load().as_ref().clone()
     }
 
     async fn set_home(&self) -> String {
@@ -193,7 +199,8 @@ impl ControlPlane {
             channel_model,
             branch_model,
             &temporal_context.current_time_line(),
-            self.settings().and_then(|s| s.home_channel()).as_ref(),
+            self.deps.settings().and_then(|s| s.home_channel()).as_ref(),
+            self.deps.pause_reason().as_deref(),
         )
     }
 
@@ -263,6 +270,74 @@ async fn conversation_broadcast_target(
 
     crate::messaging::target::resolve_broadcast_target(&channel)
         .ok_or_else(|| "couldn't resolve this chat's delivery address".to_string())
+}
+
+/// `/whoami` reply: what the sender may do here, not who they are. The point
+/// is to make the authority split legible before someone hits a denial.
+pub fn whoami_text(is_authority: bool, surface: Surface) -> String {
+    let restricted = crate::commands::REGISTRY
+        .defs()
+        .iter()
+        .filter(|def| def.availability.on(surface))
+        .filter(|def| def.access == crate::commands::CommandAccess::Authority)
+        .count();
+
+    if is_authority {
+        format!(
+            "you have authority in this chat — every command is available to you, \
+             including the {restricted} that change my state."
+        )
+    } else {
+        format!(
+            "you can talk to me and run the read-only commands here. the {restricted} commands \
+             that change my state are limited to this chat's authority list. /help lists what \
+             you can run."
+        )
+    }
+}
+
+/// `/pause` reply, and the state change behind it. Empty args pause without a
+/// stated reason; `off` resumes.
+pub fn set_pause(deps: &crate::AgentDeps, args: &str) -> String {
+    let Some(settings) = deps.runtime_config.settings.load().as_ref().clone() else {
+        return "settings storage isn't available — pause state unchanged".to_string();
+    };
+
+    let args = args.trim();
+    if args.eq_ignore_ascii_case("off") {
+        if settings.pause_reason().is_none() {
+            return "not paused.".to_string();
+        }
+        return match settings.set_paused(None) {
+            Ok(()) => {
+                tracing::info!(agent = %deps.agent_id, "resumed after pause");
+                "resumed. new work starts again.".to_string()
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to clear pause");
+                "couldn't clear the pause — still paused".to_string()
+            }
+        };
+    }
+
+    match settings.set_paused(Some(args)) {
+        Ok(()) => {
+            tracing::warn!(agent = %deps.agent_id, reason = args, "paused: new work will not start");
+            let suffix = if args.is_empty() {
+                String::new()
+            } else {
+                format!(" ({args})")
+            };
+            format!(
+                "paused{suffix}. i won't start new work — commands still reach me. \
+                 /pause off resumes."
+            )
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to persist pause");
+            "couldn't save the pause — still running".to_string()
+        }
+    }
 }
 
 /// Claim a conversation as the home channel on behalf of first-run adoption,
@@ -379,7 +454,10 @@ mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
 
-    fn status_with_home(home: Option<&crate::settings::HomeChannel>) -> String {
+    fn status_with(
+        home: Option<&crate::settings::HomeChannel>,
+        pause_reason: Option<&str>,
+    ) -> String {
         status_text(
             "orion",
             "discord:guild:1",
@@ -389,7 +467,49 @@ mod tests {
             "model-b",
             "now",
             home,
+            pause_reason,
         )
+    }
+
+    fn status_with_home(home: Option<&crate::settings::HomeChannel>) -> String {
+        status_with(home, None)
+    }
+
+    #[test]
+    fn status_omits_the_pause_line_when_running() {
+        assert!(!status_with(None, None).contains("paused"));
+    }
+
+    #[test]
+    fn status_leads_with_a_pause_and_its_reason() {
+        let body = status_with(None, Some("deploying"));
+        assert!(body.contains("- paused: yes (deploying)"));
+        // The pause outranks everything it suppresses, so it reads first.
+        assert!(body.find("paused").unwrap() < body.find("- agent:").unwrap());
+    }
+
+    #[test]
+    fn status_reports_a_reasonless_pause_without_empty_parens() {
+        let body = status_with(None, Some(""));
+        assert!(body.contains("- paused: yes\n"));
+        assert!(!body.contains("()"));
+    }
+
+    #[test]
+    fn whoami_distinguishes_authority_from_everyone() {
+        let authority = whoami_text(true, Surface::Discord);
+        let everyone = whoami_text(false, Surface::Discord);
+        assert!(authority.contains("you have authority"));
+        assert!(everyone.contains("read-only"));
+        // Both name the same count, so the two replies describe one boundary.
+        let restricted = crate::commands::REGISTRY
+            .defs()
+            .iter()
+            .filter(|def| def.availability.on(Surface::Discord))
+            .filter(|def| def.access == crate::commands::CommandAccess::Authority)
+            .count();
+        assert!(authority.contains(&restricted.to_string()));
+        assert!(everyone.contains(&restricted.to_string()));
     }
 
     #[test]

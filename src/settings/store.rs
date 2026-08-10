@@ -16,6 +16,10 @@ const PROMPT_CAPTURE_PREFIX: &str = "prompt_capture:";
 pub const HOME_CHANNEL_KEY: &str = "home_channel";
 /// Whether the stored home channel was set deliberately.
 const HOME_CHANNEL_EXPLICIT_KEY: &str = "home_channel_explicit";
+/// Whether the agent is holding off on starting new work.
+const PAUSED_KEY: &str = "paused";
+/// Operator-supplied reason shown wherever the pause surfaces.
+const PAUSE_REASON_KEY: &str = "pause_reason";
 
 /// How worker execution logs are stored.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -203,6 +207,28 @@ impl SettingsStore {
     pub fn set_home_channel(&self, target: &str) -> Result<()> {
         self.set_raw(HOME_CHANNEL_KEY, target)?;
         self.set_raw(HOME_CHANNEL_EXPLICIT_KEY, "true")
+    }
+
+    /// Why the agent is paused, or `None` when it is running normally. A
+    /// pause with no stated reason yields an empty string.
+    pub fn pause_reason(&self) -> Option<String> {
+        matches!(self.get_raw(PAUSED_KEY), Ok(v) if v == "true")
+            .then(|| self.get_raw(PAUSE_REASON_KEY).unwrap_or_default())
+    }
+
+    /// Hold off on starting new work, or resume. Survives restart so an
+    /// emergency stop is not undone by a bounce.
+    pub fn set_paused(&self, reason: Option<&str>) -> Result<()> {
+        match reason {
+            Some(reason) => {
+                self.set_raw(PAUSE_REASON_KEY, reason)?;
+                self.set_raw(PAUSED_KEY, "true")
+            }
+            None => {
+                self.set_raw(PAUSE_REASON_KEY, "")?;
+                self.set_raw(PAUSED_KEY, "false")
+            }
+        }
     }
 
     /// Drop the home channel, returning the instance to sending nothing on

@@ -138,6 +138,12 @@ pub async fn maybe_run_autonomy(deps: &AgentDeps) {
         return;
     }
 
+    // A pause is an emergency stop on new work, and a self-directed run is
+    // the most new work the agent can start.
+    if deps.pause_reason().is_some() {
+        return;
+    }
+
     let stale_after_secs = config.timeout_secs.saturating_mul(2).max(60);
     match deps
         .autonomy_run_store

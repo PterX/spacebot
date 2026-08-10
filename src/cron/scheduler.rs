@@ -589,6 +589,18 @@ impl Scheduler {
                     }
                 }
 
+                // Skip the fire while paused, after the cursor has already
+                // advanced: a pause drops the runs it covers rather than
+                // banking them into a burst at resume.
+                if let Some(reason) = context.deps.pause_reason() {
+                    tracing::info!(
+                        cron_id = %job_id,
+                        reason = %reason,
+                        "skipping cron fire while paused"
+                    );
+                    continue;
+                }
+
                 tracing::info!(cron_id = %job_id, "cron job firing");
                 execution_lock.store(true, std::sync::atomic::Ordering::Release);
 

@@ -119,18 +119,24 @@ pub async fn dispatch_inbound(
                 // later /active. The work is a local SQLite roundtrip plus
                 // an in-memory cell update; only the reply delivery goes
                 // over the network, and that stays on a spawned task.
-                ControlAction::SetResponseMode(_) | ControlAction::SetHome => {
-                    let reply = plane.execute(action).await;
+                ControlAction::SetResponseMode(_)
+                | ControlAction::SetHome
+                | ControlAction::SetPause => {
+                    let reply = plane.execute(action, &parsed.args).await;
                     reply_ephemeral(messaging, deps, message, reply);
                 }
                 // Read-only control commands stay off the router's critical
                 // path entirely.
-                ControlAction::Status | ControlAction::Help | ControlAction::AgentId => {
+                ControlAction::Status
+                | ControlAction::Help
+                | ControlAction::AgentId
+                | ControlAction::WhoAmI => {
                     let messaging = messaging.clone();
                     let deps = deps.clone();
                     let target = message.clone();
+                    let args = parsed.args.clone();
                     tokio::spawn(async move {
-                        let reply = plane.execute(action).await;
+                        let reply = plane.execute(action, &args).await;
                         send_ephemeral(&messaging, &deps, &target, reply).await;
                     });
                 }

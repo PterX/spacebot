@@ -1550,6 +1550,18 @@ async fn run(
                         spacebot::commands::dispatch::Dispatch::Forward
                         | spacebot::commands::dispatch::Dispatch::ForwardCommand => {}
                     }
+
+                    // A paused agent starts no new work. Commands dispatch
+                    // above this line, so /pause off and /status still land.
+                    if let Some(reason) = agent.deps.pause_reason() {
+                        tracing::debug!(
+                            agent_id = %agent_id,
+                            conversation_id = %conversation_id,
+                            reason = %reason,
+                            "dropping inbound message while paused"
+                        );
+                        continue;
+                    }
                 }
 
                 // Find or create a channel for this conversation
