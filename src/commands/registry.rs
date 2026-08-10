@@ -171,6 +171,12 @@ pub enum ControlAction {
     /// Print the runtime agent id. Deterministic so identity checks bypass
     /// model output drift.
     AgentId,
+    /// Adopt the calling conversation as the instance's home channel.
+    SetHome,
+    /// Hold off on starting new work, or resume.
+    SetPause,
+    /// Report the sender's authority in this scope.
+    WhoAmI,
 }
 
 /// Agent-turn commands.
@@ -379,6 +385,28 @@ fn normalize_smart_dashes(args: &str) -> String {
 /// The command table. Order within a category is display order in `/help`.
 pub static COMMANDS: &[CommandDef] = &[
     CommandDef {
+        name: "sethome",
+        description: "set this chat as the home channel",
+        category: CommandCategory::Session,
+        aliases: &[],
+        args: ArgSpec::None,
+        handler: CommandHandler::Control(ControlAction::SetHome),
+        access: CommandAccess::Authority,
+        busy: BusyPolicy::Queue,
+        availability: CommandAvailability::ALL,
+    },
+    CommandDef {
+        name: "pause",
+        description: "stop starting new work everywhere; '/pause off' resumes",
+        category: CommandCategory::Session,
+        aliases: &[],
+        args: ArgSpec::Optional("[reason | off]"),
+        handler: CommandHandler::Control(ControlAction::SetPause),
+        access: CommandAccess::Authority,
+        busy: BusyPolicy::Queue,
+        availability: CommandAvailability::ALL,
+    },
+    CommandDef {
         name: "active",
         description: "normal reply mode",
         category: CommandCategory::Response,
@@ -462,6 +490,17 @@ pub static COMMANDS: &[CommandDef] = &[
         aliases: &["commands"],
         args: ArgSpec::None,
         handler: CommandHandler::Control(ControlAction::Help),
+        access: CommandAccess::Everyone,
+        busy: BusyPolicy::Queue,
+        availability: CommandAvailability::ALL,
+    },
+    CommandDef {
+        name: "whoami",
+        description: "show your command access in this chat",
+        category: CommandCategory::Info,
+        aliases: &[],
+        args: ArgSpec::None,
+        handler: CommandHandler::Control(ControlAction::WhoAmI),
         access: CommandAccess::Everyone,
         busy: BusyPolicy::Queue,
         availability: CommandAvailability::ALL,

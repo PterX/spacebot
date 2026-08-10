@@ -1888,6 +1888,11 @@ impl Config {
                 .as_deref()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(base_defaults.worker_log_mode),
+            home_channel: toml
+                .defaults
+                .home_channel
+                .clone()
+                .or_else(|| base_defaults.home_channel.clone()),
             projects: toml
                 .defaults
                 .projects
@@ -1914,6 +1919,15 @@ impl Config {
                 })
                 .unwrap_or_else(|| base_defaults.projects.clone()),
         };
+
+        if let Some(home) = defaults.home_channel.as_deref()
+            && crate::messaging::target::parse_delivery_target(home).is_none()
+        {
+            return Err(ConfigError::Invalid(format!(
+                "defaults.home_channel '{home}' is invalid: expected format 'adapter:target'"
+            ))
+            .into());
+        }
 
         let mut agents: Vec<AgentConfig> = toml
             .agents

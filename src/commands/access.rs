@@ -122,10 +122,19 @@ impl AccessContext<'_> {
     }
 
     pub fn allows(&self, def: &CommandDef) -> bool {
-        match def.access {
-            CommandAccess::Everyone => true,
-            CommandAccess::Authority => self.is_authority(),
-        }
+        access_allows(def, self.is_authority())
+    }
+}
+
+/// Whether an already-resolved authority verdict permits `def`.
+///
+/// The router resolves authority from binding and adapter config; the channel
+/// only receives the verdict. Both gate on this one rule so a command cannot
+/// be open on one path and closed on the other.
+pub fn access_allows(def: &CommandDef, is_authority: bool) -> bool {
+    match def.access {
+        CommandAccess::Everyone => true,
+        CommandAccess::Authority => is_authority,
     }
 }
 
@@ -163,6 +172,110 @@ pub fn busy_queued_text(def: &CommandDef) -> String {
         "/{} queued — it runs after the current turn finishes",
         def.name
     )
+}
+
+#[cfg(test)]
+mod authority_gate_tests {
+    use super::*;
+    use crate::commands::dispatch::sender_is_authority;
+    use crate::{InboundMessage, MessageContent};
+
+    fn message_with(metadata: Vec<(&str, serde_json::Value)>) -> InboundMessage {
+        let mut message = InboundMessage::empty();
+        message.content = MessageContent::Text("/sethome".to_string());
+        for (key, value) in metadata {
+            message.metadata.insert(key.to_string(), value);
+        }
+        message
+    }
+
+    #[test]
+    fn unstamped_messages_carry_no_authority() {
+        // A path that never passed the router cannot inherit authority by
+        // omission.
+        assert!(!sender_is_authority(&message_with(vec![])));
+        assert!(!sender_is_authority(&message_with(vec![(
+            super::super::dispatch::AUTHORITY_METADATA_KEY,
+            serde_json::Value::String("true".into()),
+        )])));
+    }
+
+    /// The router declines to dispatch a media caption — attachments have to
+    /// travel with the message — so the channel handles it. Skipping the
+    /// stamp on the way out would deny an authority sender their own
+    /// commands and tools on any turn that carries a file.
+    #[test]
+    fn every_content_type_is_stamped_before_the_router_gives_up() {
+        let defaults = AdapterAuthorityDefaults::default();
+        let authority: Vec<String> = vec!["boss".to_string()];
+
+        for content in [
+            MessageContent::Text("/sethome".to_string()),
+            MessageContent::Media {
+                text: Some("/sethome".to_string()),
+                attachments: Vec::new(),
+            },
+            MessageContent::Interaction {
+                action_id: "button".to_string(),
+                block_id: None,
+                values: Vec::new(),
+                label: None,
+                message_ts: None,
+            },
+        ] {
+            for (sender, expected) in [("boss", true), ("someone-else", false)] {
+                let mut message = InboundMessage::empty();
+                message.content = content.clone();
+                message.sender_id = sender.to_string();
+                let scope = crate::commands::dispatch::DispatchScope {
+                    binding_authority: Some(&authority),
+                    adapter_defaults: &defaults,
+                    binding_settings: None,
+                    turn_active: false,
+                };
+
+                let stamped = crate::commands::dispatch::stamp_authority(&mut message, &scope);
+                assert_eq!(stamped, expected);
+                assert_eq!(
+                    sender_is_authority(&message),
+                    expected,
+                    "verdict must reach the channel for every content type"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stamped_authority_round_trips() {
+        assert!(sender_is_authority(&message_with(vec![(
+            super::super::dispatch::AUTHORITY_METADATA_KEY,
+            serde_json::Value::Bool(true),
+        )])));
+        assert!(!sender_is_authority(&message_with(vec![(
+            super::super::dispatch::AUTHORITY_METADATA_KEY,
+            serde_json::Value::Bool(false),
+        )])));
+    }
+
+    /// The channel re-parses raw text without the receiving bot's username,
+    /// so text the router declined as addressed elsewhere still resolves
+    /// there. That path must gate on the stamped verdict.
+    #[test]
+    fn addressed_commands_diverge_between_the_two_parsers() {
+        let registry = &crate::commands::REGISTRY;
+        assert!(matches!(
+            registry.parse_addressed("/sethome@otherbot", Some("spacebot")),
+            crate::commands::ParseResult::NotACommand
+        ));
+        let reparsed = registry.parse("/sethome@otherbot");
+        let crate::commands::ParseResult::Command(parsed) = reparsed else {
+            panic!("channel-side parse should still resolve the command");
+        };
+        assert_eq!(parsed.def.name, "sethome");
+        assert_eq!(parsed.def.access, CommandAccess::Authority);
+        assert!(!access_allows(parsed.def, false));
+        assert!(access_allows(parsed.def, true));
+    }
 }
 
 #[cfg(test)]

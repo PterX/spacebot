@@ -514,6 +514,17 @@ pub struct AgentDeps {
 }
 
 impl AgentDeps {
+    /// The settings store, once the runtime has wired it up.
+    pub fn settings(&self) -> Option<Arc<settings::SettingsStore>> {
+        self.runtime_config.settings.load().as_ref().clone()
+    }
+
+    /// Why this agent is holding off on new work, or `None` when running
+    /// normally. A pause with no stated reason yields an empty string.
+    pub fn pause_reason(&self) -> Option<String> {
+        self.settings()?.pause_reason()
+    }
+
     /// Lifecycle handle for daemon restart/shutdown requests. `None` outside
     /// the daemon runtime (tests, config preview).
     pub fn lifecycle(&self) -> Option<lifecycle::LifecycleHandle> {

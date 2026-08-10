@@ -62,6 +62,7 @@ pub mod secret_set;
 pub mod send_agent_message;
 pub mod send_file;
 pub mod send_message_to_another_channel;
+pub mod set_home_channel;
 pub mod set_outcome;
 pub mod set_status;
 pub mod shell;
@@ -157,6 +158,9 @@ pub use send_agent_message::{
 pub use send_file::{SendFileArgs, SendFileError, SendFileOutput, SendFileTool};
 pub use send_message_to_another_channel::{
     SendMessageArgs, SendMessageError, SendMessageOutput, SendMessageTool,
+};
+pub use set_home_channel::{
+    SetHomeChannelArgs, SetHomeChannelError, SetHomeChannelOutput, SetHomeChannelTool,
 };
 pub use set_outcome::{SetOutcomeArgs, SetOutcomeError, SetOutcomeOutput, SetOutcomeTool};
 pub use set_status::{SetStatusArgs, SetStatusError, SetStatusOutput, SetStatusTool, StatusKind};
@@ -480,6 +484,7 @@ pub async fn add_channel_tools(
     current_adapter: Option<String>,
     slack_thread_ts: Option<&str>,
     cron_outcome: Option<crate::cron::CronOutcome>,
+    sender_is_authority: bool,
 ) -> Result<(), rig::tool::server::ToolServerError> {
     let conversation_id = conversation_id.into();
     let channel_kind = state.kind;
@@ -504,6 +509,20 @@ pub async fn add_channel_tools(
                 replied_flag.clone(),
                 agent_display_name,
                 state.deps.api_state.clone(),
+            ))
+            .await?;
+    }
+    // The home channel is where the agent speaks when no conversation is in
+    // scope, so only a real user conversation can claim it — and only on a
+    // turn driven by someone holding authority. `/sethome` is authority-gated
+    // for the same reason, and a tool the model can be talked into calling
+    // must not be the way around it.
+    if channel_kind == crate::agent::channel::ChannelKind::User && sender_is_authority {
+        handle
+            .add_tool(SetHomeChannelTool::new(
+                state.deps.clone(),
+                conversation_id.clone(),
+                current_adapter.as_deref() == Some("portal"),
             ))
             .await?;
     }
@@ -648,6 +667,7 @@ pub async fn add_direct_mode_tools(
     current_adapter: Option<String>,
     slack_thread_ts: Option<&str>,
     cron_outcome: Option<crate::cron::CronOutcome>,
+    sender_is_authority: bool,
 ) -> Result<(), rig::tool::server::ToolServerError> {
     // First add all standard channel tools
     add_channel_tools(
@@ -664,6 +684,7 @@ pub async fn add_direct_mode_tools(
         current_adapter.clone(),
         slack_thread_ts,
         cron_outcome,
+        sender_is_authority,
     )
     .await?;
 
@@ -674,6 +695,11 @@ pub async fn add_direct_mode_tools(
     handle
         .add_tool(MemorySaveTool::new(state.deps.memory_search.clone()))
         .await?;
+
+    // Self-documentation lookup, for reasoning about capabilities the user
+    // has not set up yet. Direct-mode channels do not branch, so without this
+    // the docs are unreachable to them.
+    handle.add_tool(SpacebotDocsTool::new()).await?;
 
     let rc = &state.deps.runtime_config;
     let workspace = rc.workspace_dir.clone();

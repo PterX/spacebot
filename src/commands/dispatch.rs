@@ -13,7 +13,7 @@
 //! Replies (usage, denials, control output, busy acks) are ephemeral where
 //! the platform supports it and degrade to plain messages elsewhere.
 
-use super::access::{self, AccessContext};
+use super::access::{self, AccessContext, access_allows};
 use super::control::ControlPlane;
 use super::registry::{BusyPolicy, CommandHandler, ControlAction, ParseResult, Surface};
 use crate::messaging::MessagingManager;
@@ -48,6 +48,50 @@ pub struct DispatchScope<'a> {
 
 /// Classify and, where possible, fully handle a slash command. Replies are
 /// sent on spawned tasks so the router loop never blocks on an adapter.
+/// Metadata key carrying the sender's resolved authority to the channel.
+///
+/// Authority resolves here, where the binding and adapter config live, and
+/// travels with the message: everything downstream that must respect it —
+/// the channel's own command path, authority-gated tool registration — reads
+/// this rather than re-deriving a check it has no configuration for. Absent
+/// means no authority, so a path that never passed through the router cannot
+/// inherit one.
+pub const AUTHORITY_METADATA_KEY: &str = "sender_is_authority";
+
+/// Resolve the sender's authority for the scope this message arrived in and
+/// record it on the message, returning the verdict.
+///
+/// Every non-system inbound message gets one, whether or not the router goes
+/// on to handle it as a command.
+pub(crate) fn stamp_authority(message: &mut InboundMessage, scope: &DispatchScope<'_>) -> bool {
+    let is_authority = AccessContext {
+        binding_authority: scope.binding_authority,
+        adapter_default: scope.adapter_defaults.for_adapter(message.adapter_key()),
+        sender_id: &message.sender_id,
+        sender_login: message
+            .metadata
+            .get("twitch_user_login")
+            .and_then(|value| value.as_str()),
+    }
+    .is_authority();
+
+    message.metadata.insert(
+        AUTHORITY_METADATA_KEY.to_string(),
+        serde_json::Value::Bool(is_authority),
+    );
+    is_authority
+}
+
+/// Whether the router resolved this sender as holding authority in the scope
+/// the message arrived in.
+pub fn sender_is_authority(message: &InboundMessage) -> bool {
+    message
+        .metadata
+        .get(AUTHORITY_METADATA_KEY)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
 pub async fn dispatch_inbound(
     message: &mut InboundMessage,
     scope: DispatchScope<'_>,
@@ -57,12 +101,23 @@ pub async fn dispatch_inbound(
     if message.source == "system" {
         return Dispatch::Forward;
     }
+    let surface = Surface::from_source(&message.source);
+    // Stamped for every non-system message, ahead of both the content match
+    // and the parse. The channel builds its command text from media captions
+    // too, and registers authority-gated tools per turn, so anything this
+    // function declines to handle still has to carry the verdict.
+    let is_authority = stamp_authority(message, &scope);
+
     let text = match &message.content {
         MessageContent::Text(text) => text.clone(),
         // Command content arrives from surfaces that parse client-side
         // (Discord interactions, Slack subcommands, the portal palette); it
         // renders as "/name args" so the shared parser revalidates it.
         MessageContent::Command { .. } => message.content.to_string(),
+        // A media caption can carry a command, but the router does not
+        // dispatch it: attachments have to reach the channel with the
+        // message. The channel's own command path handles it, gated on the
+        // verdict stamped above.
         _ => return Dispatch::Forward,
     };
 
@@ -79,18 +134,7 @@ pub async fn dispatch_inbound(
         ParseResult::Command(parsed) => parsed,
     };
 
-    let surface = Surface::from_source(&message.source);
-    let context = AccessContext {
-        binding_authority: scope.binding_authority,
-        adapter_default: scope.adapter_defaults.for_adapter(message.adapter_key()),
-        sender_id: &message.sender_id,
-        sender_login: message
-            .metadata
-            .get("twitch_user_login")
-            .and_then(|value| value.as_str()),
-    };
-    let is_authority = context.is_authority();
-    if !context.allows(parsed.def) {
+    if !access_allows(parsed.def, is_authority) {
         reply_ephemeral(
             messaging,
             deps,
@@ -119,18 +163,24 @@ pub async fn dispatch_inbound(
                 // later /active. The work is a local SQLite roundtrip plus
                 // an in-memory cell update; only the reply delivery goes
                 // over the network, and that stays on a spawned task.
-                ControlAction::SetResponseMode(_) => {
-                    let reply = plane.execute(action).await;
+                ControlAction::SetResponseMode(_)
+                | ControlAction::SetHome
+                | ControlAction::SetPause => {
+                    let reply = plane.execute(action, &parsed.args).await;
                     reply_ephemeral(messaging, deps, message, reply);
                 }
                 // Read-only control commands stay off the router's critical
                 // path entirely.
-                ControlAction::Status | ControlAction::Help | ControlAction::AgentId => {
+                ControlAction::Status
+                | ControlAction::Help
+                | ControlAction::AgentId
+                | ControlAction::WhoAmI => {
                     let messaging = messaging.clone();
                     let deps = deps.clone();
                     let target = message.clone();
+                    let args = parsed.args.clone();
                     tokio::spawn(async move {
-                        let reply = plane.execute(action).await;
+                        let reply = plane.execute(action, &args).await;
                         send_ephemeral(&messaging, &deps, &target, reply).await;
                     });
                 }

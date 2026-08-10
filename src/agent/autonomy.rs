@@ -138,6 +138,12 @@ pub async fn maybe_run_autonomy(deps: &AgentDeps) {
         return;
     }
 
+    // A pause is an emergency stop on new work, and a self-directed run is
+    // the most new work the agent can start.
+    if deps.pause_reason().is_some() {
+        return;
+    }
+
     let stale_after_secs = config.timeout_secs.saturating_mul(2).max(60);
     match deps
         .autonomy_run_store
@@ -513,9 +519,20 @@ async fn build_run_briefing(
         })
         .collect();
 
-    let task_state = render_task_state(deps, config.claim_unowned).await?;
+    let (task_state, has_tasks) = render_task_state(deps, config.claim_unowned).await?;
     let active_goals = crate::goals::render_active_goals_extended(&deps.goal_store).await?;
     let active_workers = render_active_workers(deps).await?;
+
+    // Nothing to survey and no direction to work from. The run needs different
+    // instructions, not a shorter version of the same ones.
+    //
+    // A wake event or a running worker is direction: the run has a reason to
+    // exist and a bounded turn to spend on it, which cold-start discovery
+    // would spend on the workspace instead.
+    let instance_is_empty = !has_tasks
+        && active_goals.is_empty()
+        && wake_event_views.is_empty()
+        && active_workers.is_none();
 
     let prompt_engine = deps.runtime_config.prompts.load();
     prompt_engine
@@ -530,6 +547,7 @@ async fn build_run_briefing(
             config.max_tasks_per_run,
             config.warn_secs.div_ceil(60).max(1),
             config.claim_unowned,
+            instance_is_empty,
         )
         .map_err(|error| anyhow::anyhow!("failed to render autonomy channel prompt: {error}"))
 }
@@ -543,7 +561,11 @@ fn compact_payload(payload: &serde_json::Value) -> String {
 }
 
 /// Render the full task survey: pending_approval, ready, in_progress, backlog.
-async fn render_task_state(deps: &AgentDeps, claim_unowned: bool) -> anyhow::Result<String> {
+/// Returns the rendered survey and whether any task was visible in it.
+async fn render_task_state(
+    deps: &AgentDeps,
+    claim_unowned: bool,
+) -> anyhow::Result<(String, bool)> {
     let sections: [(TaskStatus, &str); 4] = [
         (
             TaskStatus::PendingApproval,
@@ -584,7 +606,7 @@ async fn render_task_state(deps: &AgentDeps, claim_unowned: bool) -> anyhow::Res
     if !any {
         output.push_str("No active tasks.\n");
     }
-    Ok(output)
+    Ok((output, any))
 }
 
 fn render_task_line(task: &Task, agent_id: &str) -> String {

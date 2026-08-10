@@ -299,6 +299,8 @@ async fn dump_channel_context() {
         None,
         None,
         None,
+        // The context dump renders the authority-gated tool surface too.
+        true,
     )
     .await
     .expect("failed to add channel tools");
@@ -563,6 +565,8 @@ async fn dump_all_contexts() {
         None,
         None,
         None,
+        // The context dump renders the authority-gated tool surface too.
+        true,
     )
     .await
     .expect("failed to add channel tools");

@@ -1625,6 +1625,18 @@ async fn run(
                         spacebot::commands::dispatch::Dispatch::Forward
                         | spacebot::commands::dispatch::Dispatch::ForwardCommand => {}
                     }
+
+                    // A paused agent starts no new work. Commands dispatch
+                    // above this line, so /pause off and /status still land.
+                    if let Some(reason) = agent.deps.pause_reason() {
+                        tracing::debug!(
+                            agent_id = %agent_id,
+                            conversation_id = %conversation_id,
+                            reason = %reason,
+                            "dropping inbound message while paused"
+                        );
+                        continue;
+                    }
                 }
 
                 // Find or create a channel for this conversation
@@ -2438,6 +2450,19 @@ async fn initialize_agents(
             .store(Arc::new(prompt_snapshot_store.clone()));
         if let Err(error) = settings_store.set_worker_log_mode(config.defaults.worker_log_mode) {
             tracing::warn!(%error, agent = %agent_config.id, "failed to set worker_log_mode from config");
+        }
+        // Config seeds the home channel; a value set at runtime owns it from
+        // then on and is never clobbered by a reload.
+        if let Some(home) = config.defaults.home_channel.as_deref() {
+            match settings_store.adopt_home_channel(home) {
+                Ok(true) => {
+                    tracing::info!(agent = %agent_config.id, home_channel = %home, "seeded home channel from config")
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(%error, agent = %agent_config.id, "failed to seed home_channel from config")
+                }
+            }
         }
 
         // Share the instance-level secrets store with this agent.

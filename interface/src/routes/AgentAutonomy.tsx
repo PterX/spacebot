@@ -61,6 +61,16 @@ export function AgentAutonomy({agentId}: AgentAutonomyProps) {
 		},
 	});
 
+	const clearHomeMutation = useMutation({
+		mutationFn: () => api.clearHomeChannel(agentId),
+		onSuccess: (next) => {
+			queryClient.setQueryData(["autonomy-status", agentId], next);
+		},
+		onSettled: () => {
+			queryClient.invalidateQueries({queryKey: ["autonomy-status", agentId]});
+		},
+	});
+
 	return (
 		<div className="flex h-full flex-col">
 			<div className="min-h-0 flex-1 overflow-y-auto">
@@ -69,6 +79,7 @@ export function AgentAutonomy({agentId}: AgentAutonomyProps) {
 						status={status}
 						onUpdate={(update) => configMutation.mutate(update)}
 						agentName={agent?.display_name ?? agentId}
+						onClearHome={() => clearHomeMutation.mutate()}
 					/>
 
 					<div className="mt-5">
