@@ -144,6 +144,7 @@ const MACOS_READ_ONLY_SYSTEM_PATHS: &[&str] = &[
     "/Applications",
     "/private/etc",
     "/private/var/run",
+    "/private/var/select",
     "/private/tmp",
     "/etc",
     "/dev",
@@ -870,6 +871,50 @@ impl Sandbox {
             escape_sbpl_path(&tmp)
         ));
 
+        // The top-level /etc, /tmp, and /var symlinks resolve into /private,
+        // and the subpath rules above only cover the canonical targets. Path
+        // lookups that traverse a symlink also need read access to the symlink
+        // itself — without these, resolver config (/etc/resolv.conf) and the
+        // sh shim's /var/select/sh are unreachable through their usual paths,
+        // which breaks DNS for every subprocess.
+        profile.push_str(
+            "\n; top-level symlinks into /private\n(allow file-read-metadata (literal \"/etc\") (literal \"/tmp\") (literal \"/var\"))\n",
+        );
+
+        // Ancestor directories of allowed paths. Tools stat and mkdir each
+        // leading component of an absolute path (git clone does both when
+        // creating leading directories), and a denied stat on an ancestor
+        // surfaces as EPERM where the caller expects EEXIST, aborting the
+        // operation. Metadata-only access reveals nothing about siblings.
+        // Emitted before the data_dir deny below so that deny still wins for
+        // anything under data_dir.
+        let mut ancestors: Vec<PathBuf> = Vec::new();
+        let mut collect_ancestors = |path: &Path| {
+            for ancestor in path.ancestors().skip(1) {
+                if ancestor == Path::new("/") {
+                    break;
+                }
+                if !ancestors.iter().any(|existing| existing == ancestor) {
+                    ancestors.push(ancestor.to_path_buf());
+                }
+            }
+        };
+        collect_ancestors(&workspace);
+        if self.tools_bin.exists() {
+            collect_ancestors(&tools_bin);
+        }
+        for path in config.all_writable_paths() {
+            collect_ancestors(&canonicalize_or_self(path));
+        }
+        collect_ancestors(&tmp);
+        profile.push_str("\n; ancestors of allowed paths (metadata only)\n");
+        for ancestor in &ancestors {
+            profile.push_str(&format!(
+                "(allow file-read-metadata (literal \"{}\"))\n",
+                escape_sbpl_path(ancestor)
+            ));
+        }
+
         // Protect data_dir even if it falls under the workspace subtree
         let data_dir = canonicalize_or_self(&self.data_dir);
         profile.push_str(&format!(
@@ -1012,6 +1057,46 @@ mod tests {
         assert!(config.writable_paths.is_empty());
         assert!(config.project_paths.is_empty());
         assert!(config.passthrough_env.is_empty());
+    }
+
+    #[test]
+    fn test_sbpl_profile_traversal_rules() {
+        let config = Arc::new(ArcSwap::from_pointee(SandboxConfig {
+            writable_paths: vec![PathBuf::from("/Users/example/projects/demo")],
+            ..SandboxConfig::default()
+        }));
+        let sandbox = Sandbox::new_for_test(
+            config.clone(),
+            PathBuf::from("/Users/example/.spacebot/agents/main/workspace"),
+        );
+        let profile = sandbox.generate_sbpl_profile(&config.load());
+
+        // Symlink traversal for the /private-backed top-level paths.
+        assert!(profile.contains(
+            "(allow file-read-metadata (literal \"/etc\") (literal \"/tmp\") (literal \"/var\"))"
+        ));
+
+        // Metadata access on each ancestor of the workspace and writable paths.
+        for ancestor in [
+            "/Users",
+            "/Users/example",
+            "/Users/example/.spacebot/agents/main",
+            "/Users/example/projects",
+        ] {
+            assert!(
+                profile.contains(&format!(
+                    "(allow file-read-metadata (literal \"{ancestor}\"))"
+                )),
+                "missing ancestor rule for {ancestor}"
+            );
+        }
+
+        // The data dir deny must come after the ancestor allows so it wins.
+        let deny_pos = profile.find("; data dir blocked").expect("deny section");
+        let ancestors_pos = profile
+            .find("; ancestors of allowed paths")
+            .expect("ancestors section");
+        assert!(ancestors_pos < deny_pos);
     }
 
     #[test]

@@ -59,19 +59,21 @@ impl DelegationMode {
 }
 
 /// How much conversation history a worker receives.
+///
+/// Workers fork their channel the way branches do: the difference between a
+/// worker and a branch is the tools it gets, not the context it has. `Clean`
+/// is the explicit opt-out for fan-out and mechanical tasks where the
+/// conversation is noise.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerHistoryMode {
-    /// No conversation history (current default).
-    /// Worker sees only the task description.
+    /// Full clone of the channel's conversation history under the worker's
+    /// own system prompt — the same fork semantic branches use.
     #[default]
-    None,
-    /// LLM-generated summary of recent conversation context.
-    Summary,
-    /// Last N messages from the parent conversation.
-    Recent(u32),
-    /// Full conversation history clone (branch-style).
-    Full,
+    Fork,
+    /// Task description only. Detached workers, which have no channel to
+    /// fork, are always clean.
+    Clean,
 }
 
 /// How much memory context a worker receives.
@@ -464,7 +466,7 @@ mod tests {
             memory: MemoryMode::Off,
             delegation: DelegationMode::Direct,
             worker_context: WorkerContextMode {
-                history: WorkerHistoryMode::Recent(20),
+                history: WorkerHistoryMode::Clean,
                 memory: WorkerMemoryMode::Tools,
                 wiki_write: false,
             },
@@ -481,10 +483,7 @@ mod tests {
         assert_eq!(resolved.model, Some("conversation-model".to_string()));
         assert_eq!(resolved.memory, MemoryMode::Off);
         assert_eq!(resolved.delegation, DelegationMode::Direct);
-        assert_eq!(
-            resolved.worker_context.history,
-            WorkerHistoryMode::Recent(20)
-        );
+        assert_eq!(resolved.worker_context.history, WorkerHistoryMode::Clean);
         assert_eq!(resolved.worker_context.memory, WorkerMemoryMode::Tools);
     }
 
@@ -496,7 +495,7 @@ mod tests {
         assert_eq!(resolved.model, None);
         assert_eq!(resolved.memory, MemoryMode::Full);
         assert_eq!(resolved.delegation, DelegationMode::Standard);
-        assert_eq!(resolved.worker_context.history, WorkerHistoryMode::None);
+        assert_eq!(resolved.worker_context.history, WorkerHistoryMode::Fork);
         assert_eq!(resolved.worker_context.memory, WorkerMemoryMode::None);
     }
 }

@@ -5052,14 +5052,16 @@ export interface components {
             transcript?: components["schemas"]["TranscriptStep"][] | null;
             worker_type: string;
         };
-        /** @description How much conversation history a worker receives. */
-        WorkerHistoryMode: "none" | "summary" | {
-            /**
-             * Format: int32
-             * @description Last N messages from the parent conversation.
-             */
-            recent: number;
-        } | "full";
+        /**
+         * @description How much conversation history a worker receives.
+         *
+         *     Workers fork their channel the way branches do: the difference between a
+         *     worker and a branch is the tools it gets, not the context it has. `Clean`
+         *     is the explicit opt-out for fan-out and mechanical tasks where the
+         *     conversation is noise.
+         * @enum {string}
+         */
+        WorkerHistoryMode: "fork" | "clean";
         WorkerListItem: {
             channel_id?: string | null;
             channel_name?: string | null;

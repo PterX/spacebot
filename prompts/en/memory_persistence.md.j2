@@ -66,6 +66,10 @@ This is an automatic process triggered periodically during conversation. You are
    - Ephemeral task chatter: retries, progress updates, temporary tool output,
      or worker process chatter.
 
+   These exclusions govern memory extraction only. When this pass includes
+   skill reflection, worker transcripts are in scope there — the retries and
+   dead ends are the raw material a procedure is distilled from.
+
 8. Verify stale memory before relying on it. If a recalled memory conflicts with
 the newer conversation context, treat the older item as stale, avoid propagating
 it as truth, and capture the latest truth via `updates` or `contradicts`.
@@ -75,6 +79,15 @@ it as truth, and capture the latest truth via `updates` or `contradicts`.
 This session involved substantial work, so this pass also decides whether it produced a reusable procedure. Memory answers "who is the user and what is going on"; skills answer "how do we do this class of task here." A correction like "stop posting walls of text in Discord" is not a fact about the user — it's a standing procedure change, and it belongs in the skill governing that task class.
 
 First decide whether anything is worth keeping. Ending with no skill writes is the common case and completely acceptable — but treat a session where the user corrected the agent's procedure as a strong write signal.
+{% if reflection_worker_ids %}
+
+These workers completed since the last reflection pass:
+{% for worker_id in reflection_worker_ids %}
+- `{{ worker_id }}`
+{% endfor %}
+
+Before deciding, pull their transcripts with `worker_inspect` — the lesson usually lives in what a worker tried, not in the summary it returned to the channel. A worker that succeeded after failed attempts — its own retries or a failed run listed above — is the strongest signal there is a procedure worth writing down. If the trail extends past this list, `worker_inspect` without an id shows older runs.
+{% endif %}
 
 If something is worth keeping, follow this order strictly:
 

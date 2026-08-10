@@ -124,15 +124,34 @@ impl Tool for SpawnWorkerTool {
             ""
         };
 
+        // The description reflects the conversation's live worker-context
+        // setting so the model writes task prompts that match what the worker
+        // will actually see.
+        let history_mode = self.state.worker_context_settings.read().await.history;
+        let (history_note, task_description) = match history_mode {
+            crate::conversation::settings::WorkerHistoryMode::Fork => (
+                "The worker forks this conversation's history, so it already knows everything \
+                 discussed here — describe the task, not the background.",
+                "Clear, specific description of what the worker should do. The worker shares \
+                 this conversation's history — don't restate the background.",
+            ),
+            crate::conversation::settings::WorkerHistoryMode::Clean => (
+                "The worker only sees the task description you provide — no conversation history.",
+                "Clear, specific description of what the worker should do. Include all context \
+                 needed since the worker can't see your conversation.",
+            ),
+        };
+
         let base_description = crate::prompts::text::get("tools/spawn_worker");
         let description = base_description
             .replace("{tools}", &tools_list.join(", "))
+            .replace("{history_note}", history_note)
             .replace("{opencode_note}", opencode_note);
 
         let mut properties = serde_json::json!({
             "task": {
                 "type": "string",
-                "description": "Clear, specific description of what the worker should do. Include all context needed since the worker can't see your conversation."
+                "description": task_description
             },
             "interactive": {
                 "type": "boolean",

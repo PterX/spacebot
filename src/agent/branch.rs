@@ -1,6 +1,5 @@
 //! Branch: Fork context for thinking and delegation.
 
-use crate::agent::compactor::estimate_history_tokens;
 use crate::error::Result;
 use crate::hooks::SpacebotHook;
 use crate::llm::SpacebotModel;
@@ -107,7 +106,7 @@ impl Branch {
 
         // Pre-flight context check: if the forked history is already large,
         // compact before we even make the first LLM call.
-        self.maybe_compact_history();
+        self.maybe_compact_history(&prompt);
 
         let routing = self.deps.runtime_config.routing.load();
         let model_name = self
@@ -280,24 +279,27 @@ impl Branch {
         Ok(conclusion)
     }
 
-    /// Compact history if approaching context window limit.
-    /// Removes the oldest 50% of messages when usage exceeds 70%.
-    fn maybe_compact_history(&mut self) {
+    /// Compact history down to what the context window has left once this
+    /// branch's own preamble and prompt are accounted for, dropping the oldest
+    /// half of the messages at a time until it fits.
+    fn maybe_compact_history(&mut self, prompt: &str) {
         let context_window = **self.deps.runtime_config.context_window.load();
-        let estimated = estimate_history_tokens(&self.history);
-        let usage = estimated as f32 / context_window as f32;
-
-        if usage < 0.70 {
-            return;
-        }
-
-        tracing::info!(
-            branch_id = %self.id,
-            usage = %format!("{:.0}%", usage * 100.0),
-            history_len = self.history.len(),
-            "branch pre-compacting history"
+        let prompt_tokens = crate::agent::compactor::estimate_text_tokens(&self.system_prompt)
+            + crate::agent::compactor::estimate_text_tokens(prompt);
+        let removed = crate::agent::compactor::precompact_forked_history(
+            &mut self.history,
+            context_window,
+            0.50,
+            prompt_tokens,
         );
-        self.compact_history(0.50);
+        if removed > 0 {
+            tracing::info!(
+                branch_id = %self.id,
+                removed,
+                history_len = self.history.len(),
+                "branch pre-compacted forked history"
+            );
+        }
     }
 
     /// Aggressive compaction for overflow recovery. Removes 75% of messages.

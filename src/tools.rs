@@ -952,6 +952,19 @@ pub fn create_branch_tool_server(
         task_create = task_create.with_api_state(api.clone());
     }
 
+    // Reflection passes read transcripts for error text and recovery steps,
+    // which the default per-result display cap clips.
+    let mut worker_inspect = WorkerInspectTool::new(run_logger, agent_id.to_string());
+    if matches!(
+        &profile,
+        BranchToolProfile::MemoryPersistence {
+            skill_reflection: true,
+            ..
+        }
+    ) {
+        worker_inspect = worker_inspect.with_result_cap(2000);
+    }
+
     let mut server = ToolServer::new()
         .tool(memory_save)
         .tool(MemoryRecallTool::new(memory_search.clone()))
@@ -959,7 +972,7 @@ pub fn create_branch_tool_server(
         .tool(ChannelRecallTool::new(conversation_logger, channel_store))
         .tool(SpacebotDocsTool::new())
         .tool(EmailSearchTool::new(runtime_config.clone()))
-        .tool(WorkerInspectTool::new(run_logger, agent_id.to_string()))
+        .tool(worker_inspect)
         .tool(task_create)
         .tool(TaskListTool::new(task_store.clone(), agent_id.to_string()))
         .tool(TaskUpdateTool::for_branch(task_store, agent_id.clone()))

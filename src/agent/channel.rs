@@ -830,8 +830,11 @@ pub struct Channel {
     last_persistence_at: std::time::Instant,
     /// Set when a turn or worker crossed the reflection work threshold.
     /// Consumed by the next persistence branch, which then also reflects
-    /// on skills. Atomic because turn processing marks it through `&self`.
-    reflection_signal: std::sync::atomic::AtomicBool,
+    /// on skills. The worker ids are handed to that branch so it can pull
+    /// their transcripts via `worker_inspect` — the lesson usually lives in
+    /// what the worker tried, not in the summary it returned. A mutex (not
+    /// an atomic) because turn processing marks it through `&self`.
+    reflection_signal: std::sync::Mutex<ReflectionSignal>,
     /// When the last skill-reflection pass was spawned, for cooldown.
     last_reflection_at: Option<std::time::Instant>,
     /// Branch IDs for silent memory persistence branches (results not injected into history).
@@ -867,6 +870,38 @@ pub struct Channel {
     control_handle: ChannelControlHandle,
     /// Per-conversation resolved settings (memory mode, delegation mode, model override).
     pub resolved_settings: ResolvedConversationSettings,
+}
+
+/// What accumulated between skill-reflection passes: whether a turn crossed
+/// the tool-iteration threshold, and which workers completed since the last
+/// pass. Drained by the persistence branch that performs the reflection.
+///
+/// Failed completions are collected too — their transcripts are where the
+/// trials live — but only successful ones make the signal fire: an
+/// unresolved failure alone has nothing to teach.
+#[derive(Debug, Default, Clone)]
+struct ReflectionSignal {
+    /// A channel turn crossed `min_tool_iterations` tool calls.
+    turn_work: bool,
+    /// Workers that completed since the last reflection pass, in completion
+    /// order, with whether each succeeded.
+    workers: Vec<(WorkerId, bool)>,
+}
+
+impl ReflectionSignal {
+    fn is_set(&self) -> bool {
+        self.turn_work || self.workers.iter().any(|(_, success)| *success)
+    }
+
+    /// Record a completed worker for the next reflection pass. Repeat
+    /// completions for the same worker are ignored so a retriggered event
+    /// can't queue the same transcript twice.
+    fn record_worker(&mut self, worker_id: WorkerId, success: bool) {
+        if self.workers.iter().any(|(id, _)| *id == worker_id) {
+            return;
+        }
+        self.workers.push((worker_id, success));
+    }
 }
 
 /// RAII guard that records `message_handling_duration_seconds` when dropped,
@@ -1038,7 +1073,7 @@ impl Channel {
             message_count: 0,
             last_persistence_at: std::time::Instant::now(),
             memory_persistence_branches: HashSet::new(),
-            reflection_signal: std::sync::atomic::AtomicBool::new(false),
+            reflection_signal: std::sync::Mutex::new(ReflectionSignal::default()),
             last_reflection_at: None,
             branch_reply_targets: HashMap::new(),
             coalesce_buffer: Vec::new(),
@@ -3627,15 +3662,17 @@ impl Channel {
                     .await;
                 });
 
-                // A worker finishing real work successfully is a reflection
-                // signal: the session likely produced a reusable lesson.
-                if *success {
-                    let reflection = self.deps.runtime_config.skills_config.load().reflection;
-                    if reflection.enabled {
-                        self.mark_reflection_signal("worker_completed");
-                        // A worker can finish after the last user turn; check
-                        // now so reflection doesn't sit pending until the next
-                        // inbound message.
+                // Every completion is recorded for the next reflection pass —
+                // failed transcripts carry the trials — but only success fires
+                // the signal: a worker finishing real work successfully means
+                // the session likely produced a reusable lesson.
+                let reflection = self.deps.runtime_config.skills_config.load().reflection;
+                if reflection.enabled {
+                    self.mark_reflection_worker(*worker_id, *success);
+                    if *success {
+                        // A worker can finish after the last user turn;
+                        // check now so reflection doesn't sit pending
+                        // until the next inbound message.
                         self.check_memory_persistence().await;
                     }
                 }
@@ -3947,11 +3984,37 @@ impl Channel {
         if self.state.kind.suppresses_reflection() {
             return;
         }
-        let was_set = self
+        let mut signal = self
             .reflection_signal
-            .swap(true, std::sync::atomic::Ordering::Relaxed);
+            .lock()
+            .expect("reflection signal lock");
+        let was_set = signal.is_set();
+        signal.turn_work = true;
         if !was_set {
             tracing::debug!(channel_id = %self.id, source, "skill reflection signal set");
+        }
+    }
+
+    /// Record a completed worker for the next reflection pass, which pulls
+    /// its transcript via `worker_inspect`. Failed workers are recorded too
+    /// — their transcripts carry the trials — but don't fire the signal by
+    /// themselves.
+    fn mark_reflection_worker(&self, worker_id: WorkerId, success: bool) {
+        if self.id.starts_with("cron") {
+            return;
+        }
+        let mut signal = self
+            .reflection_signal
+            .lock()
+            .expect("reflection signal lock");
+        let was_set = signal.is_set();
+        signal.record_worker(worker_id, success);
+        if !was_set && signal.is_set() {
+            tracing::debug!(
+                channel_id = %self.id,
+                %worker_id,
+                "skill reflection signal set by worker completion"
+            );
         }
     }
 
@@ -3959,7 +4022,9 @@ impl Channel {
     fn reflection_due(&self) -> bool {
         if !self
             .reflection_signal
-            .load(std::sync::atomic::Ordering::Relaxed)
+            .lock()
+            .expect("reflection signal lock")
+            .is_set()
         {
             return false;
         }
@@ -4041,15 +4106,36 @@ impl Channel {
         self.message_count = 0;
         self.last_persistence_at = std::time::Instant::now();
 
-        match spawn_memory_persistence_branch(&self.state, &self.deps, reflection_due).await {
+        // Snapshot the completed workers for the reflection pass; the
+        // signal itself is only cleared once the branch actually spawns.
+        let reflection_workers: Vec<(WorkerId, bool)> = if reflection_due {
+            self.reflection_signal
+                .lock()
+                .expect("reflection signal lock")
+                .workers
+                .clone()
+        } else {
+            Vec::new()
+        };
+
+        match spawn_memory_persistence_branch(
+            &self.state,
+            &self.deps,
+            reflection_due,
+            &reflection_workers,
+        )
+        .await
+        {
             Ok(branch_id) => {
                 // Consume the reflection request only once the branch exists;
                 // a failed spawn leaves the signal set so the next check
                 // retries instead of losing the reflection for a cooldown.
                 if reflection_due {
                     self.last_reflection_at = Some(std::time::Instant::now());
-                    self.reflection_signal
-                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    *self
+                        .reflection_signal
+                        .lock()
+                        .expect("reflection signal lock") = ReflectionSignal::default();
                 }
                 self.memory_persistence_branches.insert(branch_id);
                 tracing::info!(
@@ -4290,7 +4376,7 @@ fn is_dm_conversation_id(conv_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ObserveModeFallbackState, branch_working_memory_event_summary,
+        ObserveModeFallbackState, ReflectionSignal, branch_working_memory_event_summary,
         classify_conversational_event_summary, compute_listen_mode_invocation, decision_user_id,
         extract_decision_summary_from_reply, format_conversational_event_summary,
         is_dm_conversation_id, recv_channel_event, should_process_event_for_channel,
@@ -4323,6 +4409,63 @@ mod tests {
             metadata: message_metadata,
             formatted_author: None,
         }
+    }
+
+    #[test]
+    fn reflection_signal_records_failed_workers_without_firing() {
+        let mut signal = ReflectionSignal::default();
+        let failed = uuid::Uuid::new_v4();
+        signal.record_worker(failed, false);
+
+        assert_eq!(signal.workers, vec![(failed, false)]);
+        assert!(
+            !signal.is_set(),
+            "a failure on its own has no lesson to reflect on"
+        );
+    }
+
+    #[test]
+    fn reflection_signal_carries_failed_predecessors_of_a_success() {
+        let mut signal = ReflectionSignal::default();
+        let first_failure = uuid::Uuid::new_v4();
+        let second_failure = uuid::Uuid::new_v4();
+        let success = uuid::Uuid::new_v4();
+        signal.record_worker(first_failure, false);
+        signal.record_worker(second_failure, false);
+        signal.record_worker(success, true);
+
+        assert!(signal.is_set());
+        assert_eq!(
+            signal.workers,
+            vec![
+                (first_failure, false),
+                (second_failure, false),
+                (success, true),
+            ],
+            "reflection needs the failed attempts that preceded the success"
+        );
+    }
+
+    #[test]
+    fn reflection_signal_fires_on_turn_work_alone() {
+        let mut signal = ReflectionSignal::default();
+        assert!(!signal.is_set());
+        signal.turn_work = true;
+        assert!(signal.is_set());
+    }
+
+    #[test]
+    fn reflection_signal_ignores_repeat_completions() {
+        let mut signal = ReflectionSignal::default();
+        let worker = uuid::Uuid::new_v4();
+        signal.record_worker(worker, false);
+        signal.record_worker(worker, true);
+
+        assert_eq!(
+            signal.workers,
+            vec![(worker, false)],
+            "the first completion is the terminal one"
+        );
     }
 
     #[tokio::test]
