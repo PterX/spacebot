@@ -393,7 +393,10 @@ impl CompletionModel for SpacebotModel {
             };
 
             let cooldown = routing.rate_limit_cooldown_secs;
-            let fallbacks = routing.get_fallbacks(&self.full_model_name);
+            let mut fallbacks: Vec<String> = routing.get_fallbacks(&self.full_model_name).to_vec();
+            // Set when the configured model id was rejected outright and the
+            // fallbacks were derived from the provider's default routing table.
+            let mut provider_recovery = false;
             let mut last_error: Option<CompletionError> = None;
 
             // Try the primary model (with retries) unless it's in rate-limit cooldown
@@ -422,14 +425,35 @@ impl CompletionModel for SpacebotModel {
                                 .record_rate_limit(&self.full_model_name)
                                 .await;
                         }
+                        // A rejected model id (stale default, typo, no access) never
+                        // recovers on its own — try the provider's default models
+                        // when no explicit chain is configured.
+                        if fallbacks.is_empty()
+                            && routing::is_model_not_found_error(&error.to_string())
+                        {
+                            fallbacks = routing::default_model_candidates(&self.provider)
+                                .into_iter()
+                                .filter(|candidate| candidate != &self.full_model_name)
+                                .collect();
+                            provider_recovery = !fallbacks.is_empty();
+                            if provider_recovery {
+                                tracing::warn!(
+                                    model = %self.full_model_name,
+                                    candidates = ?fallbacks,
+                                    "provider rejected configured model, trying its default models"
+                                );
+                            }
+                        }
                         if fallbacks.is_empty() {
                             // No fallbacks — this is the final error
                             return Err(error);
                         }
-                        tracing::warn!(
-                            model = %self.full_model_name,
-                            "primary model exhausted retries, trying fallbacks"
-                        );
+                        if !provider_recovery {
+                            tracing::warn!(
+                                model = %self.full_model_name,
+                                "primary model exhausted retries, trying fallbacks"
+                            );
+                        }
                         last_error = Some(error);
                     }
                 }
@@ -472,9 +496,21 @@ impl CompletionModel for SpacebotModel {
                 }
             }
 
-            Err(last_error.unwrap_or_else(|| {
+            let final_error = last_error.unwrap_or_else(|| {
                 CompletionError::ProviderError("all models in fallback chain failed".into())
-            }))
+            });
+            if provider_recovery && routing::is_model_not_found_error(&final_error.to_string()) {
+                return Err(CompletionError::ProviderError(format!(
+                    "provider '{}' rejected the configured model '{}' and every default \
+                     candidate ({}). Spacebot's built-in model ids for this provider appear \
+                     to be stale — pick a working model in Settings → Model Routing and \
+                     please report this as a bug.",
+                    self.provider,
+                    self.full_model_name,
+                    fallbacks.join(", ")
+                )));
+            }
+            Err(final_error)
         }
         .await;
 

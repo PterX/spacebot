@@ -1740,12 +1740,22 @@ export const api = {
 			deployment?: string | null;
 		}>;
 	},
-	startOpenAiOAuthBrowser: async (params: {model: string}) => {
+	providerDefaultModels: async () => {
+		const response = await fetch(`${getApiBase()}/providers/default-models`);
+		if (!response.ok) {
+			throw new Error(`API error: ${response.status}`);
+		}
+		return response.json() as Promise<{
+			defaults: Record<string, string>;
+			chatgpt_oauth: string;
+		}>;
+	},
+	startOpenAiOAuthBrowser: async (params?: {model?: string}) => {
 		const response = await fetch(`${getApiBase()}/providers/openai/browser-oauth/start`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({
-				model: params.model,
+				model: params?.model,
 			}),
 		});
 		if (!response.ok) {

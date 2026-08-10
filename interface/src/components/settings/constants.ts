@@ -87,7 +87,6 @@ export const PROVIDERS = [
 		description: "Multi-provider gateway with unified API",
 		placeholder: "sk-or-...",
 		envVar: "OPENROUTER_API_KEY",
-		defaultModel: "openrouter/anthropic/claude-sonnet-4",
 	},
 	{
 		id: "kilo",
@@ -95,7 +94,6 @@ export const PROVIDERS = [
 		description: "OpenAI-compatible multi-provider gateway",
 		placeholder: "sk-...",
 		envVar: "KILO_API_KEY",
-		defaultModel: "kilo/anthropic/claude-sonnet-4.5",
 	},
 	{
 		id: "opencode-zen",
@@ -103,7 +101,6 @@ export const PROVIDERS = [
 		description: "Multi-format gateway (Kimi, GLM, MiniMax, Qwen)",
 		placeholder: "...",
 		envVar: "OPENCODE_ZEN_API_KEY",
-		defaultModel: "opencode-zen/kimi-k2.5",
 	},
 	{
 		id: "opencode-go",
@@ -111,7 +108,6 @@ export const PROVIDERS = [
 		description: "Lite OpenCode model catalog and limits",
 		placeholder: "...",
 		envVar: "OPENCODE_GO_API_KEY",
-		defaultModel: "opencode-go/kimi-k2.5",
 	},
 	{
 		id: "anthropic",
@@ -119,7 +115,6 @@ export const PROVIDERS = [
 		description: "Claude models (Sonnet, Opus, Haiku)",
 		placeholder: "sk-ant-...",
 		envVar: "ANTHROPIC_API_KEY",
-		defaultModel: "anthropic/claude-sonnet-4",
 	},
 	{
 		id: "openai",
@@ -127,7 +122,6 @@ export const PROVIDERS = [
 		description: "GPT models",
 		placeholder: "sk-...",
 		envVar: "OPENAI_API_KEY",
-		defaultModel: "openai/gpt-4.1",
 	},
 	{
 		id: "zai-coding-plan",
@@ -135,7 +129,6 @@ export const PROVIDERS = [
 		description: "GLM coding models (glm-4.7, glm-5, glm-4.5-air)",
 		placeholder: "...",
 		envVar: "ZAI_CODING_PLAN_API_KEY",
-		defaultModel: "zai-coding-plan/glm-5",
 	},
 	{
 		id: "zhipu",
@@ -143,7 +136,6 @@ export const PROVIDERS = [
 		description: "GLM models (GLM-4, GLM-4-Flash)",
 		placeholder: "...",
 		envVar: "ZHIPU_API_KEY",
-		defaultModel: "zhipu/glm-4-plus",
 	},
 	{
 		id: "groq",
@@ -151,7 +143,6 @@ export const PROVIDERS = [
 		description: "Fast inference for Llama, Mixtral models",
 		placeholder: "gsk_...",
 		envVar: "GROQ_API_KEY",
-		defaultModel: "groq/llama-3.3-70b-versatile",
 	},
 	{
 		id: "together",
@@ -159,7 +150,6 @@ export const PROVIDERS = [
 		description: "Wide model selection with competitive pricing",
 		placeholder: "...",
 		envVar: "TOGETHER_API_KEY",
-		defaultModel: "together/meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo",
 	},
 	{
 		id: "fireworks",
@@ -167,7 +157,6 @@ export const PROVIDERS = [
 		description: "Fast inference for popular OSS models",
 		placeholder: "...",
 		envVar: "FIREWORKS_API_KEY",
-		defaultModel: "fireworks/accounts/fireworks/models/llama-v3p3-70b-instruct",
 	},
 	{
 		id: "deepseek",
@@ -175,7 +164,6 @@ export const PROVIDERS = [
 		description: "DeepSeek Chat and Reasoner models",
 		placeholder: "sk-...",
 		envVar: "DEEPSEEK_API_KEY",
-		defaultModel: "deepseek/deepseek-chat",
 	},
 	{
 		id: "xai",
@@ -183,7 +171,6 @@ export const PROVIDERS = [
 		description: "Grok models",
 		placeholder: "xai-...",
 		envVar: "XAI_API_KEY",
-		defaultModel: "xai/grok-2-latest",
 	},
 	{
 		id: "mistral",
@@ -191,7 +178,6 @@ export const PROVIDERS = [
 		description: "Mistral Large, Small, Codestral models",
 		placeholder: "...",
 		envVar: "MISTRAL_API_KEY",
-		defaultModel: "mistral/mistral-large-latest",
 	},
 	{
 		id: "gemini",
@@ -199,7 +185,6 @@ export const PROVIDERS = [
 		description: "Google Gemini experimental and production models",
 		placeholder: "AIza...",
 		envVar: "GEMINI_API_KEY",
-		defaultModel: "gemini/gemini-2.5-flash",
 	},
 	{
 		id: "nvidia",
@@ -207,7 +192,6 @@ export const PROVIDERS = [
 		description: "NVIDIA-hosted models via NIM API",
 		placeholder: "nvapi-...",
 		envVar: "NVIDIA_API_KEY",
-		defaultModel: "nvidia/meta/llama-3.1-405b-instruct",
 	},
 	{
 		id: "minimax",
@@ -215,7 +199,6 @@ export const PROVIDERS = [
 		description: "MiniMax (Anthropic message format)",
 		placeholder: "sk-...",
 		envVar: "MINIMAX_API_KEY",
-		defaultModel: "minimax/MiniMax-M2.5",
 	},
 	{
 		id: "minimax-cn",
@@ -223,7 +206,6 @@ export const PROVIDERS = [
 		description: "MiniMax China (Anthropic message format)",
 		placeholder: "sk-...",
 		envVar: "MINIMAX_CN_API_KEY",
-		defaultModel: "minimax-cn/MiniMax-M2.5",
 	},
 	{
 		id: "moonshot",
@@ -231,7 +213,6 @@ export const PROVIDERS = [
 		description: "Kimi models (Kimi K2, Kimi K2.5)",
 		placeholder: "sk-...",
 		envVar: "MOONSHOT_API_KEY",
-		defaultModel: "moonshot/kimi-k2.5",
 	},
 	{
 		id: "github-copilot",
@@ -239,7 +220,6 @@ export const PROVIDERS = [
 		description: "GitHub Copilot API (uses GitHub PAT for token exchange)",
 		placeholder: "ghp_... or gh auth token",
 		envVar: "GITHUB_COPILOT_API_KEY",
-		defaultModel: "github-copilot/claude-sonnet-4",
 	},
 	{
 		id: "azure",
@@ -247,7 +227,6 @@ export const PROVIDERS = [
 		description: "Azure OpenAI Service with custom deployments",
 		placeholder: "Azure API key (alphanumeric string)",
 		envVar: "AZURE_API_KEY",
-		defaultModel: "azure/gpt-4o",
 	},
 	{
 		id: "ollama",
@@ -255,11 +234,8 @@ export const PROVIDERS = [
 		description: "Local or remote Ollama API endpoint",
 		placeholder: "http://localhost:11434",
 		envVar: "OLLAMA_BASE_URL",
-		defaultModel: "ollama/llama3.2",
 	},
 ] as const;
-
-export const CHATGPT_OAUTH_DEFAULT_MODEL = "openai-chatgpt/gpt-5.3-codex";
 
 export const PERMISSION_OPTIONS = [
 	{

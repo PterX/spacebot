@@ -218,8 +218,38 @@ export function ConfigSectionEditor({
 						description: "Model for transcribing audio attachments",
 					},
 				];
+				const textSlotKeys = [
+					"channel",
+					"branch",
+					"worker",
+					"compactor",
+					"cortex",
+				] as const;
+				const textSlotValues = textSlotKeys.map((key) => localValues[key] ?? "");
+				const uniformModel = textSlotValues.every((v) => v === textSlotValues[0])
+					? textSlotValues[0]
+					: "";
+				const applyModelToAllSlots = (model: string) => {
+					setLocalValues((prev) => ({
+						...prev,
+						channel: model,
+						branch: model,
+						worker: model,
+						compactor: model,
+						cortex: model,
+					}));
+					setLocalDirty(true);
+				};
 				return (
 					<div className="grid gap-4">
+						<div className="border-b border-app-line/50 pb-4">
+							<ModelSelect
+								label="All Models"
+								description="Apply one model to every role below (voice excluded)"
+								value={uniformModel}
+								onChange={applyModelToAllSlots}
+							/>
+						</div>
 						{modelSlots.map(({key, label, description}) => {
 							const modelValue = localValues[key] ?? "";
 							const thinkingKey =

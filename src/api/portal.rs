@@ -492,7 +492,7 @@ pub(super) async fn conversation_defaults(
         runtime_configs
             .get(&query.agent_id)
             .map(|rc| rc.routing.load().channel.clone())
-            .unwrap_or_else(|| "anthropic/claude-sonnet-4".to_string())
+            .unwrap_or_else(|| crate::llm::RoutingConfig::default().channel)
     };
 
     // Build available models from configured providers via the models catalog.
