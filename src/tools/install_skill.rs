@@ -130,7 +130,7 @@ impl Tool for InstallSkillTool {
         // Reload skills into RuntimeConfig so they're immediately available.
         let instance_skills_dir = target_config.instance_dir.join("skills");
         let skills = SkillSet::load(&instance_skills_dir, &target_dir).await;
-        target_config.reload_skills(skills);
+        target_config.reload_skills(skills).await;
 
         if let Some(store) = target_config.skill_usage.load().as_ref()
             && let Err(error) = store.record_installed(&installed).await

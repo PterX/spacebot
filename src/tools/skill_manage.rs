@@ -86,7 +86,7 @@ impl SkillManageTool {
     async fn reload(&self) {
         let instance_skills_dir = self.runtime_config.instance_dir.join("skills");
         let skills = SkillSet::load(&instance_skills_dir, &self.workspace_skills_dir()).await;
-        self.runtime_config.reload_skills(skills);
+        self.runtime_config.reload_skills(skills).await;
     }
 
     fn usage_store(&self) -> Option<Arc<crate::skills::SkillUsageStore>> {
