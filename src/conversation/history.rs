@@ -1028,7 +1028,13 @@ impl ProcessRunLogger {
                 .try_get::<chrono::DateTime<chrono::Utc>, _>("completed_at")
                 .ok()
                 .map(|t| t.to_rfc3339()),
-            transcript_blob: row.try_get("transcript").ok(),
+            // A NULL blob decodes to an empty vec rather than erroring, so
+            // read it as nullable and drop empties — callers treat `None` as
+            // "no persisted transcript" and fall back to the live cache.
+            transcript_blob: row
+                .try_get::<Option<Vec<u8>>, _>("transcript")
+                .unwrap_or(None)
+                .filter(|blob| !blob.is_empty()),
             tool_calls: row.try_get::<i64, _>("tool_calls").unwrap_or(0),
             opencode_session_id: row.try_get("opencode_session_id").ok(),
             opencode_port: row.try_get::<i32, _>("opencode_port").ok(),

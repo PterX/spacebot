@@ -607,10 +607,13 @@ impl Worker {
             .tool_server_handle(worker_tool_server)
             .build();
 
-        // If this is a resumed worker, load the prior history into `history`
-        // (not `compacted_history`) so the LLM sees it as conversation context
-        // on the next follow-up call.
-        let resuming = self.prior_history.is_some();
+        // Seed `history` (not `compacted_history`) so the LLM sees prior
+        // messages as conversation context. Two distinct cases populate it: a
+        // resumed worker carrying its own transcript, and a fresh worker
+        // forking the channel's history. Only the former has already relayed a
+        // result, so resumption is keyed off the state the worker was built
+        // with, not off the presence of history.
+        let resuming = self.state == WorkerState::WaitingForInput;
         let mut history = self.prior_history.take().unwrap_or_default();
         let mut compacted_history = Vec::new();
 
@@ -622,6 +625,12 @@ impl Worker {
             );
             self.hook.send_status("resumed — waiting for input");
             self.hook.send_worker_idle();
+        } else if !history.is_empty() {
+            tracing::info!(
+                worker_id = %self.id,
+                forked_messages = history.len(),
+                "worker seeded with forked channel history"
+            );
         }
 
         // Run the initial task in segments with compaction checkpoints
