@@ -521,12 +521,7 @@ pub(super) async fn conversation_defaults(
         available_models,
         memory_modes: vec!["full".to_string(), "ambient".to_string(), "off".to_string()],
         delegation_modes: vec!["standard".to_string(), "direct".to_string()],
-        worker_history_modes: vec![
-            "none".to_string(),
-            "summary".to_string(),
-            "recent".to_string(),
-            "full".to_string(),
-        ],
+        worker_history_modes: vec!["fork".to_string(), "clean".to_string()],
         worker_memory_modes: vec![
             "none".to_string(),
             "ambient".to_string(),

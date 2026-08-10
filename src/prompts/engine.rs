@@ -319,11 +319,16 @@ impl PromptEngine {
     /// `skill_reflection` adds the reflection section: the pass also decides
     /// whether the session produced a reusable procedure worth persisting as
     /// a skill.
-    pub fn render_memory_persistence_prompt(&self, skill_reflection: bool) -> Result<String> {
+    pub fn render_memory_persistence_prompt(
+        &self,
+        skill_reflection: bool,
+        reflection_worker_ids: &[String],
+    ) -> Result<String> {
         self.render(
             "memory_persistence",
             context! {
                 skill_reflection => skill_reflection,
+                reflection_worker_ids => reflection_worker_ids,
             },
         )
     }
@@ -903,17 +908,25 @@ mod tests {
         let engine = PromptEngine::new("en").expect("prompt engine should build");
 
         let plain = engine
-            .render_memory_persistence_prompt(false)
+            .render_memory_persistence_prompt(false, &[])
             .expect("persistence prompt should render");
         assert!(plain.contains("memory persistence process"));
         assert!(!plain.contains("## Skill Reflection"));
 
         let reflecting = engine
-            .render_memory_persistence_prompt(true)
+            .render_memory_persistence_prompt(true, &[])
             .expect("reflection prompt should render");
         assert!(reflecting.contains("## Skill Reflection"));
         assert!(reflecting.contains("never the incident"));
         assert!(reflecting.contains("Never persist"));
+        assert!(!reflecting.contains("completed since the last reflection pass"));
+
+        let worker_ids = vec!["92ae6824-dd29-4f10-bdbe-8e33b4faa35d".to_string()];
+        let with_workers = engine
+            .render_memory_persistence_prompt(true, &worker_ids)
+            .expect("reflection prompt with workers should render");
+        assert!(with_workers.contains("92ae6824-dd29-4f10-bdbe-8e33b4faa35d"));
+        assert!(with_workers.contains("worker_inspect"));
     }
 
     #[test]

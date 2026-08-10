@@ -717,8 +717,11 @@ pub struct Channel {
     last_persistence_at: std::time::Instant,
     /// Set when a turn or worker crossed the reflection work threshold.
     /// Consumed by the next persistence branch, which then also reflects
-    /// on skills. Atomic because turn processing marks it through `&self`.
-    reflection_signal: std::sync::atomic::AtomicBool,
+    /// on skills. The worker ids are handed to that branch so it can pull
+    /// their transcripts via `worker_inspect` — the lesson usually lives in
+    /// what the worker tried, not in the summary it returned. A mutex (not
+    /// an atomic) because turn processing marks it through `&self`.
+    reflection_signal: std::sync::Mutex<ReflectionSignal>,
     /// When the last skill-reflection pass was spawned, for cooldown.
     last_reflection_at: Option<std::time::Instant>,
     /// Branch IDs for silent memory persistence branches (results not injected into history).
@@ -750,6 +753,24 @@ pub struct Channel {
     control_handle: ChannelControlHandle,
     /// Per-conversation resolved settings (memory mode, delegation mode, model override).
     pub resolved_settings: ResolvedConversationSettings,
+}
+
+/// What accumulated between skill-reflection passes: whether a turn crossed
+/// the tool-iteration threshold, and which workers completed successfully.
+/// Drained by the persistence branch that performs the reflection.
+#[derive(Debug, Default, Clone)]
+struct ReflectionSignal {
+    /// A channel turn crossed `min_tool_iterations` tool calls.
+    turn_work: bool,
+    /// Workers that completed successfully since the last reflection pass,
+    /// in completion order.
+    worker_ids: Vec<WorkerId>,
+}
+
+impl ReflectionSignal {
+    fn is_set(&self) -> bool {
+        self.turn_work || !self.worker_ids.is_empty()
+    }
 }
 
 /// RAII guard that records `message_handling_duration_seconds` when dropped,
@@ -913,7 +934,7 @@ impl Channel {
             message_count: 0,
             last_persistence_at: std::time::Instant::now(),
             memory_persistence_branches: HashSet::new(),
-            reflection_signal: std::sync::atomic::AtomicBool::new(false),
+            reflection_signal: std::sync::Mutex::new(ReflectionSignal::default()),
             last_reflection_at: None,
             branch_reply_targets: HashMap::new(),
             coalesce_buffer: Vec::new(),
@@ -3405,7 +3426,7 @@ impl Channel {
                 if *success {
                     let reflection = self.deps.runtime_config.skills_config.load().reflection;
                     if reflection.enabled {
-                        self.mark_reflection_signal("worker_completed");
+                        self.mark_reflection_worker(*worker_id);
                         // A worker can finish after the last user turn; check
                         // now so reflection doesn't sit pending until the next
                         // inbound message.
@@ -3722,11 +3743,37 @@ impl Channel {
         if self.id.starts_with("cron") {
             return;
         }
-        let was_set = self
+        let mut signal = self
             .reflection_signal
-            .swap(true, std::sync::atomic::Ordering::Relaxed);
+            .lock()
+            .expect("reflection signal lock");
+        let was_set = signal.is_set();
+        signal.turn_work = true;
         if !was_set {
             tracing::debug!(channel_id = %self.id, source, "skill reflection signal set");
+        }
+    }
+
+    /// Record a successfully completed worker for the next reflection pass,
+    /// which pulls its transcript via `worker_inspect`.
+    fn mark_reflection_worker(&self, worker_id: WorkerId) {
+        if self.id.starts_with("cron") {
+            return;
+        }
+        let mut signal = self
+            .reflection_signal
+            .lock()
+            .expect("reflection signal lock");
+        let was_set = signal.is_set();
+        if !signal.worker_ids.contains(&worker_id) {
+            signal.worker_ids.push(worker_id);
+        }
+        if !was_set {
+            tracing::debug!(
+                channel_id = %self.id,
+                %worker_id,
+                "skill reflection signal set by worker completion"
+            );
         }
     }
 
@@ -3734,7 +3781,9 @@ impl Channel {
     fn reflection_due(&self) -> bool {
         if !self
             .reflection_signal
-            .load(std::sync::atomic::Ordering::Relaxed)
+            .lock()
+            .expect("reflection signal lock")
+            .is_set()
         {
             return false;
         }
@@ -3816,15 +3865,36 @@ impl Channel {
         self.message_count = 0;
         self.last_persistence_at = std::time::Instant::now();
 
-        match spawn_memory_persistence_branch(&self.state, &self.deps, reflection_due).await {
+        // Snapshot the completed-worker ids for the reflection pass; the
+        // signal itself is only cleared once the branch actually spawns.
+        let reflection_worker_ids: Vec<WorkerId> = if reflection_due {
+            self.reflection_signal
+                .lock()
+                .expect("reflection signal lock")
+                .worker_ids
+                .clone()
+        } else {
+            Vec::new()
+        };
+
+        match spawn_memory_persistence_branch(
+            &self.state,
+            &self.deps,
+            reflection_due,
+            &reflection_worker_ids,
+        )
+        .await
+        {
             Ok(branch_id) => {
                 // Consume the reflection request only once the branch exists;
                 // a failed spawn leaves the signal set so the next check
                 // retries instead of losing the reflection for a cooldown.
                 if reflection_due {
                     self.last_reflection_at = Some(std::time::Instant::now());
-                    self.reflection_signal
-                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    *self
+                        .reflection_signal
+                        .lock()
+                        .expect("reflection signal lock") = ReflectionSignal::default();
                 }
                 self.memory_persistence_branches.insert(branch_id);
                 tracing::info!(

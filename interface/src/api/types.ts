@@ -122,7 +122,7 @@ export type ConversationSettings = {
 	response_mode?: "active" | "observe" | "mention_only";
 	save_attachments?: boolean;
 	worker_context?: {
-		history?: "none" | "summary" | "recent" | "full";
+		history?: "fork" | "clean";
 		memory?: "none" | "ambient" | "tools" | "full";
 	};
 };
@@ -132,7 +132,7 @@ export type ConversationDefaultsResponse = {
 	memory: "full" | "ambient" | "off";
 	delegation: "standard" | "direct";
 	worker_context: {
-		history: "none" | "summary" | "recent" | "full";
+		history: "fork" | "clean";
 		memory: "none" | "ambient" | "tools" | "full";
 	};
 	available_models: Array<{

@@ -220,6 +220,7 @@ pub(crate) async fn spawn_memory_persistence_branch(
     state: &ChannelState,
     deps: &AgentDeps,
     skill_reflection: bool,
+    reflection_worker_ids: &[crate::WorkerId],
 ) -> std::result::Result<BranchId, AgentError> {
     let contract_state = Arc::new(MemoryPersistenceContractState::default());
 
@@ -227,8 +228,12 @@ pub(crate) async fn spawn_memory_persistence_branch(
     let routing = deps.runtime_config.routing.load();
     let model_name = routing.resolve(ProcessType::Branch, None).to_string();
     let tool_use_enforcement = deps.runtime_config.tool_use_enforcement.load();
+    let reflection_worker_ids: Vec<String> = reflection_worker_ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect();
     let system_prompt = prompt_engine
-        .render_memory_persistence_prompt(skill_reflection)
+        .render_memory_persistence_prompt(skill_reflection, &reflection_worker_ids)
         .and_then(|prompt| {
             prompt_engine.maybe_append_tool_use_enforcement(
                 prompt,
@@ -730,29 +735,29 @@ async fn spawn_worker_inner(
         }
     }
 
-    // Inject conversation history if needed
+    // Fork the channel's conversation history under the worker's own system
+    // prompt — the same fork semantic branches use. An oversized fork is
+    // compacted here so the worker's first LLM call doesn't start life in
+    // overflow recovery.
     let initial_history: Vec<rig::message::Message> = match worker_context.history {
-        WorkerHistoryMode::None => Vec::new(),
-        WorkerHistoryMode::Summary => {
-            // TODO: Generate an LLM-based summary of conversation history.
-            tracing::warn!(
-                "WorkerHistoryMode::Summary is not yet implemented, worker will receive no history"
+        WorkerHistoryMode::Clean => Vec::new(),
+        WorkerHistoryMode::Fork => {
+            let mut history = state.history.read().await.clone();
+            let context_window = **state.deps.runtime_config.context_window.load();
+            let removed = crate::agent::compactor::precompact_forked_history(
+                &mut history,
+                context_window,
+                0.50,
             );
-            Vec::new()
-        }
-        WorkerHistoryMode::Recent(n) => {
-            let history = state.history.read().await;
+            if removed > 0 {
+                tracing::info!(
+                    channel_id = %state.channel_id,
+                    removed,
+                    history_len = history.len(),
+                    "worker fork pre-compacted history"
+                );
+            }
             history
-                .iter()
-                .rev()
-                .take(n as usize)
-                .rev()
-                .cloned()
-                .collect()
-        }
-        WorkerHistoryMode::Full => {
-            let history = state.history.read().await;
-            history.clone()
         }
     };
 

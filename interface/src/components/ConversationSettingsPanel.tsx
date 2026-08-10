@@ -33,7 +33,7 @@ const PRESETS: Array<{
 		settings: {
 			memory: "full",
 			delegation: "standard",
-			worker_context: {history: "none", memory: "none"},
+			worker_context: {history: "fork", memory: "none"},
 		},
 	},
 	{
@@ -43,7 +43,7 @@ const PRESETS: Array<{
 		settings: {
 			memory: "ambient",
 			delegation: "standard",
-			worker_context: {history: "none", memory: "none"},
+			worker_context: {history: "fork", memory: "none"},
 		},
 	},
 	{
@@ -54,7 +54,7 @@ const PRESETS: Array<{
 		settings: {
 			memory: "off",
 			delegation: "direct",
-			worker_context: {history: "recent", memory: "tools"},
+			worker_context: {history: "fork", memory: "tools"},
 		},
 	},
 	{
@@ -64,7 +64,7 @@ const PRESETS: Array<{
 		settings: {
 			memory: "off",
 			delegation: "standard",
-			worker_context: {history: "none", memory: "none"},
+			worker_context: {history: "clean", memory: "none"},
 		},
 	},
 ];
@@ -109,10 +109,8 @@ const RESPONSE_MODE_DESCRIPTIONS: Record<string, string> = {
 };
 
 const WORKER_HISTORY_OPTIONS = [
-	{value: "none", label: "None"},
-	{value: "summary", label: "Summary"},
-	{value: "recent", label: "Recent (20)"},
-	{value: "full", label: "Full"},
+	{value: "fork", label: "Full context"},
+	{value: "clean", label: "Task only"},
 ] as const;
 
 const WORKER_MEMORY_OPTIONS = [

@@ -287,6 +287,40 @@ async fn run_compaction(
     Ok(remove_count)
 }
 
+/// Compact a forked history in place when it already crowds the context
+/// window: drop the oldest `fraction` of messages and insert a marker so the
+/// fork knows material was removed. Used by branch and worker forks before
+/// their first LLM call, so a large parent history doesn't start the fork's
+/// life in overflow recovery. Returns the number of messages removed.
+pub fn precompact_forked_history(
+    history: &mut Vec<Message>,
+    context_window: usize,
+    fraction: f32,
+) -> usize {
+    let estimated = estimate_history_tokens(history);
+    let usage = estimated as f32 / context_window.max(1) as f32;
+    if usage < 0.70 {
+        return 0;
+    }
+
+    let total = history.len();
+    if total <= 4 {
+        return 0;
+    }
+
+    let remove_count = ((total as f32 * fraction) as usize)
+        .max(1)
+        .min(total.saturating_sub(2));
+    history.drain(..remove_count);
+
+    let marker = format!(
+        "[Forked context compacted: {remove_count} older messages removed to stay within context limits. \
+         Continue with the information available.]"
+    );
+    history.insert(0, Message::from(marker));
+    remove_count
+}
+
 /// Estimate token count for a history using chars/4 heuristic.
 ///
 /// This is intentionally rough — it's only used for threshold checks, not billing.

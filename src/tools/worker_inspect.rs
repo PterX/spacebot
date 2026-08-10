@@ -13,11 +13,15 @@ use rig::tool::Tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Per-tool-result display cap when rendering a transcript.
+const DEFAULT_RESULT_CAP: usize = 500;
+
 /// Tool for inspecting worker run transcripts.
 #[derive(Debug, Clone)]
 pub struct WorkerInspectTool {
     run_logger: ProcessRunLogger,
     agent_id: String,
+    result_cap: usize,
 }
 
 impl WorkerInspectTool {
@@ -25,7 +29,15 @@ impl WorkerInspectTool {
         Self {
             run_logger,
             agent_id,
+            result_cap: DEFAULT_RESULT_CAP,
         }
+    }
+
+    /// Raise the per-result display cap. Reflection passes read transcripts
+    /// for the error text and recovery steps, which the default cap can clip.
+    pub fn with_result_cap(mut self, cap: usize) -> Self {
+        self.result_cap = cap;
+        self
     }
 }
 
@@ -142,10 +154,10 @@ impl Tool for WorkerInspectTool {
                                 name, text, ..
                             } => {
                                 let label = if name.is_empty() { "tool" } else { name };
-                                let display = if text.len() > 500 {
+                                let display = if text.len() > self.result_cap {
                                     format!(
                                         "{}\n[truncated, {} bytes total]",
-                                        truncate_utf8_ellipsis(text, 500),
+                                        truncate_utf8_ellipsis(text, self.result_cap),
                                         text.len()
                                     )
                                 } else {

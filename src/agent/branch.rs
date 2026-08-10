@@ -1,6 +1,5 @@
 //! Branch: Fork context for thinking and delegation.
 
-use crate::agent::compactor::estimate_history_tokens;
 use crate::error::Result;
 use crate::hooks::SpacebotHook;
 use crate::llm::SpacebotModel;
@@ -284,20 +283,19 @@ impl Branch {
     /// Removes the oldest 50% of messages when usage exceeds 70%.
     fn maybe_compact_history(&mut self) {
         let context_window = **self.deps.runtime_config.context_window.load();
-        let estimated = estimate_history_tokens(&self.history);
-        let usage = estimated as f32 / context_window as f32;
-
-        if usage < 0.70 {
-            return;
-        }
-
-        tracing::info!(
-            branch_id = %self.id,
-            usage = %format!("{:.0}%", usage * 100.0),
-            history_len = self.history.len(),
-            "branch pre-compacting history"
+        let removed = crate::agent::compactor::precompact_forked_history(
+            &mut self.history,
+            context_window,
+            0.50,
         );
-        self.compact_history(0.50);
+        if removed > 0 {
+            tracing::info!(
+                branch_id = %self.id,
+                removed,
+                history_len = self.history.len(),
+                "branch pre-compacted forked history"
+            );
+        }
     }
 
     /// Aggressive compaction for overflow recovery. Removes 75% of messages.
