@@ -51,11 +51,7 @@ impl ChannelSettingsStore {
         conversation_id: &str,
         mode: crate::conversation::settings::ResponseMode,
     ) -> crate::error::Result<()> {
-        let mode_value = serde_json::to_value(mode).map_err(|e| anyhow::anyhow!(e))?;
-        let mode_str = mode_value
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("response mode did not serialize to a string"))?
-            .to_string();
+        let mode_str = mode.as_setting_str()?;
 
         sqlx::query(
             "INSERT INTO channel_settings (agent_id, conversation_id, settings, updated_at) \

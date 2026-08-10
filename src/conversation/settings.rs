@@ -156,6 +156,17 @@ impl ResponseMode {
             _ => ResponseMode::Active,
         }
     }
+
+    /// The serde string form ("active" / "observe" / "mention_only"), used
+    /// by the settings stores to JSON-patch the persisted `response_mode`
+    /// field without rewriting the whole settings row.
+    pub fn as_setting_str(self) -> anyhow::Result<String> {
+        let value = serde_json::to_value(self)?;
+        value
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("response mode did not serialize to a string"))
+    }
 }
 
 /// Worker context settings control what context workers receive when spawned.

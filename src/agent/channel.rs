@@ -1165,28 +1165,16 @@ impl Channel {
             .response_mode
             .store(mode.to_u8(), std::sync::atomic::Ordering::Release);
 
-        // Persist to channel_settings table — load existing settings first so we
-        // don't overwrite other fields, then spawn the DB write to avoid blocking.
+        // Persist on a spawned task to avoid blocking the channel. The
+        // store's atomic field update leaves the rest of the settings row
+        // untouched, so this write can't restore stale fields over a
+        // concurrent settings writer or a router-side mode change.
         let pool = self.deps.sqlite_pool.clone();
         let agent_id = self.deps.agent_id.clone();
         let channel_id: String = self.id.as_ref().to_owned();
         tokio::spawn(async move {
             let store = crate::conversation::ChannelSettingsStore::new(pool);
-            let mut settings = match store.get(&agent_id, &channel_id).await {
-                Ok(Some(existing)) => existing,
-                Ok(None) => crate::conversation::ConversationSettings::default(),
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        %channel_id,
-                        ?mode,
-                        "failed to load existing settings before persisting response_mode"
-                    );
-                    crate::conversation::ConversationSettings::default()
-                }
-            };
-            settings.response_mode = mode;
-            if let Err(error) = store.upsert(&agent_id, &channel_id, &settings).await {
+            if let Err(error) = store.set_response_mode(&agent_id, &channel_id, mode).await {
                 tracing::warn!(
                     %error,
                     %channel_id,
