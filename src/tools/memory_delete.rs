@@ -125,10 +125,6 @@ impl Tool for MemoryDeleteTool {
                 .with_label_values(&["unknown", "forget"])
                 .inc();
 
-            if let Some(rc) = &self.runtime_config {
-                rc.bump_knowledge_synthesis_version();
-            }
-
             tracing::info!(
                 memory_id = %args.memory_id,
                 memory_type = %memory.memory_type,

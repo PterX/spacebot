@@ -1236,10 +1236,9 @@ pub struct CortexConfig {
     pub association_updates_threshold: f32,
     /// Max associations to create per pass (rate limit).
     pub association_max_per_pass: usize,
-    /// Knowledge synthesis max words (replaces bulletin_max_words for Layer 5).
-    pub knowledge_synthesis_max_words: usize,
-    /// Debounce seconds after last memory change before regenerating knowledge synthesis.
-    pub knowledge_synthesis_debounce_secs: u64,
+    /// Max words for the deterministic memory-store render in the channel
+    /// knowledge-context slot (replaces the retired LLM knowledge synthesis).
+    pub memory_render_max_words: usize,
 }
 
 impl Default for CortexConfig {
@@ -1267,8 +1266,7 @@ impl Default for CortexConfig {
             association_similarity_threshold: 0.85,
             association_updates_threshold: 0.95,
             association_max_per_pass: 100,
-            knowledge_synthesis_max_words: 500,
-            knowledge_synthesis_debounce_secs: 60,
+            memory_render_max_words: 500,
         }
     }
 }

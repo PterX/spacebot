@@ -2927,7 +2927,26 @@ impl Channel {
 
         let rc = &self.deps.runtime_config;
         let memory_bulletin_text = Some(rc.memory_bulletin.load().to_string());
-        let knowledge_synthesis_text = Some(rc.knowledge_synthesis.load().to_string());
+        // The knowledge-context slot is a deterministic store render — no
+        // LLM synthesis, byte-stable between memory writes.
+        let knowledge_synthesis_text = {
+            let cortex_config = **rc.cortex.load();
+            match crate::memory::render::render_memory_store(
+                &self.deps.memory_search.store(),
+                &self.deps.task_store,
+                &self.deps.agent_id,
+                cortex_config.memory_render_max_words,
+            )
+            .await
+            {
+                Ok(text) if !text.is_empty() => Some(text),
+                Ok(_) => None,
+                Err(error) => {
+                    tracing::warn!(channel_id = %self.id, %error, "memory store render failed");
+                    None
+                }
+            }
+        };
         let wm_config = **rc.working_memory.load();
         let timezone = self.deps.working_memory.timezone();
 

@@ -95,13 +95,12 @@ async fn run_maintenance_for_agent(deps: &AgentDeps) -> anyhow::Result<()> {
     .await
     .map_err(|error| anyhow::anyhow!("memory maintenance failed: {error}"))?;
 
-    // Prunes and merges change memory content; decay is importance-only and
-    // does not dirty knowledge synthesis. Mirrors the cortex-loop path in
-    // `cortex.rs` so dormant agents don't get a stale memory bulletin /
-    // knowledge synthesis after a janitor pass that pruned or merged.
-    if report.pruned > 0 || report.merged > 0 {
-        deps.runtime_config.bump_knowledge_synthesis_version();
-    }
+    tracing::info!(
+        decayed = report.decayed,
+        pruned = report.pruned,
+        merged = report.merged,
+        "memory maintenance completed"
+    );
 
     Ok(())
 }

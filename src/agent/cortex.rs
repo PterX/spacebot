@@ -318,42 +318,6 @@ where
     }
 }
 
-async fn generate_if_dirty_under_lock<ShouldGenerate, Generate, Fut>(
-    warmup_lock: &tokio::sync::Mutex<()>,
-    should_generate: ShouldGenerate,
-    generate: Generate,
-) -> BulletinRefreshOutcome
-where
-    ShouldGenerate: FnOnce() -> bool,
-    Generate: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let _warmup_guard = warmup_lock.lock().await;
-
-    if !should_generate() {
-        tracing::debug!("skipping knowledge synthesis because dirty version was already handled");
-        return BulletinRefreshOutcome::SkippedFresh;
-    }
-
-    if generate().await {
-        BulletinRefreshOutcome::Generated
-    } else {
-        BulletinRefreshOutcome::Failed
-    }
-}
-
-async fn generate_knowledge_synthesis_if_dirty_under_lock(
-    deps: &AgentDeps,
-    logger: &CortexLogger,
-) -> BulletinRefreshOutcome {
-    generate_if_dirty_under_lock(
-        deps.runtime_config.warmup_lock.as_ref(),
-        || should_regenerate_knowledge_synthesis(deps),
-        || generate_knowledge_synthesis(deps, logger),
-    )
-    .await
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BulletinRefreshOutcome {
     Generated,
@@ -408,13 +372,6 @@ fn spawn_daily_synthesis_task(
     logger: CortexLogger,
 ) -> tokio::task::JoinHandle<anyhow::Result<bool>> {
     tokio::spawn(async move { maybe_synthesize_daily_summary(&deps, &logger).await })
-}
-
-fn mark_knowledge_synthesis_version_complete(
-    last_version: &std::sync::atomic::AtomicU64,
-    target_version: u64,
-) {
-    last_version.store(target_version, std::sync::atomic::Ordering::Release);
 }
 
 const SYNTHESIS_TASK_BACKOFF_INITIAL_SECS: u64 = 30;
@@ -1141,11 +1098,6 @@ impl Cortex {
     /// Process a process event and extract signals.
     pub async fn observe(&self, event: ProcessEvent) {
         self.observe_health_event(&event).await;
-
-        // Bump knowledge synthesis version on memory content changes.
-        if matches!(&event, ProcessEvent::MemorySaved { .. }) {
-            self.deps.runtime_config.bump_knowledge_synthesis_version();
-        }
 
         let Some(signal) = signal_from_event(event) else {
             return;
@@ -1895,15 +1847,12 @@ pub async fn run_warmup_once(deps: &AgentDeps, logger: &CortexLogger, reason: &s
         }
     }
 
-    // Generate knowledge synthesis (narrower scope, replaces bulletin).
-    // This also syncs memory_bulletin for backward compatibility.
-    let synthesis_ok = generate_knowledge_synthesis(deps, logger).await;
-    if !synthesis_ok {
-        // Fall back to the broader bulletin if knowledge synthesis fails.
-        let bulletin_ok = generate_bulletin(deps, logger).await;
-        if !bulletin_ok {
-            errors.push("knowledge synthesis and bulletin fallback both failed".to_string());
-        }
+    // Generate the memory bulletin at warmup. The channel knowledge-context
+    // slot is a deterministic store render now — no LLM synthesis at read
+    // time, so the bulletin is the only startup LLM knowledge write.
+    let bulletin_ok = generate_bulletin(deps, logger).await;
+    if !bulletin_ok {
+        errors.push("memory bulletin generation failed".to_string());
     }
 
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -2003,14 +1952,13 @@ async fn run_cortex_loop(
     const RETRY_DELAY_SECS: u64 = 15;
     const LAG_WARNING_INTERVAL_SECS: u64 = 30;
 
-    // Run knowledge synthesis immediately on startup, with retries.
-    // Falls back to the broader bulletin if synthesis fails.
+    // Run the memory bulletin immediately on startup, with retries.
     for attempt in 0..=MAX_RETRIES {
         let bulletin_outcome = maybe_generate_bulletin_under_lock(
             cortex.deps.runtime_config.warmup_lock.as_ref(),
             &cortex.deps.runtime_config.warmup,
             &cortex.deps.runtime_config.warmup_status,
-            || generate_knowledge_synthesis(&cortex.deps, logger),
+            || generate_bulletin(&cortex.deps, logger),
         )
         .await;
 
@@ -2021,12 +1969,12 @@ async fn run_cortex_loop(
             tracing::info!(
                 attempt = attempt + 1,
                 max = MAX_RETRIES,
-                "retrying knowledge synthesis in {RETRY_DELAY_SECS}s"
+                "retrying memory bulletin in {RETRY_DELAY_SECS}s"
             );
             logger.log(
-                "knowledge_synthesis_startup_retry",
+                "bulletin_startup_retry",
                 &format!(
-                    "Knowledge synthesis failed, retrying (attempt {}/{})",
+                    "Memory bulletin generation failed, retrying (attempt {}/{})",
                     attempt + 1,
                     MAX_RETRIES
                 ),
@@ -2293,11 +2241,6 @@ async fn run_cortex_loop(
                             }
                             maintenance_consecutive_failures = 0;
                             maintenance_disabled_at = None;
-                            // Prunes and merges change memory content; decay is
-                            // importance-only and does not dirty knowledge.
-                            if report.pruned > 0 || report.merged > 0 {
-                                cortex.deps.runtime_config.bump_knowledge_synthesis_version();
-                            }
                             logger.log(
                                 "maintenance_completed",
                                 "Memory maintenance completed",
@@ -2427,22 +2370,8 @@ async fn run_cortex_loop(
                 ) {
                     tracing::info!("cortex maintenance circuit closed; retries re-enabled");
                 }
-                // Bulletin timer-based refresh removed — knowledge synthesis
-                // is now change-driven via dirty flag + debounce. The bulletin
-                // loop was generating ~96 redundant calls/day at 15-min intervals.
-                // The old bulletin code is preserved for startup fallback only.
-
-                // Knowledge synthesis: change-driven regeneration with debounce.
-                if refresh_task.is_none()
-                    && should_regenerate_knowledge_synthesis(&cortex.deps)
-                {
-                    let deps = cortex.deps.clone();
-                    let synthesis_logger = logger.clone();
-                    refresh_task = Some(tokio::spawn(async move {
-                        generate_knowledge_synthesis_if_dirty_under_lock(&deps, &synthesis_logger)
-                            .await
-                    }));
-                }
+                // The channel knowledge-context slot renders the store
+                // directly — no change-driven regeneration exists anymore.
 
                 if last_maintenance.elapsed() >= Duration::from_secs(
                     cortex_config.maintenance_interval_secs.max(1),
@@ -2849,341 +2778,6 @@ pub async fn generate_bulletin(deps: &AgentDeps, logger: &CortexLogger) -> bool 
             false
         }
     }
-}
-
-// -- Knowledge Synthesis --
-
-/// Sections for knowledge synthesis — narrower than the bulletin.
-/// No identity (Layer 1), no recent events (Layer 2), no per-user context (Layer 4).
-const KNOWLEDGE_SYNTHESIS_SECTIONS: &[BulletinSection] = &[
-    BulletinSection {
-        label: "Decisions",
-        mode: SearchMode::Typed,
-        memory_type: Some(MemoryType::Decision),
-        sort_by: SearchSort::Recent,
-        max_results: 10,
-    },
-    BulletinSection {
-        label: "High-Importance Context",
-        mode: SearchMode::Important,
-        memory_type: None,
-        sort_by: SearchSort::Importance,
-        max_results: 10,
-    },
-    BulletinSection {
-        label: "Preferences & Patterns",
-        mode: SearchMode::Typed,
-        memory_type: Some(MemoryType::Preference),
-        sort_by: SearchSort::Importance,
-        max_results: 10,
-    },
-    BulletinSection {
-        label: "Active Goals",
-        mode: SearchMode::Typed,
-        memory_type: Some(MemoryType::Goal),
-        sort_by: SearchSort::Recent,
-        max_results: 10,
-    },
-    BulletinSection {
-        label: "Observations",
-        mode: SearchMode::Typed,
-        memory_type: Some(MemoryType::Observation),
-        sort_by: SearchSort::Recent,
-        max_results: 5,
-    },
-];
-
-#[derive(Debug, Default)]
-struct GatheredSections {
-    text: String,
-    failed_sections: usize,
-}
-
-impl GatheredSections {
-    fn has_failures(&self) -> bool {
-        self.failed_sections > 0
-    }
-}
-
-/// Generate a change-driven knowledge synthesis (Layer 5) and store it in RuntimeConfig.
-///
-/// Uses the same programmatic gather + LLM synthesis pattern as the bulletin,
-/// but with narrower scope and the `cortex_knowledge_synthesis` prompt template.
-/// Also keeps `memory_bulletin` in sync for backward compatibility.
-#[tracing::instrument(skip(deps, logger), fields(agent_id = %deps.agent_id))]
-pub async fn generate_knowledge_synthesis(deps: &AgentDeps, logger: &CortexLogger) -> bool {
-    tracing::info!("cortex generating knowledge synthesis");
-    let started = Instant::now();
-    let target_version = deps
-        .runtime_config
-        .knowledge_synthesis_version
-        .load(std::sync::atomic::Ordering::Acquire);
-
-    let mut gathered_sections = gather_sections_from_list(deps, KNOWLEDGE_SYNTHESIS_SECTIONS).await;
-    let active_tasks_failed = match gather_active_tasks(deps).await {
-        Ok(tasks) => {
-            gathered_sections.text.push_str(&tasks);
-            false
-        }
-        Err(error) => {
-            tracing::warn!(%error, "failed to gather active tasks for knowledge synthesis");
-            true
-        }
-    };
-    let gather_failed = gathered_sections.has_failures() || active_tasks_failed;
-    let failed_memory_sections = gathered_sections.failed_sections;
-    let raw_sections = gathered_sections.text;
-    let section_count = raw_sections.matches("### ").count();
-
-    if gather_failed {
-        let duration_ms = started.elapsed().as_millis() as u64;
-        tracing::warn!(
-            failed_memory_sections,
-            active_tasks_failed,
-            duration_ms,
-            "knowledge synthesis input gather failed"
-        );
-        update_warmup_status(deps, |status| {
-            status.last_error = Some("knowledge synthesis input gather failed".to_string());
-        });
-        logger.log(
-            "knowledge_synthesis_failed",
-            "Knowledge synthesis failed while gathering input",
-            Some(serde_json::json!({
-                "duration_ms": duration_ms,
-                "failed_memory_sections": failed_memory_sections,
-                "active_tasks_failed": active_tasks_failed,
-                "target_version": target_version,
-            })),
-        );
-        return false;
-    }
-
-    if raw_sections.is_empty() {
-        tracing::info!("no memories found for knowledge synthesis");
-        deps.runtime_config
-            .knowledge_synthesis
-            .store(Arc::new(String::new()));
-        // Keep bulletin in sync during transition.
-        deps.runtime_config
-            .memory_bulletin
-            .store(Arc::new(String::new()));
-        mark_knowledge_synthesis_version_complete(
-            &deps.runtime_config.knowledge_synthesis_last_version,
-            target_version,
-        );
-        update_warmup_status(deps, |status| {
-            status.last_refresh_unix_ms = Some(chrono::Utc::now().timestamp_millis());
-            status.bulletin_age_secs = Some(0);
-            if status.state != crate::config::WarmupState::Warming {
-                status.state = crate::config::WarmupState::Warm;
-                status.last_error = None;
-            }
-        });
-        logger.log(
-            "knowledge_synthesis_generated",
-            "Knowledge synthesis skipped: no memories or active tasks",
-            Some(serde_json::json!({
-                "word_count": 0,
-                "sections": 0,
-                "duration_ms": started.elapsed().as_millis() as u64,
-                "target_version": target_version,
-                "skipped": true,
-            })),
-        );
-        return true;
-    }
-
-    let cortex_config = **deps.runtime_config.cortex.load();
-    let prompt_engine = deps.runtime_config.prompts.load();
-    let synthesis_preamble = match prompt_engine.render_static("cortex_knowledge_synthesis") {
-        Ok(p) => p,
-        Err(error) => {
-            tracing::error!(%error, "failed to render cortex_knowledge_synthesis prompt");
-            return false;
-        }
-    };
-
-    let routing = deps.runtime_config.routing.load();
-    let model_name = routing.resolve(ProcessType::Cortex, None).to_string();
-    let usage_accumulator = std::sync::Arc::new(tokio::sync::Mutex::new(
-        crate::llm::usage::UsageAccumulator::new(),
-    ));
-    let model = SpacebotModel::make(&deps.llm_manager, &model_name)
-        .with_context(&*deps.agent_id, "cortex")
-        .with_routing((**routing).clone())
-        .with_accumulator(usage_accumulator.clone());
-
-    let agent = AgentBuilder::new(model)
-        .preamble(&synthesis_preamble)
-        .hook(CortexHook::new())
-        .build();
-
-    let max_words = cortex_config.knowledge_synthesis_max_words;
-    let user_prompt = match prompt_engine.render_system_cortex_synthesis(max_words, &raw_sections) {
-        Ok(p) => p,
-        Err(error) => {
-            tracing::error!(%error, "failed to render cortex synthesis user prompt");
-            return false;
-        }
-    };
-
-    let result = agent.prompt(&user_prompt).await;
-    let acc = usage_accumulator.lock().await;
-    if let Err(error) = acc
-        .flush(&deps.sqlite_pool, &deps.agent_id, "cortex", None)
-        .await
-    {
-        tracing::warn!(%error, "failed to flush cortex token usage");
-    }
-    drop(acc);
-
-    match result {
-        Ok(synthesis) => {
-            let word_count = synthesis.split_whitespace().count();
-            let duration_ms = started.elapsed().as_millis() as u64;
-            tracing::info!(
-                words = word_count,
-                sections = section_count,
-                duration_ms,
-                "knowledge synthesis generated"
-            );
-            deps.runtime_config
-                .knowledge_synthesis
-                .store(Arc::new(synthesis.clone()));
-            // Keep bulletin in sync during transition so unconverted consumers work.
-            deps.runtime_config
-                .memory_bulletin
-                .store(Arc::new(synthesis));
-            mark_knowledge_synthesis_version_complete(
-                &deps.runtime_config.knowledge_synthesis_last_version,
-                target_version,
-            );
-            // Update warmup status.
-            let refresh_ms = chrono::Utc::now().timestamp_millis();
-            update_warmup_status(deps, |status| {
-                status.last_refresh_unix_ms = Some(refresh_ms);
-                status.bulletin_age_secs = Some(0);
-                if status.state != crate::config::WarmupState::Warming {
-                    status.state = crate::config::WarmupState::Warm;
-                    status.last_error = None;
-                }
-            });
-            logger.log(
-                "knowledge_synthesis_generated",
-                &format!("Knowledge synthesis: {word_count} words, {section_count} sections, {duration_ms}ms"),
-                Some(serde_json::json!({
-                    "word_count": word_count,
-                    "sections": section_count,
-                    "duration_ms": duration_ms,
-                    "model": model_name,
-                })),
-            );
-            true
-        }
-        Err(error) => {
-            let duration_ms = started.elapsed().as_millis() as u64;
-            tracing::error!(%error, duration_ms, "knowledge synthesis failed");
-            update_warmup_status(deps, |status| {
-                status.last_error = Some(format!("knowledge synthesis failed: {error}"));
-            });
-            logger.log(
-                "knowledge_synthesis_failed",
-                &format!("Knowledge synthesis failed after {duration_ms}ms: {error}"),
-                Some(serde_json::json!({
-                    "duration_ms": duration_ms,
-                    "error": error.to_string(),
-                    "model": model_name,
-                })),
-            );
-            false
-        }
-    }
-}
-
-/// Gather raw memory sections from a specific section list.
-///
-/// Uses the same pattern as `gather_bulletin_sections` (empty-query metadata
-/// search) but accepts an arbitrary section list for narrower scoping.
-async fn gather_sections_from_list(
-    deps: &AgentDeps,
-    sections: &[BulletinSection],
-) -> GatheredSections {
-    let mut gathered = GatheredSections::default();
-
-    for section in sections {
-        let config = SearchConfig {
-            mode: section.mode,
-            memory_type: section.memory_type,
-            max_results: section.max_results,
-            sort_by: section.sort_by,
-            ..Default::default()
-        };
-
-        let results = match deps.memory_search.search("", &config).await {
-            Ok(results) => results,
-            Err(error) => {
-                tracing::warn!(
-                    section = section.label,
-                    %error,
-                    "knowledge synthesis section query failed"
-                );
-                gathered.failed_sections += 1;
-                continue;
-            }
-        };
-
-        if results.is_empty() {
-            continue;
-        }
-
-        gathered
-            .text
-            .push_str(&format!("### {}\n\n", section.label));
-        for result in &results {
-            gathered.text.push_str(&format!(
-                "- [{}] (importance: {:.1}) {}\n",
-                result.memory.memory_type,
-                result.memory.importance,
-                result
-                    .memory
-                    .content
-                    .lines()
-                    .next()
-                    .unwrap_or(&result.memory.content),
-            ));
-        }
-        gathered.text.push('\n');
-    }
-
-    gathered
-}
-
-/// Check if knowledge synthesis needs regeneration based on dirty flag and debounce.
-pub fn should_regenerate_knowledge_synthesis(deps: &AgentDeps) -> bool {
-    let current_version = deps
-        .runtime_config
-        .knowledge_synthesis_version
-        .load(std::sync::atomic::Ordering::Acquire);
-    let last_version = deps
-        .runtime_config
-        .knowledge_synthesis_last_version
-        .load(std::sync::atomic::Ordering::Acquire);
-
-    if current_version == last_version {
-        return false;
-    }
-
-    // Debounce: wait for activity to settle.
-    let cortex_config = **deps.runtime_config.cortex.load();
-    let last_change = deps
-        .runtime_config
-        .knowledge_synthesis_last_change
-        .load(std::sync::atomic::Ordering::Acquire);
-    let now = chrono::Utc::now().timestamp();
-    let elapsed = now.saturating_sub(last_change) as u64;
-
-    elapsed >= cortex_config.knowledge_synthesis_debounce_secs
 }
 
 // -- Intra-Day Synthesis + Daily Summaries --
@@ -4676,14 +4270,13 @@ async fn fetch_memories_for_association(
 mod tests {
     use super::{
         BULLETIN_REFRESH_CIRCUIT_OPEN_SECS, BULLETIN_REFRESH_CIRCUIT_OPEN_THRESHOLD, BranchTracker,
-        BulletinRefreshOutcome, CortexReceiverOutcome, GatheredSections, HealthRuntimeState,
+        BulletinRefreshOutcome, CortexReceiverOutcome, HealthRuntimeState,
         MAINTENANCE_TASK_CANCEL_GRACE_SECS, MaintenanceTimeoutAction, ReceiverClosedBehavior,
         Signal, SynthesisTaskBackoff, WorkerTracker, apply_cancelled_warmup_status,
         build_kill_targets, claim_detached_completion, collect_synthesis_task,
-        detached_timeout_transition, generate_if_dirty_under_lock, handle_cortex_receiver_result,
-        has_completed_initial_warmup, is_cancelled_control_result, is_terminal_control_result,
-        maintenance_task_timeout, maintenance_timeout_action,
-        mark_knowledge_synthesis_version_complete, maybe_close_bulletin_refresh_circuit,
+        detached_timeout_transition, handle_cortex_receiver_result, has_completed_initial_warmup,
+        is_cancelled_control_result, is_terminal_control_result, maintenance_task_timeout,
+        maintenance_timeout_action, maybe_close_bulletin_refresh_circuit,
         maybe_generate_bulletin_under_lock, maybe_spawn_synthesis_task,
         parse_structured_success_flag, push_signal_into_buffer, record_bulletin_refresh_failure,
         should_execute_warmup, should_generate_bulletin_from_bulletin_loop, signal_from_event,
@@ -4699,7 +4292,7 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
     use std::collections::VecDeque;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -4896,40 +4489,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dirty_knowledge_synthesis_rechecks_after_waiting_for_warmup_lock() {
-        let warmup_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let dirty = Arc::new(AtomicBool::new(true));
-        let calls = Arc::new(AtomicUsize::new(0));
-
-        let guard = warmup_lock.as_ref().lock().await;
-
-        let warmup_lock_for_task = Arc::clone(&warmup_lock);
-        let dirty_for_task = Arc::clone(&dirty);
-        let calls_for_task = Arc::clone(&calls);
-        let task = tokio::spawn(async move {
-            generate_if_dirty_under_lock(
-                warmup_lock_for_task.as_ref(),
-                || dirty_for_task.load(Ordering::SeqCst),
-                || async move {
-                    calls_for_task.fetch_add(1, Ordering::SeqCst);
-                    true
-                },
-            )
-            .await
-        });
-
-        // A warmup pass completes while the dirty task is waiting for the same
-        // lock. Once unblocked, the dirty task must observe the clean version
-        // and skip instead of running a duplicate synthesis.
-        dirty.store(false, Ordering::SeqCst);
-        drop(guard);
-
-        let result = task.await.expect("task should join");
-        assert_eq!(result, BulletinRefreshOutcome::SkippedFresh);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
     async fn working_memory_synthesis_task_is_single_flight() {
         let calls = Arc::new(AtomicUsize::new(0));
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
@@ -5069,35 +4628,6 @@ mod tests {
         assert_eq!(backoff.failure_count, 0);
         assert_eq!(backoff.next_allowed_instant, retry_at);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-    }
-
-    #[test]
-    fn knowledge_synthesis_completion_marks_target_version_not_current_version() {
-        let current_version = std::sync::atomic::AtomicU64::new(2);
-        let last_version = std::sync::atomic::AtomicU64::new(0);
-        let target_version = 1;
-
-        mark_knowledge_synthesis_version_complete(&last_version, target_version);
-
-        assert_eq!(
-            current_version.load(Ordering::Acquire),
-            2,
-            "newer dirty version should still be pending"
-        );
-        assert_eq!(last_version.load(Ordering::Acquire), target_version);
-    }
-
-    #[test]
-    fn gathered_sections_fail_when_any_section_query_failed() {
-        let gathered = GatheredSections {
-            text: String::new(),
-            failed_sections: 1,
-        };
-
-        assert!(
-            gathered.has_failures(),
-            "failed section queries must keep synthesis retryable"
-        );
     }
 
     #[test]

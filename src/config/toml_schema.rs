@@ -429,8 +429,7 @@ pub(super) struct TomlCortexConfig {
     pub(super) association_similarity_threshold: Option<f32>,
     pub(super) association_updates_threshold: Option<f32>,
     pub(super) association_max_per_pass: Option<usize>,
-    pub(super) knowledge_synthesis_max_words: Option<usize>,
-    pub(super) knowledge_synthesis_debounce_secs: Option<u64>,
+    pub(super) memory_render_max_words: Option<usize>,
 }
 
 #[derive(Deserialize)]

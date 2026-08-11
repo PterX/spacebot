@@ -717,10 +717,27 @@ async fn spawn_worker_inner(
 
     // Inject memory context based on worker_context settings
     if worker_context.memory.ambient_enabled() {
-        // Get knowledge synthesis and working memory
-        let knowledge_synthesis = state.deps.runtime_config.knowledge_synthesis.load();
+        // Render the memory store directly (deterministic, LLM-free) plus
+        // working memory.
         let wm_config = **state.deps.runtime_config.working_memory.load();
         let timezone = state.deps.working_memory.timezone();
+
+        let cortex_config = **state.deps.runtime_config.cortex.load();
+        let memory_store = match crate::memory::render::render_memory_store(
+            state.deps.memory_search.store(),
+            &state.deps.task_store,
+            &state.deps.agent_id,
+            cortex_config.memory_render_max_words,
+        )
+        .await
+        {
+            Ok(text) if !text.is_empty() => Some(text),
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(%error, "worker ambient memory store render failed");
+                None
+            }
+        };
 
         if let Ok(working_memory) = crate::memory::working::render_working_memory(
             &state.deps.working_memory,
@@ -730,8 +747,10 @@ async fn spawn_worker_inner(
         )
         .await
         {
-            system_prompt.push_str("\n\n## Agent's Knowledge\n");
-            system_prompt.push_str(&knowledge_synthesis.to_string());
+            if let Some(memory_store) = memory_store {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(&memory_store);
+            }
             if !working_memory.is_empty() {
                 system_prompt.push_str("\n\n## Recent Activity\n");
                 system_prompt.push_str(&working_memory);

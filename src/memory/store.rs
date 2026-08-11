@@ -570,6 +570,19 @@ impl MemoryStore {
         Ok(rows.into_iter().map(|row| row_to_memory(&row)).collect())
     }
 
+    /// Count memories of a type (excluding forgotten ones), for the
+    /// shown-of-total counts in the deterministic memory-store render.
+    pub async fn count_by_type(&self, memory_type: MemoryType) -> Result<i64> {
+        let type_str = memory_type.to_string();
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM memories WHERE memory_type = ? AND forgotten = 0")
+                .bind(&type_str)
+                .fetch_one(&self.pool)
+                .await
+                .with_context(|| format!("failed to count memories of type {:?}", memory_type))?;
+        Ok(count)
+    }
+
     /// Get high-importance memories for injection into context.
     pub async fn get_high_importance(&self, threshold: f32, limit: i64) -> Result<Vec<Memory>> {
         let rows = sqlx::query(

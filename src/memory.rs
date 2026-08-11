@@ -3,6 +3,7 @@
 pub mod embedding;
 pub mod lance;
 pub mod maintenance;
+pub mod render;
 pub mod search;
 pub mod store;
 pub mod types;

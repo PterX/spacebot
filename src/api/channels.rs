@@ -530,7 +530,21 @@ pub(super) async fn inspect_prompt(
     // ── Gather all dynamic sections ──
     let identity_context = rc.identity.load().render();
     let memory_bulletin = rc.memory_bulletin.load();
-    let knowledge_synthesis = rc.knowledge_synthesis.load();
+    let cortex_config = **rc.cortex.load();
+    let knowledge_synthesis = match crate::memory::render::render_memory_store(
+        channel_state.deps.memory_search.store(),
+        &channel_state.deps.task_store,
+        &channel_state.deps.agent_id,
+        cortex_config.memory_render_max_words,
+    )
+    .await
+    {
+        Ok(text) => text,
+        Err(error) => {
+            tracing::warn!(%error, "inspect prompt memory store render failed");
+            String::new()
+        }
+    };
     let skills = rc.skills.load();
     let skills_prompt = skills
         .render_channel_prompt(&prompt_engine)
