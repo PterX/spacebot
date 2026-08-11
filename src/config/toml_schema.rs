@@ -321,6 +321,7 @@ pub(super) struct TomlDefaultsConfig {
     pub(super) opencode: Option<TomlOpenCodeConfig>,
     pub(super) worker_log_mode: Option<String>,
     pub(super) home_channel: Option<String>,
+    pub(super) human_profile_cap: Option<usize>,
     pub(super) projects: Option<TomlProjectsConfig>,
 }
 

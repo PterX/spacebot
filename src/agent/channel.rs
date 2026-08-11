@@ -2915,7 +2915,12 @@ impl Channel {
             peers,
         };
 
-        prompt_engine.render_org_context(org_context).ok()
+        prompt_engine
+            .render_org_context(
+                org_context,
+                **self.deps.runtime_config.human_profile_cap.load(),
+            )
+            .ok()
     }
 
     async fn render_memory_layers(

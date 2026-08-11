@@ -812,17 +812,41 @@ impl PromptEngine {
     }
 
     /// Render the org context fragment showing the agent's position in the hierarchy.
-    pub fn render_org_context(&self, org_context: OrgContext) -> Result<String> {
+    ///
+    /// `human_profile_cap` caps each HUMAN.md profile: under 2x the cap the
+    /// profile renders in full (the block header reports utilization, loudly
+    /// past 100%); past 2x it truncates at a section boundary (2.2).
+    pub fn render_org_context(
+        &self,
+        mut org_context: OrgContext,
+        human_profile_cap: usize,
+    ) -> Result<String> {
+        for group in [
+            &mut org_context.superiors,
+            &mut org_context.subordinates,
+            &mut org_context.peers,
+        ] {
+            for entry in group {
+                if let Some(description) = entry.description.take() {
+                    entry.description = Some(cap_human_description(description, human_profile_cap));
+                }
+            }
+        }
         self.render(
             "fragments/org_context",
             context! {
                 org_context => org_context,
+                human_profile_cap => human_profile_cap,
             },
         )
     }
 
     /// Render the projects context fragment listing active projects with repos and worktrees.
+    ///
+    /// Bounded to `MAX_PROJECTS` projects, unreported (2.2).
     pub fn render_projects_context(&self, projects: Vec<ProjectContext>) -> Result<String> {
+        const MAX_PROJECTS: usize = 10;
+        let projects: Vec<ProjectContext> = projects.into_iter().take(MAX_PROJECTS).collect();
         self.render(
             "fragments/projects_context",
             context! {
@@ -888,6 +912,23 @@ impl PromptEngine {
     /// Get the configured language code.
     pub fn language(&self) -> &str {
         &self.language
+    }
+}
+
+/// Cap a human profile at a section boundary past 2x the budget. Under 2x the
+/// cap it renders in full — the utilization header reports >100% loudly, per
+/// the 2.2 design; past 2x it truncates at the last section heading within
+/// the ceiling so operator-authored standing rules in the tail are never
+/// silently cut mid-section.
+fn cap_human_description(description: String, cap: usize) -> String {
+    let ceiling = cap.saturating_mul(2);
+    if description.chars().count() <= ceiling {
+        return description;
+    }
+    let prefix: String = description.chars().take(ceiling).collect();
+    match prefix.rfind("\n#") {
+        Some(idx) => format!("{}…\n", &prefix[..idx]),
+        None => format!("{}…", prefix),
     }
 }
 

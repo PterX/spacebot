@@ -732,11 +732,14 @@ pub(super) async fn inspect_prompt(
                 None
             } else {
                 prompt_engine
-                    .render_org_context(crate::prompts::engine::OrgContext {
-                        superiors,
-                        subordinates,
-                        peers,
-                    })
+                    .render_org_context(
+                        crate::prompts::engine::OrgContext {
+                            superiors,
+                            subordinates,
+                            peers,
+                        },
+                        **rc.human_profile_cap.load(),
+                    )
                     .ok()
             }
         }

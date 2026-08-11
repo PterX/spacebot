@@ -1853,6 +1853,10 @@ impl Config {
                 .as_deref()
                 .and_then(resolve_env_value),
             history_backfill_count: base_defaults.history_backfill_count,
+            human_profile_cap: toml
+                .defaults
+                .human_profile_cap
+                .unwrap_or(base_defaults.human_profile_cap),
             cron: Vec::new(),
             opencode: toml
                 .defaults

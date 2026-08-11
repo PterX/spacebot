@@ -81,6 +81,8 @@ pub struct RuntimeConfig {
     pub sandbox: Arc<ArcSwap<crate::sandbox::SandboxConfig>>,
     /// Projects workspace management configuration.
     pub projects: ArcSwap<crate::config::ProjectsConfig>,
+    /// Cap on an individual HUMAN.md profile rendered into org context.
+    pub human_profile_cap: ArcSwap<usize>,
     /// Working memory configuration for temporal context injection.
     pub working_memory: ArcSwap<crate::config::types::WorkingMemoryConfig>,
     /// Participant context configuration for prompt-time participant awareness.
@@ -152,6 +154,7 @@ impl RuntimeConfig {
             secrets: ArcSwap::from_pointee(None),
             sandbox: Arc::new(ArcSwap::from_pointee(agent_config.sandbox.clone())),
             projects: ArcSwap::from_pointee(agent_config.projects.clone()),
+            human_profile_cap: ArcSwap::from_pointee(agent_config.human_profile_cap),
             working_memory: ArcSwap::from_pointee(
                 crate::config::types::WorkingMemoryConfig::default(),
             ),
@@ -277,6 +280,8 @@ impl RuntimeConfig {
         new_sandbox.project_paths = existing_project_paths;
         self.sandbox.store(Arc::new(new_sandbox));
         self.projects.store(Arc::new(resolved.projects.clone()));
+        self.human_profile_cap
+            .store(Arc::new(resolved.human_profile_cap));
 
         let old_opencode = self.opencode.load().as_ref().clone();
         let new_opencode = config.defaults.opencode.clone();

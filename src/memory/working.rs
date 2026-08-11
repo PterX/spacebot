@@ -612,13 +612,32 @@ pub async fn render_working_memory(
         };
 
         // Boost events from the current channel: always include them.
-        for event in &tail_events {
-            let line = format_event_line(event, channel_id);
-            let line_tokens = estimate_tokens(&line);
+        // Collapse consecutive identical events ("Agent started ×7").
+        let collapsed: Vec<(String, usize)> = {
+            let mut out: Vec<(String, usize)> = Vec::new();
+            for event in &tail_events {
+                let line = format_event_line(event, channel_id);
+                if let Some((last_line, count)) = out.last_mut() {
+                    if *last_line == line {
+                        *count += 1;
+                        continue;
+                    }
+                }
+                out.push((line, 1));
+            }
+            out
+        };
+        for (line, count) in &collapsed {
+            let rendered = if *count > 1 {
+                format!("{line} ×{count}")
+            } else {
+                line.clone()
+            };
+            let line_tokens = estimate_tokens(&rendered);
             if tokens_used + line_tokens > today_budget {
                 break;
             }
-            writeln!(output, "- {line}").ok();
+            writeln!(output, "- {rendered}").ok();
             tokens_used += line_tokens;
         }
     }
@@ -702,7 +721,8 @@ pub async fn render_channel_activity_map(
             c.display_name, \
             c.platform, \
             m.sender_name AS last_sender_name, \
-            m.created_at AS last_message_at \
+            m.created_at AS last_message_at, \
+            (SELECT COUNT(*) FROM conversation_messages cm WHERE cm.channel_id = c.id) AS message_count \
          FROM channels c \
          LEFT JOIN conversation_messages m ON m.id = ( \
             SELECT id FROM conversation_messages \
@@ -737,7 +757,7 @@ pub async fn render_channel_activity_map(
 
     let now = Utc::now();
     let mut output = String::with_capacity(512);
-    writeln!(output, "## Other Channels\n").ok();
+    writeln!(output, "## Channel Activity\n").ok();
 
     for row in &rows {
         let channel_id: String = row.get("id");
@@ -745,6 +765,7 @@ pub async fn render_channel_activity_map(
         let _platform: String = row.get("platform");
         let last_sender: Option<String> = row.get("last_sender_name");
         let last_message_at: Option<DateTime<Utc>> = row.get("last_message_at");
+        let message_count: i64 = row.get("message_count");
 
         let name = display_name.as_deref().unwrap_or(&channel_id);
 
@@ -756,7 +777,7 @@ pub async fn render_channel_activity_map(
         let sender = last_sender.as_deref().unwrap_or("unknown");
         let topic = topic_hints.get(&channel_id);
 
-        let mut line = format!("{name} -- {time_ago}, {sender}");
+        let mut line = format!("{name} -- {time_ago} · {message_count} messages · last: {sender}");
         if let Some(topic_summary) = topic {
             // Truncate topic to keep the map compact.
             let truncated = if topic_summary.len() > 80 {

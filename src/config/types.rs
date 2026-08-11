@@ -672,6 +672,10 @@ pub struct DefaultsConfig {
     pub home_channel: Option<String>,
     /// Projects workspace management defaults.
     pub projects: ProjectsConfig,
+    /// Cap on an individual HUMAN.md profile rendered into org context
+    /// (chars). Renders in full with a loud >100% utilization header past
+    /// the cap; truncates at a section boundary only past 2x.
+    pub human_profile_cap: usize,
 }
 
 impl std::fmt::Debug for DefaultsConfig {
@@ -1738,6 +1742,8 @@ pub struct ResolvedAgentConfig {
     pub sandbox: crate::sandbox::SandboxConfig,
     /// Projects workspace management settings.
     pub projects: ProjectsConfig,
+    /// Cap on an individual HUMAN.md profile rendered into org context.
+    pub human_profile_cap: usize,
     /// Number of messages to fetch from the platform when a new channel is created.
     pub history_backfill_count: usize,
     pub cron: Vec<CronDef>,
@@ -1777,6 +1783,7 @@ impl Default for DefaultsConfig {
             opencode: OpenCodeConfig::default(),
             worker_log_mode: crate::settings::WorkerLogMode::default(),
             home_channel: None,
+            human_profile_cap: 4_000,
             projects: ProjectsConfig::default(),
         }
     }
@@ -1804,6 +1811,7 @@ impl AgentConfig {
             role: self.role.clone(),
             gradient_start: self.gradient_start.clone(),
             gradient_end: self.gradient_end.clone(),
+            human_profile_cap: defaults.human_profile_cap,
             workspace: self
                 .workspace
                 .clone()
