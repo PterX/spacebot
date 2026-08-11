@@ -39,6 +39,8 @@ pub struct SkillsListEntry {
     pub description: String,
     /// builtin | instance | workspace
     pub source: String,
+    /// Category derived from the directory path.
+    pub category: String,
     /// user | agent | installed (absent when no usage row exists yet)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
@@ -106,6 +108,7 @@ impl Tool for SkillsListTool {
                         crate::skills::SkillSource::Instance => "instance".to_string(),
                         crate::skills::SkillSource::Workspace => "workspace".to_string(),
                     },
+                    category: skill.category.clone(),
                     created_by: record.map(|r| r.created_by.clone()),
                     state: record.map(|r| r.state.clone()),
                     pinned: record.is_some_and(|r| r.pinned),

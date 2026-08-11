@@ -121,6 +121,9 @@ pub struct Skill {
     pub related_skills: Vec<String>,
     /// Files under the skill's support subdirectories, relative to `base_dir`.
     pub linked_files: Vec<String>,
+    /// Category derived from the directory path. Top-level skills get
+    /// `"general"`; categorized skills get their parent directory name.
+    pub category: String,
 }
 
 /// Where a skill was loaded from, used for precedence tracking.
@@ -139,6 +142,9 @@ pub enum SkillSource {
 pub struct SkillSet {
     /// Skills keyed by name (lowercase). Later sources override earlier ones.
     skills: HashMap<String, Skill>,
+    /// Category descriptions loaded from `index.md` files in category
+    /// directories, keyed by category name.
+    category_descriptions: HashMap<String, String>,
 }
 
 impl SkillSet {
@@ -155,21 +161,27 @@ impl SkillSet {
 
         // Instance skills
         if instance_skills_dir.is_dir()
-            && let Ok(skills) =
+            && let Ok((skills, descriptions)) =
                 load_skills_from_dir(instance_skills_dir, SkillSource::Instance).await
         {
             for skill in skills {
                 set.skills.insert(skill.name.to_lowercase(), skill);
             }
+            for (cat, desc) in descriptions {
+                set.category_descriptions.entry(cat).or_insert(desc);
+            }
         }
 
         // Workspace skills (highest precedence, overrides instance)
         if workspace_skills_dir.is_dir()
-            && let Ok(skills) =
+            && let Ok((skills, descriptions)) =
                 load_skills_from_dir(workspace_skills_dir, SkillSource::Workspace).await
         {
             for skill in skills {
                 set.skills.insert(skill.name.to_lowercase(), skill);
+            }
+            for (cat, desc) in descriptions {
+                set.category_descriptions.entry(cat).or_insert(desc);
             }
         }
 
@@ -226,10 +238,11 @@ impl SkillSet {
                 description: index_description(&s.description),
                 location: s.file_path.display().to_string(),
                 suggested: false,
+                category: s.category.clone(),
             })
             .collect();
 
-        prompt_engine.render_skills_channel(skill_infos)
+        prompt_engine.render_skills_channel(skill_infos, &self.category_descriptions)
     }
 
     /// Render the skills listing for injection into a branch system prompt.
@@ -254,10 +267,11 @@ impl SkillSet {
                 description: index_description(&s.description),
                 location: s.file_path.display().to_string(),
                 suggested: false,
+                category: s.category.clone(),
             })
             .collect();
 
-        prompt_engine.render_skills_branch(skill_infos)
+        prompt_engine.render_skills_branch(skill_infos, &self.category_descriptions)
     }
 
     /// Render the skills listing for injection into a worker system prompt.
@@ -285,10 +299,11 @@ impl SkillSet {
                 name: s.name.clone(),
                 description: index_description(&s.description),
                 location: s.file_path.display().to_string(),
+                category: s.category.clone(),
             })
             .collect();
 
-        prompt_engine.render_skills_worker(skill_infos)
+        prompt_engine.render_skills_worker(skill_infos, &self.category_descriptions)
     }
 
     /// Remove a skill by name.
@@ -358,6 +373,7 @@ impl SkillSet {
                 base_dir: s.base_dir.clone(),
                 source: s.source.clone(),
                 source_repo: s.source_repo.clone(),
+                category: s.category.clone(),
             })
             .collect()
     }
@@ -389,6 +405,8 @@ pub struct SkillInfo {
     pub base_dir: PathBuf,
     pub source: SkillSource,
     pub source_repo: Option<String>,
+    /// Category derived from the directory path.
+    pub category: String,
 }
 
 /// Name of the archive directory under a workspace skills root. Hidden, so
@@ -526,8 +544,15 @@ pub async fn restore_skill_dir(workspace_skills_dir: &Path, name: &str) -> anyho
 /// deeper, so both `skills/{name}/SKILL.md` and
 /// `skills/{category}/{name}/SKILL.md` load. Hidden directories (`.archive`,
 /// `.snapshots`, `.git`, ...) are excluded from discovery.
-async fn load_skills_from_dir(dir: &Path, source: SkillSource) -> anyhow::Result<Vec<Skill>> {
+///
+/// Returns the loaded skills and any category descriptions found in
+/// `index.md` files within category directories.
+async fn load_skills_from_dir(
+    dir: &Path,
+    source: SkillSource,
+) -> anyhow::Result<(Vec<Skill>, HashMap<String, String>)> {
     let mut skills = Vec::new();
+    let mut category_descriptions = HashMap::new();
 
     let mut entries = tokio::fs::read_dir(dir)
         .await
@@ -544,11 +569,20 @@ async fn load_skills_from_dir(dir: &Path, source: SkillSource) -> anyhow::Result
         }
 
         if path.join("SKILL.md").exists() {
-            load_skill_into(&mut skills, &path, source.clone()).await;
+            load_skill_into(&mut skills, &path, "general", source.clone()).await;
             continue;
         }
 
         // Category directory: scan its direct subdirectories for skills.
+        let category_name = entry.file_name().to_string_lossy().to_string();
+
+        // Load category description from index.md, if present.
+        if let Ok(desc) = load_category_description(&path).await {
+            if let Some(desc) = desc {
+                category_descriptions.insert(category_name.clone(), desc);
+            }
+        }
+
         let Ok(mut category_entries) = tokio::fs::read_dir(&path).await else {
             continue;
         };
@@ -563,17 +597,41 @@ async fn load_skills_from_dir(dir: &Path, source: SkillSource) -> anyhow::Result
             {
                 continue;
             }
-            load_skill_into(&mut skills, &skill_dir, source.clone()).await;
+            load_skill_into(
+                &mut skills,
+                &skill_dir,
+                &category_name,
+                source.clone(),
+            )
+            .await;
         }
     }
 
-    Ok(skills)
+    Ok((skills, category_descriptions))
+}
+
+/// Load a category description from an `index.md` file inside a category
+/// directory. Returns `None` when the file is absent or has no description.
+async fn load_category_description(category_dir: &Path) -> anyhow::Result<Option<String>> {
+    let index_path = category_dir.join("index.md");
+    let raw = match tokio::fs::read_to_string(&index_path).await {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let (frontmatter, _body) = parse_skill_markdown(&raw)?;
+    Ok(frontmatter.description)
 }
 
 /// Load one skill directory into `skills`, logging failures and platform gates.
-async fn load_skill_into(skills: &mut Vec<Skill>, path: &Path, source: SkillSource) {
+async fn load_skill_into(
+    skills: &mut Vec<Skill>,
+    path: &Path,
+    category: &str,
+    source: SkillSource,
+) {
     let skill_file = path.join("SKILL.md");
-    match load_skill(&skill_file, path, source).await {
+    match load_skill(&skill_file, path, category, source).await {
         Ok(Some(skill)) => {
             tracing::debug!(
                 name = %skill.name,
@@ -605,6 +663,7 @@ async fn load_skill_into(skills: &mut Vec<Skill>, path: &Path, source: SkillSour
 async fn load_skill(
     file_path: &Path,
     base_dir: &Path,
+    category: &str,
     source: SkillSource,
 ) -> anyhow::Result<Option<Skill>> {
     let raw = tokio::fs::read_to_string(file_path)
@@ -645,6 +704,7 @@ async fn load_skill(
         tags: frontmatter.tags.unwrap_or_default(),
         related_skills: frontmatter.related_skills.unwrap_or_default(),
         linked_files,
+        category: category.to_string(),
     }))
 }
 
@@ -949,6 +1009,7 @@ mod tests {
                 tags: Vec::new(),
                 related_skills: Vec::new(),
                 linked_files: Vec::new(),
+                category: "general".to_string(),
             },
         );
 
@@ -975,6 +1036,7 @@ mod tests {
                 tags: Vec::new(),
                 related_skills: Vec::new(),
                 linked_files: Vec::new(),
+                category: "general".to_string(),
             },
         );
 
@@ -1009,6 +1071,7 @@ mod tests {
             tags: Vec::new(),
             related_skills: Vec::new(),
             linked_files: Vec::new(),
+            category: "general".to_string(),
         }
     }
 
