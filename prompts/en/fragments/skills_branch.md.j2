@@ -6,13 +6,10 @@ When you spawn a worker for a task that matches a skill, pass the skill names as
 
 <available_skills>
 {%- for category in categories %}
-  <category name="{{ category.name }}"{% if category.description %} description="{{ category.description }}"{% endif %}>
-  {%- for skill in category.skills %}
-    <skill>
-      <name>{{ skill.name }}</name>
-      <description>{{ skill.description }}</description>
-    </skill>
-  {%- endfor %}
-  </category>
+
+**{{ category.name }}**{% if category.description %} — {{ category.description }}{% endif %}
+{%- for skill in category.skills %}
+- {{ skill.name }}: {{ skill.description }}
+{%- endfor %}
 {%- endfor %}
 </available_skills>

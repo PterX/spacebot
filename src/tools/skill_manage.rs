@@ -9,6 +9,7 @@
 use crate::config::RuntimeConfig;
 use crate::skills::{
     DESCRIPTION_BUDGET, SUPPORT_SUBDIRS, SkillSet, SkillSource, WriteOrigin, parse_skill_markdown,
+    validate_skill_structure,
 };
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
@@ -16,9 +17,6 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-/// Maximum SKILL.md size accepted by create/edit/patch.
-const MAX_SKILL_BYTES: usize = 100 * 1024;
 /// Maximum support file size accepted by write_file.
 const MAX_SUPPORT_FILE_BYTES: usize = 1024 * 1024;
 /// Maximum skill or category name length.
@@ -193,31 +191,20 @@ fn valid_name(name: &str) -> bool {
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
 }
 
-/// Validate SKILL.md content: frontmatter parses, description present and
-/// within budget, body non-empty, size within cap.
+/// Validate SKILL.md content for create/edit: structural checks plus the
+/// description budget, which is enforced here but not on import paths.
 fn validate_skill_content(content: &str) -> Result<(), String> {
-    if content.len() > MAX_SKILL_BYTES {
-        return Err(format!(
-            "SKILL.md is {} bytes; the cap is {MAX_SKILL_BYTES}",
-            content.len()
-        ));
-    }
+    validate_skill_structure(content)?;
 
-    let (frontmatter, body) =
+    let (frontmatter, _body) =
         parse_skill_markdown(content).map_err(|error| format!("invalid frontmatter: {error}"))?;
 
     let description = frontmatter.description.unwrap_or_default();
-    if description.trim().is_empty() {
-        return Err("frontmatter must include a description".to_string());
-    }
     if description.chars().count() > DESCRIPTION_BUDGET {
         return Err(format!(
             "description is {} chars; the budget is {DESCRIPTION_BUDGET}. The description is loaded into every system prompt — compress it.",
             description.chars().count()
         ));
-    }
-    if body.trim().is_empty() {
-        return Err("skill body is empty".to_string());
     }
 
     Ok(())
@@ -818,6 +805,7 @@ impl Tool for SkillManageTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::skills::MAX_SKILL_BYTES;
 
     #[test]
     fn valid_name_accepts_task_class_names() {

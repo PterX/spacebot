@@ -1,6 +1,6 @@
 ---
 name: wiki-writing
-description: Use when creating or substantially editing wiki pages. Covers language, tone, structure, page type selection, linking discipline, and what separates a useful wiki article from filler.
+description: "Use when creating or substantially editing wiki pages: language, tone, structure, page types, linking discipline, what separates useful articles from filler."
 ---
 
 # Wiki Writing

@@ -168,6 +168,28 @@ async fn extract_and_install(
             .and_then(|n| n.to_str())
             .context("invalid skill directory name")?;
 
+        // Validate the skill before touching the target directory, so a
+        // broken archive never replaces a working installed skill. The
+        // description budget is advisory on import — over-budget
+        // descriptions render truncated in the index.
+        let content = fs::read_to_string(skill_dir.join("SKILL.md"))
+            .await
+            .with_context(|| format!("failed to read SKILL.md for '{skill_name}'"))?;
+        if let Err(message) = crate::skills::validate_skill_structure(&content) {
+            anyhow::bail!("skill '{skill_name}' failed validation: {message}");
+        }
+        if let Ok((frontmatter, _)) = crate::skills::parse_skill_markdown(&content) {
+            let description_chars = frontmatter.description.unwrap_or_default().chars().count();
+            if description_chars > crate::skills::DESCRIPTION_BUDGET {
+                tracing::warn!(
+                    skill = %skill_name,
+                    chars = description_chars,
+                    budget = crate::skills::DESCRIPTION_BUDGET,
+                    "skill description exceeds the index budget and will render truncated"
+                );
+            }
+        }
+
         let target_skill_dir = target_dir.join(skill_name);
 
         // Remove existing skill if present

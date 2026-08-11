@@ -2,17 +2,14 @@
 
 You have access to the following skills. Before starting your task, scan the list and call `read_skill` for any skill that is even partially relevant — a skill defines how its task class is done here, even when the task looks familiar. Prefer reading an unnecessary skill over missing established procedure. You may read more than one.
 
-Skills marked as **suggested** were recommended by the channel for this specific task. Read those first, then decide if any others apply.
+Skills marked (suggested) were recommended by the channel for this specific task. Read those first, then decide if any others apply.
 
 <available_skills>
 {%- for category in categories %}
-  <category name="{{ category.name }}"{% if category.description %} description="{{ category.description }}"{% endif %}>
-  {%- for skill in category.skills %}
-    <skill{% if skill.suggested %} suggested="true"{% endif %}>
-      <name>{{ skill.name }}</name>
-      <description>{{ skill.description }}</description>
-    </skill>
-  {%- endfor %}
-  </category>
+
+**{{ category.name }}**{% if category.description %} — {{ category.description }}{% endif %}
+{%- for skill in category.skills %}
+- {{ skill.name }}{% if skill.suggested %} (suggested){% endif %}: {{ skill.description }}
+{%- endfor %}
 {%- endfor %}
 </available_skills>

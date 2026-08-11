@@ -35,22 +35,19 @@ impl Identity {
     }
 
     /// Render identity context for injection into system prompts.
+    ///
+    /// Files render verbatim — an identity file carries its own headings,
+    /// so the renderer adds none — and blank files render nothing.
     pub fn render(&self) -> String {
         let mut output = String::new();
 
-        if let Some(soul) = &self.soul {
-            output.push_str("## Soul\n\n");
-            output.push_str(soul);
-            output.push_str("\n\n");
-        }
-        if let Some(identity) = &self.identity {
-            output.push_str("## Identity\n\n");
-            output.push_str(identity);
-            output.push_str("\n\n");
-        }
-        if let Some(role) = &self.role {
-            output.push_str("## Role\n\n");
-            output.push_str(role);
+        for section in [&self.soul, &self.identity, &self.role] {
+            let Some(content) = section else { continue };
+            let content = content.trim();
+            if content.is_empty() {
+                continue;
+            }
+            output.push_str(content);
             output.push_str("\n\n");
         }
 
