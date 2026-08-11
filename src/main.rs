@@ -2375,31 +2375,56 @@ async fn initialize_agents(
             tracing::warn!(%error, agent = %agent_config.id, "failed to create FTS index");
         }
 
-        let memory_search = Arc::new(
-            spacebot::memory::MemorySearch::new(
-                memory_store,
-                embedding_table,
-                embedding_model.clone(),
-            )
-            .with_chronicle_table(
-                spacebot::memory::ChronicleEmbeddingTable::open_or_create(&db.lance)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to init chronicle embeddings for agent '{}'",
-                            agent_config.id
-                        )
-                    })?,
-            ),
-        );
+        // Chronicle embeddings are optional: a table that cannot be opened
+        // disables session search for this run instead of aborting startup.
+        let chronicle_table =
+            match spacebot::memory::ChronicleEmbeddingTable::open_or_create(&db.lance).await {
+                Ok(table) => {
+                    if let Err(error) = table.ensure_fts_index().await {
+                        tracing::warn!(
+                            %error,
+                            agent = %agent_config.id,
+                            "failed to create chronicle FTS index"
+                        );
+                    }
+                    Some(table)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        agent = %agent_config.id,
+                        "failed to init chronicle embeddings; session search disabled this run"
+                    );
+                    None
+                }
+            };
 
-        // One-time backfill of level-0 checkpoint embeddings (1.7).
-        if let Err(error) = memory_search
-            .backfill_chronicle_embeddings(&db.sqlite)
-            .await
-        {
-            tracing::warn!(%error, agent = %agent_config.id, "chronicle embedding backfill failed");
+        let mut memory_search = spacebot::memory::MemorySearch::new(
+            memory_store,
+            embedding_table,
+            embedding_model.clone(),
+        );
+        if let Some(table) = chronicle_table {
+            memory_search = memory_search.with_chronicle_table(table);
         }
+        let memory_search = Arc::new(memory_search);
+
+        // One-time backfill of level-0 checkpoint embeddings (1.7), off the
+        // boot path — the table serves vector search while it fills.
+        {
+            let memory_search = Arc::clone(&memory_search);
+            let pool = db.sqlite.clone();
+            let agent = agent_config.id.clone();
+            tokio::spawn(async move {
+                if let Err(error) = memory_search.backfill_chronicle_embeddings(&pool).await {
+                    tracing::warn!(%error, %agent, "chronicle embedding backfill failed");
+                }
+            });
+        }
+
+        // Seed anchor memories for configured org humans (3.1a). Idempotent —
+        // humans with an existing anchor are left alone.
+        spacebot::tools::memory_save::seed_org_human_anchors(&memory_search, &config.humans).await;
 
         // Working memory event log (temporal situational awareness).
         let working_memory_timezone = {
@@ -2694,7 +2719,7 @@ async fn initialize_agents(
                     agent_id = %agent_id,
                     state = ?status.state,
                     embedding_ready = status.embedding_ready,
-                    bulletin_age_secs = ?status.bulletin_age_secs,
+                    refresh_age_secs = ?status.refresh_age_secs,
                     last_error = ?status.last_error,
                     "startup warmup pass finished"
                 );

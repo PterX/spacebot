@@ -18,6 +18,19 @@ pub struct MemoriesListResponse {
 #[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct MemoriesSearchResponse {
     results: Vec<MemorySearchResult>,
+    /// Chronicle checkpoint hits from the unified search surface, labeled so
+    /// the frontend can render sessions apart from memories.
+    sessions: Vec<SessionSearchHit>,
+}
+
+/// A chronicle checkpoint hit returned alongside memory results.
+#[derive(Serialize, utoipa::ToSchema)]
+pub(super) struct SessionSearchHit {
+    checkpoint_id: String,
+    title: String,
+    channel_id: String,
+    seq: i64,
+    similarity: f32,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -199,14 +212,26 @@ pub(super) async fn search_memories(
         ..SearchConfig::default()
     };
 
-    let results = memory_search.search(&query.q, &config)
+    let (results, checkpoint_hits) = memory_search
+        .search_with_chronicle(&query.q, &config, query.limit.min(5))
         .await
         .map_err(|error| {
             tracing::warn!(%error, agent_id = %query.agent_id, query = %query.q, "memory search failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    Ok(Json(MemoriesSearchResponse { results }))
+    let sessions = checkpoint_hits
+        .into_iter()
+        .map(|hit| SessionSearchHit {
+            checkpoint_id: hit.checkpoint_id,
+            title: hit.title,
+            channel_id: hit.channel_id,
+            seq: hit.seq,
+            similarity: hit.similarity,
+        })
+        .collect();
+
+    Ok(Json(MemoriesSearchResponse { results, sessions }))
 }
 
 /// Get a subgraph of memories: nodes + all edges between them.

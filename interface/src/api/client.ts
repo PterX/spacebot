@@ -658,9 +658,6 @@ export interface CortexSection {
 	worker_timeout_secs: number;
 	branch_timeout_secs: number;
 	circuit_breaker_threshold: number;
-	bulletin_interval_secs: number;
-	bulletin_max_words: number;
-	bulletin_max_turns: number;
 }
 
 export interface CoalesceSection {
@@ -770,9 +767,6 @@ export interface CortexUpdate {
 	worker_timeout_secs?: number;
 	branch_timeout_secs?: number;
 	circuit_breaker_threshold?: number;
-	bulletin_interval_secs?: number;
-	bulletin_max_words?: number;
-	bulletin_max_turns?: number;
 }
 
 export interface AutonomyUpdate {

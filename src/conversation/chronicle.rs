@@ -462,18 +462,22 @@ impl ChronicleStore {
         channel_id: &str,
         at: chrono::DateTime<chrono::Utc>,
     ) -> Result<Option<ChronicleCheckpoint>> {
+        // Coverage bounds are stored as `sql_timestamp` TEXT, so the probe
+        // must be bound in the same shape and compared under `datetime()` —
+        // a raw DateTime bind encodes as RFC 3339 and never compares equal.
         let row = sqlx::query(
             r#"
             SELECT * FROM channel_chronicle_checkpoints
             WHERE channel_id = ? AND level = 0
-              AND covers_from_at <= ? AND covers_to_at >= ?
+              AND datetime(covers_from_at) <= datetime(?)
+              AND datetime(covers_to_at) >= datetime(?)
             ORDER BY seq DESC
             LIMIT 1
             "#,
         )
         .bind(channel_id)
-        .bind(at)
-        .bind(at)
+        .bind(sql_timestamp(at))
+        .bind(sql_timestamp(at))
         .fetch_optional(&self.pool)
         .await
         .map_err(|error| anyhow::anyhow!(error))?;
@@ -603,6 +607,26 @@ impl ChronicleStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(|error| anyhow::anyhow!(error))?;
+
+        Ok(row.as_ref().and_then(|row| match checkpoint_from_row(row) {
+            Ok(checkpoint) => Some(checkpoint),
+            Err(error) => {
+                tracing::warn!(%error, "skipping undecodable chronicle checkpoint row");
+                None
+            }
+        }))
+    }
+
+    /// A single checkpoint by id alone. Checkpoint ids are global (UUIDs), so
+    /// a provenance reference recorded from one channel resolves even when the
+    /// referencing row now lives under a different channel (cross-channel
+    /// merges).
+    pub async fn checkpoint_by_id(&self, id: &str) -> Result<Option<ChronicleCheckpoint>> {
+        let row = sqlx::query("SELECT * FROM channel_chronicle_checkpoints WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
 
         Ok(row.as_ref().and_then(|row| match checkpoint_from_row(row) {
             Ok(checkpoint) => Some(checkpoint),
@@ -1187,6 +1211,158 @@ mod tests {
             ids,
             vec!["m4", "m5", "m6"],
             "the newest three, still in chronological order"
+        );
+    }
+
+    fn covering_checkpoint_fixture(
+        channel: &str,
+        from_seq: i64,
+        to_seq: i64,
+        from_at: DateTime<Utc>,
+        to_at: DateTime<Utc>,
+    ) -> NewCheckpoint {
+        let mut checkpoint = new_checkpoint(channel, from_seq, to_seq, to_seq - from_seq);
+        checkpoint.covers_from_at = from_at;
+        checkpoint.covers_to_at = to_at;
+        checkpoint
+    }
+
+    fn utc(hour: u32, minute: u32, second: u32) -> DateTime<Utc> {
+        use chrono::TimeZone as _;
+        Utc.with_ymd_and_hms(2026, 8, 1, hour, minute, second)
+            .unwrap()
+    }
+
+    /// A probe strictly inside a same-day window must resolve. This is the
+    /// case a raw DateTime bind broke: RFC 3339 text sorts after the stored
+    /// `sql_timestamp` shape for any same-day instant.
+    #[tokio::test]
+    async fn covering_checkpoint_matches_inside_a_same_day_window() {
+        let store = setup().await;
+        let CommitOutcome::Committed(checkpoint) = store
+            .commit(covering_checkpoint_fixture(
+                "ch",
+                0,
+                10,
+                utc(10, 0, 0),
+                utc(12, 0, 0),
+            ))
+            .await
+            .expect("commit")
+        else {
+            panic!("expected commit")
+        };
+
+        let found = store
+            .covering_checkpoint("ch", utc(11, 0, 0))
+            .await
+            .expect("query")
+            .expect("a probe inside the window must resolve");
+        assert_eq!(found.id, checkpoint.id);
+    }
+
+    /// The window is inclusive at both ends.
+    #[tokio::test]
+    async fn covering_checkpoint_includes_both_boundaries() {
+        let store = setup().await;
+        let CommitOutcome::Committed(checkpoint) = store
+            .commit(covering_checkpoint_fixture(
+                "ch",
+                0,
+                10,
+                utc(10, 0, 0),
+                utc(12, 0, 0),
+            ))
+            .await
+            .expect("commit")
+        else {
+            panic!("expected commit")
+        };
+
+        for probe in [utc(10, 0, 0), utc(12, 0, 0)] {
+            let found = store
+                .covering_checkpoint("ch", probe)
+                .await
+                .expect("query")
+                .expect("boundary instants are covered");
+            assert_eq!(found.id, checkpoint.id);
+        }
+
+        assert!(
+            store
+                .covering_checkpoint("ch", utc(12, 0, 1))
+                .await
+                .expect("query")
+                .is_none(),
+            "an instant past the window must not resolve"
+        );
+    }
+
+    /// Contiguous windows share their boundary instant; the newest checkpoint
+    /// (highest seq) wins the tie.
+    #[tokio::test]
+    async fn covering_checkpoint_prefers_the_newest_on_a_shared_boundary() {
+        let store = setup().await;
+        let CommitOutcome::Committed(first) = store
+            .commit(covering_checkpoint_fixture(
+                "ch",
+                0,
+                10,
+                utc(10, 0, 0),
+                utc(12, 0, 0),
+            ))
+            .await
+            .expect("commit")
+        else {
+            panic!("expected commit")
+        };
+        let CommitOutcome::Committed(second) = store
+            .commit(covering_checkpoint_fixture(
+                "ch",
+                first.covers_to_seq,
+                20,
+                utc(12, 0, 0),
+                utc(14, 0, 0),
+            ))
+            .await
+            .expect("commit")
+        else {
+            panic!("expected commit")
+        };
+
+        let found = store
+            .covering_checkpoint("ch", utc(12, 0, 0))
+            .await
+            .expect("query")
+            .expect("the shared boundary is covered");
+        assert_eq!(found.id, second.id, "the newest covering checkpoint wins");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_by_id_resolves_without_a_channel() {
+        let store = setup().await;
+        let CommitOutcome::Committed(checkpoint) = store
+            .commit(new_checkpoint("ch", 0, 10, 10))
+            .await
+            .expect("commit")
+        else {
+            panic!("expected commit")
+        };
+
+        let found = store
+            .checkpoint_by_id(&checkpoint.id)
+            .await
+            .expect("query")
+            .expect("the checkpoint resolves by id alone");
+        assert_eq!(found.channel_id, "ch");
+        assert_eq!(found.seq, checkpoint.seq);
+
+        assert!(
+            store
+                .checkpoint_by_id("no-such-id")
+                .await
+                .expect("query")
+                .is_none()
         );
     }
 

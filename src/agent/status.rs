@@ -41,7 +41,6 @@ pub struct SystemInfo {
     /// Whether embeddings are loaded and ready.
     pub embedding_ready: bool,
     /// Age of the memory bulletin in minutes, if known.
-    pub bulletin_age_minutes: Option<u64>,
     /// Number of registered cron jobs, if known.
     pub cron_job_count: Option<usize>,
 }
@@ -86,8 +85,6 @@ impl SystemInfo {
         }
         .to_string();
 
-        let bulletin_age_minutes = warmup_status.bulletin_age_secs.map(|secs| secs / 60);
-
         Self {
             version: crate::update::CURRENT_VERSION.to_string(),
             deployment: match crate::update::Deployment::detect() {
@@ -109,7 +106,6 @@ impl SystemInfo {
             sandbox_active: sandbox.containment_active(),
             warmup_state,
             embedding_ready: warmup_status.embedding_ready,
-            bulletin_age_minutes,
             cron_job_count: None,
         }
     }
@@ -596,11 +592,6 @@ fn render_system_info(info: &SystemInfo, current_time_line: Option<&str>) -> Str
         "embeddings loading".to_string()
     };
     warmup_parts.push(&embedding_label);
-    let bulletin_label;
-    if let Some(age) = info.bulletin_age_minutes {
-        bulletin_label = format!("bulletin {}m ago", age);
-        warmup_parts.push(&bulletin_label);
-    }
     output.push_str(&format!("Warmup: {}\n", warmup_parts.join(", ")));
 
     // Cron jobs
@@ -716,7 +707,6 @@ mod tests {
             sandbox_active: true,
             warmup_state: "warm".into(),
             embedding_ready: true,
-            bulletin_age_minutes: Some(12),
             cron_job_count: Some(4),
         };
 
@@ -744,7 +734,6 @@ mod tests {
         // Warmup
         assert!(rendered.contains("warm"));
         assert!(rendered.contains("embeddings ready"));
-        assert!(rendered.contains("bulletin 12m ago"));
         // Cron
         assert!(rendered.contains("4 active jobs"));
     }

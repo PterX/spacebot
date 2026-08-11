@@ -7,13 +7,13 @@
 //! contract — delegation routing, silence, acknowledgment, memory handoff —
 //! and must stay green through the 2.1 template rewrite.
 //!
-//! Live fixtures need `SPACEBOT_FIXTURE_API_KEY` (any provider key) and
-//! optionally `SPACEBOT_FIXTURE_MODEL` (default
-//! `anthropic/claude-sonnet-4-20250514`); they skip with a notice when the
-//! key is absent. The capability-consistency and byte-level suites are pure
-//! and always run.
-//!
-//! Run with: cargo test --test behavioral_fixtures -- --nocapture
+//! Live fixtures need `SPACEBOT_FIXTURE_API_KEY` (an Anthropic key — the
+//! pinned config wires `anthropic_key`) and optionally
+//! `SPACEBOT_FIXTURE_MODEL` (default `anthropic/claude-sonnet-4-20250514`).
+//! They are `#[ignore]`d so a keyless environment reports them as ignored
+//! rather than falsely green; run them deliberately with
+//! `cargo test --test behavioral_fixtures -- --ignored --nocapture`.
+//! The capability-consistency and byte-level suites are pure and always run.
 
 use spacebot::agent::channel::{Channel, ChannelKind};
 use spacebot::conversation::history::ConversationLogger;
@@ -202,7 +202,7 @@ async fn run_sample(
     conversation: &[(&str, &str)],
     settings: ResolvedConversationSettings,
 ) -> Sample {
-    let channel_id: ChannelId = Arc::from(format!("fixture:{}", uuid::Uuid::new_v4().to_string()));
+    let channel_id: ChannelId = Arc::from(format!("fixture:{}", uuid::Uuid::new_v4()));
 
     // Seed history so the turn has prior context.
     let logger = ConversationLogger::new(deps.sqlite_pool.clone());
@@ -220,7 +220,7 @@ async fn run_sample(
 
     let (channel, channel_tx) = Channel::new(
         channel_id.clone(),
-        ChannelKind::Cron,
+        ChannelKind::User,
         deps.clone(),
         response_tx,
         channel_event_rx,
@@ -237,7 +237,7 @@ async fn run_sample(
     let last = conversation.last().map(|(_, text)| *text).unwrap_or("");
     let message = InboundMessage {
         id: uuid::Uuid::new_v4().to_string(),
-        source: "cron".into(),
+        source: "fixture".into(),
         adapter: None,
         conversation_id: channel_id.to_string(),
         sender_id: "user-1".into(),
@@ -293,10 +293,12 @@ async fn run_fixture(
     settings: ResolvedConversationSettings,
     pass: impl Fn(&Sample) -> bool,
 ) {
-    if !live_key_present() {
-        eprintln!("SKIP {name}: SPACEBOT_FIXTURE_API_KEY not set");
-        return;
-    }
+    assert!(
+        live_key_present(),
+        "{name}: SPACEBOT_FIXTURE_API_KEY is not set. Live fixtures are \
+         #[ignore]d for exactly this reason — run them deliberately with \
+         `cargo test --test behavioral_fixtures -- --ignored`."
+    );
     let instance = TempDir::new().expect("tempdir");
     write_pinned_config(instance.path());
     let deps = bootstrap(instance.path()).await.expect("bootstrap");
@@ -341,6 +343,7 @@ fn direct_settings() -> ResolvedConversationSettings {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "live fixture: requires SPACEBOT_FIXTURE_API_KEY"]
 async fn standard_mode_delegates_long_running_work() {
     run_fixture(
         "delegation_routing",
@@ -349,31 +352,41 @@ async fn standard_mode_delegates_long_running_work() {
             "Write a Python script that parses my server logs and extracts error rates per hour",
         )],
         standard_settings(),
-        |s| matches!(s.first_tool.as_deref(), Some("spawn_worker" | "branch")),
+        |s| !s.timed_out && s.first_tool.as_deref() == Some("spawn_worker"),
     )
     .await;
 }
 
 #[tokio::test]
+#[ignore = "live fixture: requires SPACEBOT_FIXTURE_API_KEY"]
 async fn standard_mode_stays_silent_on_trivial_input() {
+    // Silence means the skip tool — a harness failure (timeout, no
+    // observation) must not pass, and a text reply is not silence.
     run_fixture("silence", &[("user", "ok")], standard_settings(), |s| {
-        !matches!(s.first_tool.as_deref(), Some("spawn_worker" | "branch"))
+        !s.timed_out && s.first_tool.as_deref() == Some("skip")
     })
     .await;
 }
 
 #[tokio::test]
+#[ignore = "live fixture: requires SPACEBOT_FIXTURE_API_KEY"]
 async fn standard_mode_acknowledges_without_delegating() {
+    // A short reply or a skip both satisfy the policy; delegating or a
+    // harness failure does not.
     run_fixture(
         "acknowledgment",
         &[("user", "Thanks for the help, that worked!")],
         standard_settings(),
-        |s| !matches!(s.first_tool.as_deref(), Some("spawn_worker" | "branch")),
+        |s| {
+            !s.timed_out
+                && (matches!(s.first_tool.as_deref(), Some("reply" | "skip")) || s.reply.is_some())
+        },
     )
     .await;
 }
 
 #[tokio::test]
+#[ignore = "live fixture: requires SPACEBOT_FIXTURE_API_KEY"]
 async fn standard_mode_relays_worker_results() {
     run_fixture(
         "result_relay",
@@ -382,23 +395,25 @@ async fn standard_mode_relays_worker_results() {
             "The docs worker just finished and reported the build passed. Let the user know.",
         )],
         standard_settings(),
-        |s| s.first_tool.as_deref() == Some("reply"),
+        |s| !s.timed_out && (s.first_tool.as_deref() == Some("reply") || s.reply.is_some()),
     )
     .await;
 }
 
 #[tokio::test]
+#[ignore = "live fixture: requires SPACEBOT_FIXTURE_API_KEY"]
 async fn standard_mode_hands_memory_intent_to_branch() {
     run_fixture(
         "memory_handoff",
         &[("user", "Remember that I only drink decaf coffee")],
         standard_settings(),
-        |s| s.first_tool.as_deref() == Some("branch"),
+        |s| !s.timed_out && s.first_tool.as_deref() == Some("branch"),
     )
     .await;
 }
 
 #[tokio::test]
+#[ignore = "live fixture: requires SPACEBOT_FIXTURE_API_KEY"]
 async fn standard_mode_answers_skill_question_without_delegating() {
     run_fixture(
         "skill_suggestion",
@@ -407,7 +422,11 @@ async fn standard_mode_answers_skill_question_without_delegating() {
             "Is there a skill for writing conventional commit messages?",
         )],
         standard_settings(),
-        |s| !matches!(s.first_tool.as_deref(), Some("spawn_worker" | "branch")),
+        |s| {
+            !s.timed_out
+                && (matches!(s.first_tool.as_deref(), Some("reply" | "skills_search"))
+                    || s.reply.is_some())
+        },
     )
     .await;
 }
@@ -417,6 +436,7 @@ async fn standard_mode_answers_skill_question_without_delegating() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "live fixture: requires SPACEBOT_FIXTURE_API_KEY"]
 async fn direct_mode_still_delegates_long_running_work() {
     run_fixture(
         "direct_delegation",
@@ -425,18 +445,21 @@ async fn direct_mode_still_delegates_long_running_work() {
             "Summarize the last 200 commits across all our repos into a weekly report",
         )],
         direct_settings(),
-        |s| matches!(s.first_tool.as_deref(), Some("spawn_worker" | "branch")),
+        |s| !s.timed_out && s.first_tool.as_deref() == Some("spawn_worker"),
     )
     .await;
 }
 
 #[tokio::test]
+#[ignore = "live fixture: requires SPACEBOT_FIXTURE_API_KEY"]
 async fn direct_mode_still_branches_for_memory() {
+    // Direct mode has memory tools registered, so saving inline is also a
+    // correct outcome; losing the intent (no tool at all) is the failure.
     run_fixture(
         "direct_memory_handoff",
         &[("user", "Remember my home address is 123 Main Street")],
         direct_settings(),
-        |s| s.first_tool.as_deref() == Some("branch"),
+        |s| !s.timed_out && matches!(s.first_tool.as_deref(), Some("branch" | "memory_save")),
     )
     .await;
 }
@@ -445,21 +468,21 @@ async fn direct_mode_still_branches_for_memory() {
 // Pure fixtures (no LLM)
 // ---------------------------------------------------------------------------
 
-/// Every tool the prompt advertises must be one the channel actually
-/// registers, per mode. Checked by scanning the real rendered prompt for the
-/// routing-critical tool names the harness prose owns (§3/§5 per the
-/// architecture manifest): per-tool mechanics moved to the tool schemas in
-/// 2.1, so prose advertising is a deliberate subset, and the delegation
-/// fixtures above gate the observed direction.
+/// Capability honesty, both directions. Positive: the routing-critical
+/// tool names the prose owns (per-tool mechanics live in tool schemas since
+/// 2.1) must appear for the modes that register them. Negative: prose gated
+/// on a tool must vanish when that tool is not registered — this fixture's
+/// deps carry no agent links, so `send_agent_message` must not be
+/// advertised, and standard mode must not name the branch-side memory
+/// tools it cannot call.
 #[tokio::test]
 async fn capability_consistency_prompt_advertises_registered_tools() {
     let instance = TempDir::new().expect("tempdir");
     write_pinned_config(instance.path());
     let deps = bootstrap(instance.path()).await.expect("bootstrap");
 
-    let standard_tools = ["reply", "branch", "spawn_worker", "skip", "send_file"];
+    let standard_tools = ["branch", "spawn_worker", "skip", "send_file"];
     let direct_tools = [
-        "reply",
         "branch",
         "spawn_worker",
         "skip",
@@ -467,16 +490,28 @@ async fn capability_consistency_prompt_advertises_registered_tools() {
         "memory_save",
         "memory_recall",
     ];
+    let standard_absent = ["send_agent_message", "memory_save", "memory_recall"];
+    let direct_absent = ["send_agent_message"];
 
-    for (label, settings, tools) in [
-        ("standard", standard_settings(), &standard_tools[..]),
-        ("direct", direct_settings(), &direct_tools[..]),
+    for (label, settings, tools, absent) in [
+        (
+            "standard",
+            standard_settings(),
+            &standard_tools[..],
+            &standard_absent[..],
+        ),
+        (
+            "direct",
+            direct_settings(),
+            &direct_tools[..],
+            &direct_absent[..],
+        ),
     ] {
         let channel_id: ChannelId = Arc::from(format!("cap:{label}"));
         let (response_tx, _) = mpsc::channel(4);
         let (channel, _channel_tx) = Channel::new(
             channel_id,
-            ChannelKind::Cron,
+            ChannelKind::User,
             deps.clone(),
             response_tx,
             deps.event_tx.subscribe(),
@@ -495,6 +530,12 @@ async fn capability_consistency_prompt_advertises_registered_tools() {
                 "[{label}] prompt does not advertise registered tool `{tool}`"
             );
         }
+        for tool in absent {
+            assert!(
+                !prompt.contains(tool),
+                "[{label}] prompt advertises `{tool}`, which is not registered for this mode/config"
+            );
+        }
     }
 }
 
@@ -511,7 +552,7 @@ async fn byte_level_prompt_is_stable_across_turns() {
     let (response_tx, _) = mpsc::channel(4);
     let (channel, _channel_tx) = Channel::new(
         channel_id,
-        ChannelKind::Cron,
+        ChannelKind::User,
         deps.clone(),
         response_tx,
         deps.event_tx.subscribe(),

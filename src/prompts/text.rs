@@ -59,7 +59,6 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         ("en", "branch") => include_str!("../../prompts/en/branch.md.j2"),
         ("en", "worker") => include_str!("../../prompts/en/worker.md.j2"),
         ("en", "cortex") => include_str!("../../prompts/en/cortex.md.j2"),
-        ("en", "cortex_bulletin") => include_str!("../../prompts/en/cortex_bulletin.md.j2"),
         ("en", "cortex_intraday_synthesis") => {
             include_str!("../../prompts/en/cortex_intraday_synthesis.md.j2")
         }
@@ -154,9 +153,6 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         }
         ("en", "fragments/system/autonomy_hard_timeout") => {
             include_str!("../../prompts/en/fragments/system/autonomy_hard_timeout.md.j2")
-        }
-        ("en", "fragments/system/cortex_synthesis") => {
-            include_str!("../../prompts/en/fragments/system/cortex_synthesis.md.j2")
         }
         ("en", "fragments/system/profile_synthesis") => {
             include_str!("../../prompts/en/fragments/system/profile_synthesis.md.j2")

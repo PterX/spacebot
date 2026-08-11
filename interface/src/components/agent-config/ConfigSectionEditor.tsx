@@ -427,31 +427,6 @@ export function ConfigSectionEditor({
 							min={1}
 							max={10}
 						/>
-						<NumberStepper
-							label="Bulletin Interval"
-							description="Seconds between memory bulletin refreshes"
-							value={localValues.bulletin_interval_secs as number}
-							onChange={(v) => handleChange("bulletin_interval_secs", v)}
-							min={60}
-							suffix="s"
-						/>
-						<NumberStepper
-							label="Bulletin Max Words"
-							description="Target word count for memory bulletin"
-							value={localValues.bulletin_max_words as number}
-							onChange={(v) => handleChange("bulletin_max_words", v)}
-							min={100}
-							max={5000}
-							suffix=" words"
-						/>
-						<NumberStepper
-							label="Bulletin Max Turns"
-							description="Max LLM turns for bulletin generation"
-							value={localValues.bulletin_max_turns as number}
-							onChange={(v) => handleChange("bulletin_max_turns", v)}
-							min={5}
-							max={50}
-						/>
 					</div>
 				);
 			case "coalesce":

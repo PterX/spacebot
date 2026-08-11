@@ -10,7 +10,7 @@ You are part of a multi-agent system. Here is your position:
 - **{{ entry.name }}** (human){% if entry.role %} — {{ entry.role }}{% endif %}. Your human superior.
 {% if entry.description %}
 <context name="org-description" source="{{ entry.name }}">
-[{{ (entry.description | length * 100 / human_profile_cap) | round }}% — {{ entry.description | length }}/{{ human_profile_cap }} chars]
+[{{ (entry.description_total_chars * 100 / human_profile_cap) | round }}% — {{ entry.description_total_chars }}/{{ human_profile_cap }} chars{% if entry.description | length < entry.description_total_chars %} · truncated to {{ entry.description | length }} at a section boundary{% endif %}]
 {{ entry.description }}
 </context>
 {% endif -%}
@@ -27,7 +27,7 @@ You are part of a multi-agent system. Here is your position:
 - **{{ entry.name }}** (human){% if entry.role %} — {{ entry.role }}{% endif %}. Reports to you.
 {% if entry.description %}
 <context name="org-description" source="{{ entry.name }}">
-[{{ (entry.description | length * 100 / human_profile_cap) | round }}% — {{ entry.description | length }}/{{ human_profile_cap }} chars]
+[{{ (entry.description_total_chars * 100 / human_profile_cap) | round }}% — {{ entry.description_total_chars }}/{{ human_profile_cap }} chars{% if entry.description | length < entry.description_total_chars %} · truncated to {{ entry.description | length }} at a section boundary{% endif %}]
 {{ entry.description }}
 </context>
 {% endif -%}
@@ -44,7 +44,7 @@ You are part of a multi-agent system. Here is your position:
 - **{{ entry.name }}** (human){% if entry.role %} — {{ entry.role }}{% endif %}. Communication is collaborative.
 {% if entry.description %}
 <context name="org-description" source="{{ entry.name }}">
-[{{ (entry.description | length * 100 / human_profile_cap) | round }}% — {{ entry.description | length }}/{{ human_profile_cap }} chars]
+[{{ (entry.description_total_chars * 100 / human_profile_cap) | round }}% — {{ entry.description_total_chars }}/{{ human_profile_cap }} chars{% if entry.description | length < entry.description_total_chars %} · truncated to {{ entry.description | length }} at a section boundary{% endif %}]
 {{ entry.description }}
 </context>
 {% endif -%}

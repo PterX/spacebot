@@ -1217,11 +1217,8 @@ pub struct CortexConfig {
     pub supervisor_kill_budget_per_tick: usize,
     pub circuit_breaker_threshold: u8,
     /// Interval in seconds between memory bulletin refreshes.
-    pub bulletin_interval_secs: u64,
     /// Target word count for the memory bulletin.
-    pub bulletin_max_words: usize,
     /// Max LLM turns for bulletin generation.
-    pub bulletin_max_turns: usize,
     /// Interval in seconds between memory maintenance passes.
     pub maintenance_interval_secs: u64,
     /// Per-day decay applied to memory importance during maintenance.
@@ -1264,9 +1261,6 @@ impl Default for CortexConfig {
             detached_worker_timeout_retry_limit: 2,
             supervisor_kill_budget_per_tick: 8,
             circuit_breaker_threshold: 3,
-            bulletin_interval_secs: 3600,
-            bulletin_max_words: 1500,
-            bulletin_max_turns: 15,
             maintenance_interval_secs: 3600,
             maintenance_decay_rate: 0.05,
             maintenance_prune_threshold: 0.1,
@@ -1548,7 +1542,7 @@ pub struct WarmupStatus {
     pub embedding_ready: bool,
     pub last_refresh_unix_ms: Option<i64>,
     pub last_error: Option<String>,
-    pub bulletin_age_secs: Option<u64>,
+    pub refresh_age_secs: Option<u64>,
 }
 
 impl Default for WarmupStatus {
@@ -1558,7 +1552,7 @@ impl Default for WarmupStatus {
             embedding_ready: false,
             last_refresh_unix_ms: None,
             last_error: None,
-            bulletin_age_secs: None,
+            refresh_age_secs: None,
         }
     }
 }
@@ -1568,8 +1562,7 @@ impl Default for WarmupStatus {
 pub enum WorkReadinessReason {
     StateNotWarm,
     EmbeddingNotReady,
-    BulletinMissing,
-    BulletinStale,
+    WarmupNeverCompleted,
 }
 
 impl WorkReadinessReason {
@@ -1577,8 +1570,7 @@ impl WorkReadinessReason {
         match self {
             Self::StateNotWarm => "state_not_warm",
             Self::EmbeddingNotReady => "embedding_not_ready",
-            Self::BulletinMissing => "bulletin_missing",
-            Self::BulletinStale => "bulletin_stale",
+            Self::WarmupNeverCompleted => "warmup_never_completed",
         }
     }
 }
@@ -1590,7 +1582,7 @@ pub struct WorkReadiness {
     pub reason: Option<WorkReadinessReason>,
     pub warmup_state: WarmupState,
     pub embedding_ready: bool,
-    pub bulletin_age_secs: Option<u64>,
+    pub refresh_age_secs: Option<u64>,
     pub stale_after_secs: u64,
 }
 
@@ -1600,7 +1592,7 @@ pub(super) fn evaluate_work_readiness(
     now_unix_ms: i64,
 ) -> WorkReadiness {
     let stale_after_secs = warmup_config.refresh_secs.max(1).saturating_mul(2).max(60);
-    let bulletin_age_secs = status
+    let refresh_age_secs = status
         .last_refresh_unix_ms
         .map(|refresh_ms| {
             if now_unix_ms > refresh_ms {
@@ -1609,16 +1601,16 @@ pub(super) fn evaluate_work_readiness(
                 0
             }
         })
-        .or(status.bulletin_age_secs);
+        .or(status.refresh_age_secs);
 
-    // Knowledge synthesis is change-driven, not timer-driven. Staleness
-    // is no longer a readiness concern — only "never generated" matters.
+    // Staleness is not a readiness concern — only "no warmup pass has ever
+    // completed" gates dispatch.
     let reason = if status.state != WarmupState::Warm {
         Some(WorkReadinessReason::StateNotWarm)
     } else if warmup_config.eager_embedding_load && !status.embedding_ready {
         Some(WorkReadinessReason::EmbeddingNotReady)
-    } else if bulletin_age_secs.is_none() {
-        Some(WorkReadinessReason::BulletinMissing)
+    } else if refresh_age_secs.is_none() {
+        Some(WorkReadinessReason::WarmupNeverCompleted)
     } else {
         None
     };
@@ -1628,7 +1620,7 @@ pub(super) fn evaluate_work_readiness(
         reason,
         warmup_state: status.state,
         embedding_ready: status.embedding_ready,
-        bulletin_age_secs,
+        refresh_age_secs,
         stale_after_secs,
     }
 }

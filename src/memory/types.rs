@@ -137,6 +137,31 @@ impl MemoryType {
     pub fn from_label(label: &str) -> Option<MemoryType> {
         Self::ALL.iter().copied().find(|t| t.to_string() == label)
     }
+
+    /// Per-value guidance rendered into tool schemas — the taxonomy lives
+    /// on the enum so every tool derives the same wording and a new
+    /// variant cannot ship without its description.
+    pub fn schema_description(&self) -> &'static str {
+        match self {
+            MemoryType::Fact => "What you know to be true. Grounds your responses.",
+            MemoryType::Preference => "How the user likes things done. Shapes your approach.",
+            MemoryType::Decision => "Commitments that were made. Constrains future choices.",
+            MemoryType::Identity => {
+                "Stable facts about who the user or the agent is. Shapes self-understanding."
+            }
+            MemoryType::Event => {
+                "Something that happened at a point in time. Adds situational context."
+            }
+            MemoryType::Observation => {
+                "Patterns noticed about how things work. System-level awareness."
+            }
+            MemoryType::Goal => "What the user or you are working toward. Drives proactive action.",
+            MemoryType::Todo => "Concrete tasks to complete. Creates accountability.",
+            MemoryType::Human => {
+                "A curated anchor for a specific human — who they are, how they prefer to work. Requires human_id; saves merge into the existing anchor for that human."
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for MemoryType {

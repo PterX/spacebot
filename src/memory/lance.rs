@@ -614,6 +614,94 @@ impl ChronicleEmbeddingTable {
         Ok(hits)
     }
 
+    /// Full-text search over checkpoint summary text using Tantivy FTS.
+    /// Returns (checkpoint_id, score) pairs sorted by score (descending).
+    pub async fn text_search(&self, query: &str, limit: usize) -> Result<Vec<(String, f32)>> {
+        use lancedb::query::{ExecutableQuery, QueryBase};
+
+        let results: Vec<arrow_array::RecordBatch> = self
+            .table
+            .query()
+            .full_text_search(lance_index::scalar::FullTextSearchQuery::new(
+                query.to_string(),
+            ))
+            .select(lancedb::query::Select::columns(&["id", "_score"]))
+            .limit(limit)
+            .execute()
+            .await
+            .map_err(|e| DbError::LanceDb(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| DbError::LanceDb(e.to_string()))?;
+
+        let mut matches = Vec::new();
+        for batch in results {
+            if let (Some(id_col), Some(score_col)) =
+                (batch.column_by_name("id"), batch.column_by_name("_score"))
+            {
+                let ids: &arrow_array::StringArray = id_col.as_string::<i32>();
+                let scores: &arrow_array::PrimitiveArray<Float32Type> = score_col.as_primitive();
+
+                for i in 0..ids.len() {
+                    if ids.is_valid(i) && scores.is_valid(i) {
+                        matches.push((ids.value(i).to_string(), scores.value(i)));
+                    }
+                }
+            }
+        }
+
+        Ok(matches)
+    }
+
+    /// Create HNSW vector index and FTS index for better performance.
+    /// Should be called after enough data accumulates.
+    pub async fn create_indexes(&self) -> Result<()> {
+        self.table
+            .create_index(&["embedding"], lancedb::index::Index::Auto)
+            .execute()
+            .await
+            .map_err(|e| {
+                DbError::LanceDb(format!("Failed to create chronicle vector index: {}", e))
+            })?;
+
+        self.ensure_fts_index().await?;
+
+        Ok(())
+    }
+
+    /// Ensure the FTS index exists on the text column.
+    ///
+    /// LanceDB requires an inverted index for `full_text_search()` queries.
+    /// This is safe to call multiple times — if the index already exists, the
+    /// error is silently ignored.
+    pub async fn ensure_fts_index(&self) -> Result<()> {
+        match self
+            .table
+            .create_index(&["text"], lancedb::index::Index::FTS(Default::default()))
+            .execute()
+            .await
+        {
+            Ok(()) => {
+                tracing::debug!("FTS index created on chronicle text column");
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                // LanceDB returns an error if the index already exists
+                if message.contains("already") || message.contains("index") {
+                    tracing::trace!("chronicle FTS index already exists");
+                    Ok(())
+                } else {
+                    Err(DbError::LanceDb(format!(
+                        "Failed to create chronicle FTS index: {}",
+                        message
+                    ))
+                    .into())
+                }
+            }
+        }
+    }
+
     /// Get the Arrow schema for the chronicle embeddings table.
     fn schema() -> arrow_schema::Schema {
         arrow_schema::Schema::new(vec![

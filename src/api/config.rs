@@ -60,9 +60,6 @@ pub struct CortexSection {
     pub detached_worker_timeout_retry_limit: u8,
     pub supervisor_kill_budget_per_tick: usize,
     pub circuit_breaker_threshold: u8,
-    pub bulletin_interval_secs: u64,
-    pub bulletin_max_words: usize,
-    pub bulletin_max_turns: usize,
     pub maintenance_decay_rate: f32,
     pub maintenance_prune_threshold: f32,
     pub maintenance_min_age_days: i64,
@@ -247,9 +244,6 @@ pub(super) struct CortexUpdate {
     detached_worker_timeout_retry_limit: Option<u8>,
     supervisor_kill_budget_per_tick: Option<usize>,
     circuit_breaker_threshold: Option<u8>,
-    bulletin_interval_secs: Option<u64>,
-    bulletin_max_words: Option<usize>,
-    bulletin_max_turns: Option<usize>,
     maintenance_decay_rate: Option<f32>,
     maintenance_prune_threshold: Option<f32>,
     maintenance_min_age_days: Option<i64>,
@@ -408,9 +402,6 @@ pub(super) async fn get_agent_config(
             detached_worker_timeout_retry_limit: cortex.detached_worker_timeout_retry_limit,
             supervisor_kill_budget_per_tick: cortex.supervisor_kill_budget_per_tick,
             circuit_breaker_threshold: cortex.circuit_breaker_threshold,
-            bulletin_interval_secs: cortex.bulletin_interval_secs,
-            bulletin_max_words: cortex.bulletin_max_words,
-            bulletin_max_turns: cortex.bulletin_max_turns,
             maintenance_decay_rate: cortex.maintenance_decay_rate,
             maintenance_prune_threshold: cortex.maintenance_prune_threshold,
             maintenance_min_age_days: cortex.maintenance_min_age_days,
@@ -856,16 +847,6 @@ fn update_cortex_table(
     }
     if let Some(v) = cortex.circuit_breaker_threshold {
         table["circuit_breaker_threshold"] = toml_edit::value(i64::from(v));
-    }
-    if let Some(v) = cortex.bulletin_interval_secs {
-        table["bulletin_interval_secs"] =
-            toml_edit::value(to_i64_from_u64("bulletin_interval_secs", v)?);
-    }
-    if let Some(v) = cortex.bulletin_max_words {
-        table["bulletin_max_words"] = toml_edit::value(to_i64_from_usize("bulletin_max_words", v)?);
-    }
-    if let Some(v) = cortex.bulletin_max_turns {
-        table["bulletin_max_turns"] = toml_edit::value(to_i64_from_usize("bulletin_max_turns", v)?);
     }
     if let Some(v) = cortex.maintenance_interval_secs {
         if v == 0 {
@@ -1362,9 +1343,6 @@ id = "main"
             detached_worker_timeout_retry_limit: None,
             supervisor_kill_budget_per_tick: Some(usize::MAX),
             circuit_breaker_threshold: None,
-            bulletin_interval_secs: None,
-            bulletin_max_words: None,
-            bulletin_max_turns: None,
             maintenance_decay_rate: None,
             maintenance_prune_threshold: None,
             maintenance_min_age_days: None,
@@ -1386,9 +1364,6 @@ id = "main"
             detached_worker_timeout_retry_limit: None,
             supervisor_kill_budget_per_tick: None,
             circuit_breaker_threshold: None,
-            bulletin_interval_secs: None,
-            bulletin_max_words: None,
-            bulletin_max_turns: None,
             maintenance_decay_rate: None,
             maintenance_prune_threshold: None,
             maintenance_min_age_days: None,
@@ -1420,9 +1395,6 @@ id = "main"
             detached_worker_timeout_retry_limit: None,
             supervisor_kill_budget_per_tick: None,
             circuit_breaker_threshold: None,
-            bulletin_interval_secs: None,
-            bulletin_max_words: None,
-            bulletin_max_turns: None,
             maintenance_decay_rate: Some(1.1),
             maintenance_prune_threshold: None,
             maintenance_min_age_days: None,
@@ -1441,9 +1413,6 @@ id = "main"
             detached_worker_timeout_retry_limit: None,
             supervisor_kill_budget_per_tick: None,
             circuit_breaker_threshold: None,
-            bulletin_interval_secs: None,
-            bulletin_max_words: None,
-            bulletin_max_turns: None,
             maintenance_decay_rate: None,
             maintenance_prune_threshold: None,
             maintenance_min_age_days: Some(-1),
@@ -1462,9 +1431,6 @@ id = "main"
             detached_worker_timeout_retry_limit: None,
             supervisor_kill_budget_per_tick: None,
             circuit_breaker_threshold: None,
-            bulletin_interval_secs: None,
-            bulletin_max_words: None,
-            bulletin_max_turns: None,
             maintenance_decay_rate: None,
             maintenance_prune_threshold: None,
             maintenance_min_age_days: None,
@@ -1495,9 +1461,6 @@ id = "main"
             detached_worker_timeout_retry_limit: Some(3),
             supervisor_kill_budget_per_tick: Some(12),
             circuit_breaker_threshold: Some(6),
-            bulletin_interval_secs: Some(120),
-            bulletin_max_words: Some(4000),
-            bulletin_max_turns: Some(5),
             maintenance_decay_rate: Some(0.16),
             maintenance_prune_threshold: Some(0.17),
             maintenance_min_age_days: Some(15),
@@ -1531,9 +1494,6 @@ id = "main"
             cortex["supervisor_kill_budget_per_tick"].as_integer(),
             Some(12)
         );
-        assert_eq!(cortex["bulletin_interval_secs"].as_integer(), Some(120));
-        assert_eq!(cortex["bulletin_max_words"].as_integer(), Some(4000));
-        assert_eq!(cortex["bulletin_max_turns"].as_integer(), Some(5));
         assert!((cortex["maintenance_decay_rate"].as_float().unwrap_or(0.0) - 0.16).abs() < 1e-6);
         assert!(
             (cortex["maintenance_prune_threshold"]
@@ -1574,9 +1534,6 @@ id = "main"
             detached_worker_timeout_retry_limit: None,
             supervisor_kill_budget_per_tick: None,
             circuit_breaker_threshold: None,
-            bulletin_interval_secs: None,
-            bulletin_max_words: None,
-            bulletin_max_turns: None,
             maintenance_decay_rate: None,
             maintenance_prune_threshold: None,
             maintenance_min_age_days: None,
@@ -1593,9 +1550,6 @@ id = "main"
             detached_worker_timeout_retry_limit: None,
             supervisor_kill_budget_per_tick: None,
             circuit_breaker_threshold: None,
-            bulletin_interval_secs: None,
-            bulletin_max_words: None,
-            bulletin_max_turns: None,
             maintenance_decay_rate: Some(0.2),
             maintenance_prune_threshold: None,
             maintenance_min_age_days: None,

@@ -22,6 +22,10 @@ pub struct MemorySaveTool {
     contract_state: Option<Arc<super::memory_persistence_complete::MemoryPersistenceContractState>>,
     working_memory: Option<Arc<crate::memory::WorkingMemoryStore>>,
     runtime_config: Option<Arc<crate::config::RuntimeConfig>>,
+    /// Serializes human-anchor get-or-create across tool clones so two
+    /// concurrent saves for the same human cannot both miss the lookup and
+    /// create duplicate anchors.
+    anchor_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +43,7 @@ impl MemorySaveTool {
             contract_state: None,
             working_memory: None,
             runtime_config: None,
+            anchor_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -73,6 +78,43 @@ impl MemorySaveTool {
     pub fn with_runtime_config(mut self, config: Arc<crate::config::RuntimeConfig>) -> Self {
         self.runtime_config = Some(config);
         self
+    }
+
+    /// Roll back the SQLite side after an embedding failure so a memory can
+    /// never look saved while being unrecallable. A freshly created row is
+    /// deleted along with its associations; a merged human anchor is
+    /// restored to its pre-merge state instead — deleting it would destroy
+    /// the person's accumulated profile.
+    async fn compensate_embedding_failure(
+        &self,
+        memory: &Memory,
+        replaced_anchor: Option<&Memory>,
+    ) {
+        let store = self.memory_search.store();
+        if let Some(previous) = replaced_anchor {
+            if let Err(error) = store.update(previous).await {
+                tracing::error!(
+                    memory_id = %memory.id,
+                    %error,
+                    "failed to restore human anchor after embedding error"
+                );
+            }
+            return;
+        }
+        if let Err(error) = store.delete_associations_for_memory(&memory.id).await {
+            tracing::error!(
+                memory_id = %memory.id,
+                %error,
+                "compensating association delete failed after embedding error"
+            );
+        }
+        if let Err(error) = store.delete(&memory.id).await {
+            tracing::error!(
+                memory_id = %memory.id,
+                %error,
+                "compensating delete failed after embedding error"
+            );
+        }
     }
 }
 
@@ -172,44 +214,7 @@ impl Tool for MemorySaveTool {
                     "memory_type": {
                         "type": "string",
                         "description": "The type of memory being saved. Each type drives a different behavior — choose the one whose effect matches what you're storing.",
-                        "oneOf": [
-                            {
-                                "const": "fact",
-                                "description": "What you know to be true. Grounds your responses."
-                            },
-                            {
-                                "const": "preference",
-                                "description": "How the user likes things done. Shapes your approach."
-                            },
-                            {
-                                "const": "decision",
-                                "description": "Commitments that were made. Constrains future choices."
-                            },
-                            {
-                                "const": "identity",
-                                "description": "Stable facts about who the user or the agent is. Shapes self-understanding."
-                            },
-                            {
-                                "const": "event",
-                                "description": "Something that happened at a point in time. Adds situational context."
-                            },
-                            {
-                                "const": "observation",
-                                "description": "Patterns noticed about how things work. System-level awareness."
-                            },
-                            {
-                                "const": "goal",
-                                "description": "What the user or you are working toward. Drives proactive action."
-                            },
-                            {
-                                "const": "todo",
-                                "description": "Concrete tasks to complete. Creates accountability."
-                            },
-                            {
-                                "const": "human",
-                                "description": "A curated anchor for a specific human — who they are, how they prefer to work. Requires human_id; saves merge into the existing anchor for that human."
-                            }
-                        ]
+                        "oneOf": memory_type_schema_entries(),
                     },
                     "importance": {
                         "type": "number",
@@ -280,18 +285,18 @@ impl Tool for MemorySaveTool {
             )));
         }
 
-        // Parse memory type
-        let memory_type = match args.memory_type.as_str() {
-            "fact" => MemoryType::Fact,
-            "preference" => MemoryType::Preference,
-            "decision" => MemoryType::Decision,
-            "identity" => MemoryType::Identity,
-            "event" => MemoryType::Event,
-            "observation" => MemoryType::Observation,
-            "goal" => MemoryType::Goal,
-            "todo" => MemoryType::Todo,
-            "human" => MemoryType::Human,
-            _ => MemoryType::Fact,
+        // Parse memory type; an unrecognized label is a schema violation,
+        // not a fact.
+        let Some(memory_type) = MemoryType::from_label(&args.memory_type) else {
+            return Err(MemorySaveError(format!(
+                "unknown memory_type '{}'; valid types: {}",
+                args.memory_type,
+                MemoryType::ALL
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
         };
 
         let mut memory = Memory::new(&args.content, memory_type);
@@ -311,56 +316,58 @@ impl Tool for MemorySaveTool {
         // Save to SQLite database
         let store = self.memory_search.store();
 
-        // Human anchors (3.1a): a human-typed save with a `human_id` merges
-        // into the existing anchor for that human instead of creating a
-        // duplicate. This is the reflection merge path — persistence
-        // branches save per-session human observations and they accumulate
-        // into one curated anchor per person.
+        // Human anchors (3.1a): a human-typed save resolves through the
+        // per-human anchor mapping — merging into the existing anchor for
+        // that human or creating and mapping a fresh one — then continues
+        // through the same embedding/FTS/consolidation pipeline as every
+        // other save, so anchors are recallable and count toward the
+        // persistence contract. Persistence branches save per-session human
+        // observations and they accumulate into one curated anchor per
+        // person. `replaced_anchor` holds the pre-merge anchor for
+        // compensation when a later pipeline step fails.
+        let mut replaced_anchor: Option<Memory> = None;
         if memory_type == MemoryType::Human {
-            if let Some(human_id) = args.human_id.as_deref() {
-                if let Some(existing) = store
-                    .get_human_anchor(human_id)
-                    .await
-                    .map_err(|e| MemorySaveError(format!("Failed to resolve human anchor: {e}")))?
-                {
+            let Some(human_id) = args.human_id.as_deref() else {
+                return Err(MemorySaveError(
+                    "human memories require human_id (the participant key of the person)".into(),
+                ));
+            };
+            // Serialize get-or-create so concurrent saves for the same human
+            // cannot both miss the lookup and create duplicate anchors.
+            let _anchor_guard = self.anchor_lock.lock().await;
+            match store
+                .get_human_anchor(human_id)
+                .await
+                .map_err(|e| MemorySaveError(format!("Failed to resolve human anchor: {e}")))?
+            {
+                Some(existing) => {
                     let mut merged = existing.clone();
                     merged.content = format!("{}\n{}", existing.content.trim_end(), args.content);
                     merged.importance = existing.importance.max(memory.importance);
+                    merged.updated_at = chrono::Utc::now();
                     store.update(&merged).await.map_err(|e| {
                         MemorySaveError(format!("Failed to merge human anchor: {e}"))
                     })?;
-                    return Ok(MemorySaveOutput {
-                        memory_id: existing.id,
-                        success: true,
-                        message: "merged into existing human anchor".to_string(),
-                        consolidation: None,
-                    });
+                    memory = merged;
+                    replaced_anchor = Some(existing);
                 }
-                // No anchor yet — save a fresh anchor memory and map it.
-                store
-                    .save(&memory)
-                    .await
-                    .map_err(|e| MemorySaveError(format!("Failed to save memory: {e}")))?;
-                store
-                    .set_human_anchor(human_id, &memory.id)
-                    .await
-                    .map_err(|e| MemorySaveError(format!("Failed to map human anchor: {e}")))?;
-                return Ok(MemorySaveOutput {
-                    memory_id: memory.id.clone(),
-                    success: true,
-                    message: "created human anchor".to_string(),
-                    consolidation: None,
-                });
+                None => {
+                    store
+                        .save(&memory)
+                        .await
+                        .map_err(|e| MemorySaveError(format!("Failed to save memory: {e}")))?;
+                    store
+                        .set_human_anchor(human_id, &memory.id)
+                        .await
+                        .map_err(|e| MemorySaveError(format!("Failed to map human anchor: {e}")))?;
+                }
             }
-            return Err(MemorySaveError(
-                "human memories require human_id (the participant key of the person)".into(),
-            ));
+        } else {
+            store
+                .save(&memory)
+                .await
+                .map_err(|e| MemorySaveError(format!("Failed to save memory: {e}")))?;
         }
-
-        store
-            .save(&memory)
-            .await
-            .map_err(|e| MemorySaveError(format!("Failed to save memory: {e}")))?;
 
         // Create associations
         for assoc in args.associations {
@@ -410,35 +417,19 @@ impl Tool for MemorySaveTool {
             }
         }
 
-        // Generate and store embedding. On failure, compensate by deleting the
-        // SQLite row (and any associations already written) so there is no orphan.
+        // Generate and store the embedding for the memory's final content
+        // (the merged content on the anchor merge path). On failure,
+        // compensate so the store and the index cannot disagree.
         let embedding = match self
             .memory_search
             .embedding_model_arc()
-            .embed_one(&args.content)
+            .embed_one(&memory.content)
             .await
         {
             Ok(emb) => emb,
             Err(embed_err) => {
-                if let Err(assoc_err) = self
-                    .memory_search
-                    .store()
-                    .delete_associations_for_memory(&memory.id)
-                    .await
-                {
-                    tracing::error!(
-                        memory_id = %memory.id,
-                        error = %assoc_err,
-                        "compensating association delete failed after embedding generation error"
-                    );
-                }
-                if let Err(del_err) = self.memory_search.store().delete(&memory.id).await {
-                    tracing::error!(
-                        memory_id = %memory.id,
-                        %del_err,
-                        "compensating delete failed after embedding generation error"
-                    );
-                }
+                self.compensate_embedding_failure(&memory, replaced_anchor.as_ref())
+                    .await;
                 return Err(MemorySaveError(format!(
                     "Failed to generate embedding: {embed_err}"
                 )));
@@ -448,7 +439,7 @@ impl Tool for MemorySaveTool {
         match self
             .memory_search
             .embedding_table()
-            .store(&memory.id, &args.content, &embedding)
+            .store(&memory.id, &memory.content, &embedding)
             .await
         {
             Ok(()) => {
@@ -457,25 +448,8 @@ impl Tool for MemorySaveTool {
                 }
             }
             Err(embed_err) => {
-                if let Err(assoc_err) = self
-                    .memory_search
-                    .store()
-                    .delete_associations_for_memory(&memory.id)
-                    .await
-                {
-                    tracing::error!(
-                        memory_id = %memory.id,
-                        error = %assoc_err,
-                        "compensating association delete failed after embedding store error"
-                    );
-                }
-                if let Err(del_err) = self.memory_search.store().delete(&memory.id).await {
-                    tracing::error!(
-                        memory_id = %memory.id,
-                        %del_err,
-                        "compensating delete failed after embedding store error"
-                    );
-                }
+                self.compensate_embedding_failure(&memory, replaced_anchor.as_ref())
+                    .await;
                 return Err(MemorySaveError(format!(
                     "Failed to store embedding: {embed_err}"
                 )));
@@ -580,10 +554,18 @@ impl Tool for MemorySaveTool {
                 .inc();
         }
 
+        let message = if replaced_anchor.is_some() {
+            "merged into existing human anchor".to_string()
+        } else if memory_type == MemoryType::Human {
+            "created human anchor".to_string()
+        } else {
+            "Memory saved successfully".to_string()
+        };
+
         Ok(MemorySaveOutput {
             memory_id: memory.id,
             success: true,
-            message: "Memory saved successfully".to_string(),
+            message,
             consolidation,
         })
     }
@@ -613,13 +595,68 @@ pub async fn save_fact(
     Ok(output.memory_id)
 }
 
+/// Seed anchor memories for configured org humans that carry a `HUMAN.md`
+/// description, so participant context can resolve them in-turn before
+/// reflection has observed them. Runs once at agent startup; idempotent — a
+/// human with an existing anchor is left alone. Routed through the save tool
+/// so seeded anchors get the same embedding and FTS treatment as any other
+/// save.
+pub async fn seed_org_human_anchors(
+    memory_search: &Arc<MemorySearch>,
+    humans: &[crate::config::HumanDef],
+) {
+    let tool = MemorySaveTool::new(memory_search.clone());
+    for human in humans {
+        let Some(description) = human.description.as_deref() else {
+            continue;
+        };
+        if description.trim().is_empty() {
+            continue;
+        }
+        match memory_search.store().get_human_anchor(&human.id).await {
+            Ok(Some(_)) => continue,
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, human_id = %human.id, "org anchor lookup failed");
+                continue;
+            }
+        }
+        let args = MemorySaveArgs {
+            content: description.to_string(),
+            memory_type: "human".to_string(),
+            importance: Some(0.85),
+            source: None,
+            channel_id: None,
+            human_id: Some(human.id.clone()),
+            associations: vec![],
+        };
+        if let Err(error) = tool.call(args).await {
+            tracing::warn!(%error, human_id = %human.id, "org anchor seeding failed");
+        }
+    }
+}
+
 fn summarize_memory_content(content: &str) -> String {
     crate::summarize_first_non_empty_line(content, crate::EVENT_SUMMARY_MAX_CHARS)
 }
 
+/// Build the `memory_type` enum entries for the tool schema from
+/// [`MemoryType::ALL`], so the schema and the enum cannot drift.
+fn memory_type_schema_entries() -> Vec<serde_json::Value> {
+    MemoryType::ALL
+        .iter()
+        .map(|memory_type| {
+            serde_json::json!({
+                "const": memory_type.to_string(),
+                "description": memory_type.schema_description(),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::summarize_memory_content;
+    use super::*;
 
     #[test]
     fn summarize_memory_content_prefers_first_non_empty_line() {
@@ -632,5 +669,84 @@ mod tests {
         let content = "a".repeat(200);
         let summary = summarize_memory_content(&content);
         assert_eq!(summary.chars().count(), crate::EVENT_SUMMARY_MAX_CHARS);
+    }
+
+    async fn memory_search_fixture() -> (Arc<MemorySearch>, tempfile::TempDir) {
+        let store = crate::memory::MemoryStore::connect_in_memory().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let connection = lancedb::connect(dir.path().to_str().expect("temp path"))
+            .execute()
+            .await
+            .expect("lancedb connect");
+        let embedding_table = crate::memory::EmbeddingTable::open_or_create(&connection)
+            .await
+            .expect("embedding table");
+        let embedding_model = crate::memory::embedding::shared_test_model();
+        (
+            Arc::new(MemorySearch::new(store, embedding_table, embedding_model)),
+            dir,
+        )
+    }
+
+    fn human_args(content: &str, human_id: &str) -> MemorySaveArgs {
+        MemorySaveArgs {
+            content: content.to_string(),
+            memory_type: "human".to_string(),
+            importance: None,
+            source: None,
+            channel_id: None,
+            human_id: Some(human_id.to_string()),
+            associations: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn human_anchor_merge_appends_content_and_bumps_updated_at() {
+        let (memory_search, _dir) = memory_search_fixture().await;
+        let contract_state = Arc::new(
+            super::super::memory_persistence_complete::MemoryPersistenceContractState::default(),
+        );
+        let tool =
+            MemorySaveTool::new(memory_search.clone()).with_contract_state(contract_state.clone());
+
+        let created = tool
+            .call(human_args("Victor prefers direct answers.", "discord:123"))
+            .await
+            .expect("anchor create should succeed");
+        assert_eq!(created.message, "created human anchor");
+
+        // Backdate the anchor so a merge-time bump is observable.
+        let store = memory_search.store();
+        let mut anchor = store.load(&created.memory_id).await.unwrap().unwrap();
+        let past = chrono::Utc::now() - chrono::Duration::days(2);
+        anchor.updated_at = past;
+        store.update(&anchor).await.unwrap();
+
+        let merged = tool
+            .call(human_args("Maintains the memory subsystem.", "discord:123"))
+            .await
+            .expect("anchor merge should succeed");
+        assert_eq!(merged.memory_id, created.memory_id);
+        assert_eq!(merged.message, "merged into existing human anchor");
+
+        let anchor_after = store.load(&created.memory_id).await.unwrap().unwrap();
+        assert!(
+            anchor_after
+                .content
+                .contains("Victor prefers direct answers.")
+        );
+        assert!(
+            anchor_after
+                .content
+                .contains("Maintains the memory subsystem.")
+        );
+        assert!(
+            anchor_after.updated_at > past + chrono::Duration::days(1),
+            "merge must bump updated_at to now"
+        );
+
+        // Both the create and the merge count toward the persistence contract.
+        let recorded = contract_state.saved_memory_ids();
+        assert!(recorded.contains(&created.memory_id));
     }
 }

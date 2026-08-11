@@ -315,15 +315,6 @@ impl CortexConfig {
             circuit_breaker_threshold: overrides
                 .circuit_breaker_threshold
                 .unwrap_or(defaults.circuit_breaker_threshold),
-            bulletin_interval_secs: overrides
-                .bulletin_interval_secs
-                .unwrap_or(defaults.bulletin_interval_secs),
-            bulletin_max_words: overrides
-                .bulletin_max_words
-                .unwrap_or(defaults.bulletin_max_words),
-            bulletin_max_turns: overrides
-                .bulletin_max_turns
-                .unwrap_or(defaults.bulletin_max_turns),
             maintenance_interval_secs,
             maintenance_decay_rate: overrides
                 .maintenance_decay_rate

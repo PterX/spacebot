@@ -804,7 +804,6 @@ impl CortexChatSession {
         let prompt_engine = runtime_config.prompts.load();
 
         let identity_context = runtime_config.identity.load().render();
-        let memory_bulletin = runtime_config.memory_bulletin.load();
         let agents_manifest = crate::self_awareness::agents_manifest_for_prompt();
         let changelog_highlights = crate::self_awareness::changelog_highlights();
         let runtime_config_snapshot = crate::self_awareness::runtime_snapshot_pretty(
@@ -837,7 +836,6 @@ impl CortexChatSession {
 
         let system_prompt = prompt_engine.render_cortex_chat_prompt(
             empty_to_none(identity_context),
-            empty_to_none(memory_bulletin.to_string()),
             channel_transcript,
             empty_to_none(agents_manifest),
             empty_to_none(changelog_highlights),

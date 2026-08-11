@@ -275,22 +275,15 @@ impl Tool for MemoryRecallTool {
                 .map(|c| format!("checkpoint #{}: {}", c.seq, c.title));
 
             // Supersede-with-provenance: resolve the recorded checkpoint id
-            // to a human-readable reference when it still exists.
-            let supersedes_checkpoint = if let Some(id) = &result.memory.supersedes_checkpoint_id {
-                match result
-                    .memory
-                    .channel_id
-                    .as_deref()
-                    .map(|channel| chronicle.get_by_id(channel, id))
-                {
-                    Some(fut) => match fut.await {
-                        Ok(Some(cp)) => Some(format!("#{}: {}", cp.seq, cp.title)),
-                        _ => None, // rolled up or missing — the id itself stays on the memory
-                    },
-                    None => None,
-                }
-            } else {
-                None
+            // to a human-readable reference when it still exists. Resolution
+            // is by id alone — the checkpoint was recorded from the absorbed
+            // memory's channel, which need not match the survivor's.
+            let supersedes_checkpoint = match &result.memory.supersedes_checkpoint_id {
+                Some(id) => match chronicle.checkpoint_by_id(id).await {
+                    Ok(Some(cp)) => Some(format!("#{}: {}", cp.seq, cp.title)),
+                    _ => None, // rolled up or missing — the id itself stays on the memory
+                },
+                None => None,
             };
 
             memories.push(MemoryOutput {
@@ -305,7 +298,7 @@ impl Tool for MemoryRecallTool {
             });
         }
 
-        let checkpoints = checkpoint_hits
+        let checkpoints: Vec<ChronicleHitOutput> = checkpoint_hits
             .into_iter()
             .map(|hit| ChronicleHitOutput {
                 checkpoint_id: hit.checkpoint_id,
@@ -317,7 +310,7 @@ impl Tool for MemoryRecallTool {
             .collect();
 
         let total_found = search_results.len();
-        let summary = format_memories(&memories);
+        let summary = format_memories(&memories, &checkpoints);
 
         #[cfg(feature = "metrics")]
         {
@@ -342,31 +335,44 @@ impl Tool for MemoryRecallTool {
     }
 }
 
-/// Format memories for display to an agent.
-pub fn format_memories(memories: &[MemoryOutput]) -> String {
-    if memories.is_empty() {
+/// Format memories and chronicle checkpoint hits for display to an agent.
+pub fn format_memories(memories: &[MemoryOutput], checkpoints: &[ChronicleHitOutput]) -> String {
+    if memories.is_empty() && checkpoints.is_empty() {
         return "No relevant memories found.".to_string();
     }
 
-    let mut output = String::from("## Relevant Memories\n\n");
+    let mut output = String::new();
 
-    for (i, memory) in memories.iter().enumerate() {
-        let preview = memory.content.lines().next().unwrap_or(&memory.content);
-        output.push_str(&format!(
-            "{}. [{}] (importance: {:.2}, relevance: {:.2})\n   {}\n",
-            i + 1,
-            memory.memory_type,
-            memory.importance,
-            memory.relevance_score,
-            preview
-        ));
-        if let Some(checkpoint) = &memory.checkpoint {
-            output.push_str(&format!("   from {checkpoint}\n"));
+    if !memories.is_empty() {
+        output.push_str("## Relevant Memories\n\n");
+        for (i, memory) in memories.iter().enumerate() {
+            let preview = memory.content.lines().next().unwrap_or(&memory.content);
+            output.push_str(&format!(
+                "{}. [{}] (importance: {:.2}, relevance: {:.2})\n   {}\n",
+                i + 1,
+                memory.memory_type,
+                memory.importance,
+                memory.relevance_score,
+                preview
+            ));
+            if let Some(checkpoint) = &memory.checkpoint {
+                output.push_str(&format!("   from {checkpoint}\n"));
+            }
+            if let Some(supersedes) = &memory.supersedes_checkpoint {
+                output.push_str(&format!("   supersedes claim from {supersedes}\n"));
+            }
+            output.push('\n');
         }
-        if let Some(supersedes) = &memory.supersedes_checkpoint {
-            output.push_str(&format!("   supersedes claim from {supersedes}\n"));
+    }
+
+    if !checkpoints.is_empty() {
+        output.push_str("## Related Sessions\n\n");
+        for hit in checkpoints {
+            output.push_str(&format!(
+                "- checkpoint #{} in {}: {}\n",
+                hit.seq, hit.channel_id, hit.title
+            ));
         }
-        output.push('\n');
     }
 
     output

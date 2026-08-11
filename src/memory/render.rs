@@ -10,18 +10,25 @@ use crate::memory::{MemoryStore, MemoryType};
 use crate::tasks::{TaskListFilter, TaskStatus, TaskStore};
 use anyhow::{Context, Result};
 
-/// Typed sections in render order. Facts first — the grounding section — then
-/// the taxonomy order the `memory_save` tool teaches. Identity is excluded
+/// Typed sections in render order, with per-type entry caps sized for the
+/// default word budget. Facts first — the grounding section — then the
+/// taxonomy order the `memory_save` tool teaches. Identity is excluded
 /// (identity files own that layer), events live on the chronicle/working-memory
-/// spine, and concrete todos live on the task board.
+/// spine, concrete todos live on the task board, and human anchors are
+/// scoped — they surface through the Participants block only for humans
+/// present, never in the global render.
 const SECTIONS: &[(MemoryType, &str, usize)] = &[
     (MemoryType::Fact, "Facts", 10),
     (MemoryType::Decision, "Decisions", 10),
     (MemoryType::Preference, "Preferences", 10),
     (MemoryType::Goal, "Goals", 10),
     (MemoryType::Observation, "Observations", 8),
-    (MemoryType::Human, "People", 5),
 ];
+
+/// The word budget the `SECTIONS` entry caps are sized for (the
+/// `memory_render_max_words` default). A configured budget scales each cap
+/// linearly against this baseline, so raising the budget deepens the render.
+const BASELINE_BUDGET_WORDS: usize = 500;
 
 /// Render the global memory-store view for the knowledge-context slot.
 ///
@@ -29,7 +36,9 @@ const SECTIONS: &[(MemoryType, &str, usize)] = &[
 /// renders regardless — task-awareness is a standing signal, and an empty
 /// board is itself information. Shown-of-total counts report what was
 /// actually rendered against what the store holds, so the model knows when
-/// branch recall into the full store is worth it.
+/// branch recall into the full store is worth it. When the word budget
+/// exhausts mid-render, the render stops — no section header is ever emitted
+/// without at least one entry under it.
 pub async fn render_memory_store(
     store: &MemoryStore,
     task_store: &TaskStore,
@@ -39,13 +48,21 @@ pub async fn render_memory_store(
     let mut output = String::from("## Memory Store\n\nScope: global\n");
     let mut word_budget = max_words;
 
-    for (memory_type, label, budget) in SECTIONS {
+    for (memory_type, label, baseline_cap) in SECTIONS {
+        if word_budget == 0 {
+            break;
+        }
+
         let total = store.count_by_type(*memory_type).await?;
         if total == 0 {
             continue;
         }
 
-        let mut entries = store.get_by_type(*memory_type, *budget as i64).await?;
+        // Scale the per-type entry cap with the configured budget, integer
+        // math against the baseline, at least one entry per section.
+        let entry_cap = (baseline_cap * max_words / BASELINE_BUDGET_WORDS).max(1);
+
+        let mut entries = store.get_by_type(*memory_type, entry_cap as i64).await?;
         // Stable ordering: importance desc, then updated_at desc, then id —
         // byte-identical between store writes even when SQLite's natural
         // ordering does not tie-break identically.
@@ -57,24 +74,41 @@ pub async fn render_memory_store(
                 .then_with(|| a.id.cmp(&b.id))
         });
 
-        output.push('\n');
-        if entries.len() as i64 == total {
-            output.push_str(&format!("### {label}\n"));
-        } else {
-            output.push_str(&format!("### {label} — {} of {total}\n", entries.len()));
-        }
-
+        // Render entries against the remaining budget before emitting the
+        // header, so the shown-of-total count reflects what actually
+        // rendered and an exhausted budget never leaves an empty section.
+        let mut section = String::new();
+        let mut shown = 0usize;
         for memory in &entries {
             let line = format!(
                 "- {} ({})\n",
                 first_line(&memory.content),
                 memory.updated_at.format("%Y-%m-%d")
             );
-            word_budget = word_budget.saturating_sub(line.split_whitespace().count());
-            if word_budget == 0 {
+            let words = line.split_whitespace().count();
+            if words > word_budget {
+                word_budget = 0;
                 break;
             }
-            output.push_str(&line);
+            word_budget -= words;
+            section.push_str(&line);
+            shown += 1;
+        }
+
+        if shown == 0 {
+            break;
+        }
+
+        output.push('\n');
+        if (shown as i64) < total {
+            output.push_str(&format!("### {label} — {shown} of {total}\n"));
+        } else {
+            output.push_str(&format!("### {label}\n"));
+        }
+        output.push_str(&section);
+
+        if shown < entries.len() {
+            break;
         }
     }
 
@@ -135,11 +169,140 @@ fn first_line(content: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::Memory;
 
     #[test]
     fn first_line_skips_blank_lines() {
         assert_eq!(first_line("\n\nFirst line\nSecond"), "First line");
         assert_eq!(first_line("single"), "single");
         assert_eq!(first_line("   \n  \n"), "");
+    }
+
+    async fn render_fixture() -> (std::sync::Arc<MemoryStore>, TaskStore) {
+        let store = MemoryStore::connect_in_memory().await;
+
+        // Tasks live in the global database, so the task store gets its own
+        // pool migrated with the global schema.
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .in_memory(true)
+            .create_if_missing(true);
+        let task_pool = sqlx::pool::PoolOptions::<sqlx::Sqlite>::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("in-memory SQLite");
+        sqlx::migrate!("./migrations/global")
+            .run(&task_pool)
+            .await
+            .expect("global migrations");
+
+        (store, TaskStore::new(task_pool))
+    }
+
+    /// Save a memory whose rendered bullet is exactly five words:
+    /// `- <three content words> (<date>)`.
+    async fn save_three_word_memory(
+        store: &MemoryStore,
+        memory_type: MemoryType,
+        content: &str,
+        importance: f32,
+    ) {
+        assert_eq!(content.split_whitespace().count(), 3);
+        let memory = Memory::new(content, memory_type).with_importance(importance);
+        store.save(&memory).await.unwrap();
+    }
+
+    /// Content whose first line renders as a 60-word bullet:
+    /// `-` + two prefix words + 56 filler words + the date.
+    fn sixty_word_content(prefix: &str) -> String {
+        format!("{prefix} {}", "lorem ".repeat(56).trim_end())
+    }
+
+    #[tokio::test]
+    async fn exhausted_budget_stops_render_without_empty_headers() {
+        let (store, task_store) = render_fixture().await;
+        for (prefix, importance) in [
+            ("alpha fact", 0.9),
+            ("bravo fact", 0.8),
+            ("charlie fact", 0.7),
+        ] {
+            let memory = Memory::new(sixty_word_content(prefix), MemoryType::Fact)
+                .with_importance(importance);
+            store.save(&memory).await.unwrap();
+        }
+        save_three_word_memory(&store, MemoryType::Decision, "delta decision one", 0.9).await;
+
+        // A 150-word budget keeps the Facts entry cap at 3 but only fits two
+        // 60-word bullets; the third fact and the whole Decisions section do
+        // not render.
+        let rendered = render_memory_store(&store, &task_store, "agent", 150)
+            .await
+            .unwrap();
+
+        assert!(rendered.contains("### Facts — 2 of 3"));
+        assert!(rendered.contains("alpha fact"));
+        assert!(rendered.contains("bravo fact"));
+        assert!(!rendered.contains("charlie fact"));
+        assert!(
+            !rendered.contains("### Decisions"),
+            "an exhausted budget must not emit further section headers"
+        );
+        assert!(rendered.contains("### Active Tasks"));
+    }
+
+    #[tokio::test]
+    async fn count_is_omitted_when_every_entry_renders() {
+        let (store, task_store) = render_fixture().await;
+        save_three_word_memory(&store, MemoryType::Fact, "alpha fact one", 0.9).await;
+        save_three_word_memory(&store, MemoryType::Fact, "bravo fact two", 0.8).await;
+
+        let rendered = render_memory_store(&store, &task_store, "agent", 500)
+            .await
+            .unwrap();
+
+        assert!(rendered.contains("### Facts\n"));
+        assert!(!rendered.contains("### Facts —"));
+    }
+
+    #[tokio::test]
+    async fn per_type_caps_scale_with_the_configured_budget() {
+        let (store, task_store) = render_fixture().await;
+        for index in 0..12 {
+            save_three_word_memory(
+                &store,
+                MemoryType::Fact,
+                &format!("fact number {index:02}"),
+                0.9,
+            )
+            .await;
+        }
+
+        // At the baseline budget the Facts cap is 10 of the 12 stored.
+        let baseline = render_memory_store(&store, &task_store, "agent", 500)
+            .await
+            .unwrap();
+        assert!(baseline.contains("### Facts — 10 of 12"));
+
+        // Doubling the budget doubles the cap, so every entry renders.
+        let doubled = render_memory_store(&store, &task_store, "agent", 1000)
+            .await
+            .unwrap();
+        assert!(doubled.contains("### Facts\n"));
+        assert!(!doubled.contains("### Facts —"));
+    }
+
+    #[tokio::test]
+    async fn human_anchors_are_excluded_from_the_global_render() {
+        let (store, task_store) = render_fixture().await;
+        let anchor =
+            Memory::new("Victor prefers direct answers", MemoryType::Human).with_importance(1.0);
+        store.save(&anchor).await.unwrap();
+
+        let rendered = render_memory_store(&store, &task_store, "agent", 500)
+            .await
+            .unwrap();
+
+        assert!(!rendered.contains("People"));
+        assert!(!rendered.contains("Victor prefers direct answers"));
     }
 }

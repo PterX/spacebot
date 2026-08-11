@@ -468,18 +468,6 @@ fn config_rows(config: AgentConfigResponse) -> Vec<Vec<String>> {
         config.cortex.circuit_breaker_threshold.to_string(),
     );
     push(
-        "cortex.bulletin_interval_secs",
-        config.cortex.bulletin_interval_secs.to_string(),
-    );
-    push(
-        "cortex.bulletin_max_words",
-        config.cortex.bulletin_max_words.to_string(),
-    );
-    push(
-        "cortex.bulletin_max_turns",
-        config.cortex.bulletin_max_turns.to_string(),
-    );
-    push(
         "cortex.maintenance_decay_rate",
         config.cortex.maintenance_decay_rate.to_string(),
     );

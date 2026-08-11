@@ -30,7 +30,7 @@ fn bootstrap_secrets_for_config() {
     }
 }
 
-/// Bootstrap AgentDeps from the real ~/.spacebot config (same as bulletin test).
+/// Bootstrap AgentDeps from the real ~/.spacebot config.
 async fn bootstrap_deps() -> anyhow::Result<(spacebot::AgentDeps, spacebot::config::Config)> {
     bootstrap_secrets_for_config();
     let config =
@@ -194,7 +194,6 @@ fn format_tool_defs(defs: &[rig::completion::ToolDefinition]) -> String {
 fn build_channel_system_prompt(rc: &spacebot::config::RuntimeConfig) -> String {
     let prompt_engine = rc.prompts.load();
     let identity_context = rc.identity.load().render();
-    let memory_bulletin = rc.memory_bulletin.load();
     let skills = rc.skills.load();
     let skills_prompt = skills
         .render_channel_prompt(&prompt_engine)
@@ -214,16 +213,30 @@ fn build_channel_system_prompt(rc: &spacebot::config::RuntimeConfig) -> String {
     let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
 
     prompt_engine
-        .render_channel_prompt(
+        .render_channel_prompt_with_links(
             empty_to_none(identity_context),
-            empty_to_none(memory_bulletin.to_string()),
+            None,
             empty_to_none(skills_prompt),
             worker_capabilities,
             conversation_context,
             None,
             None,
-            None,
             false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            prompt_engine
+                .render_static("fragments/execution_standard")
+                .unwrap_or_default(),
+            prompt_engine
+                .render_static("fragments/authority")
+                .unwrap_or_default(),
         )
         .expect("failed to render channel prompt")
 }
@@ -279,7 +292,7 @@ async fn dump_channel_context() {
         active_participants: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         cron_outcome: None,
         autonomy_run: None,
-        human_anchor_cache: std::sync::Arc::new(std::sync::Mutex::new(
+        human_anchor_cache: std::sync::Arc::new(tokio::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),
     };
@@ -495,19 +508,6 @@ async fn dump_all_contexts() {
     let instance_dir = rc.instance_dir.to_string_lossy();
     let workspace_dir = rc.workspace_dir.to_string_lossy();
 
-    // Generate bulletin so channel context is complete
-    let logger = spacebot::agent::cortex::CortexLogger::new(deps.sqlite_pool.clone());
-    let bulletin_success = spacebot::agent::cortex::generate_bulletin(&deps, &logger).await;
-    if bulletin_success {
-        let bulletin = rc.memory_bulletin.load();
-        println!(
-            "Bulletin generated: {} words",
-            bulletin.split_whitespace().count()
-        );
-    } else {
-        println!("Bulletin generation failed (may not have memories or LLM keys)");
-    }
-
     let conversation_logger =
         spacebot::conversation::ConversationLogger::new(deps.sqlite_pool.clone());
     let channel_store = spacebot::conversation::ChannelStore::new(deps.sqlite_pool.clone());
@@ -549,7 +549,7 @@ async fn dump_all_contexts() {
         active_participants: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         cron_outcome: None,
         autonomy_run: None,
-        human_anchor_cache: std::sync::Arc::new(std::sync::Mutex::new(
+        human_anchor_cache: std::sync::Arc::new(tokio::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),
     };
@@ -579,7 +579,7 @@ async fn dump_all_contexts() {
     let channel_tool_defs = channel_tool_server.get_tool_defs(None).await.unwrap();
     let channel_tools_text = format_tool_defs(&channel_tool_defs);
 
-    print_section("CHANNEL SYSTEM PROMPT (with bulletin)", &channel_prompt);
+    print_section("CHANNEL SYSTEM PROMPT", &channel_prompt);
     print_stats("System prompt", &channel_prompt);
     print_section(
         &format!("CHANNEL TOOLS ({} tools)", channel_tool_defs.len()),
@@ -814,10 +814,4 @@ async fn dump_all_contexts() {
         let skill_names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
         println!("\nSkills: {}", skill_names.join(", "));
     }
-
-    let bulletin = rc.memory_bulletin.load();
-    println!(
-        "\nMemory bulletin: {} words",
-        bulletin.split_whitespace().count()
-    );
 }

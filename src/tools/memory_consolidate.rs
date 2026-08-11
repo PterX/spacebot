@@ -89,7 +89,7 @@ impl Tool for MemoryConsolidateTool {
                 "properties": {
                     "partition": {
                         "type": "string",
-                        "description": "Memory type label of the partition to consolidate (fact, preference, decision, identity, event, observation, goal, todo)."
+                        "description": "Memory type label of the partition to consolidate (fact, preference, decision, identity, event, observation, goal, todo, human)."
                     },
                     "batch": {
                         "type": "array",
@@ -120,11 +120,24 @@ impl Tool for MemoryConsolidateTool {
     }
 
     async fn call(&self, args: Self::Args) -> std::result::Result<Self::Output, Self::Error> {
+        let Some(memory_type) = crate::memory::MemoryType::from_label(&args.partition) else {
+            return Err(MemoryConsolidateError(format!(
+                "unknown partition {:?} — expected a memory type label such as \"fact\"",
+                args.partition
+            )));
+        };
+
         if args.batch.is_empty() {
+            let remaining_count = self
+                .memory_search
+                .store()
+                .count_by_type(memory_type)
+                .await
+                .map_err(|e| MemoryConsolidateError(format!("{e}")))?;
             return Ok(MemoryConsolidateOutput {
                 partition: args.partition.clone(),
                 consolidated: 0,
-                remaining_count: 0,
+                remaining_count,
                 success: true,
                 message: "Empty batch — nothing to consolidate".to_string(),
             });

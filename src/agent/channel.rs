@@ -506,12 +506,12 @@ pub struct ChannelState {
     /// Whether a turn is currently in flight. Read by the inbound router's
     /// busy policy without entering the channel's message queue.
     pub turn_active: Arc<std::sync::atomic::AtomicBool>,
+    /// Per-channel session cache of resolved human anchors (participant key
+    /// -> anchor content). Misses are cached too (3.1a in-turn resolution).
+    pub human_anchor_cache: Arc<tokio::sync::Mutex<HashMap<String, Option<String>>>>,
     /// Live response mode, encoded via `ResponseMode::to_u8`. Shared so the
     /// router-side control plane can apply a mode change mid-turn; the
     /// channel reads it at every gate instead of its startup snapshot.
-    /// Per-channel session cache of resolved human anchors (participant key
-    /// -> anchor content). Misses are cached too (3.1a in-turn resolution).
-    pub human_anchor_cache: Arc<std::sync::Mutex<HashMap<String, Option<String>>>>,
     pub response_mode: Arc<std::sync::atomic::AtomicU8>,
     /// Autonomy run state for the `autonomy_complete` tool. Set only on
     /// `ChannelKind::Autonomy` channels; the run loop uses it to enforce the
@@ -1124,7 +1124,7 @@ impl Channel {
                 resolved_settings.response_mode.to_u8(),
             )),
             autonomy_run,
-            human_anchor_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            human_anchor_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         };
 
         // Each channel gets its own isolated tool server to avoid races between
@@ -2287,6 +2287,7 @@ impl Channel {
                 attachment_parts,
                 false, // not a retrigger
                 batch_adapter,
+                Some(&combined_text),
             )
             .await?;
 
@@ -2636,6 +2637,7 @@ impl Channel {
                 attachment_content,
                 is_retrigger,
                 adapter,
+                Some(&user_text),
             )
             .await?;
 
@@ -2840,10 +2842,7 @@ impl Channel {
     }
 
     /// Build org context showing the agent's position in the communication hierarchy.
-    async fn build_org_context(
-        &self,
-        prompt_engine: &crate::prompts::PromptEngine,
-    ) -> Option<String> {
+    fn build_org_context(&self, prompt_engine: &crate::prompts::PromptEngine) -> Option<String> {
         let agent_id = self.deps.agent_id.as_ref();
         let all_links = self.deps.links.load();
         let links = crate::links::links_for_agent(&all_links, agent_id);
@@ -2853,47 +2852,6 @@ impl Channel {
         let all_humans = self.deps.humans.load();
         let humans_by_id: std::collections::HashMap<&str, &crate::config::HumanDef> =
             all_humans.iter().map(|h| (h.id.as_str(), h)).collect();
-
-        // Promotion pass (3.1a): humans who carry a HUMAN.md description get
-        // an anchor seeded from it, so participant context can resolve them
-        // in-turn even before reflection has observed them. Idempotent — a
-        // human with an existing anchor is left alone.
-        for human in all_humans.iter() {
-            let Some(description) = human.description.as_deref() else {
-                continue;
-            };
-            if description.trim().is_empty() {
-                continue;
-            }
-            let anchored = self
-                .deps
-                .memory_search
-                .store()
-                .get_human_anchor(&human.id)
-                .await
-                .ok()
-                .flatten()
-                .is_some();
-            if anchored {
-                continue;
-            }
-            let mut memory =
-                crate::memory::Memory::new(description, crate::memory::MemoryType::Human);
-            memory.importance = 0.85;
-            if let Err(error) = self.deps.memory_search.store().save(&memory).await {
-                tracing::warn!(%error, human_id = %human.id, "anchor promotion save failed");
-                continue;
-            }
-            if let Err(error) = self
-                .deps
-                .memory_search
-                .store()
-                .set_human_anchor(&human.id, &memory.id)
-                .await
-            {
-                tracing::warn!(%error, human_id = %human.id, "anchor promotion mapping failed");
-            }
-        }
 
         if links.is_empty() {
             return None;
@@ -2938,6 +2896,7 @@ impl Channel {
                 is_human,
                 role,
                 description,
+                description_total_chars: None,
             };
 
             match link.kind {
@@ -2971,21 +2930,18 @@ impl Channel {
             .ok()
     }
 
-    async fn render_memory_layers(
-        &self,
-    ) -> (String, String, String, Option<String>, Option<String>) {
+    async fn render_memory_layers(&self) -> (String, String, String, Option<String>) {
         if matches!(self.resolved_settings.memory, MemoryMode::Off) {
-            return (String::new(), String::new(), String::new(), None, None);
+            return (String::new(), String::new(), String::new(), None);
         }
 
         let rc = &self.deps.runtime_config;
-        let memory_bulletin_text = Some(rc.memory_bulletin.load().to_string());
         // The knowledge-context slot is a deterministic store render — no
         // LLM synthesis, byte-stable between memory writes.
         let knowledge_synthesis_text = {
             let cortex_config = **rc.cortex.load();
             match crate::memory::render::render_memory_store(
-                &self.deps.memory_search.store(),
+                self.deps.memory_search.store(),
                 &self.deps.task_store,
                 &self.deps.agent_id,
                 cortex_config.memory_render_max_words,
@@ -3039,32 +2995,20 @@ impl Channel {
             let participants = self.state.active_participants.read().await;
             renderable_participants(&participants, &participant_config)
         };
-        // Clone the session anchor cache out and back: never hold a std lock
-        // across an await.
-        let mut anchor_cache = self
-            .state
-            .human_anchor_cache
-            .lock()
-            .expect("human anchor cache lock")
-            .clone();
+        // The session anchor cache is shared and mutated in place, so
+        // concurrent prompt builds accumulate resolved entries instead of
+        // clobbering each other, and entries survive a failed render.
         let participant_context = match crate::memory::working::render_participant_context(
             &self.deps.working_memory,
             &tracked_participants,
             self.id.as_ref(),
             &participant_config,
-            &self.deps.memory_search.store(),
-            &mut anchor_cache,
+            self.deps.memory_search.store(),
+            &self.state.human_anchor_cache,
         )
         .await
         {
-            Ok(rendered) => {
-                *self
-                    .state
-                    .human_anchor_cache
-                    .lock()
-                    .expect("human anchor cache lock") = anchor_cache;
-                rendered
-            }
+            Ok(rendered) => rendered,
             Err(error) => {
                 tracing::warn!(%error, channel_id = %self.id, "participant context render failed");
                 String::new()
@@ -3075,7 +3019,6 @@ impl Channel {
             working_memory,
             channel_activity_map,
             participant_context,
-            memory_bulletin_text,
             knowledge_synthesis_text,
         )
     }
@@ -3141,7 +3084,6 @@ impl Channel {
         let browser_enabled = rc.browser_config.load().enabled;
         let web_search_enabled = rc.brave_search_key.load().is_some();
         let opencode_enabled = rc.opencode.load().enabled;
-        let sandbox_enabled = self.deps.sandbox.containment_active();
         let mcp_tool_names = self.deps.mcp_manager.get_tool_names().await;
         let worker_capabilities = prompt_engine.render_worker_capabilities(
             browser_enabled,
@@ -3161,7 +3103,7 @@ impl Channel {
 
         let available_channels = self.build_available_channels().await;
 
-        let org_context = self.build_org_context(&prompt_engine).await;
+        let org_context = self.build_org_context(&prompt_engine);
 
         let adapter_prompt = match self.state.kind {
             ChannelKind::Cron => prompt_engine.render_channel_adapter_prompt("cron"),
@@ -3172,13 +3114,8 @@ impl Channel {
 
         let project_context = self.build_project_context(&prompt_engine).await;
 
-        let (
-            working_memory,
-            channel_activity_map,
-            participant_context,
-            memory_bulletin_text,
-            knowledge_synthesis_text,
-        ) = self.render_memory_layers().await;
+        let (working_memory, channel_activity_map, participant_context, knowledge_synthesis_text) =
+            self.render_memory_layers().await;
 
         let active_goals = self.render_active_goals().await;
 
@@ -3203,15 +3140,13 @@ impl Channel {
 
         let system_prompt = prompt_engine.render_channel_prompt_with_links(
             empty_to_none(identity_context),
-            non_empty_option(memory_bulletin_text),
             non_empty_option(knowledge_synthesis_text),
             empty_to_none(skills_prompt),
             worker_capabilities,
             self.conversation_context.clone(),
             empty_to_none(status_text),
-            None, // coalesce_hint - rides on the batched user message envelope
             available_channels,
-            sandbox_enabled,
+            self.send_agent_message_tool.is_some(),
             org_context,
             adapter_prompt,
             project_context,
@@ -3248,6 +3183,7 @@ impl Channel {
         attachment_content: Vec<UserContent>,
         is_retrigger: bool,
         adapter: Option<&str>,
+        history_user_text: Option<&str>,
     ) -> Result<AgentTurnResult> {
         let skip_flag = crate::tools::new_skip_flag();
         let replied_flag = crate::tools::new_replied_flag();
@@ -3507,6 +3443,7 @@ impl Channel {
                 history_len_before,
                 &self.id,
                 is_retrigger,
+                history_user_text.map(|plain| (user_text, plain)),
             )
         };
 

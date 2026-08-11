@@ -1,13 +1,10 @@
-//! Cortex: System-level observer and memory bulletin generator.
+//! Cortex: system-level observer and memory writer.
 //!
-//! The cortex's primary responsibility is generating the **memory bulletin** — a
-//! periodically refreshed, LLM-curated summary of the agent's current knowledge.
-//! This bulletin is injected into every channel's system prompt, giving all
-//! conversations ambient awareness of who the user is, what's been decided,
-//! what happened recently, and what's going on.
-//!
-//! The cortex also observes system-wide activity via signals for future use in
-//! health monitoring and memory consolidation.
+//! The cortex observes system-wide activity via signals, commits observation
+//! memories, elevates tasks, runs memory maintenance, and synthesizes the
+//! agent profile. It writes to the memory store like any other process; the
+//! channel prompt renders that store directly, so the cortex never authors
+//! prompt content at read time.
 
 use crate::agent::channel_dispatch::{WorkerCompletionError, map_worker_completion};
 use crate::agent::process_control::{
@@ -19,7 +16,6 @@ use crate::error::Result;
 use crate::hooks::CortexHook;
 use crate::llm::SpacebotModel;
 use crate::memory::maintenance as memory_maintenance;
-use crate::memory::search::{SearchConfig, SearchMode, SearchSort};
 use crate::memory::types::{Association, MemoryType, RelationType};
 use crate::tasks::{TaskStatus, TaskStore, UpdateTaskInput};
 use crate::{
@@ -47,7 +43,7 @@ where
     deps.runtime_config.warmup_status.store(Arc::new(status));
 }
 
-fn bulletin_age_secs(last_refresh_unix_ms: Option<i64>) -> Option<u64> {
+fn refresh_age_secs(last_refresh_unix_ms: Option<i64>) -> Option<u64> {
     let now = chrono::Utc::now().timestamp_millis();
     last_refresh_unix_ms.map(|refresh_ms| {
         if now > refresh_ms {
@@ -62,89 +58,13 @@ fn should_execute_warmup(warmup_config: crate::config::WarmupConfig, force: bool
     warmup_config.enabled || force
 }
 
-fn should_generate_bulletin_from_bulletin_loop(
-    warmup_config: crate::config::WarmupConfig,
-    status: &crate::config::WarmupStatus,
-) -> bool {
-    // If warmup is disabled, bulletin_loop remains the source of truth.
-    if !warmup_config.enabled {
-        return true;
-    }
-
-    let age_secs = bulletin_age_secs(status.last_refresh_unix_ms).or(status.bulletin_age_secs);
-
-    let Some(age_secs) = age_secs else {
-        // No recorded bulletin refresh yet — let bulletin loop generate one.
-        return true;
-    };
-
-    // Warmup loop already refreshes bulletin on this cadence. If the cached
-    // bulletin is still fresher than warmup cadence, skip duplicate synthesis.
-    age_secs >= warmup_config.refresh_secs.max(1)
-}
-
 const SIGNAL_BUFFER_CAPACITY: usize = 100;
-const BULLETIN_REFRESH_FAILURE_BACKOFF_BASE_SECS: u64 = 30;
-const BULLETIN_REFRESH_FAILURE_BACKOFF_MAX_SECS: u64 = 600;
-const BULLETIN_REFRESH_CIRCUIT_OPEN_THRESHOLD: u32 = 3;
-const BULLETIN_REFRESH_CIRCUIT_OPEN_SECS: u64 = 1800;
 const MAINTENANCE_CIRCUIT_OPEN_THRESHOLD: usize = 3;
 const MAINTENANCE_CIRCUIT_OPEN_SECS: u64 = 1800;
 const MAINTENANCE_TASK_TIMEOUT_MIN_SECS: u64 = 300;
 const MAINTENANCE_TASK_TIMEOUT_MAX_SECS: u64 = 3_600;
 const MAINTENANCE_TASK_TIMEOUT_MULTIPLIER: u64 = 6;
 const MAINTENANCE_TASK_CANCEL_GRACE_SECS: u64 = 30;
-
-fn bulletin_refresh_failure_backoff(consecutive_failures: u32) -> Duration {
-    let exponent = consecutive_failures.saturating_sub(1).min(5);
-    let multiplier = 1_u64 << exponent;
-    let seconds = BULLETIN_REFRESH_FAILURE_BACKOFF_BASE_SECS
-        .saturating_mul(multiplier)
-        .min(BULLETIN_REFRESH_FAILURE_BACKOFF_MAX_SECS);
-    Duration::from_secs(seconds)
-}
-
-fn record_bulletin_refresh_failure(
-    bulletin_refresh_failures: &mut u32,
-    bulletin_refresh_circuit_open: &mut bool,
-    next_bulletin_refresh_allowed_at: &mut Instant,
-    now: Instant,
-) -> (Duration, bool) {
-    *bulletin_refresh_failures = bulletin_refresh_failures.saturating_add(1);
-    let backoff = bulletin_refresh_failure_backoff(*bulletin_refresh_failures);
-    *next_bulletin_refresh_allowed_at = now + backoff;
-
-    let mut circuit_opened = false;
-    if *bulletin_refresh_failures >= BULLETIN_REFRESH_CIRCUIT_OPEN_THRESHOLD {
-        if !*bulletin_refresh_circuit_open {
-            *bulletin_refresh_circuit_open = true;
-            circuit_opened = true;
-        }
-        let circuit_cooldown = Duration::from_secs(BULLETIN_REFRESH_CIRCUIT_OPEN_SECS);
-        let circuit_recovery_at = now + circuit_cooldown;
-        if circuit_recovery_at > *next_bulletin_refresh_allowed_at {
-            *next_bulletin_refresh_allowed_at = circuit_recovery_at;
-        }
-    }
-
-    (backoff, circuit_opened)
-}
-
-fn maybe_close_bulletin_refresh_circuit(
-    bulletin_refresh_failures: &mut u32,
-    bulletin_refresh_circuit_open: &mut bool,
-    next_bulletin_refresh_allowed_at: &mut Instant,
-    now: Instant,
-) -> bool {
-    if !*bulletin_refresh_circuit_open || now < *next_bulletin_refresh_allowed_at {
-        return false;
-    }
-
-    *bulletin_refresh_failures = 0;
-    *bulletin_refresh_circuit_open = false;
-    *next_bulletin_refresh_allowed_at = now;
-    true
-}
 
 fn record_maintenance_failure(
     maintenance_consecutive_failures: &mut usize,
@@ -241,7 +161,7 @@ fn apply_cancelled_warmup_status(
     status.last_error = Some(format!(
         "warmup cancelled before completion (reason: {reason}, forced: {force})"
     ));
-    status.bulletin_age_secs = bulletin_age_secs(status.last_refresh_unix_ms);
+    status.refresh_age_secs = refresh_age_secs(status.last_refresh_unix_ms);
     true
 }
 
@@ -282,57 +202,6 @@ impl Drop for WarmupRunGuard<'_> {
                 );
             }
         });
-    }
-}
-
-async fn maybe_generate_bulletin_under_lock<F, Fut>(
-    warmup_lock: &tokio::sync::Mutex<()>,
-    warmup_config: &arc_swap::ArcSwap<crate::config::WarmupConfig>,
-    warmup_status: &arc_swap::ArcSwap<crate::config::WarmupStatus>,
-    generate: F,
-) -> BulletinRefreshOutcome
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let _warmup_guard = warmup_lock.lock().await;
-    let warmup_config = **warmup_config.load();
-    let status = warmup_status.load().as_ref().clone();
-    let age_secs = bulletin_age_secs(status.last_refresh_unix_ms).or(status.bulletin_age_secs);
-    let refresh_secs = warmup_config.refresh_secs.max(1);
-
-    if should_generate_bulletin_from_bulletin_loop(warmup_config, &status) {
-        if generate().await {
-            BulletinRefreshOutcome::Generated
-        } else {
-            BulletinRefreshOutcome::Failed
-        }
-    } else {
-        tracing::debug!(
-            warmup_enabled = warmup_config.enabled,
-            age_secs = ?age_secs,
-            refresh_secs,
-            "skipping bulletin loop generation because warmup bulletin is fresh"
-        );
-        BulletinRefreshOutcome::SkippedFresh
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BulletinRefreshOutcome {
-    Generated,
-    SkippedFresh,
-    Failed,
-}
-
-impl BulletinRefreshOutcome {
-    fn is_success(self) -> bool {
-        !matches!(self, Self::Failed)
-    }
-
-    #[allow(dead_code)]
-    fn generated(self) -> bool {
-        matches!(self, Self::Generated)
     }
 }
 
@@ -786,7 +655,7 @@ pub async fn register_detached_worker_for_pickup(
     Ok((lifecycle, cancel_rx))
 }
 
-/// The cortex observes system-wide activity and maintains the memory bulletin.
+/// The cortex observes system-wide activity and writes to the memory store.
 pub struct Cortex {
     pub deps: AgentDeps,
     pub hook: CortexHook,
@@ -1706,7 +1575,7 @@ fn handle_cortex_receiver_result(
 /// Spawn the cortex runtime loop for an agent.
 ///
 /// The loop observes process events and runs periodic cortex maintenance ticks.
-/// Bulletin generation and profile refresh happen inside this tick loop.
+/// Profile refresh happens inside this tick loop.
 pub fn spawn_cortex_loop(deps: AgentDeps, logger: CortexLogger) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let prompt_engine = deps.runtime_config.prompts.load();
@@ -1750,11 +1619,6 @@ pub fn spawn_cortex_loop(deps: AgentDeps, logger: CortexLogger) -> tokio::task::
     })
 }
 
-/// Backwards-compatible alias while callers migrate to `spawn_cortex_loop`.
-pub fn spawn_bulletin_loop(deps: AgentDeps, logger: CortexLogger) -> tokio::task::JoinHandle<()> {
-    spawn_cortex_loop(deps, logger)
-}
-
 /// Spawn the warmup loop for an agent.
 ///
 /// Warmup runs asynchronously and never blocks channel responsiveness.
@@ -1770,7 +1634,7 @@ pub fn spawn_warmup_loop(deps: AgentDeps, logger: CortexLogger) -> tokio::task::
             if !warmup_config.enabled {
                 update_warmup_status(&deps, |status| {
                     status.state = crate::config::WarmupState::Cold;
-                    status.bulletin_age_secs = bulletin_age_secs(status.last_refresh_unix_ms);
+                    status.refresh_age_secs = refresh_age_secs(status.last_refresh_unix_ms);
                 });
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 completed_initial_pass = false;
@@ -1818,7 +1682,7 @@ pub async fn run_warmup_once(deps: &AgentDeps, logger: &CortexLogger, reason: &s
     if !should_execute_warmup(warmup_config, force) {
         update_warmup_status(deps, |status| {
             status.state = crate::config::WarmupState::Cold;
-            status.bulletin_age_secs = bulletin_age_secs(status.last_refresh_unix_ms);
+            status.refresh_age_secs = refresh_age_secs(status.last_refresh_unix_ms);
         });
         return;
     }
@@ -1826,13 +1690,16 @@ pub async fn run_warmup_once(deps: &AgentDeps, logger: &CortexLogger, reason: &s
     update_warmup_status(deps, |status| {
         status.state = crate::config::WarmupState::Warming;
         status.last_error = None;
-        status.bulletin_age_secs = bulletin_age_secs(status.last_refresh_unix_ms);
+        status.refresh_age_secs = refresh_age_secs(status.last_refresh_unix_ms);
     });
     let mut terminal_state_guard = WarmupRunGuard::new(deps, reason, force);
 
     let mut errors = Vec::new();
     let mut embedding_ready = false;
 
+    // Warmup is LLM-free: it loads the local embedding model so first-recall
+    // latency lands here instead of on a user turn. Knowledge reaches the
+    // channel prompt through the deterministic store render.
     if warmup_config.eager_embedding_load {
         match deps
             .memory_search
@@ -1847,14 +1714,6 @@ pub async fn run_warmup_once(deps: &AgentDeps, logger: &CortexLogger, reason: &s
         }
     }
 
-    // Generate the memory bulletin at warmup. The channel knowledge-context
-    // slot is a deterministic store render now — no LLM synthesis at read
-    // time, so the bulletin is the only startup LLM knowledge write.
-    let bulletin_ok = generate_bulletin(deps, logger).await;
-    if !bulletin_ok {
-        errors.push("memory bulletin generation failed".to_string());
-    }
-
     let now_ms = chrono::Utc::now().timestamp_millis();
     if errors.is_empty() {
         update_warmup_status(deps, |status| {
@@ -1862,7 +1721,7 @@ pub async fn run_warmup_once(deps: &AgentDeps, logger: &CortexLogger, reason: &s
             status.embedding_ready = embedding_ready || status.embedding_ready;
             status.last_refresh_unix_ms = Some(now_ms);
             status.last_error = None;
-            status.bulletin_age_secs = Some(0);
+            status.refresh_age_secs = Some(0);
         });
         terminal_state_guard.mark_committed();
         logger.log(
@@ -1880,7 +1739,7 @@ pub async fn run_warmup_once(deps: &AgentDeps, logger: &CortexLogger, reason: &s
             status.state = crate::config::WarmupState::Degraded;
             status.embedding_ready = embedding_ready || status.embedding_ready;
             status.last_error = Some(last_error.clone());
-            status.bulletin_age_secs = bulletin_age_secs(status.last_refresh_unix_ms);
+            status.refresh_age_secs = refresh_age_secs(status.last_refresh_unix_ms);
         });
         terminal_state_guard.mark_committed();
         logger.log(
@@ -1917,28 +1776,6 @@ pub fn trigger_forced_warmup(deps: AgentDeps, dispatch_type: &'static str) {
     });
 }
 
-/// Preserved for fallback — the bulletin loop has been replaced by change-driven
-/// knowledge synthesis, but this function is still used at startup.
-#[allow(dead_code)]
-fn spawn_bulletin_refresh_task(
-    deps: AgentDeps,
-    logger: CortexLogger,
-) -> tokio::task::JoinHandle<BulletinRefreshOutcome> {
-    tokio::spawn(async move {
-        let bulletin_outcome = maybe_generate_bulletin_under_lock(
-            deps.runtime_config.warmup_lock.as_ref(),
-            &deps.runtime_config.warmup,
-            &deps.runtime_config.warmup_status,
-            || generate_bulletin(&deps, &logger),
-        )
-        .await;
-        if bulletin_outcome.generated() {
-            generate_profile(&deps, &logger).await;
-        }
-        bulletin_outcome
-    })
-}
-
 async fn run_cortex_loop(
     cortex: &Cortex,
     logger: &CortexLogger,
@@ -1948,45 +1785,10 @@ async fn run_cortex_loop(
 ) -> anyhow::Result<()> {
     tracing::info!("cortex loop started");
 
-    const MAX_RETRIES: u32 = 3;
-    const RETRY_DELAY_SECS: u64 = 15;
     const LAG_WARNING_INTERVAL_SECS: u64 = 30;
 
-    // Run the memory bulletin immediately on startup, with retries.
-    for attempt in 0..=MAX_RETRIES {
-        let bulletin_outcome = maybe_generate_bulletin_under_lock(
-            cortex.deps.runtime_config.warmup_lock.as_ref(),
-            &cortex.deps.runtime_config.warmup,
-            &cortex.deps.runtime_config.warmup_status,
-            || generate_bulletin(&cortex.deps, logger),
-        )
-        .await;
-
-        if bulletin_outcome.is_success() {
-            break;
-        }
-        if attempt < MAX_RETRIES {
-            tracing::info!(
-                attempt = attempt + 1,
-                max = MAX_RETRIES,
-                "retrying memory bulletin in {RETRY_DELAY_SECS}s"
-            );
-            logger.log(
-                "bulletin_startup_retry",
-                &format!(
-                    "Memory bulletin generation failed, retrying (attempt {}/{})",
-                    attempt + 1,
-                    MAX_RETRIES
-                ),
-                Some(serde_json::json!({ "attempt": attempt + 1, "max_retries": MAX_RETRIES })),
-            );
-            tokio::time::sleep(Duration::from_secs(RETRY_DELAY_SECS)).await;
-        }
-    }
-
-    // Generate an initial profile after startup bulletin synthesis.
+    // Generate an initial profile at startup.
     generate_profile(&cortex.deps, logger).await;
-    let mut _last_bulletin_refresh = Instant::now();
     let mut tick_interval_secs = cortex
         .deps
         .runtime_config
@@ -2006,7 +1808,6 @@ async fn run_cortex_loop(
     let mut last_lag_warning_tool_output: Option<Instant> = None;
     let mut memory_event_stream_open = true;
     let mut tool_output_stream_open = true;
-    let mut refresh_task: Option<tokio::task::JoinHandle<BulletinRefreshOutcome>> = None;
     let mut maintenance_task: Option<
         tokio::task::JoinHandle<crate::error::Result<memory_maintenance::MaintenanceReport>>,
     > = None;
@@ -2016,9 +1817,6 @@ async fn run_cortex_loop(
     let mut maintenance_task_forced_abort_issued = false;
     let mut maintenance_consecutive_failures: usize = 0;
     let mut maintenance_disabled_at: Option<Instant> = None;
-    let mut bulletin_refresh_failures: u32 = 0;
-    let mut bulletin_refresh_circuit_open = false;
-    let mut next_bulletin_refresh_allowed_at = Instant::now();
     let mut last_maintenance = Instant::now();
     let mut intraday_synthesis_task: Option<tokio::task::JoinHandle<anyhow::Result<bool>>> = None;
     let mut daily_synthesis_task: Option<tokio::task::JoinHandle<anyhow::Result<bool>>> = None;
@@ -2049,9 +1847,6 @@ async fn run_cortex_loop(
                         let _ = dropped;
                     }
                     CortexReceiverOutcome::StopLoop => {
-                        if let Some(task) = refresh_task.take() {
-                            task.abort();
-                        }
                         if let Some(task) = intraday_synthesis_task.take() {
                             task.abort();
                         }
@@ -2086,9 +1881,6 @@ async fn run_cortex_loop(
                         let _ = dropped;
                     }
                     CortexReceiverOutcome::StopLoop => {
-                        if let Some(task) = refresh_task.take() {
-                            task.abort();
-                        }
                         if let Some(task) = intraday_synthesis_task.take() {
                             task.abort();
                         }
@@ -2152,74 +1944,6 @@ async fn run_cortex_loop(
                     now,
                 )
                 .await;
-
-                if refresh_task
-                    .as_ref()
-                    .is_some_and(tokio::task::JoinHandle::is_finished)
-                    && let Some(task) = refresh_task.take()
-                {
-                    match task.await {
-                        Ok(outcome) => {
-                            let now = Instant::now();
-                            if outcome.is_success() {
-                                _last_bulletin_refresh = now;
-                                bulletin_refresh_failures = 0;
-                                bulletin_refresh_circuit_open = false;
-                                next_bulletin_refresh_allowed_at = now;
-                            } else {
-                                let (backoff, circuit_opened) = record_bulletin_refresh_failure(
-                                    &mut bulletin_refresh_failures,
-                                    &mut bulletin_refresh_circuit_open,
-                                    &mut next_bulletin_refresh_allowed_at,
-                                    now,
-                                );
-                                if circuit_opened {
-                                    let cooldown_secs =
-                                        next_bulletin_refresh_allowed_at.duration_since(now).as_secs();
-                                    tracing::warn!(
-                                        failures = bulletin_refresh_failures,
-                                        cooldown_secs,
-                                        backoff_secs = backoff.as_secs(),
-                                        "cortex bulletin refresh circuit opened after consecutive failures"
-                                    );
-                                } else {
-                                    tracing::warn!(
-                                        failures = bulletin_refresh_failures,
-                                        backoff_secs = backoff.as_secs(),
-                                        "cortex bulletin refresh failed; applying retry backoff"
-                                    );
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            let now = Instant::now();
-                            let (backoff, circuit_opened) = record_bulletin_refresh_failure(
-                                &mut bulletin_refresh_failures,
-                                &mut bulletin_refresh_circuit_open,
-                                &mut next_bulletin_refresh_allowed_at,
-                                now,
-                            );
-                            if circuit_opened {
-                                let cooldown_secs =
-                                    next_bulletin_refresh_allowed_at.duration_since(now).as_secs();
-                                tracing::warn!(
-                                    %error,
-                                    failures = bulletin_refresh_failures,
-                                    cooldown_secs,
-                                    backoff_secs = backoff.as_secs(),
-                                    "cortex bulletin refresh circuit opened after task failure"
-                                );
-                            } else {
-                                tracing::warn!(
-                                    %error,
-                                    failures = bulletin_refresh_failures,
-                                    backoff_secs = backoff.as_secs(),
-                                    "cortex bulletin refresh task failed"
-                                );
-                            }
-                        }
-                    }
-                }
 
                 if maintenance_task
                     .as_ref()
@@ -2353,16 +2077,7 @@ async fn run_cortex_loop(
                     }
                 }
 
-                let _bulletin_interval = Duration::from_secs(cortex_config.bulletin_interval_secs.max(1));
                 let now = Instant::now();
-                if maybe_close_bulletin_refresh_circuit(
-                    &mut bulletin_refresh_failures,
-                    &mut bulletin_refresh_circuit_open,
-                    &mut next_bulletin_refresh_allowed_at,
-                    now,
-                ) {
-                    tracing::info!("cortex bulletin refresh circuit closed; retries re-enabled");
-                }
                 if maybe_close_maintenance_circuit(
                     &mut maintenance_consecutive_failures,
                     &mut maintenance_disabled_at,
@@ -2462,320 +2177,6 @@ async fn run_cortex_loop(
                     tick_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 }
             }
-        }
-    }
-}
-
-/// Bulletin sections: each defines a search mode + config, and how to label the
-/// results when presenting them to the synthesis LLM.
-struct BulletinSection {
-    label: &'static str,
-    mode: SearchMode,
-    memory_type: Option<MemoryType>,
-    sort_by: SearchSort,
-    max_results: usize,
-}
-
-const BULLETIN_SECTIONS: &[BulletinSection] = &[
-    BulletinSection {
-        label: "Identity & Core Facts",
-        mode: SearchMode::Typed,
-        memory_type: Some(MemoryType::Identity),
-        sort_by: SearchSort::Importance,
-        max_results: 15,
-    },
-    BulletinSection {
-        label: "Recent Memories",
-        mode: SearchMode::Recent,
-        memory_type: None,
-        sort_by: SearchSort::Recent,
-        max_results: 15,
-    },
-    BulletinSection {
-        label: "Decisions",
-        mode: SearchMode::Typed,
-        memory_type: Some(MemoryType::Decision),
-        sort_by: SearchSort::Recent,
-        max_results: 10,
-    },
-    BulletinSection {
-        label: "High-Importance Context",
-        mode: SearchMode::Important,
-        memory_type: None,
-        sort_by: SearchSort::Importance,
-        max_results: 10,
-    },
-    BulletinSection {
-        label: "Preferences & Patterns",
-        mode: SearchMode::Typed,
-        memory_type: Some(MemoryType::Preference),
-        sort_by: SearchSort::Importance,
-        max_results: 10,
-    },
-    BulletinSection {
-        label: "Active Goals",
-        mode: SearchMode::Typed,
-        memory_type: Some(MemoryType::Goal),
-        sort_by: SearchSort::Recent,
-        max_results: 10,
-    },
-    BulletinSection {
-        label: "Recent Events",
-        mode: SearchMode::Typed,
-        memory_type: Some(MemoryType::Event),
-        sort_by: SearchSort::Recent,
-        max_results: 10,
-    },
-    BulletinSection {
-        label: "Observations",
-        mode: SearchMode::Typed,
-        memory_type: Some(MemoryType::Observation),
-        sort_by: SearchSort::Recent,
-        max_results: 5,
-    },
-];
-
-/// Gather raw memory data for each bulletin section by querying the store directly.
-/// Returns formatted sections ready for LLM synthesis.
-async fn gather_bulletin_sections(deps: &AgentDeps) -> String {
-    let mut output = String::new();
-
-    for section in BULLETIN_SECTIONS {
-        let config = SearchConfig {
-            mode: section.mode,
-            memory_type: section.memory_type,
-            sort_by: section.sort_by,
-            max_results: section.max_results,
-            ..Default::default()
-        };
-
-        let results = match deps.memory_search.search("", &config).await {
-            Ok(results) => results,
-            Err(error) => {
-                tracing::warn!(
-                    section = section.label,
-                    %error,
-                    "bulletin section query failed"
-                );
-                continue;
-            }
-        };
-
-        if results.is_empty() {
-            continue;
-        }
-
-        output.push_str(&format!("### {}\n\n", section.label));
-        for result in &results {
-            output.push_str(&format!(
-                "- [{}] (importance: {:.1}) {}\n",
-                result.memory.memory_type,
-                result.memory.importance,
-                result
-                    .memory
-                    .content
-                    .lines()
-                    .next()
-                    .unwrap_or(&result.memory.content),
-            ));
-        }
-        output.push('\n');
-    }
-
-    // Append active tasks (non-done) from the task store.
-    match gather_active_tasks(deps).await {
-        Ok(section) if !section.is_empty() => output.push_str(&section),
-        Err(error) => {
-            tracing::warn!(%error, "failed to gather active tasks for bulletin");
-        }
-        _ => {}
-    }
-
-    output
-}
-
-/// Query the task store for non-done tasks and format them as a bulletin section.
-async fn gather_active_tasks(deps: &AgentDeps) -> anyhow::Result<String> {
-    use crate::tasks::TaskStatus;
-
-    let mut all_tasks = Vec::new();
-    for status in &[
-        TaskStatus::InProgress,
-        TaskStatus::Ready,
-        TaskStatus::Backlog,
-        TaskStatus::PendingApproval,
-    ] {
-        let tasks = deps
-            .task_store
-            .list(crate::tasks::TaskListFilter {
-                assigned_agent_id: Some(deps.agent_id.to_string()),
-                status: Some(*status),
-                limit: Some(20),
-                ..Default::default()
-            })
-            .await?;
-        all_tasks.extend(tasks);
-    }
-
-    if all_tasks.is_empty() {
-        return Ok(String::new());
-    }
-
-    let mut output = String::from("### Active Tasks\n\n");
-    for task in &all_tasks {
-        let subtask_progress = if task.subtasks.is_empty() {
-            String::new()
-        } else {
-            let done = task.subtasks.iter().filter(|s| s.completed).count();
-            format!(" [{}/{}]", done, task.subtasks.len())
-        };
-        output.push_str(&format!(
-            "- #{} [{}] ({}) {}{}\n",
-            task.task_number, task.status, task.priority, task.title, subtask_progress,
-        ));
-    }
-    output.push('\n');
-
-    Ok(output)
-}
-
-/// Generate a memory bulletin and store it in RuntimeConfig.
-///
-/// Programmatically queries the memory store across multiple dimensions
-/// (identity, recent, decisions, importance, preferences, goals, events,
-/// observations), then asks an LLM to synthesize the raw results into a
-/// concise briefing.
-///
-/// On failure, the previous bulletin is preserved (not blanked out).
-/// Returns `true` if the bulletin was successfully generated.
-#[tracing::instrument(skip(deps, logger), fields(agent_id = %deps.agent_id))]
-pub async fn generate_bulletin(deps: &AgentDeps, logger: &CortexLogger) -> bool {
-    tracing::info!("cortex generating memory bulletin");
-    let started = Instant::now();
-
-    // Phase 1: Programmatically gather raw memory sections (no LLM needed)
-    let raw_sections = gather_bulletin_sections(deps).await;
-    let section_count = raw_sections.matches("### ").count();
-
-    if raw_sections.is_empty() {
-        tracing::info!("no memories found, skipping bulletin synthesis");
-        deps.runtime_config
-            .memory_bulletin
-            .store(Arc::new(String::new()));
-        logger.log(
-            "bulletin_generated",
-            "Bulletin skipped: no memories in graph",
-            Some(serde_json::json!({
-                "word_count": 0,
-                "sections": 0,
-                "duration_ms": started.elapsed().as_millis() as u64,
-                "skipped": true,
-            })),
-        );
-        return true;
-    }
-
-    // Phase 2: LLM synthesis of raw sections into a cohesive bulletin
-    let cortex_config = **deps.runtime_config.cortex.load();
-    let prompt_engine = deps.runtime_config.prompts.load();
-    let bulletin_prompt = match prompt_engine.render_static("cortex_bulletin") {
-        Ok(p) => p,
-        Err(error) => {
-            tracing::error!(%error, "failed to render cortex bulletin prompt");
-            return false;
-        }
-    };
-
-    let routing = deps.runtime_config.routing.load();
-    let model_name = routing.resolve(ProcessType::Cortex, None).to_string();
-    let usage_accumulator = std::sync::Arc::new(tokio::sync::Mutex::new(
-        crate::llm::usage::UsageAccumulator::new(),
-    ));
-    let model = SpacebotModel::make(&deps.llm_manager, &model_name)
-        .with_context(&*deps.agent_id, "cortex")
-        .with_routing((**routing).clone())
-        .with_accumulator(usage_accumulator.clone());
-
-    // No tools needed — the LLM just synthesizes the pre-gathered data.
-    // Attach CortexHook so observation/termination semantics stay consistent
-    // with other process types.
-    let agent = AgentBuilder::new(model)
-        .preamble(&bulletin_prompt)
-        .hook(CortexHook::new())
-        .build();
-
-    let synthesis_prompt = match prompt_engine
-        .render_system_cortex_synthesis(cortex_config.bulletin_max_words, &raw_sections)
-    {
-        Ok(p) => p,
-        Err(error) => {
-            tracing::error!(%error, "failed to render cortex synthesis prompt");
-            return false;
-        }
-    };
-
-    let result = agent.prompt(&synthesis_prompt).await;
-    // Flush cortex token usage.
-    let acc = usage_accumulator.lock().await;
-    if let Err(error) = acc
-        .flush(&deps.sqlite_pool, &deps.agent_id, "cortex", None)
-        .await
-    {
-        tracing::warn!(%error, "failed to flush cortex token usage");
-    }
-    drop(acc);
-
-    match result {
-        Ok(bulletin) => {
-            let word_count = bulletin.split_whitespace().count();
-            let duration_ms = started.elapsed().as_millis() as u64;
-            tracing::info!(words = word_count, "cortex bulletin generated");
-            deps.runtime_config
-                .memory_bulletin
-                .store(Arc::new(bulletin));
-            let refresh_ms = chrono::Utc::now().timestamp_millis();
-            update_warmup_status(deps, |status| {
-                status.last_refresh_unix_ms = Some(refresh_ms);
-                status.bulletin_age_secs = Some(0);
-                if status.state != crate::config::WarmupState::Warming {
-                    status.state = crate::config::WarmupState::Warm;
-                    status.last_error = None;
-                }
-            });
-            logger.log(
-                "bulletin_generated",
-                &format!("Bulletin generated: {word_count} words, {section_count} sections, {duration_ms}ms"),
-                Some(serde_json::json!({
-                    "word_count": word_count,
-                    "sections": section_count,
-                    "duration_ms": duration_ms,
-                    "model": model_name,
-                })),
-            );
-            true
-        }
-        Err(error) => {
-            let duration_ms = started.elapsed().as_millis() as u64;
-            tracing::error!(%error, "cortex bulletin synthesis failed, keeping previous bulletin");
-            let error_message = error.to_string();
-            update_warmup_status(deps, |status| {
-                status.bulletin_age_secs = bulletin_age_secs(status.last_refresh_unix_ms);
-                if status.state != crate::config::WarmupState::Warming {
-                    status.state = crate::config::WarmupState::Degraded;
-                    status.last_error =
-                        Some(format!("bulletin generation failed: {error_message}"));
-                }
-            });
-            logger.log(
-                "bulletin_failed",
-                &format!("Bulletin synthesis failed after {duration_ms}ms: {error}"),
-                Some(serde_json::json!({
-                    "error": error.to_string(),
-                    "duration_ms": duration_ms,
-                    "model": model_name,
-                })),
-            );
-            false
         }
     }
 }
@@ -3139,8 +2540,8 @@ struct ProfileLlmResponse {
 
 /// Generate an agent profile card and persist it to SQLite.
 ///
-/// Uses the current memory bulletin and identity files as context, then asks
-/// an LLM to produce a display name, status line, and short bio.
+/// Uses the identity files as context, then asks an LLM to produce a display
+/// name, status line, and short bio.
 #[tracing::instrument(skip(deps, logger), fields(agent_id = %deps.agent_id))]
 async fn generate_profile(deps: &AgentDeps, logger: &CortexLogger) {
     tracing::info!("cortex generating agent profile");
@@ -3155,7 +2556,6 @@ async fn generate_profile(deps: &AgentDeps, logger: &CortexLogger) {
         }
     };
 
-    // Gather context: identity + current bulletin
     let identity_context = {
         let rendered = deps.runtime_config.identity.load().render();
         if rendered.is_empty() {
@@ -3164,24 +2564,15 @@ async fn generate_profile(deps: &AgentDeps, logger: &CortexLogger) {
             Some(rendered)
         }
     };
-    let memory_bulletin = {
-        let bulletin = deps.runtime_config.memory_bulletin.load();
-        if bulletin.is_empty() {
-            None
-        } else {
-            Some(bulletin.as_ref().clone())
-        }
-    };
 
-    let synthesis_prompt = match prompt_engine
-        .render_system_profile_synthesis(identity_context.as_deref(), memory_bulletin.as_deref())
-    {
-        Ok(p) => p,
-        Err(error) => {
-            tracing::warn!(%error, "failed to render profile synthesis prompt");
-            return;
-        }
-    };
+    let synthesis_prompt =
+        match prompt_engine.render_system_profile_synthesis(identity_context.as_deref()) {
+            Ok(p) => p,
+            Err(error) => {
+                tracing::warn!(%error, "failed to render profile synthesis prompt");
+                return;
+            }
+        };
 
     let routing = deps.runtime_config.routing.load();
     let model_name = routing.resolve(ProcessType::Cortex, None).to_string();
@@ -4109,7 +3500,7 @@ async fn notify_delegation_completion(
 async fn run_association_loop(deps: &AgentDeps, logger: &CortexLogger) -> anyhow::Result<()> {
     tracing::info!("cortex association loop started");
 
-    // Short delay on startup to let the bulletin and embeddings settle
+    // Short delay on startup to let warmup and embeddings settle
     tokio::time::sleep(Duration::from_secs(10)).await;
 
     // Backfill: process all existing memories on first run
@@ -4269,18 +3660,15 @@ async fn fetch_memories_for_association(
 #[cfg(test)]
 mod tests {
     use super::{
-        BULLETIN_REFRESH_CIRCUIT_OPEN_SECS, BULLETIN_REFRESH_CIRCUIT_OPEN_THRESHOLD, BranchTracker,
-        BulletinRefreshOutcome, CortexReceiverOutcome, HealthRuntimeState,
+        BranchTracker, CortexReceiverOutcome, HealthRuntimeState,
         MAINTENANCE_TASK_CANCEL_GRACE_SECS, MaintenanceTimeoutAction, ReceiverClosedBehavior,
         Signal, SynthesisTaskBackoff, WorkerTracker, apply_cancelled_warmup_status,
         build_kill_targets, claim_detached_completion, collect_synthesis_task,
         detached_timeout_transition, handle_cortex_receiver_result, has_completed_initial_warmup,
         is_cancelled_control_result, is_terminal_control_result, maintenance_task_timeout,
-        maintenance_timeout_action, maybe_close_bulletin_refresh_circuit,
-        maybe_generate_bulletin_under_lock, maybe_spawn_synthesis_task,
-        parse_structured_success_flag, push_signal_into_buffer, record_bulletin_refresh_failure,
-        should_execute_warmup, should_generate_bulletin_from_bulletin_loop, signal_from_event,
-        summarize_signal_text, take_lagged_control_flag,
+        maintenance_timeout_action, maybe_spawn_synthesis_task, parse_structured_success_flag,
+        push_signal_into_buffer, should_execute_warmup, signal_from_event, summarize_signal_text,
+        take_lagged_control_flag,
     };
     use crate::ProcessEvent;
     use crate::agent::process_control::ControlActionResult;
@@ -4385,107 +3773,6 @@ mod tests {
 
         assert!(!changed);
         assert_eq!(status.state, crate::config::WarmupState::Warm);
-    }
-
-    #[test]
-    fn bulletin_loop_generation_runs_when_warmup_disabled() {
-        let warmup_config = crate::config::WarmupConfig {
-            enabled: false,
-            ..Default::default()
-        };
-        let status = crate::config::WarmupStatus {
-            bulletin_age_secs: Some(0),
-            ..Default::default()
-        };
-
-        assert!(should_generate_bulletin_from_bulletin_loop(
-            warmup_config,
-            &status
-        ));
-    }
-
-    #[test]
-    fn bulletin_loop_generation_skips_when_warmup_enabled_and_fresh() {
-        let warmup_config = crate::config::WarmupConfig {
-            enabled: true,
-            refresh_secs: 900,
-            ..Default::default()
-        };
-        let status = crate::config::WarmupStatus {
-            bulletin_age_secs: Some(10),
-            ..Default::default()
-        };
-
-        assert!(!should_generate_bulletin_from_bulletin_loop(
-            warmup_config,
-            &status
-        ));
-    }
-
-    #[test]
-    fn bulletin_loop_generation_runs_when_warmup_enabled_and_stale() {
-        let warmup_config = crate::config::WarmupConfig {
-            enabled: true,
-            refresh_secs: 900,
-            ..Default::default()
-        };
-        let status = crate::config::WarmupStatus {
-            bulletin_age_secs: Some(901),
-            ..Default::default()
-        };
-
-        assert!(should_generate_bulletin_from_bulletin_loop(
-            warmup_config,
-            &status
-        ));
-    }
-
-    #[tokio::test]
-    async fn bulletin_loop_generation_lock_snapshot_skips_after_fresh_update() {
-        let warmup_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let warmup_config = Arc::new(arc_swap::ArcSwap::from_pointee(
-            crate::config::WarmupConfig::default(),
-        ));
-        let warmup_status = Arc::new(arc_swap::ArcSwap::from_pointee(
-            crate::config::WarmupStatus {
-                bulletin_age_secs: Some(901), // stale at first
-                ..Default::default()
-            },
-        ));
-
-        let calls = Arc::new(AtomicUsize::new(0));
-
-        // Hold lock so we can update status before helper takes its snapshot.
-        let guard = warmup_lock.as_ref().lock().await;
-
-        let warmup_lock_for_task = Arc::clone(&warmup_lock);
-        let warmup_config_for_task = Arc::clone(&warmup_config);
-        let warmup_status_for_task = Arc::clone(&warmup_status);
-        let calls_for_task = Arc::clone(&calls);
-        let task = tokio::spawn(async move {
-            maybe_generate_bulletin_under_lock(
-                warmup_lock_for_task.as_ref(),
-                warmup_config_for_task.as_ref(),
-                warmup_status_for_task.as_ref(),
-                || async {
-                    calls_for_task.fetch_add(1, Ordering::SeqCst);
-                    true
-                },
-            )
-            .await
-        });
-
-        // Warmup refresh lands before lock is released; helper should observe
-        // fresh status and skip generation.
-        warmup_status.store(Arc::new(crate::config::WarmupStatus {
-            bulletin_age_secs: Some(10),
-            ..Default::default()
-        }));
-        drop(guard);
-
-        let result = task.await.expect("task should join");
-        assert_eq!(result, BulletinRefreshOutcome::SkippedFresh);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -4913,47 +4200,6 @@ mod tests {
     }
 
     #[test]
-    fn bulletin_refresh_failure_opens_circuit_at_threshold() {
-        let mut failures = 0_u32;
-        let mut circuit_open = false;
-        let mut next_allowed_at = Instant::now();
-        let now = Instant::now();
-
-        let (_, opened_first) = record_bulletin_refresh_failure(
-            &mut failures,
-            &mut circuit_open,
-            &mut next_allowed_at,
-            now,
-        );
-        assert!(!opened_first);
-        assert!(!circuit_open);
-
-        let (_, opened_second) = record_bulletin_refresh_failure(
-            &mut failures,
-            &mut circuit_open,
-            &mut next_allowed_at,
-            now,
-        );
-        assert!(!opened_second);
-        assert!(!circuit_open);
-
-        let (_, opened_third) = record_bulletin_refresh_failure(
-            &mut failures,
-            &mut circuit_open,
-            &mut next_allowed_at,
-            now,
-        );
-        assert!(opened_third);
-        assert!(circuit_open);
-        assert_eq!(failures, BULLETIN_REFRESH_CIRCUIT_OPEN_THRESHOLD);
-        assert!(
-            next_allowed_at
-                >= now + std::time::Duration::from_secs(BULLETIN_REFRESH_CIRCUIT_OPEN_SECS),
-            "circuit-open cooldown should dominate retry window"
-        );
-    }
-
-    #[test]
     fn parse_structured_success_flag_requires_json_object_bool() {
         assert_eq!(
             parse_structured_success_flag(r#"{"success":false}"#),
@@ -5253,33 +4499,6 @@ mod tests {
             !registry.unregister_detached_worker(worker_id).await,
             "detached control entry should have been cleaned up on update failure"
         );
-    }
-
-    #[test]
-    fn bulletin_refresh_circuit_closes_after_cooldown() {
-        let mut failures = BULLETIN_REFRESH_CIRCUIT_OPEN_THRESHOLD;
-        let mut circuit_open = true;
-        let now = Instant::now();
-        let mut next_allowed_at = now + std::time::Duration::from_millis(5);
-
-        let closed_early = maybe_close_bulletin_refresh_circuit(
-            &mut failures,
-            &mut circuit_open,
-            &mut next_allowed_at,
-            now,
-        );
-        assert!(!closed_early);
-        assert!(circuit_open);
-
-        let closed = maybe_close_bulletin_refresh_circuit(
-            &mut failures,
-            &mut circuit_open,
-            &mut next_allowed_at,
-            now + std::time::Duration::from_millis(10),
-        );
-        assert!(closed);
-        assert!(!circuit_open);
-        assert_eq!(failures, 0);
     }
 
     #[test]

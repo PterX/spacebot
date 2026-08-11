@@ -514,7 +514,7 @@ impl Chronicler {
         match outcome {
             CommitOutcome::Committed(checkpoint) => {
                 emit_checkpoint_event(&self.deps, &self.channel_id, &checkpoint);
-                self.embed_checkpoint(&checkpoint).await;
+                embed_checkpoint(&self.deps, &checkpoint).await;
             }
             // The drain already happened. Without a checkpoint the discarded
             // span has nothing describing it, so say so rather than returning
@@ -540,24 +540,6 @@ impl Chronicler {
         }
 
         Ok(true)
-    }
-
-    /// Embed a freshly committed level-0 checkpoint into the chronicle
-    /// embeddings table (1.7). Never blocks the cut — failures are logged
-    /// and the checkpoint stays in SQLite (backfill can retry it).
-    async fn embed_checkpoint(&self, checkpoint: &ChronicleCheckpoint) {
-        if let Err(error) = self
-            .deps
-            .memory_search
-            .embed_chronicle_checkpoint(checkpoint)
-            .await
-        {
-            tracing::warn!(
-                %error,
-                checkpoint_id = %checkpoint.id,
-                "chronicle checkpoint embedding failed"
-            );
-        }
     }
 }
 
@@ -656,7 +638,7 @@ impl CutContext {
 
         let checkpoint = match outcome {
             CommitOutcome::Committed(checkpoint) => {
-                self.embed_checkpoint(&checkpoint).await;
+                embed_checkpoint(&self.deps, &checkpoint).await;
                 checkpoint
             }
             CommitOutcome::Superseded { expected, found } => {
@@ -688,26 +670,6 @@ impl CutContext {
         );
 
         Ok(())
-    }
-
-    /// Produce the checkpoint's title and summary.
-    ///
-    /// Embed a freshly committed level-0 checkpoint into the chronicle
-    /// embeddings table (1.7). Never blocks the cut — failures are logged
-    /// and the checkpoint stays in SQLite (backfill can retry it).
-    async fn embed_checkpoint(&self, checkpoint: &ChronicleCheckpoint) {
-        if let Err(error) = self
-            .deps
-            .memory_search
-            .embed_chronicle_checkpoint(checkpoint)
-            .await
-        {
-            tracing::warn!(
-                %error,
-                checkpoint_id = %checkpoint.id,
-                "chronicle checkpoint embedding failed"
-            );
-        }
     }
 
     /// Build the summary text for a span.
@@ -837,6 +799,23 @@ pub(crate) async fn trim_live_history_to_boundary(
         "trimmed live history to a covered turn boundary"
     );
     remove
+}
+
+/// Embed a freshly committed level-0 checkpoint into the chronicle
+/// embeddings table (1.7). Never blocks the cut — failures are logged
+/// and the checkpoint stays in SQLite (backfill can retry it).
+async fn embed_checkpoint(deps: &AgentDeps, checkpoint: &ChronicleCheckpoint) {
+    if let Err(error) = deps
+        .memory_search
+        .embed_chronicle_checkpoint(checkpoint)
+        .await
+    {
+        tracing::warn!(
+            %error,
+            checkpoint_id = %checkpoint.id,
+            "chronicle checkpoint embedding failed"
+        );
+    }
 }
 
 fn emit_checkpoint_event(

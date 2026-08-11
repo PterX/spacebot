@@ -1252,7 +1252,7 @@ fn ensure_cron_dispatch_readiness(context: &CronContext, cron_id: &str) {
         reason,
         warmup_state = ?readiness.warmup_state,
         embedding_ready = readiness.embedding_ready,
-        bulletin_age_secs = ?readiness.bulletin_age_secs,
+        refresh_age_secs = ?readiness.refresh_age_secs,
         stale_after_secs = readiness.stale_after_secs,
         "cron dispatch requested before readiness contract was satisfied"
     );

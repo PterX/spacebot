@@ -9,6 +9,12 @@ use crate::memory::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Minimum cosine similarity for a chronicle checkpoint hit to count as a
+/// result. Memory results go through RRF and carry their own `min_score`;
+/// chronicle hits are raw nearest neighbours, so without a floor every query
+/// returns *something* no matter how unrelated.
+const CHRONICLE_MIN_SIMILARITY: f32 = 0.3;
+
 /// Which search strategy to use.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SearchMode {
@@ -117,33 +123,33 @@ impl MemorySearch {
     }
 
     /// One-time backfill: embed every level-0 checkpoint that lacks a row.
-    /// Level-0 rows only, per the chronicle spine contract.
+    /// Level-0 rows only, per the chronicle spine contract. Returns how many
+    /// checkpoints were embedded.
     pub async fn backfill_chronicle_embeddings(&self, pool: &sqlx::SqlitePool) -> Result<usize> {
         let Some(table) = &self.chronicle_table else {
             return Ok(0);
         };
         let store = crate::conversation::chronicle::ChronicleStore::new(pool.clone());
-        let checkpoints = store
-            .list_level_zero_all()
-            .await
-            .map_err(crate::error::Error::from)?;
+        let checkpoints = store.list_level_zero_all().await?;
         let mut embedded = 0;
+        let mut skipped = 0;
         for checkpoint in checkpoints {
             if table.has(&checkpoint.id).await? {
+                skipped += 1;
                 continue;
             }
             self.embed_chronicle_checkpoint(&checkpoint).await?;
             embedded += 1;
         }
-        if embedded > 0 {
-            tracing::info!(%embedded, "chronicle embedding backfill complete");
-        }
+        tracing::info!(embedded, skipped, "chronicle embedding backfill complete");
         Ok(embedded)
     }
 
     /// Unified labeled search: memory results (with checkpoint range-join
     /// provenance) plus chronicle checkpoint hits, when the chronicle table
-    /// is wired. Checkpoint hits are labeled by title + seq.
+    /// is wired. Checkpoint hits are labeled by title + seq. Queryless modes
+    /// (recent/important/typed) return no checkpoint hits — embedding an
+    /// empty string would surface arbitrary nearest neighbours.
     pub async fn search_with_chronicle(
         &self,
         query: &str,
@@ -152,10 +158,13 @@ impl MemorySearch {
     ) -> Result<(Vec<MemorySearchResult>, Vec<ChronicleHit>)> {
         let memories = self.search(query, config).await?;
         let mut checkpoints = Vec::new();
-        if let Some(table) = &self.chronicle_table {
+        if let Some(table) = &self.chronicle_table
+            && !query.trim().is_empty()
+        {
             match self.embedding_model.embed_one(query).await {
                 Ok(embedding) => {
                     checkpoints = table.vector_search(&embedding, checkpoint_limit).await?;
+                    checkpoints.retain(|hit| hit.similarity >= CHRONICLE_MIN_SIMILARITY);
                 }
                 Err(error) => {
                     tracing::debug!(%error, "chronicle search embedding failed");

@@ -529,7 +529,6 @@ pub(super) async fn inspect_prompt(
 
     // ── Gather all dynamic sections ──
     let identity_context = rc.identity.load().render();
-    let memory_bulletin = rc.memory_bulletin.load();
     let cortex_config = **rc.cortex.load();
     let knowledge_synthesis = match crate::memory::render::render_memory_store(
         channel_state.deps.memory_search.store(),
@@ -596,7 +595,6 @@ pub(super) async fn inspect_prompt(
         _ => None,
     };
 
-    let sandbox_enabled = channel_state.deps.sandbox.containment_active();
     let adapter = query.channel_id.split(':').next().filter(|a| !a.is_empty());
 
     // ── Render working memory layers (Layers 2 + 3) ──
@@ -631,8 +629,8 @@ pub(super) async fn inspect_prompt(
         &tracked_participants,
         &query.channel_id,
         &participant_config,
-        &channel_state.deps.memory_search.store(),
-        &mut std::collections::HashMap::new(),
+        channel_state.deps.memory_search.store(),
+        &tokio::sync::Mutex::new(std::collections::HashMap::new()),
     )
     .await
     .unwrap_or_else(|error| {
@@ -672,6 +670,10 @@ pub(super) async fn inspect_prompt(
     };
 
     // ── Org context ──
+    let agent_links = {
+        let all_links = channel_state.deps.links.load();
+        !crate::links::links_for_agent(&all_links, channel_state.deps.agent_id.as_ref()).is_empty()
+    };
     let org_context = {
         let agent_id = channel_state.deps.agent_id.as_ref();
         let all_links = channel_state.deps.links.load();
@@ -717,6 +719,7 @@ pub(super) async fn inspect_prompt(
                     is_human,
                     role,
                     description,
+                    description_total_chars: None,
                 };
                 match link.kind {
                     crate::links::LinkKind::Hierarchical => {
@@ -842,15 +845,13 @@ pub(super) async fn inspect_prompt(
     let system_prompt = prompt_engine
         .render_channel_prompt_with_links(
             empty_to_none(identity_context),
-            empty_to_none(memory_bulletin.to_string()),
             empty_to_none(knowledge_synthesis.to_string()),
             empty_to_none(skills_prompt),
             worker_capabilities,
             conversation_context,
             empty_to_none(status_text),
-            None, // coalesce_hint — only set during batched message handling
             available_channels,
-            sandbox_enabled,
+            agent_links,
             org_context,
             adapter_prompt,
             project_context,
@@ -860,9 +861,18 @@ pub(super) async fn inspect_prompt(
             empty_to_none(channel_activity_map),
             empty_to_none(participant_context),
             empty_to_none(active_goals),
-            prompt_engine
-                .render_static("fragments/execution_standard")
-                .unwrap_or_default(),
+            {
+                // Render the execution fragment for the channel's actual
+                // delegation mode so inspection shows the prompt it sends.
+                let fragment = if channel_state.model_overrides.delegation
+                    == crate::conversation::settings::DelegationMode::Direct
+                {
+                    "fragments/execution_direct"
+                } else {
+                    "fragments/execution_standard"
+                };
+                prompt_engine.render_static(fragment).unwrap_or_default()
+            },
             prompt_engine
                 .render_static("fragments/authority")
                 .unwrap_or_default(),
