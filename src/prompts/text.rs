@@ -80,6 +80,12 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         ("en", "adapters/email") => include_str!("../../prompts/en/adapters/email.md.j2"),
         ("en", "adapters/cron") => include_str!("../../prompts/en/adapters/cron.md.j2"),
         ("en", "adapters/signal") => include_str!("../../prompts/en/adapters/signal.md.j2"),
+        ("en", "adapters/discord") => include_str!("../../prompts/en/adapters/discord.md.j2"),
+        ("en", "adapters/slack") => include_str!("../../prompts/en/adapters/slack.md.j2"),
+        ("en", "adapters/mattermost") => include_str!("../../prompts/en/adapters/mattermost.md.j2"),
+        ("en", "adapters/portal") => include_str!("../../prompts/en/adapters/portal.md.j2"),
+        ("en", "adapters/twitch") => include_str!("../../prompts/en/adapters/twitch.md.j2"),
+        ("en", "adapters/webhook") => include_str!("../../prompts/en/adapters/webhook.md.j2"),
 
         // Slash-command agent-turn instructions
         ("en", "commands/tasks") => include_str!("../../prompts/en/commands/tasks.md.j2"),
@@ -111,6 +117,13 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         ("en", "fragments/available_channels") => {
             include_str!("../../prompts/en/fragments/available_channels.md.j2")
         }
+        ("en", "fragments/execution_standard") => {
+            include_str!("../../prompts/en/fragments/execution_standard.md.j2")
+        }
+        ("en", "fragments/execution_direct") => {
+            include_str!("../../prompts/en/fragments/execution_direct.md.j2")
+        }
+        ("en", "fragments/authority") => include_str!("../../prompts/en/fragments/authority.md.j2"),
 
         // System Message Fragments
         ("en", "fragments/system/retrigger") => {

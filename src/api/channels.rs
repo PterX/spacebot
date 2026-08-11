@@ -855,7 +855,12 @@ pub(super) async fn inspect_prompt(
             empty_to_none(channel_activity_map),
             empty_to_none(participant_context),
             empty_to_none(active_goals),
-            false, // direct_mode — resolved at runtime by the channel, not available here
+            prompt_engine
+                .render_static("fragments/execution_standard")
+                .unwrap_or_default(),
+            prompt_engine
+                .render_static("fragments/authority")
+                .unwrap_or_default(),
         )
         .unwrap_or_default();
 

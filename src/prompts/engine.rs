@@ -137,6 +137,18 @@ impl PromptEngine {
             crate::prompts::text::get("fragments/available_channels"),
         )?;
         env.add_template(
+            "fragments/execution_standard",
+            crate::prompts::text::get("fragments/execution_standard"),
+        )?;
+        env.add_template(
+            "fragments/execution_direct",
+            crate::prompts::text::get("fragments/execution_direct"),
+        )?;
+        env.add_template(
+            "fragments/authority",
+            crate::prompts::text::get("fragments/authority"),
+        )?;
+        env.add_template(
             "fragments/org_context",
             crate::prompts::text::get("fragments/org_context"),
         )?;
@@ -676,7 +688,10 @@ impl PromptEngine {
             None,
             None,
             None,
-            false,
+            self.render_static("fragments/execution_standard")
+                .unwrap_or_default(),
+            self.render_static("fragments/authority")
+                .unwrap_or_default(),
         )
     }
 
@@ -719,11 +734,22 @@ impl PromptEngine {
     }
 
     /// Render optional adapter-specific channel guidance.
+    ///
+    /// Only adapters whose formatting claims passed converter verification
+    /// (1.5) ship a rendering fragment; the rest stay silent until their
+    /// converter is fixed. cron/email/signal fragments are channel
+    /// semantics, not rendering — they stay as they are.
     pub fn render_channel_adapter_prompt(&self, adapter: &str) -> Option<String> {
         let template_name = match adapter {
             "email" => "adapters/email",
             "cron" => "adapters/cron",
             "signal" => "adapters/signal",
+            "discord" => "adapters/discord",
+            "slack" => "adapters/slack",
+            "mattermost" => "adapters/mattermost",
+            "portal" => "adapters/portal",
+            "twitch" => "adapters/twitch",
+            "webhook" => "adapters/webhook",
             _ => return None,
         };
 
@@ -828,7 +854,8 @@ impl PromptEngine {
         channel_activity_map: Option<String>,
         participant_context: Option<String>,
         active_goals: Option<String>,
-        direct_mode: bool,
+        execution_mode: String,
+        authority: String,
     ) -> Result<String> {
         self.render(
             "channel",
@@ -852,7 +879,8 @@ impl PromptEngine {
                 participant_context => participant_context,
                 active_goals => active_goals,
                 knowledge_synthesis => knowledge_synthesis,
-                direct_mode => direct_mode,
+                execution_mode => execution_mode,
+                authority => authority,
             },
         )
     }
@@ -1065,7 +1093,12 @@ mod tests {
                 None,
                 None,
                 None,
-                false,
+                engine
+                    .render_static("fragments/execution_standard")
+                    .unwrap_or_default(),
+                engine
+                    .render_static("fragments/authority")
+                    .unwrap_or_default(),
             )
             .expect("channel prompt should render");
 
@@ -1099,7 +1132,12 @@ mod tests {
                     None,
                     None,
                     None,
-                    false,
+                    engine
+                        .render_static("fragments/execution_standard")
+                        .unwrap_or_default(),
+                    engine
+                        .render_static("fragments/authority")
+                        .unwrap_or_default(),
                 )
                 .expect("channel prompt should render")
         };

@@ -447,32 +447,25 @@ async fn direct_mode_still_branches_for_memory() {
 
 /// Every tool the prompt advertises must be one the channel actually
 /// registers, per mode. Checked by scanning the real rendered prompt for the
-/// expected per-mode tool set, and by observing that live tool choices stay
-/// inside that set (the delegation fixtures above already gate the observed
-/// direction).
+/// routing-critical tool names the harness prose owns (§3/§5 per the
+/// architecture manifest): per-tool mechanics moved to the tool schemas in
+/// 2.1, so prose advertising is a deliberate subset, and the delegation
+/// fixtures above gate the observed direction.
 #[tokio::test]
 async fn capability_consistency_prompt_advertises_registered_tools() {
     let instance = TempDir::new().expect("tempdir");
     write_pinned_config(instance.path());
     let deps = bootstrap(instance.path()).await.expect("bootstrap");
 
-    let standard_tools = [
-        "reply",
-        "branch",
-        "spawn_worker",
-        "route",
-        "cancel",
-        "skip",
-        "react",
-    ];
+    let standard_tools = ["reply", "branch", "spawn_worker", "skip", "send_file"];
     let direct_tools = [
         "reply",
         "branch",
         "spawn_worker",
+        "skip",
+        "send_file",
         "memory_save",
         "memory_recall",
-        "shell",
-        "file_read",
     ];
 
     for (label, settings, tools) in [

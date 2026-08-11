@@ -3118,6 +3118,18 @@ impl Channel {
         let model_name = routing.resolve(ProcessType::Channel, None).to_string();
         let tool_use_enforcement = rc.tool_use_enforcement.load();
         let direct_mode = self.resolved_settings.delegation == DelegationMode::Direct;
+        let execution_mode = if direct_mode {
+            prompt_engine
+                .render_static("fragments/execution_direct")
+                .unwrap_or_default()
+        } else {
+            prompt_engine
+                .render_static("fragments/execution_standard")
+                .unwrap_or_default()
+        };
+        let authority = prompt_engine
+            .render_static("fragments/authority")
+            .unwrap_or_default();
 
         let system_prompt = prompt_engine.render_channel_prompt_with_links(
             empty_to_none(identity_context),
@@ -3139,7 +3151,8 @@ impl Channel {
             empty_to_none(channel_activity_map),
             empty_to_none(participant_context),
             active_goals,
-            direct_mode,
+            execution_mode,
+            authority,
         )?;
 
         let system_prompt = prompt_engine.maybe_append_tool_use_enforcement(
