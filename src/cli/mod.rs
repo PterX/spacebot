@@ -37,7 +37,7 @@ use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "spacebot", version)]
+#[command(name = "spacebot", version = env!("SPACEBOT_VERSION"))]
 #[command(about = "A Rust agentic system with dedicated processes for every task")]
 pub struct Cli {
     #[command(subcommand)]

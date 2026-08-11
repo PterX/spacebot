@@ -93,7 +93,7 @@ pub(super) async fn status(State(state): State<Arc<ApiState>>) -> Json<StatusRes
     let uptime = state.started_at.elapsed();
     Json(StatusResponse {
         status: "running",
-        version: env!("CARGO_PKG_VERSION"),
+        version: env!("SPACEBOT_VERSION"),
         pid: std::process::id(),
         uptime_seconds: uptime.as_secs(),
     })
