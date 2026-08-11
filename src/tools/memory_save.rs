@@ -21,6 +21,7 @@ pub struct MemorySaveTool {
     event_context: Option<MemorySaveEventContext>,
     contract_state: Option<Arc<super::memory_persistence_complete::MemoryPersistenceContractState>>,
     working_memory: Option<Arc<crate::memory::WorkingMemoryStore>>,
+    runtime_config: Option<Arc<crate::config::RuntimeConfig>>,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +38,7 @@ impl MemorySaveTool {
             event_context: None,
             contract_state: None,
             working_memory: None,
+            runtime_config: None,
         }
     }
 
@@ -64,6 +66,12 @@ impl MemorySaveTool {
     /// Enable working memory event emission for successful memory saves.
     pub fn with_working_memory(mut self, store: Arc<crate::memory::WorkingMemoryStore>) -> Self {
         self.working_memory = Some(store);
+        self
+    }
+
+    /// Enable the write-time consolidation check (config for cap/threshold).
+    pub fn with_runtime_config(mut self, config: Arc<crate::config::RuntimeConfig>) -> Self {
+        self.runtime_config = Some(config);
         self
     }
 }
@@ -132,6 +140,11 @@ pub struct MemorySaveOutput {
     pub success: bool,
     /// Optional message about the result.
     pub message: String,
+    /// Advisory write-time consolidation advice (near-duplicates or an
+    /// over-cap partition). Present only when the save flagged something
+    /// actionable; the branch decides whether to consolidate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consolidation: Option<crate::memory::consolidation::ConsolidationAdvice>,
 }
 
 impl Tool for MemorySaveTool {
@@ -420,6 +433,37 @@ impl Tool for MemorySaveTool {
             tracing::warn!(%error, "failed to ensure FTS index after memory save");
         }
 
+        // Write-time consolidation check. Advisory: the save has already
+        // landed; the advice tells the branch about near-duplicates and
+        // per-partition over-cap debt so it can run one atomic batch.
+        let consolidation = match &self.runtime_config {
+            Some(rc) => {
+                let cortex_config = **rc.cortex.load();
+                match crate::memory::consolidation::check_save(
+                    self.memory_search.consolidation(),
+                    self.memory_search.store(),
+                    self.memory_search.embedding_table(),
+                    &memory.id,
+                    memory.memory_type,
+                    cortex_config.consolidation_partition_cap,
+                    cortex_config.consolidation_near_duplicate_threshold,
+                )
+                .await
+                {
+                    Ok(advice) => advice,
+                    Err(error) => {
+                        tracing::warn!(
+                            memory_id = %memory.id,
+                            %error,
+                            "consolidation check failed after memory save"
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+
         if let Some(event_context) = &self.event_context
             && event_context.memory_event_tx.receiver_count() > 0
         {
@@ -480,6 +524,7 @@ impl Tool for MemorySaveTool {
             memory_id: memory.id,
             success: true,
             message: "Memory saved successfully".to_string(),
+            consolidation,
         })
     }
 }

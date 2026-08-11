@@ -430,6 +430,8 @@ pub(super) struct TomlCortexConfig {
     pub(super) association_updates_threshold: Option<f32>,
     pub(super) association_max_per_pass: Option<usize>,
     pub(super) memory_render_max_words: Option<usize>,
+    pub(super) consolidation_partition_cap: Option<usize>,
+    pub(super) consolidation_near_duplicate_threshold: Option<f32>,
 }
 
 #[derive(Deserialize)]

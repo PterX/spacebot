@@ -122,6 +122,11 @@ impl MemoryType {
         MemoryType::Goal,
         MemoryType::Todo,
     ];
+
+    /// Parse a memory type from its lowercase label, matching `Display`.
+    pub fn from_label(label: &str) -> Option<MemoryType> {
+        Self::ALL.iter().copied().find(|t| t.to_string() == label)
+    }
 }
 
 impl std::fmt::Display for MemoryType {

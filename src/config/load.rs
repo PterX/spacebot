@@ -352,6 +352,12 @@ impl CortexConfig {
             memory_render_max_words: overrides
                 .memory_render_max_words
                 .unwrap_or(defaults.memory_render_max_words),
+            consolidation_partition_cap: overrides
+                .consolidation_partition_cap
+                .unwrap_or(defaults.consolidation_partition_cap),
+            consolidation_near_duplicate_threshold: overrides
+                .consolidation_near_duplicate_threshold
+                .unwrap_or(defaults.consolidation_near_duplicate_threshold),
         };
         config.validate_maintenance_bounds()?;
         Ok(config)

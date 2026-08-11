@@ -38,6 +38,8 @@ pub struct MemorySearch {
     store: Arc<MemoryStore>,
     embedding_table: EmbeddingTable,
     embedding_model: Arc<EmbeddingModel>,
+    /// Shared write-time consolidation state (debt + partition locks).
+    consolidation: Arc<crate::memory::consolidation::ConsolidationState>,
 }
 
 impl Clone for MemorySearch {
@@ -46,6 +48,7 @@ impl Clone for MemorySearch {
             store: Arc::clone(&self.store),
             embedding_table: self.embedding_table.clone(),
             embedding_model: Arc::clone(&self.embedding_model),
+            consolidation: Arc::clone(&self.consolidation),
         }
     }
 }
@@ -69,6 +72,7 @@ impl MemorySearch {
             store,
             embedding_table,
             embedding_model,
+            consolidation: Arc::new(crate::memory::consolidation::ConsolidationState::default()),
         }
     }
 
@@ -90,6 +94,12 @@ impl MemorySearch {
     /// Get a shared handle to the embedding model (for async embed_one).
     pub fn embedding_model_arc(&self) -> &Arc<EmbeddingModel> {
         &self.embedding_model
+    }
+
+    /// The shared write-time consolidation state (debt + partition locks).
+    /// Clones of `MemorySearch` share one instance.
+    pub fn consolidation(&self) -> &Arc<crate::memory::consolidation::ConsolidationState> {
+        &self.consolidation
     }
 
     /// Unified search entry point. Dispatches to the appropriate strategy

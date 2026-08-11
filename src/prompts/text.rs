@@ -230,6 +230,9 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         ("en", "tools/memory_delete") => {
             include_str!("../../prompts/en/tools/memory_delete_description.md.j2")
         }
+        ("en", "tools/memory_consolidate") => {
+            include_str!("../../prompts/en/tools/memory_consolidate_description.md.j2")
+        }
         ("en", "tools/channel_recall") => {
             include_str!("../../prompts/en/tools/channel_recall_description.md.j2")
         }

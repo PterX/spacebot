@@ -12,7 +12,8 @@
 //! - No memory tools — the channel delegates memory work to branches.
 //!
 //! **Branch ToolServer** (one per branch, isolated):
-//! - `memory_save` + `memory_recall` + `memory_delete` + `channel_recall`
+//! - `memory_save` + `memory_recall` + `memory_delete` + `memory_consolidate`
+//!   + `channel_recall`
 //! - `spacebot_docs` for embedded self-documentation lookup
 //! - `task_create` + `task_list` + `task_update`
 //! - `spawn_worker` is included for channel-originated branches only
@@ -49,6 +50,7 @@ pub mod goal_list;
 pub mod goal_update;
 pub mod install_skill;
 pub mod mcp;
+pub mod memory_consolidate;
 pub mod memory_delete;
 pub mod memory_persistence_complete;
 pub mod memory_recall;
@@ -129,6 +131,10 @@ pub use install_skill::{
     InstallSkillArgs, InstallSkillError, InstallSkillOutput, InstallSkillTool,
 };
 pub use mcp::{McpToolAdapter, McpToolError, McpToolOutput};
+pub use memory_consolidate::{
+    ConsolidateOpArgs, MemoryConsolidateArgs, MemoryConsolidateError, MemoryConsolidateOutput,
+    MemoryConsolidateTool,
+};
 pub use memory_delete::{
     MemoryDeleteArgs, MemoryDeleteError, MemoryDeleteOutput, MemoryDeleteTool,
 };
@@ -1006,7 +1012,8 @@ pub fn create_branch_tool_server(
         agent_id.clone(),
         memory_event_tx.clone(),
         None,
-    );
+    )
+    .with_runtime_config(runtime_config.clone());
     if let BranchToolProfile::MemoryPersistence { contract_state, .. } = &profile {
         memory_save = memory_save.with_contract_state(contract_state.clone());
     }
@@ -1032,7 +1039,8 @@ pub fn create_branch_tool_server(
     let mut server = ToolServer::new()
         .tool(memory_save)
         .tool(MemoryRecallTool::new(memory_search.clone()))
-        .tool(MemoryDeleteTool::new(memory_search))
+        .tool(MemoryDeleteTool::new(memory_search.clone()))
+        .tool(MemoryConsolidateTool::new(memory_search))
         .tool(ChannelRecallTool::new(conversation_logger, channel_store))
         .tool(SpacebotDocsTool::new())
         .tool(EmailSearchTool::new(runtime_config.clone()))

@@ -1239,6 +1239,12 @@ pub struct CortexConfig {
     /// Max words for the deterministic memory-store render in the channel
     /// knowledge-context slot (replaces the retired LLM knowledge synthesis).
     pub memory_render_max_words: usize,
+    /// Per-partition memory cap for write-time consolidation. When a
+    /// partition (memory type) exceeds this, saves surface consolidation
+    /// debt advising the branch to merge near-duplicates.
+    pub consolidation_partition_cap: usize,
+    /// Similarity threshold for near-duplicate detection at save time.
+    pub consolidation_near_duplicate_threshold: f32,
 }
 
 impl Default for CortexConfig {
@@ -1267,6 +1273,8 @@ impl Default for CortexConfig {
             association_updates_threshold: 0.95,
             association_max_per_pass: 100,
             memory_render_max_words: 500,
+            consolidation_partition_cap: 200,
+            consolidation_near_duplicate_threshold: 0.95,
         }
     }
 }
