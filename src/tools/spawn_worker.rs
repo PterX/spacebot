@@ -143,10 +143,19 @@ impl Tool for SpawnWorkerTool {
         };
 
         let base_description = crate::prompts::text::get("tools/spawn_worker");
+        // Sandbox posture for the workers this tool spawns, reflecting the
+        // live containment state (moved here from the channel template's
+        // Builtin Worker Sandbox section).
+        let sandbox_note = if self.state.deps.sandbox.containment_active() {
+            "Builtin workers run sandboxed: `shell` executes under OS-level containment while `file` stays workspace-scoped by path validation."
+        } else {
+            "Builtin workers run unsandboxed: `shell`/`file` have full host filesystem access (OS permissions apply). Environment sanitization still applies."
+        };
         let description = base_description
             .replace("{tools}", &tools_list.join(", "))
             .replace("{history_note}", history_note)
-            .replace("{opencode_note}", opencode_note);
+            .replace("{opencode_note}", opencode_note)
+            .replace("{sandbox_note}", sandbox_note);
 
         let mut properties = serde_json::json!({
             "task": {

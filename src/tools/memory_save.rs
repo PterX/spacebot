@@ -154,11 +154,41 @@ impl Tool for MemorySaveTool {
                     },
                     "memory_type": {
                         "type": "string",
-                        "enum": crate::memory::types::MemoryType::ALL
-                            .iter()
-                            .map(|t| t.to_string())
-                            .collect::<Vec<_>>(),
-                        "description": "The type of memory being saved. Choose the most appropriate type."
+                        "description": "The type of memory being saved. Each type drives a different behavior — choose the one whose effect matches what you're storing.",
+                        "oneOf": [
+                            {
+                                "const": "fact",
+                                "description": "What you know to be true. Grounds your responses."
+                            },
+                            {
+                                "const": "preference",
+                                "description": "How the user likes things done. Shapes your approach."
+                            },
+                            {
+                                "const": "decision",
+                                "description": "Commitments that were made. Constrains future choices."
+                            },
+                            {
+                                "const": "identity",
+                                "description": "Stable facts about who the user or the agent is. Shapes self-understanding."
+                            },
+                            {
+                                "const": "event",
+                                "description": "Something that happened at a point in time. Adds situational context."
+                            },
+                            {
+                                "const": "observation",
+                                "description": "Patterns noticed about how things work. System-level awareness."
+                            },
+                            {
+                                "const": "goal",
+                                "description": "What the user or you are working toward. Drives proactive action."
+                            },
+                            {
+                                "const": "todo",
+                                "description": "Concrete tasks to complete. Creates accountability."
+                            }
+                        ]
                     },
                     "importance": {
                         "type": "number",
