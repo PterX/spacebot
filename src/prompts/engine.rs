@@ -329,11 +329,16 @@ impl PromptEngine {
     }
 
     /// Convenience method for rendering skills channel fragment.
-    pub fn render_skills_channel(&self, skills: Vec<SkillInfo>) -> Result<String> {
+    pub fn render_skills_channel(
+        &self,
+        skills: Vec<SkillInfo>,
+        category_descriptions: &std::collections::HashMap<String, String>,
+    ) -> Result<String> {
+        let categories = group_skills_by_category(skills, category_descriptions);
         self.render(
             "fragments/skills_channel",
             context! {
-                skills => skills,
+                categories => categories,
             },
         )
     }
@@ -361,11 +366,16 @@ impl PromptEngine {
     ///
     /// Branches read skills directly via `read_skill` or pass names to
     /// spawned workers as `suggested_skills`.
-    pub fn render_skills_branch(&self, skills: Vec<SkillInfo>) -> Result<String> {
+    pub fn render_skills_branch(
+        &self,
+        skills: Vec<SkillInfo>,
+        category_descriptions: &std::collections::HashMap<String, String>,
+    ) -> Result<String> {
+        let categories = group_skills_by_category(skills, category_descriptions);
         self.render(
             "fragments/skills_branch",
             context! {
-                skills => skills,
+                categories => categories,
             },
         )
     }
@@ -436,11 +446,16 @@ impl PromptEngine {
     ///
     /// Workers see all available skills with suggestions from the channel flagged.
     /// They read whichever skills they need via the read_skill tool.
-    pub fn render_skills_worker(&self, skills: Vec<SkillInfo>) -> Result<String> {
+    pub fn render_skills_worker(
+        &self,
+        skills: Vec<SkillInfo>,
+        category_descriptions: &std::collections::HashMap<String, String>,
+    ) -> Result<String> {
+        let categories = group_skills_by_category(skills, category_descriptions);
         self.render(
             "fragments/skills_worker",
             context! {
-                skills => skills,
+                categories => categories,
             },
         )
     }
@@ -914,6 +929,47 @@ pub struct SkillInfo {
     /// Whether the spawning channel suggested this skill for the current task.
     /// Workers should prioritise suggested skills but may read others too.
     pub suggested: bool,
+    /// Category derived from the directory path.
+    pub category: String,
+}
+
+/// Group of skills under one category for grouped index rendering.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SkillCategoryGroup {
+    pub name: String,
+    /// Description from the category's `index.md`, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub skills: Vec<SkillInfo>,
+}
+
+/// Group skills by category, sorted by category name then skill name within
+/// each group. Category descriptions come from `index.md` files loaded
+/// during discovery.
+fn group_skills_by_category(
+    skills: Vec<SkillInfo>,
+    category_descriptions: &std::collections::HashMap<String, String>,
+) -> Vec<SkillCategoryGroup> {
+    let mut groups: std::collections::BTreeMap<String, Vec<SkillInfo>> =
+        std::collections::BTreeMap::new();
+    for skill in skills {
+        groups
+            .entry(skill.category.clone())
+            .or_default()
+            .push(skill);
+    }
+    groups
+        .into_iter()
+        .map(|(name, mut skills)| {
+            skills.sort_by(|a, b| a.name.cmp(&b.name));
+            let description = category_descriptions.get(&name).cloned();
+            SkillCategoryGroup {
+                name,
+                description,
+                skills,
+            }
+        })
+        .collect()
 }
 
 /// Information about a channel for template rendering.

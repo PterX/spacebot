@@ -39,6 +39,7 @@ pub(super) struct SkillInfo {
     source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     source_repo: Option<String>,
+    category: String,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -262,6 +263,7 @@ pub(super) async fn list_skills(
                 crate::skills::SkillSource::Workspace => "workspace".to_string(),
             },
             source_repo: s.source_repo,
+            category: s.category,
         })
         .collect();
 

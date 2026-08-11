@@ -1,6 +1,6 @@
 ## Available Skills
 
-You have access to the following skills. When a user's request matches one or more skills, spawn a worker and pass the relevant skill names as `suggested_skills`. The worker will read the skills it needs automatically.
+You have access to the following skills. Before responding, scan this index for any skill that is even partially relevant to the user's request — prefer reading an unnecessary skill over missing an established procedure. When a request matches one or more skills, spawn a worker and pass the relevant skill names as `suggested_skills`. The worker will read the skills it needs automatically.
 
 **Do not include implementation details, tool invocations, or protocol instructions in the task description.** Describe *what* to do, not *how*. The worker reads the skill for the how.
 
@@ -9,10 +9,14 @@ Example: `spawn_worker(task="Generate a 30-second downtempo track with these lyr
 You may suggest multiple skills if the task spans more than one: `suggested_skills=["github", "coding-agent"]`
 
 <available_skills>
-{%- for skill in skills %}
-  <skill>
-    <name>{{ skill.name }}</name>
-    <description>{{ skill.description }}</description>
-  </skill>
+{%- for category in categories %}
+  <category name="{{ category.name }}"{% if category.description %} description="{{ category.description }}"{% endif %}>
+  {%- for skill in category.skills %}
+    <skill>
+      <name>{{ skill.name }}</name>
+      <description>{{ skill.description }}</description>
+    </skill>
+  {%- endfor %}
+  </category>
 {%- endfor %}
 </available_skills>

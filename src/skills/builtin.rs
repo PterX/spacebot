@@ -56,6 +56,7 @@ fn parse_builtin(dir_name: &str, raw: &str) -> anyhow::Result<Option<Skill>> {
         tags: frontmatter.tags.unwrap_or_default(),
         related_skills: frontmatter.related_skills.unwrap_or_default(),
         linked_files: Vec::new(),
+        category: "general".to_string(),
     }))
 }
 
