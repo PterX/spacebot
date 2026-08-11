@@ -78,7 +78,7 @@ async fn bootstrap_deps() -> anyhow::Result<(spacebot::AgentDeps, spacebot::conf
     ));
     let task_store = Arc::new(spacebot::tasks::TaskStore::new(instance_pool.clone()));
 
-    let identity = spacebot::identity::Identity::load(&agent_config.workspace).await;
+    let identity = spacebot::identity::Identity::load(&agent_config.identity_dir).await;
     let prompts =
         spacebot::prompts::PromptEngine::new("en").context("failed to init prompt engine")?;
     let skills =
@@ -137,9 +137,12 @@ async fn bootstrap_deps() -> anyhow::Result<(spacebot::AgentDeps, spacebot::conf
         sqlite_pool: db.sqlite.clone(),
         messaging_manager: None,
         sandbox,
-        links: Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
+        links: Arc::new(arc_swap::ArcSwap::from_pointee(
+            spacebot::links::AgentLink::from_config(&config.links)
+                .context("failed to parse agent links")?,
+        )),
         agent_names: Arc::new(std::collections::HashMap::new()),
-        humans: Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
+        humans: Arc::new(arc_swap::ArcSwap::from_pointee(config.humans.clone())),
         process_control_registry: Arc::new(
             spacebot::agent::process_control::ProcessControlRegistry::new(),
         ),
@@ -248,7 +251,27 @@ async fn dump_channel_context() {
     let (deps, _config) = bootstrap_deps().await.expect("failed to bootstrap");
     let rc = &deps.runtime_config;
 
-    let prompt = build_channel_system_prompt(rc);
+    // Render through the real channel builder so the dump is the byte
+    // stream a turn actually sends, not a hand-maintained mirror.
+    let (channel_response_tx, _channel_response_rx) = tokio::sync::mpsc::channel(16);
+    let (channel, _channel_tx) = spacebot::agent::channel::Channel::new(
+        Arc::from("dump:channel"),
+        spacebot::agent::channel::ChannelKind::User,
+        deps.clone(),
+        channel_response_tx,
+        deps.event_tx.subscribe(),
+        std::path::PathBuf::from("/tmp/screenshots"),
+        std::path::PathBuf::from("/tmp/logs"),
+        None,
+        None,
+        spacebot::conversation::settings::ResolvedConversationSettings::default(),
+        None,
+        None,
+    );
+    let prompt = channel
+        .build_system_prompt()
+        .await
+        .expect("failed to build channel system prompt");
     print_section("CHANNEL SYSTEM PROMPT", &prompt);
     print_stats("System prompt", &prompt);
 
