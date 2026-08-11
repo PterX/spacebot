@@ -414,6 +414,17 @@ pub(crate) fn format_batched_user_message(
     format!("[{display_name}] ({absolute_timestamp}; {relative_text}): {text_content}")
 }
 
+/// Wrap a live user message with the current wall-clock line.
+///
+/// The clock leaves the system prompt — a guaranteed per-turn cache miss —
+/// and rides on the current user message envelope instead, where per-turn
+/// change costs nothing. History messages already bake absolute timestamps
+/// at insert time (`format_user_message`), so the model keeps temporal
+/// grounding without the system prompt ever observing `Utc::now()`.
+pub(crate) fn with_time_envelope(current_time_line: &str, body: &str) -> String {
+    format!("Current date/time: {current_time_line}\n\n{body}")
+}
+
 pub(crate) fn extract_message_id(message: &InboundMessage) -> Option<String> {
     message
         .metadata
@@ -1042,6 +1053,24 @@ mod tests {
         assert!(
             !formatted_normal.contains("[attachment or empty message]"),
             "normal messages should not use placeholder"
+        );
+    }
+
+    #[test]
+    fn with_time_envelope_prepends_clock_line() {
+        use super::with_time_envelope;
+
+        let enveloped = with_time_envelope("2026-08-11 12:00:00 UTC", "hello");
+        assert_eq!(
+            enveloped,
+            "Current date/time: 2026-08-11 12:00:00 UTC\n\nhello"
+        );
+
+        // Multi-line body keeps its own shape below the envelope.
+        let enveloped = with_time_envelope("2026-08-11 12:00:00 UTC", "line 1\nline 2");
+        assert_eq!(
+            enveloped,
+            "Current date/time: 2026-08-11 12:00:00 UTC\n\nline 1\nline 2"
         );
     }
 

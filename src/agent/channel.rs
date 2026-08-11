@@ -6,7 +6,7 @@ use crate::agent::channel_dispatch::spawn_memory_persistence_branch;
 use crate::agent::channel_history::{
     apply_history_after_turn, event_is_for_channel, extract_message_id,
     extract_reply_from_tool_syntax, format_batched_user_message, format_user_message,
-    message_display_name, pop_retrigger_bridge_message,
+    message_display_name, pop_retrigger_bridge_message, with_time_envelope,
 };
 use crate::agent::channel_prompt::{
     MAX_RETRIGGERS_PER_TURN, RETRIGGER_DEBOUNCE_MS, RETRIGGER_MAX_TURNS, TemporalContext,
@@ -2237,10 +2237,10 @@ impl Channel {
             text_parts.join("\n")
         );
 
-        // Build system prompt with coalesce hint
-        let system_prompt = self
-            .build_system_prompt_with_coalesce(message_count, elapsed_secs, unique_sender_count)
-            .await?;
+        // Build system prompt. Time and the coalesce hint ride on the user
+        // message envelope below instead of the system prompt — the prompt
+        // must stay byte-stable across turns for provider caches to hit.
+        let system_prompt = self.build_system_prompt().await?;
 
         // Extract adapter from messages (prefer explicit message.adapter, fall back to stored source_adapter)
         // This preserves per-message adapter for Signal named instances (e.g., "signal:work")
@@ -2261,10 +2261,23 @@ impl Channel {
             self.current_inbound = Some(last_real.clone());
         }
 
+        // Time and the coalesce hint live on the user message envelope, not
+        // the system prompt: the prompt must stay byte-stable across turns,
+        // while the envelope changes every turn at no cache cost.
+        let prompt_engine = self.deps.runtime_config.prompts.load();
+        let elapsed_str = format!("{:.1}s", elapsed_secs);
+        let mut envelope_body = prompt_engine
+            .render_coalesce_hint(message_count, &elapsed_str, unique_sender_count)
+            .ok()
+            .map(|hint| format!("{hint}\n\n"))
+            .unwrap_or_default();
+        envelope_body.push_str(&combined_text);
+        let live_text = with_time_envelope(&temporal_context.current_time_line(), &envelope_body);
+
         // Run agent turn with any image/audio attachments preserved
         let turn_result = self
             .run_agent_turn(
-                &combined_text,
+                &live_text,
                 &system_prompt,
                 &conversation_id,
                 attachment_parts,
@@ -2294,112 +2307,6 @@ impl Channel {
         self.claim_home_channel_if_unset().await;
 
         Ok(())
-    }
-
-    /// Build system prompt with coalesce hint for batched messages.
-    async fn build_system_prompt_with_coalesce(
-        &self,
-        message_count: usize,
-        elapsed_secs: f64,
-        unique_senders: usize,
-    ) -> Result<String> {
-        let rc = &self.deps.runtime_config;
-        let prompt_engine = rc.prompts.load();
-
-        let identity_context = rc.identity.load().render();
-        let skills = rc.skills.load();
-        let skills_prompt = skills.render_channel_prompt(&prompt_engine)?;
-
-        let browser_enabled = rc.browser_config.load().enabled;
-        let web_search_enabled = rc.brave_search_key.load().is_some();
-        let opencode_enabled = rc.opencode.load().enabled;
-        let sandbox_enabled = self.deps.sandbox.containment_active();
-        let mcp_tool_names = self.deps.mcp_manager.get_tool_names().await;
-        let worker_capabilities = prompt_engine.render_worker_capabilities(
-            browser_enabled,
-            web_search_enabled,
-            opencode_enabled,
-            &mcp_tool_names,
-        )?;
-
-        let temporal_context = TemporalContext::from_runtime(rc.as_ref());
-        let current_time_line = temporal_context.current_time_line();
-        let system_info = self.build_system_info().await;
-        let status_text = {
-            let status = self.state.status_block.read().await;
-            status.render_full(&current_time_line, &system_info)
-        };
-
-        // Render coalesce hint
-        let elapsed_str = format!("{:.1}s", elapsed_secs);
-        let coalesce_hint = prompt_engine
-            .render_coalesce_hint(message_count, &elapsed_str, unique_senders)
-            .ok();
-
-        let available_channels = self.build_available_channels().await;
-
-        let org_context = self.build_org_context(&prompt_engine);
-
-        let adapter_prompt = match self.state.kind {
-            ChannelKind::Cron => prompt_engine.render_channel_adapter_prompt("cron"),
-            ChannelKind::User | ChannelKind::Autonomy => self
-                .current_adapter()
-                .and_then(|adapter| prompt_engine.render_channel_adapter_prompt(adapter)),
-        };
-
-        let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
-        let non_empty_option = |value: Option<String>| value.filter(|text| !text.is_empty());
-
-        let project_context = self.build_project_context(&prompt_engine).await;
-
-        let (
-            working_memory,
-            channel_activity_map,
-            participant_context,
-            memory_bulletin_text,
-            knowledge_synthesis_text,
-        ) = self.render_memory_layers().await;
-
-        let active_goals = self.render_active_goals().await;
-
-        let routing = rc.routing.load();
-        let model_name = routing.resolve(ProcessType::Channel, None).to_string();
-        let tool_use_enforcement = rc.tool_use_enforcement.load();
-
-        let direct_mode = self.resolved_settings.delegation == DelegationMode::Direct;
-
-        let system_prompt = prompt_engine.render_channel_prompt_with_links(
-            empty_to_none(identity_context),
-            non_empty_option(memory_bulletin_text),
-            non_empty_option(knowledge_synthesis_text),
-            empty_to_none(skills_prompt),
-            worker_capabilities,
-            self.conversation_context.clone(),
-            empty_to_none(status_text),
-            coalesce_hint,
-            available_channels,
-            sandbox_enabled,
-            org_context,
-            adapter_prompt,
-            project_context,
-            self.backfill_transcript.clone(),
-            self.render_session_chronicle().await,
-            empty_to_none(working_memory),
-            empty_to_none(channel_activity_map),
-            empty_to_none(participant_context),
-            active_goals,
-            direct_mode,
-        )?;
-
-        let system_prompt = prompt_engine.maybe_append_tool_use_enforcement(
-            system_prompt,
-            tool_use_enforcement.as_ref(),
-            &model_name,
-        )?;
-        self.chronicler.fence().record_prompt_tokens(
-            crate::agent::compactor::estimate_text_tokens(&system_prompt),
-        );
-        Ok(system_prompt)
     }
 
     /// Handle an incoming message by running the channel's LLM agent loop.
@@ -2622,6 +2529,11 @@ impl Channel {
         let temporal_context = TemporalContext::from_runtime(self.deps.runtime_config.as_ref());
         let message_timestamp = temporal_context.format_timestamp(message.timestamp);
         let user_text = format_user_message(&rewritten_text, &message, &message_timestamp);
+        // The wall-clock line rides on the live user message, not the system
+        // prompt — the prompt must stay byte-stable across turns for provider
+        // caches to hit. History and suppressed messages keep the plain text:
+        // their per-message timestamps already ground them.
+        let live_user_text = with_time_envelope(&temporal_context.current_time_line(), &user_text);
 
         let mut invoked_by_command = false;
         let mut invoked_by_mention = false;
@@ -2714,7 +2626,7 @@ impl Channel {
             .or_else(|| self.current_adapter());
         let turn_result = self
             .run_agent_turn(
-                &user_text,
+                &live_user_text,
                 &system_prompt,
                 &message.conversation_id,
                 attachment_content,
@@ -3144,12 +3056,13 @@ impl Channel {
             &mcp_tool_names,
         )?;
 
-        let temporal_context = TemporalContext::from_runtime(rc.as_ref());
-        let current_time_line = temporal_context.current_time_line();
+        // Time no longer renders here — it rides on the current user message
+        // envelope instead, so this prompt stays byte-stable across turns
+        // (see `with_time_envelope`).
         let system_info = self.build_system_info().await;
         let status_text = {
             let status = self.state.status_block.read().await;
-            status.render_full(&current_time_line, &system_info)
+            status.render_with_context(None, Some(&system_info))
         };
 
         let available_channels = self.build_available_channels().await;
@@ -3176,6 +3089,7 @@ impl Channel {
         let active_goals = self.render_active_goals().await;
 
         let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
+        let non_empty_option = |value: Option<String>| value.filter(|text| !text.is_empty());
         let routing = rc.routing.load();
         let model_name = routing.resolve(ProcessType::Channel, None).to_string();
         let tool_use_enforcement = rc.tool_use_enforcement.load();
@@ -3183,13 +3097,13 @@ impl Channel {
 
         let system_prompt = prompt_engine.render_channel_prompt_with_links(
             empty_to_none(identity_context),
-            memory_bulletin_text,
-            knowledge_synthesis_text,
+            non_empty_option(memory_bulletin_text),
+            non_empty_option(knowledge_synthesis_text),
             empty_to_none(skills_prompt),
             worker_capabilities,
             self.conversation_context.clone(),
             empty_to_none(status_text),
-            None, // coalesce_hint - only set for batched messages
+            None, // coalesce_hint - rides on the batched user message envelope
             available_channels,
             sandbox_enabled,
             org_context,
