@@ -577,10 +577,8 @@ async fn load_skills_from_dir(
         let category_name = entry.file_name().to_string_lossy().to_string();
 
         // Load category description from index.md, if present.
-        if let Ok(desc) = load_category_description(&path).await {
-            if let Some(desc) = desc {
-                category_descriptions.insert(category_name.clone(), desc);
-            }
+        if let Ok(Some(desc)) = load_category_description(&path).await {
+            category_descriptions.insert(category_name.clone(), desc);
         }
 
         let Ok(mut category_entries) = tokio::fs::read_dir(&path).await else {
@@ -597,13 +595,7 @@ async fn load_skills_from_dir(
             {
                 continue;
             }
-            load_skill_into(
-                &mut skills,
-                &skill_dir,
-                &category_name,
-                source.clone(),
-            )
-            .await;
+            load_skill_into(&mut skills, &skill_dir, &category_name, source.clone()).await;
         }
     }
 

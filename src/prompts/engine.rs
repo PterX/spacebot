@@ -953,7 +953,10 @@ fn group_skills_by_category(
     let mut groups: std::collections::BTreeMap<String, Vec<SkillInfo>> =
         std::collections::BTreeMap::new();
     for skill in skills {
-        groups.entry(skill.category.clone()).or_default().push(skill);
+        groups
+            .entry(skill.category.clone())
+            .or_default()
+            .push(skill);
     }
     groups
         .into_iter()
