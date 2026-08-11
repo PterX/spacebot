@@ -1,41 +1,32 @@
 Things to Fix:
   ☐ Add behaviour settings per channel
   ☐ Force branching before response
-  ☐ Read category descriptions from DESCRIPTION.md, not index.md (skills.rs
-    load_category_description). DESCRIPTION.md is the ecosystem convention —
-    the OpenClaw migration path we claim compat with writes it, and portable
-    skill trees ship it. Accept both, prefer DESCRIPTION.md. Categories from
-    an imported tree currently load with empty descriptions.
-  ☐ Skill index renders one skill as 5 indented XML lines (<skill><name>
-    <description>). On a 121-skill catalog that is 22.6k chars to carry 9.7k of
-    names and descriptions — 57% markup, 107 chars overhead per skill, and 54%
-    of the whole system prompt. Flatten the leaf to `- name: description`
-    under the existing category grouping: 9.8k saved, no information lost.
-  ☐ HUMAN.md renders into the org context uncapped — a 9k profile is 9k of
-    prompt on every turn. Budget it with an inline utilization header
-    (valid there: store = render for authored docs), and cap the other
-    unbounded sections (skill index, projects, channels) as plain limits.
-    View blocks (memory render, working memory, participants) report scope
-    + shown-of-total counts instead of fill — a view always fills its
-    budget by selection, so a percentage is meaningless there.
-  ☐ Skill loader only descends one category level. Skills at
-    {category}/{subcategory}/{name} (e.g. mlops/inference/llama-cpp) are
-    silently dropped — a 126-skill tree renders 120. Recurse and render the
-    subcategory as its own grouping, or flatten to "category/subcategory".
-  ☐ DESCRIPTION_BUDGET (80) truncates the bundled wiki-writing description at
-    183 chars, cutting its routing signal mid-word. Either raise the budget or
-    fix the bundled skill — but the budget is unenforced on load, so imported
-    trees hit this too (~26% of a 126-skill tree).
+
+Prompt / memory rework (remaining, see docs/design-docs/execution-plan.md):
+  ☐ Run the live behavioral fixtures against 06178a6d (pre-rewrite) and HEAD
+    to record the baseline the rewrite shipped without — needs
+    SPACEBOT_FIXTURE_API_KEY, `cargo test --test behavioral_fixtures -- --ignored`
+  ☐ Converter fixes gating adapter fragments (adapter-verification-2026-08-11.md):
+    telegram send_photo/send_video/send_voice + spoiler entities; slack
+    `blocks` exposure in the reply tool; signal markdown → textStyle ranges
+    (or keep the plain-text fragment); webhook file delivery (or explicit
+    no-files contract); portal audio/video inline elements
+  ☐ Memory-first phases 3.1b/3.1c: project scoping with hysteresis, then the
+    loaded set (per-channel stored state, branch curation, loader provenance)
+  ☐ Daily digest cron + retire intraday synthesis (memory-first phase 5)
+  ☐ Memory-first phase 6 UI: store sizes, consolidation debt surfacing
+    (debt is process-local until then), digests in the chronicle timeline
+  ☐ Cache breakpoint after durable context (rework 5.18) — needs section
+    ordering settled; measure whether the memory block earns its own slot
+  ☐ inspect_prompt in api/channels.rs is still a hand-maintained copy of
+    build_system_prompt — consolidate so inspection can't drift from the
+    real prompt
+  ☐ Fuse chronicle FTS into search_with_chronicle scoring (RRF pass like
+    memory hybrid search; index and text_search surface already exist)
 
 Cortex Loops:
   ☐ Check tasks + elevate todos
-  ☐ Improve bulletin
   ☐ Better cortex loop context
-  ☐ Replace knowledge synthesis with a direct memory-store render — typed
-    sections by importance, configurable budget, human anchor memories with
-    platform-id resolution, write-time consolidation under budget pressure;
-    cortex becomes a writer, not a renderer. Idle instance = zero LLM calls
-    (see memory-first-knowledge-context.md)
 
 Improvements:
   ☐ Improve cron
