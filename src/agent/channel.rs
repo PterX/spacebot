@@ -3054,8 +3054,13 @@ impl Channel {
         info
     }
 
-    /// Assemble the full system prompt using the PromptEngine.
-    async fn build_system_prompt(&self) -> crate::error::Result<String> {
+    /// Build the channel's full system prompt: template, identity, memory
+    /// layers, status block, skills, tool notes.
+    ///
+    /// Public for fixture harnesses and context inspection — this is the
+    /// exact byte stream the channel sends, so behavioral fixtures can gate
+    /// on it without duplicating the composition.
+    pub async fn build_system_prompt(&self) -> crate::error::Result<String> {
         let rc = &self.deps.runtime_config;
         let prompt_engine = rc.prompts.load();
 
