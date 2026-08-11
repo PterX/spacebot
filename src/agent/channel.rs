@@ -509,6 +509,9 @@ pub struct ChannelState {
     /// Live response mode, encoded via `ResponseMode::to_u8`. Shared so the
     /// router-side control plane can apply a mode change mid-turn; the
     /// channel reads it at every gate instead of its startup snapshot.
+    /// Per-channel session cache of resolved human anchors (participant key
+    /// -> anchor content). Misses are cached too (3.1a in-turn resolution).
+    pub human_anchor_cache: Arc<std::sync::Mutex<HashMap<String, Option<String>>>>,
     pub response_mode: Arc<std::sync::atomic::AtomicU8>,
     /// Autonomy run state for the `autonomy_complete` tool. Set only on
     /// `ChannelKind::Autonomy` channels; the run loop uses it to enforce the
@@ -1121,6 +1124,7 @@ impl Channel {
                 resolved_settings.response_mode.to_u8(),
             )),
             autonomy_run,
+            human_anchor_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
 
         // Each channel gets its own isolated tool server to avoid races between
@@ -2836,20 +2840,64 @@ impl Channel {
     }
 
     /// Build org context showing the agent's position in the communication hierarchy.
-    fn build_org_context(&self, prompt_engine: &crate::prompts::PromptEngine) -> Option<String> {
+    async fn build_org_context(
+        &self,
+        prompt_engine: &crate::prompts::PromptEngine,
+    ) -> Option<String> {
         let agent_id = self.deps.agent_id.as_ref();
         let all_links = self.deps.links.load();
         let links = crate::links::links_for_agent(&all_links, agent_id);
-
-        if links.is_empty() {
-            return None;
-        }
 
         // Build a lookup map for humans so we can surface display names,
         // roles, and descriptions in the org context prompt.
         let all_humans = self.deps.humans.load();
         let humans_by_id: std::collections::HashMap<&str, &crate::config::HumanDef> =
             all_humans.iter().map(|h| (h.id.as_str(), h)).collect();
+
+        // Promotion pass (3.1a): humans who carry a HUMAN.md description get
+        // an anchor seeded from it, so participant context can resolve them
+        // in-turn even before reflection has observed them. Idempotent — a
+        // human with an existing anchor is left alone.
+        for human in all_humans.iter() {
+            let Some(description) = human.description.as_deref() else {
+                continue;
+            };
+            if description.trim().is_empty() {
+                continue;
+            }
+            let anchored = self
+                .deps
+                .memory_search
+                .store()
+                .get_human_anchor(&human.id)
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+            if anchored {
+                continue;
+            }
+            let mut memory =
+                crate::memory::Memory::new(description, crate::memory::MemoryType::Human);
+            memory.importance = 0.85;
+            if let Err(error) = self.deps.memory_search.store().save(&memory).await {
+                tracing::warn!(%error, human_id = %human.id, "anchor promotion save failed");
+                continue;
+            }
+            if let Err(error) = self
+                .deps
+                .memory_search
+                .store()
+                .set_human_anchor(&human.id, &memory.id)
+                .await
+            {
+                tracing::warn!(%error, human_id = %human.id, "anchor promotion mapping failed");
+            }
+        }
+
+        if links.is_empty() {
+            return None;
+        }
 
         let mut superiors = Vec::new();
         let mut subordinates = Vec::new();
@@ -2991,17 +3039,34 @@ impl Channel {
             let participants = self.state.active_participants.read().await;
             renderable_participants(&participants, &participant_config)
         };
+        // Clone the session anchor cache out and back: never hold a std lock
+        // across an await.
+        let mut anchor_cache = self
+            .state
+            .human_anchor_cache
+            .lock()
+            .expect("human anchor cache lock")
+            .clone();
         let participant_context = match crate::memory::working::render_participant_context(
             &self.deps.working_memory,
             &tracked_participants,
             self.id.as_ref(),
             &participant_config,
+            &self.deps.memory_search.store(),
+            &mut anchor_cache,
         )
         .await
         {
-            Ok(text) => text,
+            Ok(rendered) => {
+                *self
+                    .state
+                    .human_anchor_cache
+                    .lock()
+                    .expect("human anchor cache lock") = anchor_cache;
+                rendered
+            }
             Err(error) => {
-                tracing::warn!(channel_id = %self.id, %error, "participant context render failed");
+                tracing::warn!(%error, channel_id = %self.id, "participant context render failed");
                 String::new()
             }
         };
@@ -3096,7 +3161,7 @@ impl Channel {
 
         let available_channels = self.build_available_channels().await;
 
-        let org_context = self.build_org_context(&prompt_engine);
+        let org_context = self.build_org_context(&prompt_engine).await;
 
         let adapter_prompt = match self.state.kind {
             ChannelKind::Cron => prompt_engine.render_channel_adapter_prompt("cron"),

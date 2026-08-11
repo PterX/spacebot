@@ -20,6 +20,7 @@ const SECTIONS: &[(MemoryType, &str, usize)] = &[
     (MemoryType::Preference, "Preferences", 10),
     (MemoryType::Goal, "Goals", 10),
     (MemoryType::Observation, "Observations", 8),
+    (MemoryType::Human, "People", 5),
 ];
 
 /// Render the global memory-store view for the knowledge-context slot.

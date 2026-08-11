@@ -279,6 +279,9 @@ async fn dump_channel_context() {
         active_participants: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         cron_outcome: None,
         autonomy_run: None,
+        human_anchor_cache: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
     };
 
     let tool_server = rig::tool::server::ToolServer::new().run();
@@ -546,6 +549,9 @@ async fn dump_all_contexts() {
         active_participants: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         cron_outcome: None,
         autonomy_run: None,
+        human_anchor_cache: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
     };
     let channel_tool_server = rig::tool::server::ToolServer::new().run();
     let skip_flag = spacebot::tools::new_skip_flag();

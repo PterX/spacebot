@@ -101,6 +101,10 @@ pub struct MemorySaveArgs {
     pub source: Option<String>,
     /// Optional channel ID to associate this memory with the conversation it came from.
     pub channel_id: Option<String>,
+    /// Required when `memory_type` is `human`: the exact participant key of
+    /// the human this anchor is about. Saves merge into the existing anchor
+    /// instead of creating a duplicate (3.1a).
+    pub human_id: Option<String>,
     /// Optional associations to create with other memories.
     #[serde(default)]
     pub associations: Vec<AssociationInput>,
@@ -200,6 +204,10 @@ impl Tool for MemorySaveTool {
                             {
                                 "const": "todo",
                                 "description": "Concrete tasks to complete. Creates accountability."
+                            },
+                            {
+                                "const": "human",
+                                "description": "A curated anchor for a specific human — who they are, how they prefer to work. Requires human_id; saves merge into the existing anchor for that human."
                             }
                         ]
                     },
@@ -216,6 +224,10 @@ impl Tool for MemorySaveTool {
                     "channel_id": {
                         "type": "string",
                         "description": "Optional channel ID to associate this memory with the conversation it came from"
+                    },
+                    "human_id": {
+                        "type": "string",
+                        "description": "Required when memory_type is 'human': the exact participant key of the human this anchor is about. Saves merge into the existing anchor."
                     },
                     "associations": {
                         "type": "array",
@@ -278,6 +290,7 @@ impl Tool for MemorySaveTool {
             "observation" => MemoryType::Observation,
             "goal" => MemoryType::Goal,
             "todo" => MemoryType::Todo,
+            "human" => MemoryType::Human,
             _ => MemoryType::Fact,
         };
 
@@ -297,6 +310,53 @@ impl Tool for MemorySaveTool {
 
         // Save to SQLite database
         let store = self.memory_search.store();
+
+        // Human anchors (3.1a): a human-typed save with a `human_id` merges
+        // into the existing anchor for that human instead of creating a
+        // duplicate. This is the reflection merge path — persistence
+        // branches save per-session human observations and they accumulate
+        // into one curated anchor per person.
+        if memory_type == MemoryType::Human {
+            if let Some(human_id) = args.human_id.as_deref() {
+                if let Some(existing) = store
+                    .get_human_anchor(human_id)
+                    .await
+                    .map_err(|e| MemorySaveError(format!("Failed to resolve human anchor: {e}")))?
+                {
+                    let mut merged = existing.clone();
+                    merged.content = format!("{}\n{}", existing.content.trim_end(), args.content);
+                    merged.importance = existing.importance.max(memory.importance);
+                    store.update(&merged).await.map_err(|e| {
+                        MemorySaveError(format!("Failed to merge human anchor: {e}"))
+                    })?;
+                    return Ok(MemorySaveOutput {
+                        memory_id: existing.id,
+                        success: true,
+                        message: "merged into existing human anchor".to_string(),
+                        consolidation: None,
+                    });
+                }
+                // No anchor yet — save a fresh anchor memory and map it.
+                store
+                    .save(&memory)
+                    .await
+                    .map_err(|e| MemorySaveError(format!("Failed to save memory: {e}")))?;
+                store
+                    .set_human_anchor(human_id, &memory.id)
+                    .await
+                    .map_err(|e| MemorySaveError(format!("Failed to map human anchor: {e}")))?;
+                return Ok(MemorySaveOutput {
+                    memory_id: memory.id.clone(),
+                    success: true,
+                    message: "created human anchor".to_string(),
+                    consolidation: None,
+                });
+            }
+            return Err(MemorySaveError(
+                "human memories require human_id (the participant key of the person)".into(),
+            ));
+        }
+
         store
             .save(&memory)
             .await
@@ -542,6 +602,7 @@ pub async fn save_fact(
         importance: None,
         source: None,
         channel_id: channel_id.map(|id| id.to_string()),
+        human_id: None,
         associations: vec![],
     };
 

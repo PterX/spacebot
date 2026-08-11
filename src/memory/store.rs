@@ -587,6 +587,57 @@ impl MemoryStore {
         Ok(count)
     }
 
+    /// Point a human at their anchor memory. `INSERT OR REPLACE` semantics:
+    /// a second anchor for the same human replaces the mapping (the old
+    /// anchor memory stays in the store, unmapped).
+    pub async fn set_human_anchor(&self, human_id: &str, memory_id: &str) -> Result<()> {
+        sqlx::query("INSERT OR REPLACE INTO human_identities (human_id, memory_id) VALUES (?, ?)")
+            .bind(human_id)
+            .bind(memory_id)
+            .execute(&self.pool)
+            .await
+            .with_context(|| format!("failed to map human anchor for {human_id}"))?;
+        Ok(())
+    }
+
+    /// Resolve a human to their anchor memory by exact participant key.
+    /// `None` when the human has no anchor yet (3.1a in-turn resolution).
+    pub async fn get_human_anchor(&self, human_id: &str) -> Result<Option<Memory>> {
+        let row = sqlx::query(
+            "SELECT m.id, m.content, m.memory_type, m.importance, m.created_at, m.updated_at, \
+             m.last_accessed_at, m.access_count, m.source, m.channel_id, m.forgotten, \
+             m.supersedes_checkpoint_id \
+             FROM human_identities h \
+             JOIN memories m ON m.id = h.memory_id \
+             WHERE h.human_id = ? AND m.forgotten = 0",
+        )
+        .bind(human_id)
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("failed to resolve human anchor for {human_id}"))?;
+        Ok(row.map(|r| row_to_memory(&r)))
+    }
+
+    /// All human → anchor mappings (human_id, anchor memory). Used for the
+    /// ambient → org promotion pass.
+    pub async fn list_human_anchors(&self) -> Result<Vec<(String, Memory)>> {
+        let rows = sqlx::query(
+            "SELECT h.human_id, m.id, m.content, m.memory_type, m.importance, \
+             m.created_at, m.updated_at, m.last_accessed_at, m.access_count, \
+             m.source, m.channel_id, m.forgotten, m.supersedes_checkpoint_id \
+             FROM human_identities h \
+             JOIN memories m ON m.id = h.memory_id \
+             WHERE m.forgotten = 0",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list human anchors")?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get("human_id"), row_to_memory(&row)))
+            .collect())
+    }
+
     /// Get high-importance memories for injection into context.
     pub async fn get_high_importance(&self, threshold: f32, limit: i64) -> Result<Vec<Memory>> {
         let rows = sqlx::query(

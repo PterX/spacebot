@@ -72,6 +72,7 @@ pub(super) fn parse_memory_type(type_str: &str) -> Option<MemoryType> {
         "observation" => Some(MemoryType::Observation),
         "goal" => Some(MemoryType::Goal),
         "todo" => Some(MemoryType::Todo),
+        "human" => Some(MemoryType::Human),
         _ => None,
     }
 }

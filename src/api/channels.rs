@@ -631,6 +631,8 @@ pub(super) async fn inspect_prompt(
         &tracked_participants,
         &query.channel_id,
         &participant_config,
+        &channel_state.deps.memory_search.store(),
+        &mut std::collections::HashMap::new(),
     )
     .await
     .unwrap_or_else(|error| {

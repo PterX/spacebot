@@ -801,6 +801,8 @@ pub async fn render_participant_context(
     participants: &[crate::conversation::ActiveParticipant],
     channel_id: &str,
     config: &crate::config::ParticipantContextConfig,
+    memory_store: &crate::memory::MemoryStore,
+    anchor_cache: &mut std::collections::HashMap<String, Option<String>>,
 ) -> Result<String> {
     use std::fmt::Write;
 
@@ -832,6 +834,19 @@ pub async fn render_participant_context(
         )
         .await?;
         writeln!(output, "  Recent: {recent_line}.").ok();
+
+        // Human anchor (3.1a): the curated anchor memory for this person,
+        // resolved exactly by participant key and cached per session. Only
+        // the first line is shown inline — the anchor is a summary, not a
+        // dump.
+        if let Some(anchor) =
+            resolve_human_anchor(memory_store, anchor_cache, &participant.participant_key).await?
+        {
+            let first_line = anchor.lines().next().unwrap_or("").trim();
+            if !first_line.is_empty() {
+                writeln!(output, "  Anchor: {first_line}").ok();
+            }
+        }
         writeln!(output).ok();
 
         if estimate_tokens(&output) >= config.token_budget {
@@ -855,6 +870,25 @@ pub async fn render_participant_context(
     }
 
     Ok(output.trim_end().to_string())
+}
+
+/// In-turn human anchor resolution with a per-session cache. Exact match on
+/// the participant key; misses are cached too, so each human costs at most
+/// one query per session (3.1a).
+async fn resolve_human_anchor(
+    store: &crate::memory::MemoryStore,
+    cache: &mut std::collections::HashMap<String, Option<String>>,
+    human_id: &str,
+) -> Result<Option<String>> {
+    if let Some(cached) = cache.get(human_id) {
+        return Ok(cached.clone());
+    }
+    let resolved = store
+        .get_human_anchor(human_id)
+        .await?
+        .map(|memory| memory.content);
+    cache.insert(human_id.to_string(), resolved.clone());
+    Ok(resolved)
 }
 
 /// Format a single event as a one-line summary for the raw tail.
@@ -1763,9 +1797,16 @@ mod tests {
             last_message_at: Utc::now(),
         }];
 
-        let rendered = render_participant_context(&store, &participants, "discord:chan-1", &config)
-            .await
-            .unwrap();
+        let rendered = render_participant_context(
+            &store,
+            &participants,
+            "discord:chan-1",
+            &config,
+            &*crate::memory::MemoryStore::connect_in_memory().await,
+            &mut std::collections::HashMap::new(),
+        )
+        .await
+        .unwrap();
 
         assert!(rendered.contains("## Participants"));
         assert!(rendered.contains("**Victor** -- Maintainer"));

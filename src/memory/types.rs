@@ -88,6 +88,7 @@ impl MemoryType {
             MemoryType::Observation => 0.3,
             MemoryType::Goal => 0.9,
             MemoryType::Todo => 0.8,
+            MemoryType::Human => 0.85,
         }
     }
 }
@@ -112,6 +113,10 @@ pub enum MemoryType {
     Goal,
     /// An actionable task or reminder.
     Todo,
+    /// A curated anchor for a specific human — who they are, how they
+    /// prefer to work, what they care about. One anchor per human,
+    /// mapped via `human_identities` and merged by reflection (3.1a).
+    Human,
 }
 
 impl MemoryType {
@@ -125,6 +130,7 @@ impl MemoryType {
         MemoryType::Observation,
         MemoryType::Goal,
         MemoryType::Todo,
+        MemoryType::Human,
     ];
 
     /// Parse a memory type from its lowercase label, matching `Display`.
@@ -144,6 +150,7 @@ impl std::fmt::Display for MemoryType {
             MemoryType::Observation => write!(f, "observation"),
             MemoryType::Goal => write!(f, "goal"),
             MemoryType::Todo => write!(f, "todo"),
+            MemoryType::Human => write!(f, "human"),
         }
     }
 }
