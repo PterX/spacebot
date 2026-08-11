@@ -369,3 +369,271 @@ impl EmbeddingTable {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// Chronicle embeddings (execution-plan 1.7)
+// ---------------------------------------------------------------------------
+
+/// Schema constants for the chronicle embeddings table.
+const CHRONICLE_TABLE_NAME: &str = "chronicle_embeddings";
+
+/// A labeled hit from the chronicle embedding table.
+#[derive(Debug, Clone)]
+pub struct ChronicleHit {
+    /// Checkpoint id.
+    pub checkpoint_id: String,
+    /// Checkpoint title.
+    pub title: String,
+    /// Channel the checkpoint belongs to.
+    pub channel_id: String,
+    /// Checkpoint sequence within the channel.
+    pub seq: i64,
+    /// Cosine similarity (1 - distance).
+    pub similarity: f32,
+}
+
+/// LanceDB table for level-0 chronicle checkpoint embeddings. Shares the
+/// Lance connection and embedding model with the memory table; rows are
+/// keyed by checkpoint id and carry title/channel/seq so the query surface
+/// can label results without a SQLite round-trip.
+pub struct ChronicleEmbeddingTable {
+    table: lancedb::Table,
+}
+
+impl Clone for ChronicleEmbeddingTable {
+    fn clone(&self) -> Self {
+        Self {
+            table: self.table.clone(),
+        }
+    }
+}
+
+impl ChronicleEmbeddingTable {
+    /// Open the existing table or create it. Corrupted tables are dropped and
+    /// recreated — checkpoint embeddings can be regenerated from SQLite.
+    pub async fn open_or_create(connection: &lancedb::Connection) -> Result<Self> {
+        match connection.open_table(CHRONICLE_TABLE_NAME).execute().await {
+            Ok(table) => return Ok(Self { table }),
+            Err(error) => {
+                tracing::debug!(%error, "failed to open chronicle embeddings table, will create");
+            }
+        }
+
+        match Self::create_empty_table(connection).await {
+            Ok(table) => return Ok(Self { table }),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "failed to create chronicle embeddings table, attempting recovery"
+                );
+            }
+        }
+
+        if let Err(error) = connection.drop_table(CHRONICLE_TABLE_NAME, &[]).await {
+            tracing::warn!(%error, "drop_table failed during chronicle recovery, proceeding");
+        }
+        let table = Self::create_empty_table(connection).await?;
+        tracing::info!("chronicle embeddings table recovered — will backfill from checkpoints");
+        Ok(Self { table })
+    }
+
+    /// Create an empty chronicle embeddings table.
+    async fn create_empty_table(connection: &lancedb::Connection) -> Result<lancedb::Table> {
+        let schema = Self::schema();
+        let batches = RecordBatchIterator::new(vec![].into_iter().map(Ok), Arc::new(schema));
+
+        connection
+            .create_table(CHRONICLE_TABLE_NAME, Box::new(batches))
+            .execute()
+            .await
+            .map_err(|e| DbError::LanceDb(e.to_string()).into())
+    }
+
+    /// Store (or replace) the embedding row for a checkpoint.
+    pub async fn store(
+        &self,
+        checkpoint_id: &str,
+        title: &str,
+        channel_id: &str,
+        seq: i64,
+        text: &str,
+        embedding: &[f32],
+    ) -> Result<()> {
+        if embedding.len() != EMBEDDING_DIM as usize {
+            return Err(DbError::LanceDb(format!(
+                "Chronicle embedding dimension mismatch: expected {}, got {}",
+                EMBEDDING_DIM,
+                embedding.len()
+            ))
+            .into());
+        }
+
+        // Replace any prior row for the same checkpoint.
+        let predicate = format!("id = '{}'", checkpoint_id.replace('\'', "''"));
+        let _ = self.table.delete(&predicate).await;
+
+        use arrow_array::{RecordBatch, StringArray};
+
+        let schema = Self::schema();
+        let id_array = StringArray::from(vec![checkpoint_id]);
+        let title_array = StringArray::from(vec![title]);
+        let channel_array = StringArray::from(vec![channel_id]);
+        let seq_array = arrow_array::Int64Array::from(vec![seq]);
+        let text_array = StringArray::from(vec![text]);
+
+        let embedding_array =
+            arrow_array::FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+                vec![Some(embedding.iter().map(|v| Some(*v)).collect::<Vec<_>>())],
+                EMBEDDING_DIM,
+            );
+
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(id_array) as arrow_array::ArrayRef,
+                Arc::new(title_array) as arrow_array::ArrayRef,
+                Arc::new(channel_array) as arrow_array::ArrayRef,
+                Arc::new(seq_array) as arrow_array::ArrayRef,
+                Arc::new(text_array) as arrow_array::ArrayRef,
+                Arc::new(embedding_array) as arrow_array::ArrayRef,
+            ],
+        )
+        .map_err(|e| DbError::LanceDb(e.to_string()))?;
+
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], Arc::new(Self::schema()));
+
+        self.table
+            .add(Box::new(batches))
+            .execute()
+            .await
+            .map_err(|e| DbError::LanceDb(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Delete the embedding row for a checkpoint.
+    pub async fn delete(&self, checkpoint_id: &str) -> Result<()> {
+        let predicate = format!("id = '{}'", checkpoint_id.replace('\'', "''"));
+        self.table
+            .delete(&predicate)
+            .await
+            .map_err(|e| DbError::LanceDb(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Whether a checkpoint already has an embedding row (backfill check).
+    pub async fn has(&self, checkpoint_id: &str) -> Result<bool> {
+        use lancedb::query::{ExecutableQuery, QueryBase};
+
+        let results: Vec<arrow_array::RecordBatch> = self
+            .table
+            .query()
+            .only_if(format!("id = '{}'", checkpoint_id.replace('\'', "''")))
+            .limit(1)
+            .execute()
+            .await
+            .map_err(|e| DbError::LanceDb(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| DbError::LanceDb(e.to_string()))?;
+
+        Ok(results.iter().any(|batch| batch.num_rows() > 0))
+    }
+
+    /// Vector similarity search over checkpoint embeddings.
+    /// Returns labeled hits sorted by similarity (descending).
+    pub async fn vector_search(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<ChronicleHit>> {
+        if query_embedding.len() != EMBEDDING_DIM as usize {
+            return Err(DbError::LanceDb(format!(
+                "Query embedding dimension mismatch: expected {}, got {}",
+                EMBEDDING_DIM,
+                query_embedding.len()
+            ))
+            .into());
+        }
+
+        use lancedb::query::{ExecutableQuery, QueryBase};
+
+        let results: Vec<arrow_array::RecordBatch> = self
+            .table
+            .query()
+            .nearest_to(query_embedding)
+            .map_err(|e| DbError::LanceDb(e.to_string()))?
+            .limit(limit)
+            .execute()
+            .await
+            .map_err(|e| DbError::LanceDb(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| DbError::LanceDb(e.to_string()))?;
+
+        let mut hits = Vec::new();
+        for batch in results {
+            if let (
+                Some(id_col),
+                Some(title_col),
+                Some(channel_col),
+                Some(seq_col),
+                Some(dist_col),
+            ) = (
+                batch.column_by_name("id"),
+                batch.column_by_name("title"),
+                batch.column_by_name("channel_id"),
+                batch.column_by_name("seq"),
+                batch.column_by_name("_distance"),
+            ) {
+                let ids: &arrow_array::StringArray = id_col.as_string::<i32>();
+                let titles: &arrow_array::StringArray = title_col.as_string::<i32>();
+                let channels: &arrow_array::StringArray = channel_col.as_string::<i32>();
+                let seqs: &arrow_array::Int64Array = seq_col.as_primitive();
+                let dists: &arrow_array::PrimitiveArray<Float32Type> = dist_col.as_primitive();
+
+                for i in 0..ids.len() {
+                    if ids.is_valid(i) && dists.is_valid(i) && titles.is_valid(i) {
+                        hits.push(ChronicleHit {
+                            checkpoint_id: ids.value(i).to_string(),
+                            title: titles.value(i).to_string(),
+                            channel_id: channels.value(i).to_string(),
+                            seq: seqs.value(i),
+                            similarity: 1.0 - dists.value(i),
+                        });
+                    }
+                }
+            }
+        }
+
+        hits.sort_by(|a, b| {
+            b.similarity
+                .partial_cmp(&a.similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(hits)
+    }
+
+    /// Get the Arrow schema for the chronicle embeddings table.
+    fn schema() -> arrow_schema::Schema {
+        arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Utf8, false),
+            arrow_schema::Field::new("title", arrow_schema::DataType::Utf8, false),
+            arrow_schema::Field::new("channel_id", arrow_schema::DataType::Utf8, false),
+            arrow_schema::Field::new("seq", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("text", arrow_schema::DataType::Utf8, false),
+            arrow_schema::Field::new(
+                "embedding",
+                arrow_schema::DataType::FixedSizeList(
+                    Arc::new(arrow_schema::Field::new(
+                        "item",
+                        arrow_schema::DataType::Float32,
+                        true,
+                    )),
+                    EMBEDDING_DIM,
+                ),
+                false,
+            ),
+        ])
+    }
+}

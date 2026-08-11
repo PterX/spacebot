@@ -209,6 +209,22 @@ pub async fn execute_batch(
         updated_survivor.importance = survivor.importance.max(absorbed.importance);
         updated_survivor.updated_at = chrono::Utc::now();
 
+        // Supersede-with-provenance (1.7): record the chronicle checkpoint
+        // whose span the absorbed memory came from, so the merged memory
+        // carries where the superseded claim originated.
+        if updated_survivor.supersedes_checkpoint_id.is_none()
+            && let Some(channel_id) = &absorbed.channel_id
+        {
+            let chronicle =
+                crate::conversation::chronicle::ChronicleStore::new(store.pool().clone());
+            if let Ok(Some(checkpoint)) = chronicle
+                .covering_checkpoint(channel_id, absorbed.created_at)
+                .await
+            {
+                updated_survivor.supersedes_checkpoint_id = Some(checkpoint.id);
+            }
+        }
+
         store
             .merge_memories_atomic(&updated_survivor, &absorbed)
             .await

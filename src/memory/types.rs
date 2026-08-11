@@ -19,6 +19,9 @@ pub struct Memory {
     /// Soft-delete flag. Forgotten memories are excluded from search and recall
     /// but remain in the database.
     pub forgotten: bool,
+    /// Chronicle checkpoint whose span this memory superseded (set by write-
+    /// time consolidation). Provenance for supersede-with-provenance (1.7).
+    pub supersedes_checkpoint_id: Option<String>,
 }
 
 impl Memory {
@@ -40,6 +43,7 @@ impl Memory {
             source: None,
             channel_id: None,
             forgotten: false,
+            supersedes_checkpoint_id: None,
         }
     }
 
@@ -210,12 +214,24 @@ impl std::fmt::Display for RelationType {
     }
 }
 
+/// Chronicle checkpoint reference surfaced on search results: which
+/// checkpoint's span produced this memory (range join, 1.7).
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct CheckpointRef {
+    pub title: String,
+    pub seq: i64,
+}
+
 /// Search result combining memory with relevance score.
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct MemorySearchResult {
     pub memory: Memory,
     pub score: f32,
     pub rank: usize,
+    /// The chronicle checkpoint whose span this memory came from, when the
+    /// memory has a channel and a covering checkpoint exists (range join).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<CheckpointRef>,
 }
 
 /// Input for memory creation.

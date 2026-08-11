@@ -69,8 +69,9 @@ impl MemoryStore {
         sqlx::query(
             r#"
             INSERT INTO memories (id, content, memory_type, importance, created_at, updated_at,
-                                 last_accessed_at, access_count, source, channel_id, forgotten)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 last_accessed_at, access_count, source, channel_id, forgotten,
+                                 supersedes_checkpoint_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&memory.id)
@@ -84,6 +85,7 @@ impl MemoryStore {
         .bind(&memory.source)
         .bind(memory.channel_id.as_deref())
         .bind(memory.forgotten)
+        .bind(memory.supersedes_checkpoint_id.as_deref())
         .execute(&self.pool)
         .await
         .with_context(|| format!("failed to save memory {}", memory.id))?;
@@ -114,7 +116,8 @@ impl MemoryStore {
         let row = sqlx::query(
             r#"
             SELECT id, content, memory_type, importance, created_at, updated_at,
-                   last_accessed_at, access_count, source, channel_id, forgotten
+                   last_accessed_at, access_count, source, channel_id, forgotten,
+                   supersedes_checkpoint_id
             FROM memories
             WHERE id = ?
             "#,
@@ -554,7 +557,8 @@ impl MemoryStore {
         let rows = sqlx::query(
             r#"
             SELECT id, content, memory_type, importance, created_at, updated_at,
-                   last_accessed_at, access_count, source, channel_id, forgotten
+                   last_accessed_at, access_count, source, channel_id, forgotten,
+                   supersedes_checkpoint_id
             FROM memories
             WHERE memory_type = ? AND forgotten = 0
             ORDER BY importance DESC, updated_at DESC
@@ -588,7 +592,8 @@ impl MemoryStore {
         let rows = sqlx::query(
             r#"
             SELECT id, content, memory_type, importance, created_at, updated_at,
-                   last_accessed_at, access_count, source, channel_id, forgotten
+                   last_accessed_at, access_count, source, channel_id, forgotten,
+                   supersedes_checkpoint_id
             FROM memories
             WHERE importance >= ? AND forgotten = 0
             ORDER BY importance DESC, updated_at DESC
@@ -624,7 +629,8 @@ impl MemoryStore {
             (
                 format!(
                     "SELECT id, content, memory_type, importance, created_at, updated_at, \
-                     last_accessed_at, access_count, source, channel_id, forgotten \
+                     last_accessed_at, access_count, source, channel_id, forgotten, \
+                     supersedes_checkpoint_id \
                      FROM memories WHERE memory_type = ? AND forgotten = 0 {order_clause} LIMIT ?"
                 ),
                 Some(memory_type.to_string()),
@@ -633,7 +639,8 @@ impl MemoryStore {
             (
                 format!(
                     "SELECT id, content, memory_type, importance, created_at, updated_at, \
-                     last_accessed_at, access_count, source, channel_id, forgotten \
+                     last_accessed_at, access_count, source, channel_id, forgotten, \
+                     supersedes_checkpoint_id \
                      FROM memories WHERE forgotten = 0 {order_clause} LIMIT ?"
                 ),
                 None,
@@ -708,7 +715,8 @@ fn row_to_memory(row: &sqlx::sqlite::SqliteRow) -> Memory {
         access_count: row.try_get("access_count").unwrap_or(0),
         source: row.try_get("source").ok(),
         channel_id,
-        forgotten: row.try_get::<bool, _>("forgotten").unwrap_or(false),
+        forgotten: row.try_get("forgotten").unwrap_or(false),
+        supersedes_checkpoint_id: row.try_get("supersedes_checkpoint_id").ok(),
     }
 }
 

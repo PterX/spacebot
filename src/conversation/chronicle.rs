@@ -453,6 +453,54 @@ impl ChronicleStore {
         Ok(checkpoints_from_rows(rows))
     }
 
+    /// The newest level-0 checkpoint whose timestamp window covers `at`, or
+    /// `None` when no checkpoint covers that instant. This is the range-join
+    /// key from memories (by `created_at`) back to the chronicle span that
+    /// produced them (1.7).
+    pub async fn covering_checkpoint(
+        &self,
+        channel_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<ChronicleCheckpoint>> {
+        let row = sqlx::query(
+            r#"
+            SELECT * FROM channel_chronicle_checkpoints
+            WHERE channel_id = ? AND level = 0
+              AND covers_from_at <= ? AND covers_to_at >= ?
+            ORDER BY seq DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(channel_id)
+        .bind(at)
+        .bind(at)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+        Ok(match row {
+            Some(row) => checkpoint_from_row(&row).ok(),
+            None => None,
+        })
+    }
+
+    /// Every level-0 checkpoint across all channels, oldest first. Used for
+    /// the one-time chronicle embedding backfill (1.7).
+    pub async fn list_level_zero_all(&self) -> Result<Vec<ChronicleCheckpoint>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM channel_chronicle_checkpoints
+            WHERE level = 0
+            ORDER BY seq ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+        Ok(checkpoints_from_rows(rows))
+    }
+
     /// Checkpoints at a level with a sequence below `before_seq`, oldest first.
     /// Used to select the older-history portion of the prompt view.
     pub async fn list_before_seq(

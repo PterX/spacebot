@@ -2375,11 +2375,31 @@ async fn initialize_agents(
             tracing::warn!(%error, agent = %agent_config.id, "failed to create FTS index");
         }
 
-        let memory_search = Arc::new(spacebot::memory::MemorySearch::new(
-            memory_store,
-            embedding_table,
-            embedding_model.clone(),
-        ));
+        let memory_search = Arc::new(
+            spacebot::memory::MemorySearch::new(
+                memory_store,
+                embedding_table,
+                embedding_model.clone(),
+            )
+            .with_chronicle_table(
+                spacebot::memory::ChronicleEmbeddingTable::open_or_create(&db.lance)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to init chronicle embeddings for agent '{}'",
+                            agent_config.id
+                        )
+                    })?,
+            ),
+        );
+
+        // One-time backfill of level-0 checkpoint embeddings (1.7).
+        if let Err(error) = memory_search
+            .backfill_chronicle_embeddings(&db.sqlite)
+            .await
+        {
+            tracing::warn!(%error, agent = %agent_config.id, "chronicle embedding backfill failed");
+        }
 
         // Working memory event log (temporal situational awareness).
         let working_memory_timezone = {

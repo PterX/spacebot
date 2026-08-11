@@ -113,6 +113,10 @@ pub struct MemoryRecallOutput {
     pub total_found: usize,
     /// Formatted summary of the memories.
     pub summary: String,
+    /// Labeled chronicle checkpoint hits from the unified recall surface
+    /// (1.7). Empty when the chronicle table is not wired or no query was
+    /// embedded.
+    pub checkpoints: Vec<ChronicleHitOutput>,
 }
 
 /// Simplified memory output for serialization.
@@ -130,6 +134,29 @@ pub struct MemoryOutput {
     pub created_at: String,
     /// The relevance score from the search.
     pub relevance_score: f32,
+    /// The chronicle checkpoint whose span this memory came from
+    /// (range join, 1.7), rendered as "checkpoint #seq: title".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+    /// The chronicle checkpoint the superseded claim came from
+    /// (supersede-with-provenance, 1.7), rendered as "#seq: title".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supersedes_checkpoint: Option<String>,
+}
+
+/// A labeled chronicle checkpoint hit from the unified recall surface (1.7).
+#[derive(Debug, Serialize)]
+pub struct ChronicleHitOutput {
+    /// The checkpoint id.
+    pub checkpoint_id: String,
+    /// The checkpoint title.
+    pub title: String,
+    /// The channel the checkpoint belongs to.
+    pub channel_id: String,
+    /// The checkpoint sequence within the channel.
+    pub seq: i64,
+    /// Cosine similarity to the query.
+    pub similarity: f32,
 }
 
 impl Tool for MemoryRecallTool {
@@ -221,15 +248,16 @@ impl Tool for MemoryRecallTool {
         };
 
         let query = args.query.as_deref().unwrap_or("");
-        let search_results = self
+        let (search_results, checkpoint_hits) = self
             .memory_search
-            .search(query, &config)
+            .search_with_chronicle(query, &config, args.max_results.min(5))
             .await
             .map_err(|e| MemoryRecallError(format!("Search failed: {e}")))?;
 
         let curated = curate_results(&search_results, args.max_results);
 
         let store = self.memory_search.store();
+        let chronicle = crate::conversation::chronicle::ChronicleStore::new(store.pool().clone());
         let mut memories = Vec::new();
 
         for result in &curated {
@@ -241,6 +269,30 @@ impl Tool for MemoryRecallTool {
                 );
             }
 
+            let checkpoint = result
+                .checkpoint
+                .as_ref()
+                .map(|c| format!("checkpoint #{}: {}", c.seq, c.title));
+
+            // Supersede-with-provenance: resolve the recorded checkpoint id
+            // to a human-readable reference when it still exists.
+            let supersedes_checkpoint = if let Some(id) = &result.memory.supersedes_checkpoint_id {
+                match result
+                    .memory
+                    .channel_id
+                    .as_deref()
+                    .map(|channel| chronicle.get_by_id(channel, id))
+                {
+                    Some(fut) => match fut.await {
+                        Ok(Some(cp)) => Some(format!("#{}: {}", cp.seq, cp.title)),
+                        _ => None, // rolled up or missing — the id itself stays on the memory
+                    },
+                    None => None,
+                }
+            } else {
+                None
+            };
+
             memories.push(MemoryOutput {
                 id: result.memory.id.clone(),
                 content: result.memory.content.clone(),
@@ -248,8 +300,21 @@ impl Tool for MemoryRecallTool {
                 importance: result.memory.importance,
                 created_at: result.memory.created_at.to_rfc3339(),
                 relevance_score: result.score,
+                checkpoint,
+                supersedes_checkpoint,
             });
         }
+
+        let checkpoints = checkpoint_hits
+            .into_iter()
+            .map(|hit| ChronicleHitOutput {
+                checkpoint_id: hit.checkpoint_id,
+                title: hit.title,
+                channel_id: hit.channel_id,
+                seq: hit.seq,
+                similarity: hit.similarity,
+            })
+            .collect();
 
         let total_found = search_results.len();
         let summary = format_memories(&memories);
@@ -272,6 +337,7 @@ impl Tool for MemoryRecallTool {
             memories,
             total_found,
             summary,
+            checkpoints,
         })
     }
 }
@@ -287,13 +353,20 @@ pub fn format_memories(memories: &[MemoryOutput]) -> String {
     for (i, memory) in memories.iter().enumerate() {
         let preview = memory.content.lines().next().unwrap_or(&memory.content);
         output.push_str(&format!(
-            "{}. [{}] (importance: {:.2}, relevance: {:.2})\n   {}\n\n",
+            "{}. [{}] (importance: {:.2}, relevance: {:.2})\n   {}\n",
             i + 1,
             memory.memory_type,
             memory.importance,
             memory.relevance_score,
             preview
         ));
+        if let Some(checkpoint) = &memory.checkpoint {
+            output.push_str(&format!("   from {checkpoint}\n"));
+        }
+        if let Some(supersedes) = &memory.supersedes_checkpoint {
+            output.push_str(&format!("   supersedes claim from {supersedes}\n"));
+        }
+        output.push('\n');
     }
 
     output
