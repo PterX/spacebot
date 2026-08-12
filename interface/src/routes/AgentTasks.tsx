@@ -17,6 +17,7 @@ import {
 	type TaskCreateFormData,
 } from "@spacedrive/ai";
 import {
+	ExecutionPlanSection,
 	GithubMetadataBadges,
 	getGithubReferences,
 } from "@/components/TaskUtils";
@@ -221,6 +222,9 @@ export function AgentTasks({agentId}: {agentId: string}) {
 						onSubtaskToggle={handleSubtaskToggle}
 						onDelete={handleDelete}
 						onClose={() => setActiveTaskId(null)}
+						beforeSubtasks={
+							<ExecutionPlanSection task={activeTask as unknown as TaskItem} />
+						}
 					/>
 					{/* GitHub metadata (not part of the shared TaskDetail) */}
 					<GithubSection

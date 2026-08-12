@@ -1,7 +1,18 @@
 import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
-import { faCodeBranch, faExternalLinkAlt } from "@fortawesome/free-solid-svg-icons";
+import {
+  faCodeBranch,
+  faExternalLinkAlt,
+  faRobot,
+  faFolderTree,
+  faGraduationCap,
+  faLock,
+  faLockOpen,
+  faLayerGroup,
+} from "@fortawesome/free-solid-svg-icons";
 import { Badge, Popover, SelectPill, OptionList, OptionListItem } from "@spacedrive/primitives";
+import { api, type TaskItem } from "@/api/client";
 
 // ---------------------------------------------------------------------------
 // GitHub metadata helpers
@@ -117,6 +128,148 @@ export function GithubMetadataBadges({
           </Badge>
         );
       })}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Execution plan — where and how a task's work runs
+// ---------------------------------------------------------------------------
+
+const WORKTREE_MODE_LABELS: Record<string, string> = {
+  root: "project root",
+  existing: "existing worktree",
+  create: "new worktree",
+};
+
+function taskHasExecutionPlan(task: TaskItem): boolean {
+  return Boolean(
+    task.worker_type ||
+      task.project_id ||
+      task.worktree_mode ||
+      task.worktree_id ||
+      (task.required_skills?.length ?? 0) > 0 ||
+      (task.depends_on?.length ?? 0) > 0,
+  );
+}
+
+export function ExecutionPlanSection({ task }: { task: TaskItem }) {
+  const hasPlan = taskHasExecutionPlan(task);
+
+  const { data: projectsData } = useQuery({
+    queryKey: ["projects"],
+    queryFn: () => api.listProjects("active"),
+    staleTime: 30_000,
+    enabled: hasPlan && Boolean(task.project_id),
+  });
+
+  // Repo and worktree names live on the project detail; fetched only when
+  // the plan references one.
+  const needsDetail = Boolean(task.project_id && (task.repo_id || task.worktree_id));
+  const { data: projectDetail } = useQuery({
+    queryKey: ["project", task.project_id],
+    queryFn: () => api.getProject(task.project_id as string),
+    staleTime: 30_000,
+    enabled: needsDetail,
+  });
+
+  if (!hasPlan) return null;
+
+  const project = projectsData?.projects.find((p) => p.id === task.project_id);
+  const repo = projectDetail?.repos.find((r) => r.id === task.repo_id);
+  const worktree = projectDetail?.worktrees.find((w) => w.id === task.worktree_id);
+
+  const worktreeLabel = (() => {
+    if (task.worktree_mode === "existing") {
+      return worktree ? `worktree: ${worktree.name}` : "existing worktree";
+    }
+    if (task.worktree_mode) {
+      return WORKTREE_MODE_LABELS[task.worktree_mode] ?? task.worktree_mode;
+    }
+    // A bound worktree without an explicit mode still names where work runs.
+    return worktree ? `worktree: ${worktree.name}` : null;
+  })();
+
+  // Styled to sit inside TaskDetail's `beforeSubtasks` slot, which already
+  // provides section spacing and padding.
+  return (
+    <div>
+      <h3 className="mb-2 text-xs font-medium uppercase tracking-wide text-ink-dull">
+        Execution Plan
+      </h3>
+      <div className="flex flex-wrap items-center gap-1.5">
+        {task.worker_type && (
+          <Badge
+            variant={task.worker_type === "opencode" ? "accent" : "default"}
+            size="sm"
+          >
+            <FontAwesomeIcon icon={faRobot} className="text-[10px]" />
+            <span>{task.worker_type}</span>
+          </Badge>
+        )}
+        {task.project_id && (
+          <Badge variant="default" size="sm">
+            <FontAwesomeIcon icon={faFolderTree} className="text-[10px]" />
+            <span>{project?.name ?? "project"}</span>
+            {repo && project && repo.name !== project.name && (
+              <span className="text-ink-faint">/ {repo.name}</span>
+            )}
+          </Badge>
+        )}
+        {worktreeLabel && (
+          <Badge variant="default" size="sm">
+            <FontAwesomeIcon icon={faCodeBranch} className="text-[10px]" />
+            <span>{worktreeLabel}</span>
+          </Badge>
+        )}
+      </div>
+      {(task.depends_on?.length ?? 0) > 0 && (
+        <div className="mt-2">
+          <div className="mb-1 text-[10px] uppercase tracking-wide text-ink-faint">
+            Dependencies
+          </div>
+          <div className="flex flex-wrap items-center gap-1.5">
+            {task.depends_on.map((edge) => (
+              <Badge
+                key={edge.depends_on_task_number}
+                variant={edge.satisfied ? "success" : "warning"}
+                size="sm"
+                title={`${edge.depends_on_title} — ${edge.depends_on_status}`}
+              >
+                <FontAwesomeIcon
+                  icon={
+                    edge.kind === "stack"
+                      ? faLayerGroup
+                      : edge.satisfied
+                        ? faLockOpen
+                        : faLock
+                  }
+                  className="text-[10px]"
+                />
+                <span>
+                  {edge.kind === "stack" ? "stacks on" : "after"} SPC-
+                  {edge.depends_on_task_number}
+                </span>
+              </Badge>
+            ))}
+          </div>
+        </div>
+      )}
+      {(task.required_skills?.length ?? 0) > 0 && (
+        <div className="mt-2">
+          <div className="mb-1 text-[10px] uppercase tracking-wide text-ink-faint">
+            Required skills
+          </div>
+          <div className="flex flex-wrap items-center gap-1.5">
+            {task.required_skills.map((skill) => (
+              <Badge key={skill} variant="info" size="sm">
+                <FontAwesomeIcon icon={faGraduationCap} className="text-[10px]" />
+                <span>{skill}</span>
+              </Badge>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

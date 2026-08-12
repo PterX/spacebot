@@ -23,6 +23,7 @@ import {
 	type TaskCreateFormData,
 } from "@spacedrive/ai";
 import {
+	ExecutionPlanSection,
 	GithubMetadataBadges,
 	getGithubReferences,
 } from "@/components/TaskUtils";
@@ -310,6 +311,9 @@ export function GlobalTasks() {
 						onSubtaskToggle={handleSubtaskToggle}
 						onDelete={handleDelete}
 						onClose={() => setActiveTaskId(null)}
+						beforeSubtasks={
+							<ExecutionPlanSection task={activeTask as unknown as TaskItem} />
+						}
 					/>
 					<GithubSection
 						metadata={(activeTask as unknown as TaskItem).metadata}

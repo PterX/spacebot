@@ -40,6 +40,7 @@ const TYPE_COLORS: Record<MemoryType, string> = {
 	observation: "bg-cyan-500/15 text-cyan-400",
 	goal: "bg-orange-500/15 text-orange-400",
 	todo: "bg-red-500/15 text-red-400",
+	human: "bg-yellow-500/15 text-yellow-400",
 };
 
 function TypeBadge({type: memoryType}: {type: MemoryType}) {

@@ -33,6 +33,7 @@ const NODE_COLORS: Record<MemoryType, string> = {
 	observation: "#06b6d4",
 	goal: "#f97316",
 	todo: "#ef4444",
+	human: "#eab308",
 };
 
 const EDGE_COLORS: Record<RelationType, string> = {
