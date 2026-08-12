@@ -815,11 +815,18 @@ impl CortexChatSession {
         let web_search_enabled = runtime_config.brave_search_key.load().is_some();
         let opencode_enabled = runtime_config.opencode.load().enabled;
         let mcp_tool_names = self.deps.mcp_manager.get_tool_names().await;
+        // Cortex chat spawns detached workers: no channel to fork, no memory.
+        let worker_context = crate::conversation::settings::WorkerContextMode {
+            history: crate::conversation::settings::WorkerHistoryMode::Clean,
+            memory: crate::conversation::settings::WorkerMemoryMode::None,
+            ..Default::default()
+        };
         let worker_capabilities = prompt_engine.render_worker_capabilities(
             browser_enabled,
             web_search_enabled,
             opencode_enabled,
             &mcp_tool_names,
+            &worker_context,
         )?;
 
         // Load channel transcript if a channel context is active

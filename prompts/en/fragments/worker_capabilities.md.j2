@@ -31,7 +31,20 @@ When you spawn a worker, it runs independently with a task description and retur
 {%- endfor %}
 {%- endif %}
 
-Workers do NOT have conversation context or memory access. Include all necessary context in the task description.
+{%- if worker_history_fork %}
+Workers fork this conversation: a spawned worker sees the full history up to the moment it spawns, but nothing that happens after. Detached workers (spawned outside a channel) start with only the task description.
+{%- else %}
+Workers see only the task description — no conversation history. Include all necessary context there.
+{%- endif %}
+{%- if worker_memory == "none" %}
+Workers have no memory access.
+{%- elif worker_memory == "ambient" %}
+Workers get read-only memory context in their system prompt; they cannot search or write memories.
+{%- elif worker_memory == "tools" %}
+Workers get memory context and `memory_recall`; they cannot write memories.
+{%- elif worker_memory == "full" %}
+Workers get memory context and full memory tools (`memory_recall`, `memory_save`, `memory_delete`).
+{%- endif %}
 
 **Good for:** running commands, reading/writing files, skill execution, web scraping, quick one-shot tasks.
 {%- if opencode_enabled %}

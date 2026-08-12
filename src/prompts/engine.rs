@@ -291,12 +291,15 @@ impl PromptEngine {
     }
 
     /// Convenience method for rendering worker capabilities fragment.
+    /// `worker_context` selects the context prose so the advertised behavior
+    /// matches this conversation's actual worker settings.
     pub fn render_worker_capabilities(
         &self,
         browser_enabled: bool,
         web_search_enabled: bool,
         opencode_enabled: bool,
         mcp_tool_names: &[String],
+        worker_context: &crate::conversation::settings::WorkerContextMode,
     ) -> Result<String> {
         self.render(
             "fragments/worker_capabilities",
@@ -305,6 +308,11 @@ impl PromptEngine {
                 web_search_enabled => web_search_enabled,
                 opencode_enabled => opencode_enabled,
                 mcp_tool_names => mcp_tool_names,
+                worker_history_fork => matches!(
+                    worker_context.history,
+                    crate::conversation::settings::WorkerHistoryMode::Fork
+                ),
+                worker_memory => worker_context.memory.as_str(),
             },
         )
     }

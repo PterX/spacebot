@@ -3085,11 +3085,13 @@ impl Channel {
         let web_search_enabled = rc.brave_search_key.load().is_some();
         let opencode_enabled = rc.opencode.load().enabled;
         let mcp_tool_names = self.deps.mcp_manager.get_tool_names().await;
+        let worker_context = self.state.worker_context_settings.read().await.clone();
         let worker_capabilities = prompt_engine.render_worker_capabilities(
             browser_enabled,
             web_search_enabled,
             opencode_enabled,
             &mcp_tool_names,
+            &worker_context,
         )?;
 
         // Time no longer renders here — it rides on the current user message

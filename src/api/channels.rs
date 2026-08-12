@@ -553,12 +553,14 @@ pub(super) async fn inspect_prompt(
     let web_search_enabled = rc.brave_search_key.load().is_some();
     let opencode_enabled = rc.opencode.load().enabled;
     let mcp_tool_names = channel_state.deps.mcp_manager.get_tool_names().await;
+    let worker_context = channel_state.worker_context_settings.read().await.clone();
     let worker_capabilities = prompt_engine
         .render_worker_capabilities(
             browser_enabled,
             web_search_enabled,
             opencode_enabled,
             &mcp_tool_names,
+            &worker_context,
         )
         .unwrap_or_default();
 
