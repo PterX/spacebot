@@ -164,6 +164,10 @@ impl PromptEngine {
             crate::prompts::text::get("fragments/system/retrigger"),
         )?;
         env.add_template(
+            "fragments/system/retrigger_autonomy",
+            crate::prompts::text::get("fragments/system/retrigger_autonomy"),
+        )?;
+        env.add_template(
             "fragments/system/truncation",
             crate::prompts::text::get("fragments/system/truncation"),
         )?;
@@ -480,6 +484,18 @@ impl PromptEngine {
     pub fn render_system_retrigger(&self, results: &[RetriggerResult]) -> Result<String> {
         self.render(
             "fragments/system/retrigger",
+            context! {
+                results => results,
+            },
+        )
+    }
+
+    /// Render the retrigger message for autonomy channels, which have no
+    /// user-facing reply surface. Results are framed as run context to
+    /// incorporate, not content that must be relayed to a user.
+    pub fn render_system_retrigger_autonomy(&self, results: &[RetriggerResult]) -> Result<String> {
+        self.render(
+            "fragments/system/retrigger_autonomy",
             context! {
                 results => results,
             },

@@ -1,0 +1,10 @@
+[System: {{ results | length }} background process(es) just completed. This is an autonomy run — no human is present and nothing you say is delivered to anyone. Incorporate the results below into your work, then continue or finish the run.
+
+{% for r in results %}
+--- {{ r.process_type }} {{ r.process_id }}{% if not r.success %} (FAILED){% endif %} ---
+{{ r.result }}
+{% endfor %}
+Instructions:
+- Do not attempt to relay these results to any user — there is no reply surface from this channel.
+- Use them to decide your next action: keep working, or call `autonomy_complete` with a summary that reflects what these results changed.
+- Do not mention internal processes (branch, worker, retrigger, process IDs).]

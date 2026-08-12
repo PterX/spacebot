@@ -128,6 +128,9 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         ("en", "fragments/system/retrigger") => {
             include_str!("../../prompts/en/fragments/system/retrigger.md.j2")
         }
+        ("en", "fragments/system/retrigger_autonomy") => {
+            include_str!("../../prompts/en/fragments/system/retrigger_autonomy.md.j2")
+        }
         ("en", "fragments/system/truncation") => {
             include_str!("../../prompts/en/fragments/system/truncation.md.j2")
         }

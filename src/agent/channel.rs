@@ -2815,6 +2815,7 @@ impl Channel {
             let replied = turn_result
                 .replied_flag
                 .load(std::sync::atomic::Ordering::Relaxed);
+            let is_autonomy = self.state.kind == ChannelKind::Autonomy;
             if replied && turn_result.retrigger_reply_preserved {
                 tracing::debug!(
                     channel_id = %self.id,
@@ -2832,6 +2833,17 @@ impl Channel {
 
                 let record = if replied {
                     summary.to_string()
+                } else if is_autonomy {
+                    // Autonomy channels have no reply tool, so a retrigger turn
+                    // never "replies". The results were already presented as
+                    // run context in the retrigger message; record a compact
+                    // copy so they survive into the run's history without the
+                    // user-relay framing.
+                    tracing::debug!(
+                        channel_id = %self.id,
+                        "autonomy retrigger produced no reply; results preserved in history as run context"
+                    );
+                    format!("[background process results]\n{summary}")
                 } else {
                     tracing::warn!(
                         channel_id = %self.id,
@@ -2861,7 +2873,12 @@ impl Channel {
             // Mark the completed items as relayed in the status block so their
             // full result summaries stop appearing on subsequent turns. This
             // prevents the LLM from re-summarising stale worker/branch results.
-            if replied
+            //
+            // For autonomy there is no user-facing relay, but the results are
+            // now recorded in history (either via the reply path or the record
+            // above), so marking them prevents the same results being
+            // re-injected on every subsequent turn of the run.
+            if (replied || is_autonomy)
                 && let Some(ids) = message
                     .metadata
                     .get("retrigger_process_ids")
@@ -4256,13 +4273,18 @@ impl Channel {
             })
             .collect();
 
-        let retrigger_message = match self
-            .deps
-            .runtime_config
-            .prompts
-            .load()
-            .render_system_retrigger(&result_items)
-        {
+        // Autonomy channels have no user-facing reply surface, so the
+        // retrigger must frame results as run context instead of demanding
+        // they be relayed to a user (which the model cannot do and would
+        // resolve by returning an empty message).
+        let prompts = self.deps.runtime_config.prompts.load();
+        let retrigger_message = if self.state.kind == ChannelKind::Autonomy {
+            prompts.render_system_retrigger_autonomy(&result_items)
+        } else {
+            prompts.render_system_retrigger(&result_items)
+        };
+
+        let retrigger_message = match retrigger_message {
             Ok(message) => message,
             Err(error) => {
                 tracing::error!(
