@@ -283,6 +283,11 @@ piece, and the rest can be retired as their successors prove out.
   §3 of that doc asked for tasks to become the spine of autonomous work and
   §4 for character-budgeted run history. This doc is the completion of both
   — deliberation replaces "render everything and hope."
+- **Goals** ([goals-as-authority.md](goals-as-authority.md)): deliberation
+  ranks by goal contribution, and a goal's authority is what admits derived
+  work without per-task approval. An instance with an active goal is also
+  never in the empty-instance cold start — the goal is the direction that
+  branch exists to substitute for.
 
 ## Failure modes
 

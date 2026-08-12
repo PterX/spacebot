@@ -6,6 +6,13 @@ This doc covers the goals data model, tools, context injection, and lifecycle. F
 
 ---
 
+> **Extended by [goals-as-authority.md](goals-as-authority.md).** That doc
+> reframes a goal as standing permission from a human — a scope of delegated
+> authority that admits derived work without per-task approval — and adds
+> per-goal authority levels, success conditions, proposed goals, and channel
+> creation. The data model, injection, and never-auto-complete rule below
+> still hold.
+
 ## Why Goals Are Different from Tasks
 
 Tasks are work to be done. Goals are things to achieve. The distinction matters:
@@ -119,6 +126,12 @@ No token budget — autonomy channels and goal review get the full picture.
 ### Channel Tools (read-only)
 
 Channels get `goal_list` only. They can read goals and reference them in conversation, but cannot mutate them. Goal mutations go through branches.
+
+> Revised by [goals-as-authority.md](goals-as-authority.md): goals originate
+> in conversation, so `goal_create`/`goal_update` move onto the channel
+> toolset. Routing them through a branch added indirection with nothing to
+> protect, and is the reason no goal has ever been created on the live
+> instance.
 
 ### Goal Completion
 
