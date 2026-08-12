@@ -64,6 +64,29 @@ pub(super) struct CreateTaskRequest {
     worktree_id: Option<String>,
     #[serde(default)]
     required_skills: Vec<String>,
+    #[serde(default)]
+    depends_on: Vec<TaskDependencyRequest>,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+pub(super) struct TaskDependencyRequest {
+    task: i64,
+    #[serde(default)]
+    kind: Option<crate::tasks::TaskDependencyKind>,
+}
+
+fn dependency_edges(
+    requests: &[TaskDependencyRequest],
+) -> Vec<(i64, crate::tasks::TaskDependencyKind)> {
+    requests
+        .iter()
+        .map(|r| {
+            (
+                r.task,
+                r.kind.unwrap_or(crate::tasks::TaskDependencyKind::Gate),
+            )
+        })
+        .collect()
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -100,6 +123,9 @@ pub(super) struct UpdateTaskRequest {
     worktree_id: Option<String>,
     #[serde(default)]
     required_skills: Option<Vec<String>>,
+    /// Full replacement of dependency edges; omit to leave unchanged.
+    #[serde(default)]
+    depends_on: Option<Vec<TaskDependencyRequest>>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -362,6 +388,18 @@ pub(super) async fn create_task(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
+    let task = if request.depends_on.is_empty() {
+        task
+    } else {
+        store
+            .set_dependencies(task.task_number, &dependency_edges(&request.depends_on))
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, task_number = task.task_number, "failed to set task dependencies");
+                StatusCode::BAD_REQUEST
+            })?
+    };
+
     finish_task_mutation(&state, &task, "created", None).await;
     Ok(Json(TaskResponse { task }))
 }
@@ -391,6 +429,16 @@ pub(super) async fn update_task(
 
     let status = parse_status(request.status.as_deref())?;
     let priority = parse_priority(request.priority.as_deref())?;
+
+    if let Some(depends_on) = &request.depends_on {
+        store
+            .set_dependencies(number, &dependency_edges(depends_on))
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, task_number = number, "failed to set task dependencies");
+                StatusCode::BAD_REQUEST
+            })?;
+    }
 
     let update = store
         .update_with_status_transition(

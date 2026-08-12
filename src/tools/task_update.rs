@@ -73,6 +73,9 @@ pub struct TaskUpdateArgs {
     pub worktree_mode: Option<String>,
     pub worktree_id: Option<String>,
     pub required_skills: Option<Vec<String>>,
+    /// Full replacement of the task's dependency edges; omit to leave
+    /// unchanged.
+    pub depends_on: Option<Vec<crate::tools::task_create::TaskDependencyArg>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -166,6 +169,22 @@ impl Tool for TaskUpdateTool {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Full replacement of the task's required skills list"
+                    },
+                    "depends_on": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "task": { "type": "integer", "description": "Task number this task depends on" },
+                                "kind": {
+                                    "type": "string",
+                                    "enum": crate::tasks::TaskDependencyKind::ALL.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
+                                    "description": "\"gate\" (default) waits for done; \"stack\" waits only for the dependency's branch"
+                                }
+                            },
+                            "required": ["task"]
+                        },
+                        "description": "Full replacement of this task's dependency edges"
                     }
                 },
                 "required": ["task_number"]
@@ -193,7 +212,8 @@ impl Tool for TaskUpdateTool {
                 || args.repo_id.is_some()
                 || args.worktree_mode.is_some()
                 || args.worktree_id.is_some()
-                || args.required_skills.is_some())
+                || args.required_skills.is_some()
+                || args.depends_on.is_some())
         {
             return Err(TaskUpdateError(
                 "workers can only update subtasks and metadata".to_string(),
@@ -256,6 +276,15 @@ impl Tool for TaskUpdateTool {
             worktree_id: args.worktree_id,
             required_skills: args.required_skills,
         };
+
+        if let Some(depends_on) = &args.depends_on {
+            let edges = crate::tools::task_create::parse_dependency_args(depends_on)
+                .map_err(TaskUpdateError)?;
+            self.task_store
+                .set_dependencies(task_number, &edges)
+                .await
+                .map_err(|error| TaskUpdateError(format!("{error}")))?;
+        }
 
         let update_result = match &self.scope {
             TaskUpdateScope::Branch => self
@@ -407,6 +436,7 @@ mod tests {
                 worktree_mode: None,
                 worktree_id: None,
                 required_skills: None,
+                depends_on: None,
             })
             .await
             .expect("task update should succeed");
@@ -464,6 +494,7 @@ mod tests {
                 worktree_mode: None,
                 worktree_id: None,
                 required_skills: None,
+                depends_on: None,
             })
             .await
             .expect("task update should succeed");
@@ -545,6 +576,7 @@ mod tests {
                 worktree_mode: None,
                 worktree_id: None,
                 required_skills: None,
+                depends_on: None,
             })
             .await
             .expect_err("foreign task should be rejected");
@@ -566,6 +598,7 @@ mod tests {
                 worktree_mode: None,
                 worktree_id: None,
                 required_skills: None,
+                depends_on: None,
             })
             .await
             .expect_err("missing task should be rejected the same way");

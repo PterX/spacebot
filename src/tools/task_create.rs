@@ -100,6 +100,22 @@ pub(crate) async fn resolve_project_reference(
     }
 }
 
+/// Parse tool-level dependency args into store edges.
+pub(crate) fn parse_dependency_args(
+    args: &[TaskDependencyArg],
+) -> Result<Vec<(i64, crate::tasks::TaskDependencyKind)>, String> {
+    args.iter()
+        .map(|arg| {
+            let kind = match arg.kind.as_deref() {
+                None => crate::tasks::TaskDependencyKind::Gate,
+                Some(value) => crate::tasks::TaskDependencyKind::parse(value)
+                    .ok_or_else(|| format!("invalid dependency kind: {value}"))?,
+            };
+            Ok((arg.task, kind))
+        })
+        .collect()
+}
+
 /// Verify every named skill exists in the registry.
 pub(crate) fn validate_required_skills(
     runtime_config: &crate::config::RuntimeConfig,
@@ -155,6 +171,17 @@ pub struct TaskCreateArgs {
     /// skills index.
     #[serde(default)]
     pub required_skills: Vec<String>,
+    /// Tasks this one depends on. `kind` "gate" (default) blocks until the
+    /// dependency is done; "stack" blocks only until its branch exists.
+    #[serde(default)]
+    pub depends_on: Vec<TaskDependencyArg>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TaskDependencyArg {
+    pub task: i64,
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 fn default_priority() -> String {
@@ -225,6 +252,22 @@ impl Tool for TaskCreateTool {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Skills injected into the executing worker unconditionally. Use for procedures the worker must follow, not suggestions."
+                    },
+                    "depends_on": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "task": { "type": "integer", "description": "Task number this task depends on" },
+                                "kind": {
+                                    "type": "string",
+                                    "enum": crate::tasks::TaskDependencyKind::ALL.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
+                                    "description": "\"gate\" (default): blocked until the dependency is done. \"stack\": builds on the dependency's branch, blocked only until that branch exists."
+                                }
+                            },
+                            "required": ["task"]
+                        },
+                        "description": "Tasks that must precede this one. Use when creating a pipeline so the board holds the ordering — dependents stay blocked until their edges clear."
                     }
                 },
                 "required": ["title"]
@@ -236,6 +279,8 @@ impl Tool for TaskCreateTool {
         let priority = TaskPriority::parse(&args.priority)
             .ok_or_else(|| TaskCreateError(format!("invalid priority: {}", args.priority)))?;
         let status = TaskStatus::PendingApproval;
+
+        let depends_on = parse_dependency_args(&args.depends_on).map_err(TaskCreateError)?;
 
         let worker_type = args
             .worker_type
@@ -324,6 +369,22 @@ impl Tool for TaskCreateTool {
             })
             .await
             .map_err(|error| TaskCreateError(format!("{error}")))?;
+
+        // Edges attach after the row exists; a bad edge fails loudly rather
+        // than silently dropping the ordering.
+        let task = if depends_on.is_empty() {
+            task
+        } else {
+            self.task_store
+                .set_dependencies(task.task_number, &depends_on)
+                .await
+                .map_err(|error| {
+                    TaskCreateError(format!(
+                        "task #{} created, but dependencies were rejected: {error}",
+                        task.task_number
+                    ))
+                })?
+        };
 
         // Emit SSE event + notification so the dashboard updates in real time.
         if let Some(api_state) = &self.api_state {
@@ -441,6 +502,7 @@ mod tests {
                 worktree_mode: None,
                 worktree_id: None,
                 required_skills: Vec::new(),
+                depends_on: Vec::new(),
             })
             .await
             .expect("task create should succeed");

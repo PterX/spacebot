@@ -4,7 +4,7 @@ pub mod migration;
 pub mod store;
 
 pub use store::{
-    CreateTaskInput, ExecutionDefaults, ExecutionPlan, Task, TaskListFilter, TaskPriority,
-    TaskStatus, TaskStore, TaskSubtask, TaskUpdateResult, TaskWorkerType, TaskWorktreeMode,
-    UpdateTaskInput, WorkerTaskUpdateResult,
+    CreateTaskInput, ExecutionDefaults, ExecutionPlan, Task, TaskDependencyEdge,
+    TaskDependencyKind, TaskListFilter, TaskPriority, TaskStatus, TaskStore, TaskSubtask,
+    TaskUpdateResult, TaskWorkerType, TaskWorktreeMode, UpdateTaskInput, WorkerTaskUpdateResult,
 };

@@ -640,6 +640,15 @@ fn render_task_line(task: &Task, agent_id: &str) -> String {
     if !plan.is_empty() {
         line.push_str(&format!(" [{}]", plan.summary()));
     }
+    // Surface ordering so runs don't re-derive the pipeline from prose.
+    let blocked_by = task.blocked_by();
+    if !blocked_by.is_empty() {
+        let numbers: Vec<String> = blocked_by.iter().map(|n| format!("#{n}")).collect();
+        line.push_str(&format!(" [blocked by {}]", numbers.join(", ")));
+    }
+    if let Some(parent) = task.stack_parent() {
+        line.push_str(&format!(" [stacks on #{parent}]"));
+    }
     line.push('\n');
     line
 }
@@ -815,6 +824,7 @@ mod tests {
             worktree_mode: None,
             worktree_id: None,
             required_skills: Vec::new(),
+            depends_on: Vec::new(),
             created_by: "user".to_string(),
             approved_at: None,
             approved_by: None,

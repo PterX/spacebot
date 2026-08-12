@@ -193,6 +193,56 @@ pub struct TaskSubtask {
     pub completed: bool,
 }
 
+/// How a dependency edge blocks its dependent.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskDependencyKind {
+    /// The dependent needs the dependency's outcome — blocked until done.
+    Gate,
+    /// The dependent builds on the dependency's code — blocked only until
+    /// its branch exists (worktree provisioned) or it is done.
+    Stack,
+}
+
+impl TaskDependencyKind {
+    pub const ALL: [TaskDependencyKind; 2] = [TaskDependencyKind::Gate, TaskDependencyKind::Stack];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskDependencyKind::Gate => "gate",
+            TaskDependencyKind::Stack => "stack",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "gate" => Some(TaskDependencyKind::Gate),
+            "stack" => Some(TaskDependencyKind::Stack),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for TaskDependencyKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// A dependency edge as seen from the dependent task, with enough context to
+/// render and to compute blockedness without another query.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct TaskDependencyEdge {
+    pub depends_on_task_number: i64,
+    pub depends_on_title: String,
+    pub depends_on_status: TaskStatus,
+    pub kind: TaskDependencyKind,
+    /// Whether this edge currently permits the dependent to run.
+    pub satisfied: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Task {
     pub id: String,
@@ -224,6 +274,10 @@ pub struct Task {
     /// Skills whose content is injected into the executing worker's context
     /// unconditionally — a contract, unlike advisory `suggested_skills`.
     pub required_skills: Vec<String>,
+    /// Dependency edges, hydrated by the store's read paths (not stored on
+    /// the tasks row).
+    #[serde(default)]
+    pub depends_on: Vec<TaskDependencyEdge>,
     pub created_by: String,
     pub approved_at: Option<String>,
     pub approved_by: Option<String>,
@@ -239,6 +293,23 @@ impl Task {
         self.assigned_agent_id
             .as_deref()
             .unwrap_or(&self.owner_agent_id)
+    }
+
+    /// Task numbers of unsatisfied dependencies.
+    pub fn blocked_by(&self) -> Vec<i64> {
+        self.depends_on
+            .iter()
+            .filter(|edge| !edge.satisfied)
+            .map(|edge| edge.depends_on_task_number)
+            .collect()
+    }
+
+    /// The stack parent's task number, when this task has a stack edge.
+    pub fn stack_parent(&self) -> Option<i64> {
+        self.depends_on
+            .iter()
+            .find(|edge| edge.kind == TaskDependencyKind::Stack)
+            .map(|edge| edge.depends_on_task_number)
     }
 }
 
@@ -583,7 +654,161 @@ impl TaskStore {
             .await
             .context("failed to list tasks")?;
 
-        rows.into_iter().map(task_from_row).collect()
+        let mut tasks: Vec<Task> = rows.into_iter().map(task_from_row).collect::<Result<_>>()?;
+        self.hydrate_dependencies(&mut tasks).await?;
+        Ok(tasks)
+    }
+
+    /// Attach dependency edges to the given tasks in one batch query.
+    async fn hydrate_dependencies(&self, tasks: &mut [Task]) -> Result<()> {
+        if tasks.is_empty() {
+            return Ok(());
+        }
+
+        let placeholders = vec!["?"; tasks.len()].join(", ");
+        let query = format!(
+            "SELECT d.task_id, d.kind, dep.task_number, dep.title, dep.status, dep.worktree_id \
+             FROM task_dependencies d \
+             JOIN tasks dep ON dep.id = d.depends_on_task_id \
+             WHERE d.task_id IN ({placeholders}) \
+             ORDER BY dep.task_number ASC"
+        );
+        let mut sql = sqlx::query(&query);
+        for task in tasks.iter() {
+            sql = sql.bind(&task.id);
+        }
+        let rows = sql
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to load task dependencies")?;
+
+        let mut edges: std::collections::HashMap<String, Vec<TaskDependencyEdge>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let task_id: String = row.try_get("task_id").context("dependency task_id")?;
+            let kind_value: String = row.try_get("kind").context("dependency kind")?;
+            let kind = TaskDependencyKind::parse(&kind_value)
+                .with_context(|| format!("invalid dependency kind in database: {kind_value}"))?;
+            let status_value: String = row.try_get("status").context("dependency status")?;
+            let status = TaskStatus::parse(&status_value)
+                .with_context(|| format!("invalid task status in database: {status_value}"))?;
+            let worktree_id: Option<String> = row
+                .try_get::<Option<String>, _>("worktree_id")
+                .ok()
+                .flatten();
+
+            let satisfied = match kind {
+                TaskDependencyKind::Gate => status == TaskStatus::Done,
+                TaskDependencyKind::Stack => status == TaskStatus::Done || worktree_id.is_some(),
+            };
+
+            edges.entry(task_id).or_default().push(TaskDependencyEdge {
+                depends_on_task_number: row
+                    .try_get("task_number")
+                    .context("dependency task_number")?,
+                depends_on_title: row.try_get("title").context("dependency title")?,
+                depends_on_status: status,
+                kind,
+                satisfied,
+            });
+        }
+
+        for task in tasks.iter_mut() {
+            task.depends_on = edges.remove(&task.id).unwrap_or_default();
+        }
+        Ok(())
+    }
+
+    /// Replace a task's dependency edges.
+    ///
+    /// Rejects unknown task numbers, self-dependencies, more than one stack
+    /// edge, and any edge that would create a cycle.
+    pub async fn set_dependencies(
+        &self,
+        task_number: i64,
+        edges: &[(i64, TaskDependencyKind)],
+    ) -> Result<Task> {
+        let task = self
+            .get_by_number(task_number)
+            .await?
+            .with_context(|| format!("task #{task_number} not found"))?;
+
+        let stack_edges = edges
+            .iter()
+            .filter(|(_, kind)| *kind == TaskDependencyKind::Stack)
+            .count();
+        if stack_edges > 1 {
+            return Err(crate::error::Error::Other(anyhow::anyhow!(
+                "a task can stack on at most one parent"
+            )));
+        }
+
+        let mut resolved: Vec<(String, TaskDependencyKind)> = Vec::with_capacity(edges.len());
+        for (dep_number, kind) in edges {
+            if *dep_number == task_number {
+                return Err(crate::error::Error::Other(anyhow::anyhow!(
+                    "task #{task_number} cannot depend on itself"
+                )));
+            }
+            let dep = self
+                .get_by_number(*dep_number)
+                .await?
+                .with_context(|| format!("dependency task #{dep_number} not found"))?;
+
+            // A cycle exists when the dependency can already reach this task
+            // through existing edges.
+            let reaches: Option<i64> = sqlx::query_scalar(
+                "WITH RECURSIVE reachable(id) AS ( \
+                     SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ? \
+                     UNION \
+                     SELECT d.depends_on_task_id FROM task_dependencies d \
+                     JOIN reachable r ON d.task_id = r.id \
+                 ) SELECT 1 FROM reachable WHERE id = ? LIMIT 1",
+            )
+            .bind(&dep.id)
+            .bind(&task.id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("failed to run dependency cycle check")?;
+            if reaches.is_some() {
+                return Err(crate::error::Error::Other(anyhow::anyhow!(
+                    "dependency on #{dep_number} would create a cycle"
+                )));
+            }
+
+            resolved.push((dep.id, *kind));
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to open dependency transaction")?;
+        sqlx::query("DELETE FROM task_dependencies WHERE task_id = ?")
+            .bind(&task.id)
+            .execute(&mut *tx)
+            .await
+            .context("failed to clear task dependencies")?;
+        for (dep_id, kind) in &resolved {
+            sqlx::query(
+                "INSERT INTO task_dependencies (task_id, depends_on_task_id, kind) \
+                 VALUES (?, ?, ?)",
+            )
+            .bind(&task.id)
+            .bind(dep_id)
+            .bind(kind.as_str())
+            .execute(&mut *tx)
+            .await
+            .context("failed to insert task dependency")?;
+        }
+        tx.commit()
+            .await
+            .context("failed to commit dependency transaction")?;
+
+        self.get_by_number(task_number)
+            .await?
+            .context("task vanished during dependency update")
+            .map_err(Into::into)
     }
 
     /// List ready tasks assigned to the given agent.
@@ -607,7 +832,13 @@ impl TaskStore {
         .await
         .context("failed to fetch task by number")?;
 
-        row.map(task_from_row).transpose()
+        let Some(task) = row.map(task_from_row).transpose()? else {
+            return Ok(None);
+        };
+        let mut tasks = [task];
+        self.hydrate_dependencies(&mut tasks).await?;
+        let [task] = tasks;
+        Ok(Some(task))
     }
 
     pub async fn update(&self, task_number: i64, input: UpdateTaskInput) -> Result<Option<Task>> {
@@ -860,8 +1091,20 @@ impl TaskStore {
     /// Atomically claim the highest-priority ready task assigned to the given
     /// agent. Moves it to `in_progress` and returns it.
     pub async fn claim_next_ready(&self, assigned_agent_id: &str) -> Result<Option<Task>> {
+        // Readiness is status plus dependency edges: a `gate` dependency
+        // blocks until done, a `stack` dependency until its branch exists
+        // (worktree provisioned) or it is done.
         let row = sqlx::query(
             "SELECT task_number FROM tasks WHERE assigned_agent_id = ? AND status = 'ready' \
+             AND NOT EXISTS ( \
+               SELECT 1 FROM task_dependencies d \
+               JOIN tasks dep ON dep.id = d.depends_on_task_id \
+               WHERE d.task_id = tasks.id \
+                 AND CASE d.kind \
+                   WHEN 'stack' THEN dep.worktree_id IS NULL AND dep.status != 'done' \
+                   ELSE dep.status != 'done' \
+                 END \
+             ) \
              ORDER BY CASE priority \
                WHEN 'critical' THEN 0 \
                WHEN 'high' THEN 1 \
@@ -1059,6 +1302,7 @@ fn task_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Task> {
             .flatten()
             .and_then(|value| serde_json::from_str(&value).ok())
             .unwrap_or_default(),
+        depends_on: Vec::new(),
         created_by: row
             .try_get("created_by")
             .context("failed to read task created_by")?,
@@ -1148,6 +1392,19 @@ pub(crate) async fn setup_test_store() -> TaskStore {
     .await
     .expect("task_number_seq should be created");
 
+    sqlx::query(
+        "CREATE TABLE task_dependencies (
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            depends_on_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL DEFAULT 'gate',
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            PRIMARY KEY (task_id, depends_on_task_id)
+        )",
+    )
+    .execute(&pool)
+    .await
+    .expect("task_dependencies should be created");
+
     sqlx::query("INSERT INTO task_number_seq (id, next_number) VALUES (1, 1)")
         .execute(&pool)
         .await
@@ -1198,6 +1455,176 @@ mod tests {
             .expect("task should exist");
         assert_eq!(loaded.assigned_agent_id, None);
         assert_eq!(loaded.effective_agent_id(), "agent-test");
+    }
+
+    #[tokio::test]
+    async fn dependency_edges_gate_readiness_and_reject_cycles() {
+        let store = setup_store().await;
+        let a = store
+            .create(self_assigned_input("task a", TaskStatus::Ready))
+            .await
+            .expect("a");
+        let b = store
+            .create(self_assigned_input("task b", TaskStatus::Ready))
+            .await
+            .expect("b");
+
+        // b gates on a.
+        let b_hydrated = store
+            .set_dependencies(b.task_number, &[(a.task_number, TaskDependencyKind::Gate)])
+            .await
+            .expect("edge should insert");
+        assert_eq!(b_hydrated.blocked_by(), vec![a.task_number]);
+
+        // Self-dependency and cycle rejected.
+        assert!(
+            store
+                .set_dependencies(a.task_number, &[(a.task_number, TaskDependencyKind::Gate)])
+                .await
+                .is_err(),
+            "self-dependency must be rejected"
+        );
+        assert!(
+            store
+                .set_dependencies(a.task_number, &[(b.task_number, TaskDependencyKind::Gate)])
+                .await
+                .is_err(),
+            "a -> b -> a must be rejected as a cycle"
+        );
+
+        // Both ready, but only the unblocked task is claimable — and claim
+        // order would otherwise prefer the lower task number.
+        let claimed = store
+            .claim_next_ready("agent-test")
+            .await
+            .expect("claim")
+            .expect("a task should be claimable");
+        assert_eq!(claimed.task_number, a.task_number);
+
+        // Finishing a unblocks b.
+        store
+            .update(
+                a.task_number,
+                UpdateTaskInput {
+                    status: Some(TaskStatus::Done),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("finish a");
+        let claimed = store
+            .claim_next_ready("agent-test")
+            .await
+            .expect("claim")
+            .expect("b should now be claimable");
+        assert_eq!(claimed.task_number, b.task_number);
+    }
+
+    #[tokio::test]
+    async fn stack_dependencies_unblock_on_worktree() {
+        let store = setup_store().await;
+        let parent = store
+            .create(self_assigned_input("parent", TaskStatus::Ready))
+            .await
+            .expect("parent");
+        let child = store
+            .create(self_assigned_input("child", TaskStatus::Ready))
+            .await
+            .expect("child");
+        store
+            .set_dependencies(
+                child.task_number,
+                &[(parent.task_number, TaskDependencyKind::Stack)],
+            )
+            .await
+            .expect("stack edge");
+
+        // Claim the parent so the child isn't shadowed by claim order; the
+        // child stays blocked while the parent has no branch.
+        let claimed = store
+            .claim_next_ready("agent-test")
+            .await
+            .expect("claim")
+            .expect("parent claimable");
+        assert_eq!(claimed.task_number, parent.task_number);
+        assert!(
+            store
+                .claim_next_ready("agent-test")
+                .await
+                .expect("claim")
+                .is_none(),
+            "stack child must stay blocked before the parent branch exists"
+        );
+
+        // The parent's worktree appearing unblocks the child even though the
+        // parent is still in progress.
+        store
+            .update(
+                parent.task_number,
+                UpdateTaskInput {
+                    worktree_id: Some("wt-parent".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("bind worktree");
+        let claimed = store
+            .claim_next_ready("agent-test")
+            .await
+            .expect("claim")
+            .expect("child should unblock once the parent branch exists");
+        assert_eq!(claimed.task_number, child.task_number);
+
+        let child = store
+            .get_by_number(child.task_number)
+            .await
+            .expect("get")
+            .expect("child");
+        assert_eq!(child.stack_parent(), Some(parent.task_number));
+    }
+
+    #[tokio::test]
+    async fn at_most_one_stack_parent() {
+        let store = setup_store().await;
+        let a = store
+            .create(self_assigned_input("a", TaskStatus::Backlog))
+            .await
+            .expect("a");
+        let b = store
+            .create(self_assigned_input("b", TaskStatus::Backlog))
+            .await
+            .expect("b");
+        let c = store
+            .create(self_assigned_input("c", TaskStatus::Backlog))
+            .await
+            .expect("c");
+
+        assert!(
+            store
+                .set_dependencies(
+                    c.task_number,
+                    &[
+                        (a.task_number, TaskDependencyKind::Stack),
+                        (b.task_number, TaskDependencyKind::Stack),
+                    ],
+                )
+                .await
+                .is_err(),
+            "two stack parents must be rejected"
+        );
+
+        // One stack parent plus a gate is fine.
+        let c = store
+            .set_dependencies(
+                c.task_number,
+                &[
+                    (a.task_number, TaskDependencyKind::Stack),
+                    (b.task_number, TaskDependencyKind::Gate),
+                ],
+            )
+            .await
+            .expect("mixed edges should insert");
+        assert_eq!(c.depends_on.len(), 2);
     }
 
     #[tokio::test]
@@ -1266,6 +1693,7 @@ mod tests {
             worktree_mode: Some(TaskWorktreeMode::Root),
             worktree_id: None,
             required_skills: vec!["Task-Skill".to_string(), "shared".to_string()],
+            depends_on: Vec::new(),
             created_by: "branch".to_string(),
             approved_at: None,
             approved_by: None,
