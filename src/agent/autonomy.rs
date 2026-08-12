@@ -634,6 +634,12 @@ fn render_task_line(task: &Task, agent_id: &str) -> String {
             300,
         ));
     }
+    // Surface the execution plan so runs execute tasks as configured instead
+    // of re-deciding where and how the work happens.
+    let plan = crate::tasks::ExecutionPlan::resolve(task, None);
+    if !plan.is_empty() {
+        line.push_str(&format!(" [{}]", plan.summary()));
+    }
     line.push('\n');
     line
 }
@@ -803,6 +809,12 @@ mod tests {
             goal_id: None,
             source_memory_id: None,
             worker_id: None,
+            worker_type: None,
+            project_id: None,
+            repo_id: None,
+            worktree_mode: None,
+            worktree_id: None,
+            required_skills: Vec::new(),
             created_by: "user".to_string(),
             approved_at: None,
             approved_by: None,

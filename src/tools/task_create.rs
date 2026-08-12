@@ -15,6 +15,8 @@ pub struct TaskCreateTool {
     created_by: String,
     working_memory: Option<Arc<crate::memory::WorkingMemoryStore>>,
     api_state: Option<Arc<crate::api::ApiState>>,
+    project_store: Option<Arc<crate::projects::ProjectStore>>,
+    runtime_config: Option<Arc<crate::config::RuntimeConfig>>,
 }
 
 impl std::fmt::Debug for TaskCreateTool {
@@ -38,6 +40,8 @@ impl TaskCreateTool {
             created_by: created_by.into(),
             working_memory: None,
             api_state: None,
+            project_store: None,
+            runtime_config: None,
         }
     }
 
@@ -49,6 +53,71 @@ impl TaskCreateTool {
     pub fn with_api_state(mut self, state: Arc<crate::api::ApiState>) -> Self {
         self.api_state = Some(state);
         self
+    }
+
+    /// Enables execution-plan validation: project name/ID resolution and
+    /// required-skill existence checks.
+    pub fn with_execution_context(
+        mut self,
+        project_store: Arc<crate::projects::ProjectStore>,
+        runtime_config: Arc<crate::config::RuntimeConfig>,
+    ) -> Self {
+        self.project_store = Some(project_store);
+        self.runtime_config = Some(runtime_config);
+        self
+    }
+}
+
+/// Resolve a project reference (ID or name, case-insensitive) to its ID.
+pub(crate) async fn resolve_project_reference(
+    store: &crate::projects::ProjectStore,
+    reference: &str,
+) -> Result<String, String> {
+    if let Ok(Some(project)) = store.get_project(reference).await {
+        return Ok(project.id);
+    }
+    let projects = store
+        .list_projects(Some(crate::projects::ProjectStatus::Active))
+        .await
+        .map_err(|error| format!("failed to list projects: {error}"))?;
+    let matched: Vec<_> = projects
+        .iter()
+        .filter(|p| p.name.eq_ignore_ascii_case(reference))
+        .collect();
+    match matched.as_slice() {
+        [project] => Ok(project.id.clone()),
+        [] => Err(format!(
+            "no project matches '{reference}'. Known projects: {}",
+            projects
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        _ => Err(format!(
+            "multiple projects named '{reference}' — use the project ID"
+        )),
+    }
+}
+
+/// Verify every named skill exists in the registry.
+pub(crate) fn validate_required_skills(
+    runtime_config: &crate::config::RuntimeConfig,
+    skills: &[String],
+) -> Result<(), String> {
+    let registry = runtime_config.skills.load();
+    let missing: Vec<&str> = skills
+        .iter()
+        .filter(|name| registry.get(name).is_none())
+        .map(String::as_str)
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "unknown skill(s): {}. Skill names must match the skills index.",
+            missing.join(", ")
+        ))
     }
 }
 
@@ -66,6 +135,26 @@ pub struct TaskCreateArgs {
     pub subtasks: Vec<String>,
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+    /// Execution plan: "builtin" or "opencode".
+    #[serde(default)]
+    pub worker_type: Option<String>,
+    /// Execution plan: project name or ID the work belongs to.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Execution plan: repo ID within the project (multi-repo projects with
+    /// worktree_mode "create").
+    #[serde(default)]
+    pub repo_id: Option<String>,
+    /// Execution plan: "root", "existing", or "create".
+    #[serde(default)]
+    pub worktree_mode: Option<String>,
+    /// Execution plan: existing worktree ID (worktree_mode "existing").
+    #[serde(default)]
+    pub worktree_id: Option<String>,
+    /// Skills the executing worker must receive; validated against the
+    /// skills index.
+    #[serde(default)]
+    pub required_skills: Vec<String>,
 }
 
 fn default_priority() -> String {
@@ -109,6 +198,33 @@ impl Tool for TaskCreateTool {
                     "metadata": {
                         "type": "object",
                         "description": "Optional metadata object"
+                    },
+                    "worker_type": {
+                        "type": "string",
+                        "enum": crate::tasks::TaskWorkerType::ALL.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
+                        "description": "Execution plan: which worker kind runs this task. Omit to inherit the project default."
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "Execution plan: project name or ID the work belongs to. Required for opencode tasks."
+                    },
+                    "repo_id": {
+                        "type": "string",
+                        "description": "Execution plan: repo ID within the project. Needed with worktree_mode \"create\" on multi-repo projects."
+                    },
+                    "worktree_mode": {
+                        "type": "string",
+                        "enum": crate::tasks::TaskWorktreeMode::ALL.iter().map(|m| m.to_string()).collect::<Vec<_>>(),
+                        "description": "Execution plan: \"root\" runs in the checkout, \"existing\" in the worktree named by worktree_id, \"create\" makes a fresh worktree at spawn."
+                    },
+                    "worktree_id": {
+                        "type": "string",
+                        "description": "Execution plan: existing worktree ID (worktree_mode \"existing\")."
+                    },
+                    "required_skills": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Skills injected into the executing worker unconditionally. Use for procedures the worker must follow, not suggestions."
                     }
                 },
                 "required": ["title"]
@@ -120,6 +236,62 @@ impl Tool for TaskCreateTool {
         let priority = TaskPriority::parse(&args.priority)
             .ok_or_else(|| TaskCreateError(format!("invalid priority: {}", args.priority)))?;
         let status = TaskStatus::PendingApproval;
+
+        let worker_type = args
+            .worker_type
+            .as_deref()
+            .map(|value| {
+                crate::tasks::TaskWorkerType::parse(value)
+                    .ok_or_else(|| TaskCreateError(format!("invalid worker_type: {value}")))
+            })
+            .transpose()?;
+        let worktree_mode = args
+            .worktree_mode
+            .as_deref()
+            .map(|value| {
+                crate::tasks::TaskWorktreeMode::parse(value)
+                    .ok_or_else(|| TaskCreateError(format!("invalid worktree_mode: {value}")))
+            })
+            .transpose()?;
+
+        if worktree_mode == Some(crate::tasks::TaskWorktreeMode::Existing)
+            && args.worktree_id.is_none()
+        {
+            return Err(TaskCreateError(
+                "worktree_mode \"existing\" requires worktree_id".into(),
+            ));
+        }
+
+        let project_id = match &args.project {
+            Some(reference) => match &self.project_store {
+                Some(store) => Some(
+                    resolve_project_reference(store, reference)
+                        .await
+                        .map_err(TaskCreateError)?,
+                ),
+                // No store wired here — keep the reference as given rather
+                // than dropping the intent.
+                None => Some(reference.clone()),
+            },
+            None => None,
+        };
+
+        if worker_type == Some(crate::tasks::TaskWorkerType::Opencode)
+            && project_id.is_none()
+            && args.worktree_id.is_none()
+        {
+            return Err(TaskCreateError(
+                "opencode tasks need a project (or an explicit worktree_id) so the \
+                 worker has a directory to run in"
+                    .into(),
+            ));
+        }
+
+        if !args.required_skills.is_empty()
+            && let Some(rc) = &self.runtime_config
+        {
+            validate_required_skills(rc, &args.required_skills).map_err(TaskCreateError)?;
+        }
 
         let subtasks = args
             .subtasks
@@ -143,6 +315,12 @@ impl Tool for TaskCreateTool {
                 metadata: args.metadata.unwrap_or_else(|| serde_json::json!({})),
                 source_memory_id: None,
                 created_by: self.created_by.clone(),
+                worker_type,
+                project_id,
+                repo_id: args.repo_id,
+                worktree_mode,
+                worktree_id: args.worktree_id,
+                required_skills: args.required_skills,
             })
             .await
             .map_err(|error| TaskCreateError(format!("{error}")))?;
@@ -257,6 +435,12 @@ mod tests {
                 priority: "medium".to_string(),
                 subtasks: Vec::new(),
                 metadata: None,
+                worker_type: None,
+                project: None,
+                repo_id: None,
+                worktree_mode: None,
+                worktree_id: None,
+                required_skills: Vec::new(),
             })
             .await
             .expect("task create should succeed");

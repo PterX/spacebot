@@ -351,6 +351,7 @@ async fn spawn_branch(
         state.deps.agent_id.clone(),
         state.deps.task_store.clone(),
         state.deps.goal_store.clone(),
+        state.deps.project_store.clone(),
         state.deps.memory_search.clone(),
         state.deps.runtime_config.clone(),
         state.deps.memory_event_tx.clone(),
@@ -621,11 +622,16 @@ pub async fn build_project_context(
 }
 
 /// Spawn a worker from a ChannelState. Used by the SpawnWorkerTool.
+///
+/// `required_skills` differ from `suggested_skills`: their full content is
+/// injected into the worker's system prompt rather than flagged in the
+/// index, so the worker cannot skip them.
 pub async fn spawn_worker_from_state(
     state: &ChannelState,
     task: impl Into<String>,
     interactive: bool,
     suggested_skills: &[&str],
+    required_skills: &[&str],
     worker_context: &WorkerContextMode,
 ) -> std::result::Result<WorkerId, AgentError> {
     check_worker_limit(state).await?;
@@ -633,8 +639,15 @@ pub async fn spawn_worker_from_state(
     reserve_task_if_unique(state, &task).await?;
     ensure_dispatch_readiness(state, "worker");
 
-    let result =
-        spawn_worker_inner(state, &task, interactive, suggested_skills, worker_context).await;
+    let result = spawn_worker_inner(
+        state,
+        &task,
+        interactive,
+        suggested_skills,
+        required_skills,
+        worker_context,
+    )
+    .await;
 
     // Release the reservation regardless of success or failure.
     // On success the task is now in the status block; on failure it needs cleanup.
@@ -650,6 +663,7 @@ async fn spawn_worker_inner(
     task: &str,
     interactive: bool,
     suggested_skills: &[&str],
+    required_skills: &[&str],
     worker_context: &WorkerContextMode,
 ) -> std::result::Result<WorkerId, AgentError> {
     let rc = &state.deps.runtime_config;
@@ -694,7 +708,7 @@ async fn spawn_worker_inner(
     // Append skills listing to worker system prompt. Suggested skills are
     // flagged so the worker knows the channel's intent, but it can read any
     // skill it decides is relevant via the read_skill tool.
-    let system_prompt = match skills.render_worker_skills(suggested_skills, &prompt_engine) {
+    let mut system_prompt = match skills.render_worker_skills(suggested_skills, &prompt_engine) {
         Ok(skills_prompt) if !skills_prompt.is_empty() => {
             format!("{worker_system_prompt}\n\n{skills_prompt}")
         }
@@ -704,6 +718,14 @@ async fn spawn_worker_inner(
             worker_system_prompt
         }
     };
+
+    // Required skills are a task contract: full content in the system prompt,
+    // not an entry in the index the worker may or may not read. Unresolvable
+    // names were rejected at task creation and at spawn.
+    if let Some(required_block) = skills.render_required_skills(required_skills) {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(&required_block);
+    }
 
     // Append tool-use enforcement after skills so it's the last instruction
     // in the preamble ("last instruction wins").
@@ -910,6 +932,7 @@ pub async fn spawn_opencode_worker_from_state(
     task: impl Into<String>,
     directory: &str,
     interactive: bool,
+    required_skills: &[&str],
 ) -> std::result::Result<crate::WorkerId, AgentError> {
     if !interactive {
         return Err(AgentError::Other(anyhow::anyhow!(
@@ -922,7 +945,8 @@ pub async fn spawn_opencode_worker_from_state(
     reserve_task_if_unique(state, &task).await?;
     ensure_dispatch_readiness(state, "opencode_worker");
 
-    let result = spawn_opencode_worker_inner(state, &task, directory, interactive).await;
+    let result =
+        spawn_opencode_worker_inner(state, &task, directory, interactive, required_skills).await;
 
     // Release the reservation regardless of success or failure.
     release_task_reservation(state, &task).await;
@@ -937,6 +961,7 @@ async fn spawn_opencode_worker_inner(
     task: &str,
     directory: &str,
     interactive: bool,
+    required_skills: &[&str],
 ) -> std::result::Result<crate::WorkerId, AgentError> {
     let directory = expand_tilde(directory);
 
@@ -966,7 +991,36 @@ async fn spawn_opencode_worker_inner(
 
     // Build temporal/status context so OpenCode workers get the same system
     // info (time, model, context window) as builtin workers.
-    let worker_status_text = build_worker_status_text(rc.as_ref(), &state.deps.sandbox);
+    let mut worker_status_text = build_worker_status_text(rc.as_ref(), &state.deps.sandbox);
+
+    // OpenCode reads files natively, so required skills arrive as read-first
+    // file references in the system prompt rather than inlined content.
+    if !required_skills.is_empty() {
+        let skills = rc.skills.load();
+        let mut entries = Vec::new();
+        for name in required_skills {
+            match skills.get(name) {
+                Some(skill) => {
+                    entries.push(format!("- {} — {}", skill.file_path.display(), skill.name));
+                }
+                None => {
+                    tracing::warn!(skill = %name, "required skill not found, skipping injection");
+                }
+            }
+        }
+        if !entries.is_empty() {
+            let block = format!(
+                "## Required Skills\n\nBefore starting the task, read each of these skill \
+                 files and follow them — they are part of the task's contract, not \
+                 suggestions:\n{}",
+                entries.join("\n")
+            );
+            worker_status_text = Some(match worker_status_text {
+                Some(existing) => format!("{existing}\n\n{block}"),
+                None => block,
+            });
+        }
+    }
 
     let worker = if interactive {
         let (worker, input_tx) = crate::opencode::OpenCodeWorker::new_interactive(

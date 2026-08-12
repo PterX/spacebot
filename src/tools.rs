@@ -997,6 +997,7 @@ pub fn create_branch_tool_server(
     agent_id: AgentId,
     task_store: Arc<TaskStore>,
     goal_store: Arc<GoalStore>,
+    project_store: Arc<crate::projects::ProjectStore>,
     memory_search: Arc<MemorySearch>,
     runtime_config: Arc<RuntimeConfig>,
     memory_event_tx: broadcast::Sender<ProcessEvent>,
@@ -1019,7 +1020,8 @@ pub fn create_branch_tool_server(
         memory_save = memory_save.with_contract_state(contract_state.clone());
     }
 
-    let mut task_create = TaskCreateTool::new(task_store.clone(), agent_id.to_string(), "branch");
+    let mut task_create = TaskCreateTool::new(task_store.clone(), agent_id.to_string(), "branch")
+        .with_execution_context(project_store, runtime_config.clone());
     if let Some(ref api) = api_state {
         task_create = task_create.with_api_state(api.clone());
     }

@@ -107,6 +107,86 @@ impl std::fmt::Display for TaskPriority {
     }
 }
 
+/// Which kind of worker executes a task.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskWorkerType {
+    Builtin,
+    Opencode,
+}
+
+impl TaskWorkerType {
+    pub const ALL: [TaskWorkerType; 2] = [TaskWorkerType::Builtin, TaskWorkerType::Opencode];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskWorkerType::Builtin => "builtin",
+            TaskWorkerType::Opencode => "opencode",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "builtin" => Some(TaskWorkerType::Builtin),
+            "opencode" => Some(TaskWorkerType::Opencode),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for TaskWorkerType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Where a task's worker runs relative to its project checkout.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskWorktreeMode {
+    /// Run in the project (or repo) root checkout.
+    Root,
+    /// Run in an existing worktree, selected by the task's `worktree_id`.
+    Existing,
+    /// Create a fresh worktree for this task at spawn time.
+    Create,
+}
+
+impl TaskWorktreeMode {
+    pub const ALL: [TaskWorktreeMode; 3] = [
+        TaskWorktreeMode::Root,
+        TaskWorktreeMode::Existing,
+        TaskWorktreeMode::Create,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskWorktreeMode::Root => "root",
+            TaskWorktreeMode::Existing => "existing",
+            TaskWorktreeMode::Create => "create",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "root" => Some(TaskWorktreeMode::Root),
+            "existing" => Some(TaskWorktreeMode::Existing),
+            "create" => Some(TaskWorktreeMode::Create),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for TaskWorktreeMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 pub struct TaskSubtask {
     pub title: String,
@@ -129,6 +209,21 @@ pub struct Task {
     pub goal_id: Option<String>,
     pub source_memory_id: Option<String>,
     pub worker_id: Option<String>,
+    /// Execution plan: which worker kind runs this task. `None` inherits the
+    /// project default, or leaves the choice to the executing turn.
+    pub worker_type: Option<TaskWorkerType>,
+    /// Execution plan: project this task's work belongs to.
+    pub project_id: Option<String>,
+    /// Execution plan: repo within the project, needed when `worktree_mode`
+    /// is `create` on a multi-repo project.
+    pub repo_id: Option<String>,
+    /// Execution plan: where the worker runs relative to the checkout.
+    pub worktree_mode: Option<TaskWorktreeMode>,
+    /// Execution plan: existing worktree to run in (`worktree_mode: existing`).
+    pub worktree_id: Option<String>,
+    /// Skills whose content is injected into the executing worker's context
+    /// unconditionally — a contract, unlike advisory `suggested_skills`.
+    pub required_skills: Vec<String>,
     pub created_by: String,
     pub approved_at: Option<String>,
     pub approved_by: Option<String>,
@@ -147,6 +242,91 @@ impl Task {
     }
 }
 
+/// Project-level execution defaults that a task's own fields override.
+///
+/// Kept here (rather than importing `ProjectSettings`) so plan resolution
+/// stays decoupled from how projects store their settings blob.
+#[derive(Debug, Clone, Default)]
+pub struct ExecutionDefaults {
+    pub worker_type: Option<TaskWorkerType>,
+    pub worktree_mode: Option<TaskWorktreeMode>,
+    pub required_skills: Vec<String>,
+}
+
+/// The resolved answer to "how and where does this task run".
+///
+/// Task fields win over project defaults; `required_skills` is the union,
+/// project defaults first.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, utoipa::ToSchema)]
+pub struct ExecutionPlan {
+    pub worker_type: Option<TaskWorkerType>,
+    pub project_id: Option<String>,
+    pub repo_id: Option<String>,
+    pub worktree_mode: Option<TaskWorktreeMode>,
+    pub worktree_id: Option<String>,
+    pub required_skills: Vec<String>,
+}
+
+impl ExecutionPlan {
+    pub fn resolve(task: &Task, project_defaults: Option<&ExecutionDefaults>) -> Self {
+        let defaults = project_defaults.cloned().unwrap_or_default();
+
+        let mut required_skills = defaults.required_skills;
+        for skill in &task.required_skills {
+            if !required_skills
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(skill))
+            {
+                required_skills.push(skill.clone());
+            }
+        }
+
+        Self {
+            worker_type: task.worker_type.or(defaults.worker_type),
+            project_id: task.project_id.clone(),
+            repo_id: task.repo_id.clone(),
+            worktree_mode: task.worktree_mode.or(defaults.worktree_mode),
+            worktree_id: task.worktree_id.clone(),
+            required_skills,
+        }
+    }
+
+    /// True when nothing in the plan is specified.
+    pub fn is_empty(&self) -> bool {
+        self.worker_type.is_none()
+            && self.project_id.is_none()
+            && self.worktree_mode.is_none()
+            && self.worktree_id.is_none()
+            && self.required_skills.is_empty()
+    }
+
+    /// One-line human summary for prompts and approval surfaces.
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(worker_type) = self.worker_type {
+            parts.push(format!("worker: {worker_type}"));
+        }
+        if let Some(project_id) = &self.project_id {
+            parts.push(format!("project: {project_id}"));
+        }
+        if let Some(mode) = self.worktree_mode {
+            match (mode, &self.worktree_id) {
+                (TaskWorktreeMode::Existing, Some(id)) => {
+                    parts.push(format!("worktree: existing ({id})"));
+                }
+                _ => parts.push(format!("worktree: {mode}")),
+            }
+        }
+        if !self.required_skills.is_empty() {
+            parts.push(format!(
+                "requires skills: {}",
+                self.required_skills.join(", ")
+            ));
+        }
+        parts.join(" · ")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CreateTaskInput {
     pub owner_agent_id: String,
@@ -159,6 +339,35 @@ pub struct CreateTaskInput {
     pub metadata: Value,
     pub source_memory_id: Option<String>,
     pub created_by: String,
+    pub worker_type: Option<TaskWorkerType>,
+    pub project_id: Option<String>,
+    pub repo_id: Option<String>,
+    pub worktree_mode: Option<TaskWorktreeMode>,
+    pub worktree_id: Option<String>,
+    pub required_skills: Vec<String>,
+}
+
+impl Default for CreateTaskInput {
+    fn default() -> Self {
+        Self {
+            owner_agent_id: String::new(),
+            assigned_agent_id: None,
+            title: String::new(),
+            description: None,
+            status: TaskStatus::Backlog,
+            priority: TaskPriority::Medium,
+            subtasks: Vec::new(),
+            metadata: serde_json::json!({}),
+            source_memory_id: None,
+            created_by: String::new(),
+            worker_type: None,
+            project_id: None,
+            repo_id: None,
+            worktree_mode: None,
+            worktree_id: None,
+            required_skills: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -175,6 +384,12 @@ pub struct UpdateTaskInput {
     pub complete_subtask: Option<usize>,
     /// Reassign the task to a different agent.
     pub assigned_agent_id: Option<String>,
+    pub worker_type: Option<TaskWorkerType>,
+    pub project_id: Option<String>,
+    pub repo_id: Option<String>,
+    pub worktree_mode: Option<TaskWorktreeMode>,
+    pub worktree_id: Option<String>,
+    pub required_skills: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -227,6 +442,8 @@ impl TaskStore {
         let subtasks_json =
             serde_json::to_string(&input.subtasks).context("failed to serialize subtasks")?;
         let metadata_json = input.metadata.to_string();
+        let required_skills_json = serde_json::to_string(&input.required_skills)
+            .context("failed to serialize required skills")?;
 
         for attempt in 0..Self::MAX_CREATE_RETRIES {
             let mut tx = self
@@ -252,9 +469,11 @@ impl TaskStore {
                 INSERT INTO tasks (
                     id, task_number, title, description, status, priority,
                     owner_agent_id, assigned_agent_id,
-                    subtasks, metadata, source_memory_id, created_by
+                    subtasks, metadata, source_memory_id, created_by,
+                    worker_type, project_id, repo_id, worktree_mode, worktree_id,
+                    required_skills
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(&task_id)
@@ -269,6 +488,12 @@ impl TaskStore {
             .bind(&metadata_json)
             .bind(&input.source_memory_id)
             .bind(&input.created_by)
+            .bind(input.worker_type.map(TaskWorkerType::as_str))
+            .bind(&input.project_id)
+            .bind(&input.repo_id)
+            .bind(input.worktree_mode.map(TaskWorktreeMode::as_str))
+            .bind(&input.worktree_id)
+            .bind(&required_skills_json)
             .execute(&mut *tx)
             .await;
 
@@ -546,9 +771,20 @@ impl TaskStore {
             None
         };
 
+        let next_worker_type = input.worker_type.or(current.worker_type);
+        let next_project_id = input.project_id.or(current.project_id);
+        let next_repo_id = input.repo_id.or(current.repo_id);
+        let next_worktree_mode = input.worktree_mode.or(current.worktree_mode);
+        let next_worktree_id = input.worktree_id.or(current.worktree_id);
+        let next_required_skills = input.required_skills.unwrap_or(current.required_skills);
+        let required_skills_json = serde_json::to_string(&next_required_skills)
+            .context("failed to serialize required skills")?;
+
         let mut query = String::from(
             "UPDATE tasks SET title = ?, description = ?, status = ?, priority = ?, \
-             assigned_agent_id = ?, subtasks = ?, metadata = ?, ",
+             assigned_agent_id = ?, subtasks = ?, metadata = ?, \
+             worker_type = ?, project_id = ?, repo_id = ?, worktree_mode = ?, \
+             worktree_id = ?, required_skills = ?, ",
         );
 
         if clear_worker {
@@ -582,7 +818,13 @@ impl TaskStore {
             .bind(next_priority.as_str())
             .bind(&next_assigned)
             .bind(serde_json::to_string(&subtasks).context("failed to serialize subtasks")?)
-            .bind(next_metadata.to_string());
+            .bind(next_metadata.to_string())
+            .bind(next_worker_type.map(TaskWorkerType::as_str))
+            .bind(&next_project_id)
+            .bind(&next_repo_id)
+            .bind(next_worktree_mode.map(TaskWorktreeMode::as_str))
+            .bind(&next_worktree_id)
+            .bind(&required_skills_json);
 
         if !clear_worker {
             sql = sql.bind(next_worker_id);
@@ -674,6 +916,7 @@ impl TaskStore {
 /// Column list used by all SELECT queries. Kept in sync with `task_from_row`.
 const SELECT_COLUMNS: &str = "SELECT id, task_number, title, description, status, priority, \
      owner_agent_id, assigned_agent_id, subtasks, metadata, goal_id, source_memory_id, worker_id, \
+     worker_type, project_id, repo_id, worktree_mode, worktree_id, required_skills, \
      created_by, approved_at, approved_by, created_at, updated_at, completed_at";
 
 pub fn can_transition(current: TaskStatus, next: TaskStatus) -> bool {
@@ -789,6 +1032,33 @@ fn task_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Task> {
             .ok()
             .flatten()
             .filter(|value| !value.is_empty()),
+        worker_type: row
+            .try_get::<Option<String>, _>("worker_type")
+            .ok()
+            .flatten()
+            .as_deref()
+            .and_then(TaskWorkerType::parse),
+        project_id: row
+            .try_get::<Option<String>, _>("project_id")
+            .ok()
+            .flatten(),
+        repo_id: row.try_get::<Option<String>, _>("repo_id").ok().flatten(),
+        worktree_mode: row
+            .try_get::<Option<String>, _>("worktree_mode")
+            .ok()
+            .flatten()
+            .as_deref()
+            .and_then(TaskWorktreeMode::parse),
+        worktree_id: row
+            .try_get::<Option<String>, _>("worktree_id")
+            .ok()
+            .flatten(),
+        required_skills: row
+            .try_get::<Option<String>, _>("required_skills")
+            .ok()
+            .flatten()
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default(),
         created_by: row
             .try_get("created_by")
             .context("failed to read task created_by")?,
@@ -849,6 +1119,12 @@ pub(crate) async fn setup_test_store() -> TaskStore {
             goal_id TEXT,
             source_memory_id TEXT,
             worker_id TEXT,
+            worker_type TEXT,
+            project_id TEXT,
+            repo_id TEXT,
+            worktree_mode TEXT,
+            worktree_id TEXT,
+            required_skills TEXT NOT NULL DEFAULT '[]',
             created_by TEXT NOT NULL,
             approved_at TEXT,
             approved_by TEXT,
@@ -900,6 +1176,7 @@ mod tests {
             metadata: serde_json::json!({}),
             source_memory_id: None,
             created_by: "branch".to_string(),
+            ..Default::default()
         }
     }
 
@@ -921,6 +1198,105 @@ mod tests {
             .expect("task should exist");
         assert_eq!(loaded.assigned_agent_id, None);
         assert_eq!(loaded.effective_agent_id(), "agent-test");
+    }
+
+    #[tokio::test]
+    async fn execution_plan_fields_round_trip() {
+        let store = setup_store().await;
+        let created = store
+            .create(CreateTaskInput {
+                worker_type: Some(TaskWorkerType::Opencode),
+                project_id: Some("proj-1".to_string()),
+                repo_id: Some("repo-1".to_string()),
+                worktree_mode: Some(TaskWorktreeMode::Create),
+                required_skills: vec!["spacebot-dev".to_string()],
+                ..self_assigned_input("planned task", TaskStatus::Backlog)
+            })
+            .await
+            .expect("task should be created");
+
+        let loaded = store
+            .get_by_number(created.task_number)
+            .await
+            .expect("task should load")
+            .expect("task should exist");
+        assert_eq!(loaded.worker_type, Some(TaskWorkerType::Opencode));
+        assert_eq!(loaded.project_id.as_deref(), Some("proj-1"));
+        assert_eq!(loaded.repo_id.as_deref(), Some("repo-1"));
+        assert_eq!(loaded.worktree_mode, Some(TaskWorktreeMode::Create));
+        assert_eq!(loaded.worktree_id, None);
+        assert_eq!(loaded.required_skills, vec!["spacebot-dev".to_string()]);
+
+        // Updates set individual plan fields without disturbing the rest.
+        let updated = store
+            .update(
+                created.task_number,
+                UpdateTaskInput {
+                    worktree_id: Some("wt-1".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update should succeed")
+            .expect("task should exist");
+        assert_eq!(updated.worktree_id.as_deref(), Some("wt-1"));
+        assert_eq!(updated.worker_type, Some(TaskWorkerType::Opencode));
+        assert_eq!(updated.required_skills, vec!["spacebot-dev".to_string()]);
+    }
+
+    #[test]
+    fn execution_plan_resolution_merges_project_defaults() {
+        let task = Task {
+            id: "t".to_string(),
+            task_number: 1,
+            title: "t".to_string(),
+            description: None,
+            status: TaskStatus::Ready,
+            priority: TaskPriority::Medium,
+            owner_agent_id: "a".to_string(),
+            assigned_agent_id: None,
+            subtasks: Vec::new(),
+            metadata: serde_json::json!({}),
+            goal_id: None,
+            source_memory_id: None,
+            worker_id: None,
+            worker_type: None,
+            project_id: Some("proj-1".to_string()),
+            repo_id: None,
+            worktree_mode: Some(TaskWorktreeMode::Root),
+            worktree_id: None,
+            required_skills: vec!["Task-Skill".to_string(), "shared".to_string()],
+            created_by: "branch".to_string(),
+            approved_at: None,
+            approved_by: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            completed_at: None,
+        };
+        let defaults = ExecutionDefaults {
+            worker_type: Some(TaskWorkerType::Opencode),
+            worktree_mode: Some(TaskWorktreeMode::Create),
+            required_skills: vec!["shared".to_string(), "project-skill".to_string()],
+        };
+
+        let plan = ExecutionPlan::resolve(&task, Some(&defaults));
+
+        // Task fields win; unset fields inherit the defaults.
+        assert_eq!(plan.worker_type, Some(TaskWorkerType::Opencode));
+        assert_eq!(plan.worktree_mode, Some(TaskWorktreeMode::Root));
+        // Union keeps project defaults first and dedups case-insensitively.
+        assert_eq!(
+            plan.required_skills,
+            vec![
+                "shared".to_string(),
+                "project-skill".to_string(),
+                "Task-Skill".to_string(),
+            ]
+        );
+
+        let bare = ExecutionPlan::resolve(&task, None);
+        assert_eq!(bare.worker_type, None);
+        assert_eq!(bare.worktree_mode, Some(TaskWorktreeMode::Root));
     }
 
     #[tokio::test]
@@ -1229,6 +1605,7 @@ mod tests {
                 metadata: serde_json::json!({}),
                 source_memory_id: None,
                 created_by: "branch".to_string(),
+                ..Default::default()
             })
             .await
             .expect("should create");

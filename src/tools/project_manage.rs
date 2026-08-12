@@ -586,102 +586,28 @@ impl ProjectManageTool {
             .branch
             .ok_or_else(|| ProjectManageError("'branch' is required for create_worktree".into()))?;
 
-        let project = self
-            .project_store
-            .get_project(&project_id)
-            .await
-            .map_err(|error| ProjectManageError(format!("failed to get project: {error}")))?
-            .ok_or_else(|| ProjectManageError(format!("project not found: {project_id}")))?;
-
-        let repo = self
-            .project_store
-            .get_repo(&repo_id)
-            .await
-            .map_err(|error| ProjectManageError(format!("failed to get repo: {error}")))?
-            .ok_or_else(|| ProjectManageError(format!("repo not found: {repo_id}")))?;
-
-        // Verify the repo belongs to this project.
-        if repo.project_id != project_id {
-            return Ok(ProjectManageOutput {
-                success: false,
-                action: "create_worktree".to_string(),
-                message: format!("repo '{repo_id}' does not belong to project '{project_id}'"),
-                data: None,
-            });
-        }
-
-        let worktree_dir_name = args
-            .worktree_name
-            .unwrap_or_else(|| branch.replace('/', "-"));
-
-        // Sanitize the worktree name — must be a single path segment, no traversal.
-        if worktree_dir_name.is_empty()
-            || worktree_dir_name.contains('/')
-            || worktree_dir_name.contains('\\')
-            || worktree_dir_name == ".."
-            || worktree_dir_name == "."
-        {
-            return Ok(ProjectManageOutput {
-                success: false,
-                action: "create_worktree".to_string(),
-                message: format!(
-                    "invalid worktree name '{worktree_dir_name}': must be a single directory name"
-                ),
-                data: None,
-            });
-        }
-
-        let root = Path::new(&project.root_path);
-        let repo_abs_path = root.join(&repo.path);
-        let is_single_repo = repo.path == ".";
-
-        // For single-repo projects, place worktrees in the parent directory
-        // (as siblings of the repo). For multi-repo projects, place them
-        // inside the project root.
-        let (worktree_abs_path, worktree_db_path) = if is_single_repo {
-            let parent = root.parent().ok_or_else(|| {
-                ProjectManageError("single-repo project root has no parent directory".into())
-            })?;
-            (
-                parent.join(&worktree_dir_name),
-                format!("../{worktree_dir_name}"),
-            )
-        } else {
-            (root.join(&worktree_dir_name), worktree_dir_name.clone())
-        };
-
-        // Create the git worktree (branch from HEAD of the repo)
-        git::create_worktree(&repo_abs_path, &worktree_abs_path, &branch, None)
-            .await
-            .map_err(|error| ProjectManageError(format!("git worktree add failed: {error}")))?;
-
-        // Register in the database
-        let worktree = self
-            .project_store
-            .create_worktree(CreateWorktreeInput {
-                project_id: project_id.clone(),
-                repo_id: repo_id.clone(),
-                name: worktree_dir_name.clone(),
-                path: worktree_db_path,
-                branch: branch.clone(),
-                created_by: "agent".to_string(),
-            })
-            .await
-            .map_err(|error| {
-                ProjectManageError(format!("failed to register worktree in database: {error}"))
-            })?;
+        let provisioned = crate::projects::provision_worktree(
+            &self.project_store,
+            &project_id,
+            Some(&repo_id),
+            &branch,
+            args.worktree_name.as_deref(),
+            "agent",
+        )
+        .await
+        .map_err(|error| ProjectManageError(format!("{error:#}")))?;
 
         Ok(ProjectManageOutput {
             success: true,
             action: "create_worktree".to_string(),
             message: format!(
-                "Created worktree '{worktree_dir_name}' (branch: {branch}) from repo '{}' at {}",
-                repo.name,
-                worktree_abs_path.display()
+                "Created worktree '{}' (branch: {branch}) at {}",
+                provisioned.worktree.name,
+                provisioned.abs_path.display()
             ),
             data: Some(serde_json::json!({
-                "worktree_id": worktree.id,
-                "path": worktree_abs_path.to_string_lossy(),
+                "worktree_id": provisioned.worktree.id,
+                "path": provisioned.abs_path.to_string_lossy(),
             })),
         })
     }

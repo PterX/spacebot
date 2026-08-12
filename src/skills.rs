@@ -309,6 +309,35 @@ impl SkillSet {
         prompt_engine.render_skills_worker(skill_infos, &self.category_descriptions)
     }
 
+    /// Render the full content of required skills for direct injection into
+    /// a worker's system prompt.
+    ///
+    /// Unlike the index rendered by [`Self::render_worker_skills`], this
+    /// carries entire skill bodies — required skills are a contract the
+    /// worker must receive, not a listing it may consult. Names that don't
+    /// resolve are skipped with a warning; validation belongs to the caller.
+    pub fn render_required_skills(&self, names: &[&str]) -> Option<String> {
+        let mut sections = Vec::new();
+        for name in names {
+            match self.get(name) {
+                Some(skill) => {
+                    sections.push(format!("### {}\n\n{}", skill.name, skill.content.trim()));
+                }
+                None => {
+                    tracing::warn!(skill = %name, "required skill not found, skipping injection");
+                }
+            }
+        }
+        if sections.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "## Required Skills\n\nThe following skills are part of this task's contract. \
+             Follow them — they are not suggestions.\n\n{}",
+            sections.join("\n\n")
+        ))
+    }
+
     /// Remove a skill by name.
     ///
     /// Only workspace-level skills can be removed via this method. Built-in

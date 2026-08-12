@@ -52,6 +52,18 @@ pub(super) struct CreateTaskRequest {
     source_memory_id: Option<String>,
     #[serde(default)]
     created_by: Option<String>,
+    #[serde(default)]
+    worker_type: Option<crate::tasks::TaskWorkerType>,
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    repo_id: Option<String>,
+    #[serde(default)]
+    worktree_mode: Option<crate::tasks::TaskWorktreeMode>,
+    #[serde(default)]
+    worktree_id: Option<String>,
+    #[serde(default)]
+    required_skills: Vec<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -76,6 +88,18 @@ pub(super) struct UpdateTaskRequest {
     worker_id: Option<String>,
     #[serde(default)]
     approved_by: Option<String>,
+    #[serde(default)]
+    worker_type: Option<crate::tasks::TaskWorkerType>,
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    repo_id: Option<String>,
+    #[serde(default)]
+    worktree_mode: Option<crate::tasks::TaskWorktreeMode>,
+    #[serde(default)]
+    worktree_id: Option<String>,
+    #[serde(default)]
+    required_skills: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -325,6 +349,12 @@ pub(super) async fn create_task(
             metadata: request.metadata.unwrap_or_else(|| serde_json::json!({})),
             source_memory_id: request.source_memory_id,
             created_by: request.created_by.unwrap_or_else(|| "human".to_string()),
+            worker_type: request.worker_type,
+            project_id: request.project_id,
+            repo_id: request.repo_id,
+            worktree_mode: request.worktree_mode,
+            worktree_id: request.worktree_id,
+            required_skills: request.required_skills,
         })
         .await
         .map_err(|error| {
@@ -377,6 +407,12 @@ pub(super) async fn update_task(
                 clear_worker_id: false,
                 approved_by: request.approved_by,
                 complete_subtask: request.complete_subtask,
+                worker_type: request.worker_type,
+                project_id: request.project_id,
+                repo_id: request.repo_id,
+                worktree_mode: request.worktree_mode,
+                worktree_id: request.worktree_id,
+                required_skills: request.required_skills,
             },
         )
         .await

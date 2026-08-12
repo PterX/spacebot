@@ -57,6 +57,30 @@ pub struct ProjectSettings {
     pub auto_discover_worktrees: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_usage_warning_threshold: Option<u64>,
+    /// Default worker type for tasks in this project; a task's own
+    /// `worker_type` overrides it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_worker_type: Option<crate::tasks::TaskWorkerType>,
+    /// Default worktree mode for tasks in this project; a task's own
+    /// `worktree_mode` overrides it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_worktree_mode: Option<crate::tasks::TaskWorktreeMode>,
+    /// Skills injected into every worker executing a task in this project,
+    /// merged with (before) the task's own `required_skills`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_required_skills: Option<Vec<String>>,
+}
+
+impl ProjectSettings {
+    /// The execution defaults this project contributes to task plan
+    /// resolution.
+    pub fn execution_defaults(&self) -> crate::tasks::ExecutionDefaults {
+        crate::tasks::ExecutionDefaults {
+            worker_type: self.default_worker_type,
+            worktree_mode: self.default_worktree_mode,
+            required_skills: self.default_required_skills.clone().unwrap_or_default(),
+        }
+    }
 }
 
 // Domain types

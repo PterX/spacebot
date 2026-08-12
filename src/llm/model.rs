@@ -3649,17 +3649,27 @@ fn parse_openai_responses_response(
                 )));
             }
 
-            // Output items exist but none carried text-bearing content: a
-            // message whose only content item is thinking, an empty message
-            // the model returned deliberately, or an item we don't recognize.
-            // That is a legitimate empty completion, not a malformed response
-            // — surface it as empty text so callers can treat it as "the
-            // model said nothing" instead of failing the whole turn.
+            // A response made only of item types known to legitimately carry
+            // no text — a message whose content is empty or thinking-only, or
+            // a standalone reasoning item — is the model saying nothing, not
+            // a malformed response. Surface it as empty text so the turn can
+            // treat it as an empty completion. An unrecognized item type
+            // still errors: silently swallowing it would hide real protocol
+            // or provider breakage.
+            let all_known_textless = output_items
+                .iter()
+                .all(|item| matches!(item["type"].as_str(), Some("message") | Some("reasoning")));
+            if !all_known_textless {
+                return Err(CompletionError::ResponseError(format!(
+                    "empty or unsupported response from {provider_label} Responses API; expected text-bearing message content (output_text/text/summary/refusal/content) or function_call output items; received output types: {output_types}"
+                )));
+            }
+
             tracing::warn!(
                 provider = %provider_label,
                 output_items = output_items.len(),
                 output_types = %output_types,
-                "responses API returned output items with no text-bearing content — treating as empty completion"
+                "responses API returned message/reasoning items with no text-bearing content — treating as empty completion"
             );
             OneOrMany::one(AssistantContent::Text(Text {
                 text: String::new(),
