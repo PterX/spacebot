@@ -148,6 +148,16 @@ Set at creation: a task the author knows is under-specified is created with
 small, fully-specified work is `not_needed`; anything requiring
 investigation before it can be executed or judged is `needed`.
 
+**A task created from a design document is already enriched.** When a task
+is created with an attachment (§5), the research that enrichment would have
+produced is the thing it was created from, so it starts at `not_needed`.
+This is the common case for the work that matters most: a design doc gets
+written, tasks are cut from it, each carries a copy of the doc, and the loop
+spends its enrichment budget on the tasks that actually lack a plan. An
+attachment can still be marked `needed` explicitly when the doc raises
+questions it doesn't answer — the default follows the attachment, it isn't
+imposed by it.
+
 **The enrichment pass.** When deliberation selects a `needed` task, the run
 spawns a regular worker (per the task's execution plan) to research it. The
 worker's contract:
@@ -180,7 +190,8 @@ answered.
 ## 5. Task attachments
 
 Enrichment produces documents, and a plan document does not belong in a
-description field or a comment body.
+description field or a comment body. Neither does a design doc a task was
+cut from.
 
 ```
 {workspace_dir}/tasks/{task_number}/
@@ -200,6 +211,43 @@ the file tool's workspace-scoped path validation already contains them.
   runs it, which is the entire point of doing the research early.
 - Deleting a task leaves its directory (cheap, recoverable, and deletion of
   work product should be deliberate); a maintenance pass can reap orphans.
+
+### Attachments are copies, never references
+
+`task_create` accepts source paths (`attach: ["docs/design-docs/foo.md"]`)
+and **copies** their contents into the task directory at creation. It never
+stores a path and reads through it later. Four reasons, any one sufficient:
+
+- **The source may not be durable.** Design docs live in a repo only if
+  their author commits them — many are scratch files, and the ones outside
+  a repo are exactly the ones that vanish.
+- **Worktrees are ephemeral by design.** A task with
+  `worktree_mode: create` runs in a worktree that gets provisioned and
+  reaped ([task-dependencies.md](task-dependencies.md)). A plan living at a
+  path inside one would be gone before the work finished.
+- **The worker may not have the source checked out.** Cross-repo tasks and
+  builtin workers running outside any project would resolve the path to
+  nothing.
+- **A task's plan should be stable.** The plan a task was scoped and
+  approved against shouldn't silently change because someone edited the
+  source doc weeks later. Approval means something only if what was
+  approved holds still.
+
+Provenance is recorded rather than depended on — task `metadata` carries the
+source path, and the repo and commit when the source was inside a checkout:
+
+```json
+{"attachments": {"plan.md": {
+    "source": "docs/design-docs/autonomy-lifecycle.md",
+    "source_repo": "spacebot",
+    "source_commit": "9949c5db",
+    "copied_at": "2026-08-12T21:40:00Z"
+}}}
+```
+
+That keeps the trail — an agent or human can diff the copy against the
+current source, or refresh it — while the task's own copy stays the
+authority. Refreshing is an explicit action, never automatic.
 
 ## 6. Cortex succession
 
@@ -258,8 +306,9 @@ piece, and the rest can be retired as their successors prove out.
    selected ready tasks inside the run. One path to execution.
 2. **Enrichment state.** `enrichment` column, tool/API surface, the
    enrichment worker contract, transition rules, briefing render.
-3. **Attachments.** `tasks/{n}/` convention, API listing, worker briefing
-   inclusion of `plan.md`, UI rendering.
+3. **Attachments.** `tasks/{n}/` convention, `attach:` copying with
+   provenance metadata at creation, API listing, worker briefing inclusion
+   of `plan.md`, UI rendering.
 4. **Deliberation phase.** Summary-first briefing, retrieval tools in Phase
    A, declared intent recorded on the run.
 5. **Run-scheduled wakes.** `next_wake` on `autonomy_complete`, run row
