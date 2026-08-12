@@ -563,6 +563,7 @@ pub async fn add_channel_tools(
                 state.conversation_logger.clone(),
                 send_message_display_name,
                 current_adapter.clone(),
+                state.deps.process_control_registry.clone(),
             ))
             .await?;
     }

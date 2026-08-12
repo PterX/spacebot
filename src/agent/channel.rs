@@ -66,6 +66,9 @@ struct PendingResult {
 }
 
 const EVENT_LAG_WARNING_INTERVAL_SECS: u64 = 30;
+/// Ceiling on messages restored into live history when a channel starts. The
+/// compactor and chronicler trim from there under their own thresholds.
+const HYDRATE_MESSAGE_LIMIT: i64 = 200;
 const DECISION_MARKERS: &[&str] = &[
     "we decided to ",
     "i decided to ",
@@ -454,6 +457,10 @@ pub struct ChannelState {
     pub channel_id: ChannelId,
     pub kind: ChannelKind,
     pub history: Arc<RwLock<Vec<rig::message::Message>>>,
+    /// Guards `history` against cuts that raced a mutation. Writers outside the
+    /// channel's own turn loop must note their mutation so an in-flight cut
+    /// holding an older snapshot declines to trim.
+    pub history_fence: Arc<crate::agent::chronicle::HistoryFence>,
     pub active_branches: Arc<RwLock<HashMap<BranchId, tokio::task::JoinHandle<()>>>>,
     pub active_workers: Arc<RwLock<HashMap<WorkerId, Worker>>>,
     /// Tokio task handles for running workers, used for cancellation via abort().
@@ -520,6 +527,22 @@ pub struct ChannelState {
 }
 
 impl ChannelState {
+    /// Append a message this agent sent into the channel from outside the
+    /// channel's own turn loop, so the next turn sees what was said.
+    ///
+    /// The durable log is written separately by the sender; this keeps the live
+    /// history from diverging from it while the channel is resident in memory.
+    pub async fn inject_agent_message(&self, text: &str) {
+        {
+            let mut history = self.history.write().await;
+            history.push(rig::message::Message::Assistant {
+                id: None,
+                content: OneOrMany::one(rig::message::AssistantContent::text(text)),
+            });
+        }
+        self.history_fence.note_head_mutation();
+    }
+
     /// Cancel a running worker by aborting its tokio task and cleaning up state.
     /// Returns an error message if the worker is not found.
     pub async fn cancel_worker(&self, worker_id: WorkerId) -> std::result::Result<(), String> {
@@ -739,6 +762,10 @@ impl ChannelControlHandle {
         WeakChannelControlHandle {
             inner: Arc::downgrade(&self.inner),
         }
+    }
+
+    pub fn state(&self) -> &ChannelState {
+        &self.inner.state
     }
 
     pub async fn cancel_worker_with_reason(
@@ -1089,13 +1116,14 @@ impl Channel {
             deps.clone(),
             history.clone(),
             compactor_model,
-            history_fence,
+            history_fence.clone(),
         );
 
         let state = ChannelState {
             channel_id: id.clone(),
             kind,
             history: history.clone(),
+            history_fence: history_fence.clone(),
             active_branches: active_branches.clone(),
             active_workers: active_workers.clone(),
             worker_handles: Arc::new(RwLock::new(HashMap::new())),
@@ -1229,6 +1257,87 @@ impl Channel {
         if let Err(error) = result {
             tracing::warn!(channel_id = %self.id, %error, "context maintenance check failed");
         }
+    }
+
+    /// Rebuild live history from the durable log so a resident channel resumes
+    /// where it left off instead of starting blank after a restart.
+    ///
+    /// Under chronicle mode the load starts at the newest checkpoint boundary:
+    /// the chronicle view already covers everything below it, so loading the
+    /// uncovered tail reproduces exactly what the chronicler expects to see.
+    /// Rolling compaction has no durable boundary, so it takes the newest slice
+    /// it can afford instead.
+    async fn hydrate_history(&mut self) {
+        if !self.state.history.read().await.is_empty() {
+            return;
+        }
+
+        let store =
+            crate::conversation::chronicle::ChronicleStore::new(self.deps.sqlite_pool.clone());
+        let chronicle = self.deps.runtime_config.compaction.load().mode
+            == crate::config::CompactionMode::Chronicle;
+
+        let boundary = if chronicle {
+            match store.latest(&self.id, 0).await {
+                Ok(Some(checkpoint)) => checkpoint.end_boundary(),
+                Ok(None) => crate::conversation::chronicle::ChronicleBoundary::origin(),
+                Err(error) => {
+                    tracing::warn!(channel_id = %self.id, %error, "chronicle lookup failed, skipping hydration");
+                    return;
+                }
+            }
+        } else {
+            crate::conversation::chronicle::ChronicleBoundary::origin()
+        };
+
+        let loaded = if chronicle {
+            store
+                .messages_after(&self.id, boundary, HYDRATE_MESSAGE_LIMIT)
+                .await
+        } else {
+            store
+                .newest_messages_after(&self.id, boundary, HYDRATE_MESSAGE_LIMIT)
+                .await
+        };
+
+        let messages = match loaded {
+            Ok(messages) if messages.is_empty() => return,
+            Ok(messages) => messages,
+            Err(error) => {
+                tracing::warn!(channel_id = %self.id, %error, "history hydration failed");
+                return;
+            }
+        };
+
+        let durable_seq = messages.iter().filter_map(|message| message.seq).max();
+        let live_len = {
+            let mut history = self.state.history.write().await;
+            for message in &messages {
+                history.push(if message.role == "assistant" {
+                    rig::message::Message::Assistant {
+                        id: None,
+                        content: OneOrMany::one(rig::message::AssistantContent::text(
+                            &message.content,
+                        )),
+                    }
+                } else {
+                    rig::message::Message::User {
+                        content: OneOrMany::one(UserContent::text(&message.content)),
+                    }
+                });
+            }
+            history.len()
+        };
+
+        if let Some(seq) = durable_seq {
+            self.chronicler.fence().record_turn(live_len, seq);
+        }
+        tracing::info!(
+            channel_id = %self.id,
+            restored = live_len,
+            chronicle,
+            "restored live history from durable log"
+        );
     }
 
     /// Pair the live history length with the durable sequence that covers it.
@@ -1643,6 +1752,7 @@ impl Channel {
     /// Run the channel event loop.
     pub async fn run(mut self) -> Result<()> {
         tracing::info!(channel_id = %self.id, "channel started");
+        self.hydrate_history().await;
         let mut lagged_events_since_warning: u64 = 0;
         let mut last_lag_warning: Option<std::time::Instant> = None;
 
