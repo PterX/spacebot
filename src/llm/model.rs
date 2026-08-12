@@ -3632,22 +3632,40 @@ fn parse_openai_responses_response(
         }
     }
 
-    let choice = OneOrMany::many(assistant_content).map_err(|_| {
-        let output_types = output_items
-            .iter()
-            .map(|item| item["type"].as_str().unwrap_or("<missing-type>"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        tracing::warn!(
-            provider = %provider_label,
-            output_items = output_items.len(),
-            output_types = %output_types,
-            "empty response from responses API"
-        );
-        CompletionError::ResponseError(format!(
-            "empty or unsupported response from {provider_label} Responses API; expected text-bearing message content (output_text/text/summary/refusal/content) or function_call output items; received output types: {output_types}"
-        ))
-    })?;
+    let choice = match OneOrMany::many(assistant_content) {
+        Ok(choice) => choice,
+        Err(_) => {
+            let output_types = output_items
+                .iter()
+                .map(|item| item["type"].as_str().unwrap_or("<missing-type>"))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            if output_items.is_empty() {
+                // No output items at all — there is nothing that could be a
+                // legitimate completion. Genuinely malformed/empty response.
+                return Err(CompletionError::ResponseError(format!(
+                    "empty response from {provider_label} Responses API; received no output items"
+                )));
+            }
+
+            // Output items exist but none carried text-bearing content: a
+            // message whose only content item is thinking, an empty message
+            // the model returned deliberately, or an item we don't recognize.
+            // That is a legitimate empty completion, not a malformed response
+            // — surface it as empty text so callers can treat it as "the
+            // model said nothing" instead of failing the whole turn.
+            tracing::warn!(
+                provider = %provider_label,
+                output_items = output_items.len(),
+                output_types = %output_types,
+                "responses API returned output items with no text-bearing content — treating as empty completion"
+            );
+            OneOrMany::one(AssistantContent::Text(Text {
+                text: String::new(),
+            }))
+        }
+    };
 
     let input_tokens = body["usage"]["input_tokens"].as_u64().unwrap_or(0);
     let output_tokens = body["usage"]["output_tokens"].as_u64().unwrap_or(0);
