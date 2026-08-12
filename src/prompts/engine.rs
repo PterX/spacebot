@@ -82,16 +82,21 @@ impl PromptEngine {
         )?;
         env.add_template("factory", crate::prompts::text::get("factory"))?;
 
-        // Adapter-specific prompt fragments
-        env.add_template(
+        // Adapter-specific prompt fragments — every platform that
+        // `render_channel_adapter_prompt` maps must be registered here.
+        for adapter in [
             "adapters/email",
-            crate::prompts::text::get("adapters/email"),
-        )?;
-        env.add_template("adapters/cron", crate::prompts::text::get("adapters/cron"))?;
-        env.add_template(
+            "adapters/cron",
             "adapters/signal",
-            crate::prompts::text::get("adapters/signal"),
-        )?;
+            "adapters/discord",
+            "adapters/slack",
+            "adapters/mattermost",
+            "adapters/portal",
+            "adapters/twitch",
+            "adapters/webhook",
+        ] {
+            env.add_template(adapter, crate::prompts::text::get(adapter))?;
+        }
 
         // Slash-command agent-turn instructions
         env.add_template(
@@ -1052,6 +1057,29 @@ mod tests {
     fn cap_human_description_renders_small_docs_in_full() {
         let doc = "# Profile\n\nShort.".to_string();
         assert_eq!(super::cap_human_description(doc.clone(), 4_000), doc);
+    }
+
+    #[test]
+    fn every_mapped_adapter_template_is_registered() {
+        let engine = PromptEngine::new("en").expect("engine builds");
+        for adapter in [
+            "email",
+            "cron",
+            "signal",
+            "discord",
+            "slack",
+            "mattermost",
+            "portal",
+            "twitch",
+            "webhook",
+        ] {
+            // A mapped adapter whose template is missing renders as None and
+            // logs an error; assert the render path finds the template.
+            assert!(
+                engine.render_channel_adapter_prompt(adapter).is_some(),
+                "adapter fragment for {adapter} failed to render"
+            );
+        }
     }
 
     #[test]
