@@ -1267,7 +1267,14 @@ impl Channel {
     /// uncovered tail reproduces exactly what the chronicler expects to see.
     /// Rolling compaction has no durable boundary, so it takes the newest slice
     /// it can afford instead.
+    ///
+    /// System-initiated channels are excluded: each cron or autonomy run is a
+    /// fresh single-shot session whose prior rows are its own wake prompts, and
+    /// its briefing carries the continuity it needs.
     async fn hydrate_history(&mut self) {
+        if self.state.kind.self_exits() {
+            return;
+        }
         if !self.state.history.read().await.is_empty() {
             return;
         }
