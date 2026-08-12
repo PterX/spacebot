@@ -3693,6 +3693,7 @@ fn parse_openai_responses_sse_response(
 
     let mut output_acc: BTreeMap<usize, OutputItemAcc> = BTreeMap::new();
     let mut completed_response: Option<Value> = None;
+    let mut failure_message: Option<String> = None;
 
     for line in response_text.lines() {
         let Some(data) = line.strip_prefix("data: ") else {
@@ -3752,13 +3753,43 @@ fn parse_openai_responses_sse_response(
             Some("response.completed") => {
                 completed_response = event_body.get("response").cloned();
             }
+            // Terminal event with partial output (e.g. max_output_tokens
+            // hit); surface what arrived rather than erroring.
+            Some("response.incomplete") => {
+                if completed_response.is_none() {
+                    completed_response = event_body.get("response").cloned();
+                }
+            }
+            Some("response.failed") => {
+                let message = event_body["response"]["error"]["message"]
+                    .as_str()
+                    .unwrap_or("no error message in response.failed event")
+                    .to_string();
+                failure_message = Some(message);
+            }
+            Some("error") => {
+                let message = event_body["message"]
+                    .as_str()
+                    .unwrap_or("no error message in error event")
+                    .to_string();
+                failure_message = Some(message);
+            }
             _ => {}
+        }
+    }
+
+    if completed_response.is_none() {
+        if let Some(message) = failure_message {
+            return Err(CompletionError::ProviderError(format!(
+                "{provider_label} Responses API reported failure: {message}"
+            )));
         }
     }
 
     let mut response = completed_response.ok_or_else(|| {
         CompletionError::ProviderError(format!(
-            "{provider_label} Responses SSE stream missing response.completed event.\nBody: {}",
+            "{provider_label} Responses SSE stream missing response.completed event \
+             (stream ended without a terminal event; connection likely dropped).\nBody: {}",
             truncate_body(response_text)
         ))
     })?;
@@ -4430,6 +4461,50 @@ mod tests {
         let error = parse_openai_chat_sse_response("{\"choices\":[]}", "OpenRouter")
             .expect_err("should fail");
         assert!(error.to_string().contains("missing SSE data events"));
+    }
+
+    #[test]
+    fn responses_sse_failure_event_surfaces_provider_message() {
+        let sse = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n",
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"The model is overloaded\"}}}\n\n"
+        );
+
+        let error =
+            parse_openai_responses_sse_response(sse, "OpenAI ChatGPT").expect_err("should fail");
+        let message = error.to_string();
+        assert!(message.contains("The model is overloaded"), "{message}");
+        assert!(!message.contains("missing response.completed"), "{message}");
+        assert!(crate::llm::routing::is_retriable_error(&message));
+    }
+
+    #[test]
+    fn responses_sse_truncated_stream_is_retriable() {
+        let sse = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n"
+        );
+
+        let error =
+            parse_openai_responses_sse_response(sse, "OpenAI ChatGPT").expect_err("should fail");
+        let message = error.to_string();
+        assert!(message.contains("missing response.completed"), "{message}");
+        assert!(crate::llm::routing::is_retriable_error(&message));
+    }
+
+    #[test]
+    fn responses_sse_incomplete_event_yields_partial_output() {
+        let sse = concat!(
+            "event: response.incomplete\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_1\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"partial\"}]}]}}\n\n"
+        );
+
+        let parsed = parse_openai_responses_sse_response(sse, "OpenAI ChatGPT")
+            .expect("incomplete is a terminal event with usable output");
+        assert_eq!(parsed["status"], "incomplete");
+        assert_eq!(parsed["output"][0]["content"][0]["text"], "partial");
     }
 
     #[test]
