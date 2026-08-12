@@ -810,6 +810,10 @@ pub async fn create_agent_internal(
         &agent_config.archives_dir,
         &agent_config.ingest_dir(),
         &agent_config.logs_dir(),
+        &agent_config.saved_dir(),
+        &agent_config.notes_dir(),
+        &agent_config.research_dir(),
+        &agent_config.workspace_archive_dir(),
     ] {
         std::fs::create_dir_all(dir).map_err(|error| {
             tracing::error!(%error, dir = %dir.display(), "failed to create agent directory");

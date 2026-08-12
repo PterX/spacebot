@@ -1902,6 +1902,22 @@ impl ResolvedAgentConfig {
     pub fn saved_dir(&self) -> PathBuf {
         self.workspace.join("saved")
     }
+
+    /// Path to durable prose the agent and user author.
+    pub fn notes_dir(&self) -> PathBuf {
+        self.workspace.join("notes")
+    }
+
+    /// Path to reference material gathered from outside the instance.
+    pub fn research_dir(&self) -> PathBuf {
+        self.workspace.join("research")
+    }
+
+    /// Path to superseded workspace material, distinct from `archives_dir`
+    /// at the agent root which holds conversation archives.
+    pub fn workspace_archive_dir(&self) -> PathBuf {
+        self.workspace.join("archive")
+    }
 }
 
 // ---------------------------------------------------------------------------

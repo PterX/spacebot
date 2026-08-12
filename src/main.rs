@@ -2300,6 +2300,14 @@ async fn initialize_agents(
                 agent_config.saved_dir().display()
             )
         })?;
+        for dir in [
+            agent_config.notes_dir(),
+            agent_config.research_dir(),
+            agent_config.workspace_archive_dir(),
+        ] {
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("failed to create workspace dir: {}", dir.display()))?;
+        }
 
         // Per-agent database connections
         let db = spacebot::db::Db::connect(&agent_config.data_dir)
