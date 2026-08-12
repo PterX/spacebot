@@ -304,6 +304,9 @@ export function GlobalTasks() {
 			{/* Detail panel */}
 			{activeTask && (
 				<div className="w-[400px] shrink-0 overflow-y-auto border-l border-app-line">
+					{/* Sits above TaskDetail until @spacedrive/ai ships the
+					    beforeSubtasks slot, which places it in-card. */}
+					<ExecutionPlanSection task={activeTask as unknown as TaskItem} />
 					<TaskDetail
 						task={activeTask}
 						resolveAgentName={resolveAgentName}
@@ -311,9 +314,6 @@ export function GlobalTasks() {
 						onSubtaskToggle={handleSubtaskToggle}
 						onDelete={handleDelete}
 						onClose={() => setActiveTaskId(null)}
-						beforeSubtasks={
-							<ExecutionPlanSection task={activeTask as unknown as TaskItem} />
-						}
 					/>
 					<GithubSection
 						metadata={(activeTask as unknown as TaskItem).metadata}

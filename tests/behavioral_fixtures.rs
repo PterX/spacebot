@@ -333,9 +333,10 @@ fn standard_settings() -> ResolvedConversationSettings {
 }
 
 fn direct_settings() -> ResolvedConversationSettings {
-    let mut settings = ResolvedConversationSettings::default();
-    settings.delegation = DelegationMode::Direct;
-    settings
+    ResolvedConversationSettings {
+        delegation: DelegationMode::Direct,
+        ..Default::default()
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -190,10 +190,8 @@ export function ExecutionPlanSection({ task }: { task: TaskItem }) {
     return worktree ? `worktree: ${worktree.name}` : null;
   })();
 
-  // Styled to sit inside TaskDetail's `beforeSubtasks` slot, which already
-  // provides section spacing and padding.
   return (
-    <div>
+    <div className="border-b border-app-line/40 px-4 py-3">
       <h3 className="mb-2 text-xs font-medium uppercase tracking-wide text-ink-dull">
         Execution Plan
       </h3>
