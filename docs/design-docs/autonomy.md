@@ -16,6 +16,13 @@ This has a well-known failure mode: the agent writes malformed JSON, overwrites 
 
 ## The Autonomy Channel
 
+> **Superseded in part by [autonomy-lifecycle.md](autonomy-lifecycle.md).**
+> That doc replaces the fixed interval with run-scheduled wakes, splits the
+> run into a deliberation phase and an action phase, moves ready-task pickup
+> off the cortex and into the run, and adds explicit task enrichment state.
+> The philosophy, level semantics, wake model, and briefing-as-system-prompt
+> decisions below still hold.
+
 The autonomy channel is the agent's process for self-directed work. It is not per-task. It is one channel that wakes on a configured interval, surveys the task state, does as much enrichment and preparation as useful, executes ready tasks if any exist, and exits. On the next interval it wakes again.
 
 The interval is the default trigger, not the only one. Wake events — schedules, webhooks, internal events like a task approval or a user comment, and idle/staleness conditions — pull the next run forward and appear in its context with their payloads and instructions. The channel is the single consumer of all wake sources; see [`wakes.md`](wakes.md) for the trigger model, queue semantics, and authority rules.
@@ -186,6 +193,12 @@ struct AddTaskCommentInput {
 
 ### Enrichment Pattern
 
+> Enrichment gains an explicit task state in
+> [autonomy-lifecycle.md](autonomy-lifecycle.md) §4 — `not_needed` /
+> `needed` / `in_progress` / `done`, with a plan document written as a task
+> attachment and a terminating rule (a run may not re-enrich a `done`
+> task). The pattern below is the shipped, state-free version.
+
 ```
 wake → survey pending_approval tasks
   → pick highest-priority unenriched task
@@ -284,6 +297,12 @@ Working memory provides broader system context. The transcript provides the auto
 ---
 
 ## Lifecycle
+
+> The flow below describes the shipped implementation. See
+> [autonomy-lifecycle.md](autonomy-lifecycle.md) for the successor: the
+> trigger becomes the previous run's requested `next_wake` (interval as
+> floor and crash fallback), and the run opens with a deliberation phase
+> that queries rather than reading a rendered dump.
 
 ```
 Cortex tick
