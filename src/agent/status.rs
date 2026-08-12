@@ -130,10 +130,19 @@ pub struct StatusBlock {
     pub active_branches: Vec<BranchStatus>,
     /// Currently running workers.
     pub active_workers: Vec<WorkerStatus>,
+    /// The currently running context compaction, if any.
+    pub active_compaction: Option<CompactionStatus>,
     /// Recently completed work.
     pub completed_items: Vec<CompletedItem>,
     /// Active link conversations with other agents.
     pub active_link_conversations: Vec<LinkConversationStatus>,
+}
+
+/// Status of an active rolling compaction or chronicle checkpoint.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CompactionStatus {
+    pub kind: String,
+    pub started_at: DateTime<Utc>,
 }
 
 /// Status of an active branch.
@@ -195,6 +204,15 @@ impl StatusBlock {
     /// Update from a process event.
     pub fn update(&mut self, event: &ProcessEvent) {
         match event {
+            ProcessEvent::CompactionStarted { kind, .. } => {
+                self.active_compaction = Some(CompactionStatus {
+                    kind: kind.clone(),
+                    started_at: Utc::now(),
+                });
+            }
+            ProcessEvent::CompactionCompleted { .. } => {
+                self.active_compaction = None;
+            }
             ProcessEvent::WorkerStatus {
                 worker_id, status, ..
             } => {
@@ -612,7 +630,52 @@ fn render_system_info(info: &SystemInfo, current_time_line: Option<&str>) -> Str
 #[cfg(test)]
 mod tests {
     use super::StatusBlock;
+    use crate::{AgentId, ChannelId, ProcessEvent};
+    use std::sync::Arc;
     use uuid::Uuid;
+
+    fn compaction_started(kind: &str) -> ProcessEvent {
+        ProcessEvent::CompactionStarted {
+            agent_id: Arc::<str>::from("agent"),
+            channel_id: Arc::<str>::from("channel"),
+            kind: kind.to_string(),
+        }
+    }
+
+    fn compaction_completed(success: bool) -> ProcessEvent {
+        ProcessEvent::CompactionCompleted {
+            agent_id: AgentId::from("agent"),
+            channel_id: ChannelId::from("channel"),
+            success,
+        }
+    }
+
+    #[test]
+    fn compaction_lifecycle_tracks_one_active_compaction() {
+        let mut status = StatusBlock::new();
+
+        status.update(&compaction_started("rolling"));
+        status.update(&compaction_started("chronicle"));
+
+        assert_eq!(
+            status
+                .active_compaction
+                .as_ref()
+                .map(|value| value.kind.as_str()),
+            Some("chronicle")
+        );
+    }
+
+    #[test]
+    fn compaction_completion_is_idempotent() {
+        let mut status = StatusBlock::new();
+
+        status.update(&compaction_started("rolling"));
+        status.update(&compaction_completed(true));
+        status.update(&compaction_completed(false));
+
+        assert!(status.active_compaction.is_none());
+    }
 
     #[test]
     fn render_with_time_context_renders_current_time_when_empty() {

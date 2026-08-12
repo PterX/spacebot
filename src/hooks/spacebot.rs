@@ -479,6 +479,7 @@ impl SpacebotHook {
 
         let mut current_max_turns = 0usize;
         let mut last_text_response = String::new();
+        let mut aggregated_reasoning = String::new();
         let mut did_call_tool = false;
 
         loop {
@@ -679,9 +680,37 @@ impl SpacebotHook {
                             is_text_response = false;
                         }
                     }
-                    StreamedAssistantContent::Reasoning(_)
-                    | StreamedAssistantContent::ReasoningDelta { .. } => {
-                        did_call_tool = false;
+                    StreamedAssistantContent::Reasoning(reasoning) => {
+                        // Full reasoning block (e.g. assembled from an
+                        // `output_item.done` snapshot). Extract the readable
+                        // parts and forward them for the portal. The
+                        // `ends_with` check dedupes the common case where the
+                        // same reasoning was already streamed as deltas.
+                        let mut parts = Vec::new();
+                        for content in reasoning.content {
+                            match content {
+                                rig::message::ReasoningContent::Text { text, .. } => {
+                                    parts.push(text)
+                                }
+                                rig::message::ReasoningContent::Summary(summary) => {
+                                    parts.push(summary)
+                                }
+                                _ => {}
+                            }
+                        }
+                        let full = parts.join("\n");
+                        if !full.is_empty() && !aggregated_reasoning.ends_with(&full) {
+                            aggregated_reasoning.push_str(&full);
+                            self.forward_reasoning_delta(&full, &aggregated_reasoning)
+                                .await;
+                        }
+                    }
+                    StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
+                        if !reasoning.is_empty() {
+                            aggregated_reasoning.push_str(&reasoning);
+                            self.forward_reasoning_delta(&reasoning, &aggregated_reasoning)
+                                .await;
+                        }
                     }
                 }
             }
@@ -734,6 +763,24 @@ impl SpacebotHook {
             status: status.into(),
         };
         self.event_tx.send(event).ok();
+    }
+
+    /// Forward a reasoning/thinking delta to the portal (channel processes
+    /// only, mirroring text delta forwarding). Reasoning is not user-facing
+    /// text, so it rides its own event rather than the `TextDelta` path.
+    async fn forward_reasoning_delta(&self, reasoning_delta: &str, aggregated: &str) {
+        if self.process_type == ProcessType::Channel
+            && let Some(channel_id) = self.channel_id.clone()
+        {
+            let event = ProcessEvent::ReasoningDelta {
+                agent_id: self.agent_id.clone(),
+                process_id: self.process_id.clone(),
+                channel_id: Some(channel_id),
+                reasoning_delta: reasoning_delta.to_string(),
+                aggregated_reasoning: aggregated.to_string(),
+            };
+            self.event_tx.send(event).ok();
+        }
     }
 
     /// Send a worker idle event. Only valid for worker processes.

@@ -255,6 +255,16 @@ pub enum ProcessEvent {
         channel_id: ChannelId,
         threshold_reached: f32,
     },
+    CompactionStarted {
+        agent_id: AgentId,
+        channel_id: ChannelId,
+        kind: String,
+    },
+    CompactionCompleted {
+        agent_id: AgentId,
+        channel_id: ChannelId,
+        success: bool,
+    },
     /// A session chronicle checkpoint was committed for a channel.
     ///
     /// Carries the whole record so the timeline can render it without a
@@ -335,6 +345,16 @@ pub enum ProcessEvent {
         channel_id: Option<ChannelId>,
         text_delta: String,
         aggregated_text: String,
+    },
+    /// Streaming reasoning/thinking delta for a channel turn. Mirrors
+    /// [`TextDelta`](ProcessEvent::TextDelta) but carries model reasoning
+    /// (thinking) content, which is not user-facing text.
+    ReasoningDelta {
+        agent_id: AgentId,
+        process_id: ProcessId,
+        channel_id: Option<ChannelId>,
+        reasoning_delta: String,
+        aggregated_reasoning: String,
     },
     /// A cortex chat auto-triggered turn completed (e.g. after a worker delivered
     /// its result). The frontend appends this message to the cortex chat panel.

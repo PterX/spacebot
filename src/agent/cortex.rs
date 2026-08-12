@@ -1425,14 +1425,17 @@ fn signal_from_event(event: ProcessEvent) -> Option<Signal> {
         // UI-only events — no cortex signal needed. Chronicle checkpoints are
         // durable and reachable through the timeline and the chronicle tool,
         // so they do not also need a slot in the signal buffer.
-        ProcessEvent::ChronicleCheckpoint { .. }
+        ProcessEvent::CompactionStarted { .. }
+        | ProcessEvent::CompactionCompleted { .. }
+        | ProcessEvent::ChronicleCheckpoint { .. }
         | ProcessEvent::OpenCodeSessionCreated { .. }
         | ProcessEvent::OpenCodePartUpdated { .. }
         | ProcessEvent::WorkerInitialResult { .. }
         | ProcessEvent::WorkerText { .. }
         | ProcessEvent::CortexChatUpdate { .. }
         | ProcessEvent::SettingsUpdated { .. }
-        | ProcessEvent::ToolOutput { .. } => return None,
+        | ProcessEvent::ToolOutput { .. }
+        | ProcessEvent::ReasoningDelta { .. } => return None,
     })
 }
 
@@ -4354,6 +4357,12 @@ mod tests {
                 goal_id TEXT,
                 source_memory_id TEXT,
                 worker_id TEXT,
+                worker_type TEXT,
+                project_id TEXT,
+                repo_id TEXT,
+                worktree_mode TEXT,
+                worktree_id TEXT,
+                required_skills TEXT NOT NULL DEFAULT '[]',
                 created_by TEXT NOT NULL,
                 approved_at TEXT,
                 approved_by TEXT,
@@ -4365,6 +4374,19 @@ mod tests {
         .execute(&pool)
         .await
         .expect("failed to create tasks table");
+
+        sqlx::query(
+            "CREATE TABLE task_dependencies (
+                task_id TEXT NOT NULL,
+                depends_on_task_id TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'gate',
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                PRIMARY KEY (task_id, depends_on_task_id)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("failed to create task_dependencies table");
 
         let task_store = TaskStore::new(pool.clone());
         let registry = crate::agent::process_control::ProcessControlRegistry::new();
@@ -4439,6 +4461,12 @@ mod tests {
                 goal_id TEXT,
                 source_memory_id TEXT,
                 worker_id TEXT,
+                worker_type TEXT,
+                project_id TEXT,
+                repo_id TEXT,
+                worktree_mode TEXT,
+                worktree_id TEXT,
+                required_skills TEXT NOT NULL DEFAULT '[]',
                 created_by TEXT NOT NULL,
                 approved_at TEXT,
                 approved_by TEXT,
@@ -4450,6 +4478,19 @@ mod tests {
         .execute(&pool)
         .await
         .expect("failed to create tasks table");
+
+        sqlx::query(
+            "CREATE TABLE task_dependencies (
+                task_id TEXT NOT NULL,
+                depends_on_task_id TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'gate',
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                PRIMARY KEY (task_id, depends_on_task_id)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("failed to create task_dependencies table");
 
         let task_store = TaskStore::new(pool.clone());
         let registry = crate::agent::process_control::ProcessControlRegistry::new();

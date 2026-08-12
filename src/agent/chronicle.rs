@@ -405,6 +405,18 @@ impl Chronicler {
         };
         let cutting = self.cutting.clone();
 
+        if let Err(error) = self
+            .deps
+            .event_tx
+            .send(crate::ProcessEvent::CompactionStarted {
+                agent_id: self.deps.agent_id.clone(),
+                channel_id: self.channel_id.clone(),
+                kind: "chronicle".to_string(),
+            })
+        {
+            tracing::debug!(channel_id = %self.channel_id, %error, "failed to emit compaction-started event");
+        }
+
         tokio::spawn(async move {
             // Released on unwind too: a panic in summarization would otherwise
             // leave the flag set for the process lifetime, and the channel
@@ -412,8 +424,20 @@ impl Chronicler {
             // emergency truncation every turn.
             let _release = CuttingGuard(cutting);
             let channel_id = cut.channel_id.clone();
-            if let Err(error) = cut.run(kind, boundary).await {
+            let result = cut.run(kind, boundary).await;
+            if let Err(error) = &result {
                 tracing::error!(channel_id = %channel_id, %error, "chronicle checkpoint failed");
+            }
+            if let Err(error) = cut
+                .deps
+                .event_tx
+                .send(crate::ProcessEvent::CompactionCompleted {
+                    agent_id: cut.deps.agent_id.clone(),
+                    channel_id,
+                    success: result.is_ok(),
+                })
+            {
+                tracing::debug!(%error, "failed to emit compaction-completed event");
             }
         });
     }

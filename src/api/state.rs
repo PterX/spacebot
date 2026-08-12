@@ -390,6 +390,14 @@ pub enum ApiEvent {
         text_delta: String,
         aggregated_text: String,
     },
+    /// Streaming reasoning/thinking delta for a channel turn. Not user-facing
+    /// text — the portal renders it as a thinking block.
+    ReasoningDelta {
+        agent_id: String,
+        channel_id: String,
+        reasoning_delta: String,
+        aggregated_reasoning: String,
+    },
     /// A worker was started.
     WorkerStarted {
         agent_id: String,
@@ -433,6 +441,18 @@ pub enum ApiEvent {
         channel_id: String,
         branch_id: String,
         conclusion: String,
+    },
+    /// Context compaction began for a channel.
+    CompactionStarted {
+        agent_id: String,
+        channel_id: String,
+        kind: String,
+    },
+    /// Context compaction reached a terminal outcome.
+    CompactionCompleted {
+        agent_id: String,
+        channel_id: String,
+        success: bool,
     },
     /// A tool call started on a process.
     ToolStarted {
@@ -704,6 +724,30 @@ impl ApiState {
                                         covers_to: checkpoint.covers_to.clone(),
                                         message_count: checkpoint.message_count,
                                         created_at: checkpoint.created_at.clone(),
+                                    })
+                                    .ok();
+                            }
+                            ProcessEvent::CompactionStarted {
+                                channel_id, kind, ..
+                            } => {
+                                api_tx
+                                    .send(ApiEvent::CompactionStarted {
+                                        agent_id: agent_id.clone(),
+                                        channel_id: channel_id.to_string(),
+                                        kind: kind.clone(),
+                                    })
+                                    .ok();
+                            }
+                            ProcessEvent::CompactionCompleted {
+                                channel_id,
+                                success,
+                                ..
+                            } => {
+                                api_tx
+                                    .send(ApiEvent::CompactionCompleted {
+                                        agent_id: agent_id.clone(),
+                                        channel_id: channel_id.to_string(),
+                                        success: *success,
                                     })
                                     .ok();
                             }
@@ -991,6 +1035,21 @@ impl ApiState {
                                         channel_id: channel_id.to_string(),
                                         text_delta: text_delta.clone(),
                                         aggregated_text: aggregated_text.clone(),
+                                    })
+                                    .ok();
+                            }
+                            ProcessEvent::ReasoningDelta {
+                                channel_id: Some(channel_id),
+                                reasoning_delta,
+                                aggregated_reasoning,
+                                ..
+                            } => {
+                                api_tx
+                                    .send(ApiEvent::ReasoningDelta {
+                                        agent_id: agent_id.clone(),
+                                        channel_id: channel_id.to_string(),
+                                        reasoning_delta: reasoning_delta.clone(),
+                                        aggregated_reasoning: aggregated_reasoning.clone(),
                                     })
                                     .ok();
                             }

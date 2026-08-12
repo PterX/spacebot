@@ -132,6 +132,14 @@ export interface OutboundMessageDeltaEvent {
 	aggregated_text: string;
 }
 
+export interface ReasoningDeltaEvent {
+	type: "reasoning_delta";
+	agent_id: string;
+	channel_id: string;
+	reasoning_delta: string;
+	aggregated_reasoning: string;
+}
+
 export interface TypingStateEvent {
 	type: "typing_state";
 	agent_id: string;
@@ -203,6 +211,20 @@ export interface BranchCompletedEvent {
 	channel_id: string;
 	branch_id: string;
 	conclusion: string;
+}
+
+export interface CompactionStartedEvent {
+	type: "compaction_started";
+	agent_id: string;
+	channel_id: string;
+	kind: "rolling" | "chronicle";
+}
+
+export interface CompactionCompletedEvent {
+	type: "compaction_completed";
+	agent_id: string;
+	channel_id: string;
+	success: boolean;
 }
 
 export interface ToolStartedEvent {
@@ -289,6 +311,7 @@ export type ApiEvent =
 	| InboundMessageEvent
 	| OutboundMessageEvent
 	| OutboundMessageDeltaEvent
+	| ReasoningDeltaEvent
 	| TypingStateEvent
 	| WorkerStartedEvent
 	| WorkerStatusEvent
@@ -396,9 +419,16 @@ export interface CompletedItemInfo {
 	result_summary: string;
 }
 
+export interface CompactionStatusInfo {
+	/** Matches the compaction modes the backend emits. */
+	kind: "rolling" | "chronicle";
+	started_at: string;
+}
+
 export interface StatusBlockSnapshot {
 	active_workers: WorkerStatusInfo[];
 	active_branches: BranchStatusInfo[];
+	active_compaction: CompactionStatusInfo | null;
 	completed_items: CompletedItemInfo[];
 }
 
@@ -485,7 +515,8 @@ export type MemoryType =
 	| "event"
 	| "observation"
 	| "goal"
-	| "todo";
+	| "todo"
+	| "human";
 
 export const MEMORY_TYPES: MemoryType[] = [
 	"fact", "preference", "decision", "identity",
@@ -1047,6 +1078,17 @@ export interface UploadSkillResponse {
 
 export type TaskStatus = "pending_approval" | "backlog" | "ready" | "in_progress" | "done" | "failed";
 export type TaskPriority = "critical" | "high" | "medium" | "low";
+export type TaskWorkerType = "builtin" | "opencode";
+export type TaskWorktreeMode = "root" | "existing" | "create";
+export type TaskDependencyKind = "gate" | "stack";
+
+export interface TaskDependencyEdge {
+	depends_on_task_number: number;
+	depends_on_title: string;
+	depends_on_status: TaskStatus;
+	kind: TaskDependencyKind;
+	satisfied: boolean;
+}
 
 export interface TaskSubtask {
 	title: string;
@@ -1067,6 +1109,13 @@ export interface TaskItem {
 	goal_id?: string;
 	source_memory_id?: string;
 	worker_id?: string;
+	worker_type?: TaskWorkerType | null;
+	project_id?: string | null;
+	repo_id?: string | null;
+	worktree_mode?: TaskWorktreeMode | null;
+	worktree_id?: string | null;
+	required_skills: string[];
+	depends_on: TaskDependencyEdge[];
 	created_by: string;
 	approved_at?: string;
 	approved_by?: string;

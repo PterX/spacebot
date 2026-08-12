@@ -519,6 +519,14 @@ pub(crate) fn event_is_for_channel(event: &ProcessEvent, channel_id: &ChannelId)
             channel_id: event_channel,
             ..
         }
+        | ProcessEvent::CompactionStarted {
+            channel_id: event_channel,
+            ..
+        }
+        | ProcessEvent::CompactionCompleted {
+            channel_id: event_channel,
+            ..
+        }
         | ProcessEvent::ChronicleCheckpoint {
             channel_id: event_channel,
             ..
@@ -532,6 +540,10 @@ pub(crate) fn event_is_for_channel(event: &ProcessEvent, channel_id: &ChannelId)
             ..
         } => event_channel == channel_id,
         ProcessEvent::TextDelta {
+            channel_id: event_channel,
+            ..
+        }
+        | ProcessEvent::ReasoningDelta {
             channel_id: event_channel,
             ..
         } => event_channel.as_ref() == Some(channel_id),
