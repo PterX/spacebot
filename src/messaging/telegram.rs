@@ -364,9 +364,8 @@ impl Messaging for TelegramAdapter {
             } => {
                 self.stop_typing(&message.conversation_id).await;
 
-                // Use send_audio for audio files so Telegram renders an inline player.
-                // Fall back to send_document for everything else.
-                if mime_type.starts_with("audio/") {
+                let media_type = telegram_media_type(&mime_type);
+                if matches!(media_type, TelegramMediaType::Audio) {
                     let input_file = InputFile::memory(data.clone()).file_name(filename.clone());
                     let sent = if let Some(ref caption_text) = caption {
                         let html_caption = markdown_to_telegram_html(caption_text);
@@ -398,6 +397,94 @@ impl Messaging for TelegramAdapter {
                         } else {
                             return Err(error)
                                 .context("failed to send telegram audio with HTML caption")?;
+                        }
+                    }
+                } else if matches!(media_type, TelegramMediaType::Photo) {
+                    let input_file = InputFile::memory(data.clone()).file_name(filename.clone());
+                    let sent = if let Some(ref caption_text) = caption {
+                        self.bot
+                            .send_photo(chat_id, input_file)
+                            .caption(markdown_to_telegram_html(caption_text))
+                            .parse_mode(ParseMode::Html)
+                            .send()
+                            .await
+                    } else {
+                        self.bot.send_photo(chat_id, input_file).send().await
+                    };
+                    if let Err(error) = sent {
+                        if should_retry_plain_caption(&error) {
+                            let mut request = self
+                                .bot
+                                .send_photo(chat_id, InputFile::memory(data).file_name(filename));
+                            if let Some(caption_text) = caption {
+                                request = request.caption(caption_text);
+                            }
+                            request
+                                .send()
+                                .await
+                                .context("failed to send telegram photo")?;
+                        } else {
+                            return Err(error)
+                                .context("failed to send telegram photo with HTML caption")?;
+                        }
+                    }
+                } else if matches!(media_type, TelegramMediaType::Video) {
+                    let input_file = InputFile::memory(data.clone()).file_name(filename.clone());
+                    let sent = if let Some(ref caption_text) = caption {
+                        self.bot
+                            .send_video(chat_id, input_file)
+                            .caption(markdown_to_telegram_html(caption_text))
+                            .parse_mode(ParseMode::Html)
+                            .send()
+                            .await
+                    } else {
+                        self.bot.send_video(chat_id, input_file).send().await
+                    };
+                    if let Err(error) = sent {
+                        if should_retry_plain_caption(&error) {
+                            let mut request = self
+                                .bot
+                                .send_video(chat_id, InputFile::memory(data).file_name(filename));
+                            if let Some(caption_text) = caption {
+                                request = request.caption(caption_text);
+                            }
+                            request
+                                .send()
+                                .await
+                                .context("failed to send telegram video")?;
+                        } else {
+                            return Err(error)
+                                .context("failed to send telegram video with HTML caption")?;
+                        }
+                    }
+                } else if matches!(media_type, TelegramMediaType::Voice) {
+                    let input_file = InputFile::memory(data.clone()).file_name(filename.clone());
+                    let sent = if let Some(ref caption_text) = caption {
+                        self.bot
+                            .send_voice(chat_id, input_file)
+                            .caption(markdown_to_telegram_html(caption_text))
+                            .parse_mode(ParseMode::Html)
+                            .send()
+                            .await
+                    } else {
+                        self.bot.send_voice(chat_id, input_file).send().await
+                    };
+                    if let Err(error) = sent {
+                        if should_retry_plain_caption(&error) {
+                            let mut request = self
+                                .bot
+                                .send_voice(chat_id, InputFile::memory(data).file_name(filename));
+                            if let Some(caption_text) = caption {
+                                request = request.caption(caption_text);
+                            }
+                            request
+                                .send()
+                                .await
+                                .context("failed to send telegram voice message")?;
+                        } else {
+                            return Err(error).context(
+                                "failed to send telegram voice message with HTML caption",
+                            )?;
                         }
                     }
                 } else {
@@ -1085,6 +1172,8 @@ static ITALIC_UNDERSCORE_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"_(.+?)_").expect("hardcoded regex"));
 static STRIKETHROUGH_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"~~(.+?)~~").expect("hardcoded regex"));
+static SPOILER_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\|\|(.+?)\|\|").expect("hardcoded regex"));
 static LINK_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").expect("hardcoded regex"));
 
@@ -1237,8 +1326,28 @@ fn format_markdown_spans(text: &str) -> String {
     let text = ITALIC_PATTERN.replace_all(&text, "<i>$1</i>");
     let text = ITALIC_UNDERSCORE_PATTERN.replace_all(&text, "<i>$1</i>");
     let text = STRIKETHROUGH_PATTERN.replace_all(&text, "<s>$1</s>");
+    let text = SPOILER_PATTERN.replace_all(&text, "<tg-spoiler>$1</tg-spoiler>");
     let text = LINK_PATTERN.replace_all(&text, r#"<a href="$2">$1</a>"#);
     text.into_owned()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TelegramMediaType {
+    Audio,
+    Photo,
+    Video,
+    Voice,
+    Document,
+}
+
+fn telegram_media_type(mime_type: &str) -> TelegramMediaType {
+    match mime_type {
+        mime if mime.starts_with("image/") => TelegramMediaType::Photo,
+        mime if mime.starts_with("video/") => TelegramMediaType::Video,
+        "audio/ogg" | "audio/opus" => TelegramMediaType::Voice,
+        mime if mime.starts_with("audio/") => TelegramMediaType::Audio,
+        _ => TelegramMediaType::Document,
+    }
 }
 
 /// Send a plain text Telegram message for formatting fallback paths.
@@ -1392,6 +1501,27 @@ mod tests {
         assert_eq!(markdown_to_telegram_html("# Title"), "<b>Title</b>");
         assert_eq!(markdown_to_telegram_html("## Sub"), "<b>Sub</b>");
         assert_eq!(markdown_to_telegram_html("### Section"), "<b>Section</b>");
+    }
+
+    #[test]
+    fn spoilers_render_as_telegram_spoilers() {
+        assert_eq!(
+            markdown_to_telegram_html("Visible ||secret|| text"),
+            "Visible <tg-spoiler>secret</tg-spoiler> text"
+        );
+    }
+
+    #[test]
+    fn dispatches_media_by_mime_type() {
+        assert_eq!(telegram_media_type("image/png"), TelegramMediaType::Photo);
+        assert_eq!(telegram_media_type("video/mp4"), TelegramMediaType::Video);
+        assert_eq!(telegram_media_type("audio/ogg"), TelegramMediaType::Voice);
+        assert_eq!(telegram_media_type("audio/opus"), TelegramMediaType::Voice);
+        assert_eq!(telegram_media_type("audio/mpeg"), TelegramMediaType::Audio);
+        assert_eq!(
+            telegram_media_type("application/pdf"),
+            TelegramMediaType::Document
+        );
     }
 
     #[test]

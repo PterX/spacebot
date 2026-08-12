@@ -107,6 +107,10 @@ pub struct ReplyArgs {
     /// Great for structured reports, summaries, or visually distinct content.
     #[serde(default)]
     pub cards: Option<Vec<crate::Card>>,
+    /// Optional: Slack Block Kit blocks as raw JSON objects. Slack renders these
+    /// natively; other adapters use the message content fallback.
+    #[serde(default)]
+    pub blocks: Option<Vec<serde_json::Value>>,
     /// Optional: interactive elements (e.g. buttons, select menus) to attach.
     /// Button clicks will be sent back to you as an inbound InteractionEvent
     /// with the corresponding custom_id.
@@ -343,6 +347,11 @@ impl Tool for ReplyTool {
                         }
                     }
                 },
+                "blocks": {
+                    "type": "array",
+                    "description": "Optional: Slack Block Kit blocks as raw JSON objects. Slack renders them natively; provide content as a readable fallback for other adapters.",
+                    "items": { "type": "object" }
+                },
                 "interactive_elements": {
                     "type": "array",
                     "description": "Optional: interactive components to attach. Button clicks will be sent back to you as an inbound InteractionEvent with the corresponding custom_id. Max 5 elements (rows).",
@@ -479,10 +488,14 @@ impl Tool for ReplyTool {
                 thread_name,
                 text: converted_content.clone(),
             }
-        } else if args.cards.is_some() || args.interactive_elements.is_some() || poll.is_some() {
+        } else if args.cards.is_some()
+            || args.blocks.is_some()
+            || args.interactive_elements.is_some()
+            || poll.is_some()
+        {
             OutboundResponse::RichMessage {
                 text: converted_content.clone(),
-                blocks: vec![],
+                blocks: args.blocks.unwrap_or_default(),
                 cards: args.cards.unwrap_or_default(),
                 interactive_elements: args.interactive_elements.unwrap_or_default(),
                 poll,
@@ -537,6 +550,16 @@ mod tests {
     use super::{
         normalize_discord_mention_tokens, normalize_poll_payload, sanitize_discord_user_id,
     };
+
+    #[test]
+    fn reply_schema_exposes_slack_blocks() {
+        let args: super::ReplyArgs = serde_json::from_value(serde_json::json!({
+            "content": "Fallback",
+            "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "Hello"}}]
+        }))
+        .expect("reply args accepts Slack blocks");
+        assert_eq!(args.blocks.unwrap().len(), 1);
+    }
     use crate::Poll;
 
     #[test]

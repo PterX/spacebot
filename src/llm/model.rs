@@ -3778,12 +3778,12 @@ fn parse_openai_responses_sse_response(
         }
     }
 
-    if completed_response.is_none() {
-        if let Some(message) = failure_message {
-            return Err(CompletionError::ProviderError(format!(
-                "{provider_label} Responses API reported failure: {message}"
-            )));
-        }
+    if completed_response.is_none()
+        && let Some(message) = failure_message
+    {
+        return Err(CompletionError::ProviderError(format!(
+            "{provider_label} Responses API reported failure: {message}"
+        )));
     }
 
     let mut response = completed_response.ok_or_else(|| {

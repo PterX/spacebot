@@ -14,6 +14,7 @@ use axum::extract::{Json, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, mpsc};
 
@@ -65,6 +66,11 @@ struct WebhookResponse {
     response_type: String,
     content: Option<String>,
     filename: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Base64-encoded file content. This keeps each poll response self-contained.
+    data: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     caption: Option<String>,
 }
@@ -154,44 +160,61 @@ impl Messaging for WebhookAdapter {
                 response_type: "text".into(),
                 content: Some(text),
                 filename: None,
+                mime_type: None,
+                data: None,
                 caption: None,
             },
             OutboundResponse::RichMessage { text, .. } => WebhookResponse {
                 response_type: "text".into(),
                 content: Some(text),
                 filename: None,
+                mime_type: None,
+                data: None,
                 caption: None,
             },
             OutboundResponse::ThreadReply { text, .. } => WebhookResponse {
                 response_type: "text".into(),
                 content: Some(text),
                 filename: None,
+                mime_type: None,
+                data: None,
                 caption: None,
             },
             OutboundResponse::File {
-                filename, caption, ..
+                filename,
+                data,
+                mime_type,
+                caption,
             } => WebhookResponse {
                 response_type: "file".into(),
                 content: None,
                 filename: Some(filename),
+                mime_type: Some(mime_type),
+                data: Some(base64::engine::general_purpose::STANDARD.encode(data)),
                 caption,
             },
             OutboundResponse::StreamStart => WebhookResponse {
                 response_type: "stream_start".into(),
                 content: None,
                 filename: None,
+                mime_type: None,
+                data: None,
                 caption: None,
             },
             OutboundResponse::StreamChunk(text) => WebhookResponse {
                 response_type: "stream_chunk".into(),
                 content: Some(text),
                 filename: None,
+                mime_type: None,
+                data: None,
                 caption: None,
             },
             OutboundResponse::StreamEnd => WebhookResponse {
                 response_type: "stream_end".into(),
                 content: None,
                 filename: None,
+                mime_type: None,
+                data: None,
                 caption: None,
             },
             // Reactions, status updates, and remove-reaction aren't meaningful over webhook
@@ -203,12 +226,16 @@ impl Messaging for WebhookAdapter {
                 response_type: "text".into(),
                 content: Some(text),
                 filename: None,
+                mime_type: None,
+                data: None,
                 caption: None,
             },
             OutboundResponse::ScheduledMessage { text, .. } => WebhookResponse {
                 response_type: "text".into(),
                 content: Some(text),
                 filename: None,
+                mime_type: None,
+                data: None,
                 caption: None,
             },
         };
@@ -337,4 +364,33 @@ fn is_authorized(headers: &HeaderMap, expected_token: Option<&str>) -> bool {
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .is_some_and(|token| token == expected_token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_poll_response_contains_self_contained_payload() {
+        let response = WebhookResponse {
+            response_type: "file".to_string(),
+            content: None,
+            filename: Some("report.txt".to_string()),
+            mime_type: Some("text/plain".to_string()),
+            data: Some(base64::engine::general_purpose::STANDARD.encode(b"report")),
+            caption: Some("Generated report".to_string()),
+        };
+
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({
+                "type": "file",
+                "content": null,
+                "filename": "report.txt",
+                "mime_type": "text/plain",
+                "data": "cmVwb3J0",
+                "caption": "Generated report"
+            })
+        );
+    }
 }

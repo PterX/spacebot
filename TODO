@@ -6,11 +6,6 @@ Prompt / memory rework (remaining, see docs/design-docs/execution-plan.md):
   ☐ Run the live behavioral fixtures against 06178a6d (pre-rewrite) and HEAD
     to record the baseline the rewrite shipped without — needs
     SPACEBOT_FIXTURE_API_KEY, `cargo test --test behavioral_fixtures -- --ignored`
-  ☐ Converter fixes gating adapter fragments (adapter-verification-2026-08-11.md):
-    telegram send_photo/send_video/send_voice + spoiler entities; slack
-    `blocks` exposure in the reply tool; signal markdown → textStyle ranges
-    (or keep the plain-text fragment); webhook file delivery (or explicit
-    no-files contract); portal audio/video inline elements
   ☐ Memory-first phases 3.1b/3.1c: project scoping with hysteresis, then the
     loaded set (per-channel stored state, branch curation, loader provenance)
   ☐ Daily digest cron + retire intraday synthesis (memory-first phase 5)

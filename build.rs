@@ -66,10 +66,10 @@ fn dev_version(pkg: &str) -> Option<String> {
         rerun_paths.push(head_ref);
     }
     for path in rerun_paths {
-        if let Some(resolved) = git(&["rev-parse", "--git-path", &path]) {
-            if std::path::Path::new(&resolved).exists() {
-                println!("cargo:rerun-if-changed={resolved}");
-            }
+        if let Some(resolved) = git(&["rev-parse", "--git-path", &path])
+            && std::path::Path::new(&resolved).exists()
+        {
+            println!("cargo:rerun-if-changed={resolved}");
         }
     }
 

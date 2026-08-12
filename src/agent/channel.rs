@@ -3176,6 +3176,7 @@ impl Channel {
     /// Register per-turn tools, run the LLM agentic loop, and clean up.
     ///
     /// Returns the prompt result and per-turn flags for the caller to dispatch.
+    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip(self, user_text, system_prompt, attachment_content), fields(channel_id = %self.id, agent_id = %self.deps.agent_id))]
     async fn run_agent_turn(
         &self,
