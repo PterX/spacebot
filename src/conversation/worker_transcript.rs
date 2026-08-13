@@ -78,8 +78,13 @@ pub enum ActionContent {
 
 /// Convert a Rig message history to transcript steps, serialize as JSON, and gzip compress.
 pub fn serialize_transcript(history: &[rig::message::Message]) -> Vec<u8> {
-    let steps = convert_history(history);
+    let steps = transcript_steps(history);
     serialize_steps(&steps)
+}
+
+/// Convert a Rig message history to transcript steps.
+pub fn transcript_steps(history: &[rig::message::Message]) -> Vec<TranscriptStep> {
+    convert_history(history)
 }
 
 /// Serialize pre-built transcript steps as gzipped JSON.

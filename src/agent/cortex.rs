@@ -1431,7 +1431,7 @@ fn signal_from_event(event: ProcessEvent) -> Option<Signal> {
         | ProcessEvent::OpenCodeSessionCreated { .. }
         | ProcessEvent::OpenCodePartUpdated { .. }
         | ProcessEvent::WorkerInitialResult { .. }
-        | ProcessEvent::WorkerText { .. }
+        | ProcessEvent::ProcessText { .. }
         | ProcessEvent::CortexChatUpdate { .. }
         | ProcessEvent::SettingsUpdated { .. }
         | ProcessEvent::ToolOutput { .. }
@@ -3976,6 +3976,10 @@ mod tests {
                 branch_id,
                 channel_id: channel_id.clone(),
                 description: "branch start".to_string(),
+                input: "actual prompt".to_string(),
+                profile: "default".to_string(),
+                model: "test-model".to_string(),
+                max_turns: 10,
                 reply_to_message_id: Some("message-1".to_string()),
             },
             ProcessEvent::BranchResult {
@@ -3983,6 +3987,9 @@ mod tests {
                 branch_id,
                 channel_id: channel_id.clone(),
                 conclusion: "branch done".to_string(),
+                status: "done".to_string(),
+                transcript: None,
+                tool_calls: 0,
             },
             ProcessEvent::WorkerStarted {
                 agent_id: agent_id.clone(),

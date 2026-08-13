@@ -1347,7 +1347,7 @@ async fn run(
                         agent.config.screenshot_dir(),
                         agent.config.logs_dir(),
                         snapshot_store,
-                        Some(api_state.live_worker_transcripts.clone()),
+                        Some(api_state.live_process_transcripts.clone()),
                         resolved_settings,
                         None, // no cron outcome for normal channels
                         None, // no autonomy run for normal channels
@@ -1745,7 +1745,7 @@ async fn run(
                         agent.config.screenshot_dir(),
                         agent.config.logs_dir(),
                         snapshot_store,
-                        Some(api_state.live_worker_transcripts.clone()),
+                        Some(api_state.live_process_transcripts.clone()),
                         resolved_settings,
                         None, // no cron outcome for normal channels
                         None, // no autonomy run for normal channels

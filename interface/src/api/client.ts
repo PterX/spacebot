@@ -106,6 +106,36 @@ export type WorkerRunInfo = Types.WorkerListItem;
 export type AssociationItem = Types.Association;
 
 export type ProcessType = "channel" | "branch" | "worker";
+export type ProcessKind = "branch" | "worker";
+
+export interface ProcessRun {
+	kind: ProcessKind;
+	id: string;
+	input: string;
+	output: string | null;
+	status: string;
+	process_type: string;
+	profile: string | null;
+	channel_id: string | null;
+	channel_name: string | null;
+	started_at: string;
+	completed_at: string | null;
+	has_transcript: boolean;
+	transcript: Types.TranscriptStep[] | null;
+	tool_calls: number;
+	model: string | null;
+	max_turns: number | null;
+	opencode_session_id: string | null;
+	opencode_port: number | null;
+	directory: string | null;
+	interactive: boolean;
+	project_id: string | null;
+}
+
+export interface ProcessListResponse {
+	processes: ProcessRun[];
+	total: number;
+}
 
 export interface InboundMessageEvent {
 	type: "inbound_message";
@@ -292,10 +322,12 @@ export interface OpenCodePartUpdatedEvent {
 	part: OpenCodePart;
 }
 
-export interface WorkerTextEvent {
-	type: "worker_text";
+export interface ProcessTextEvent {
+	type: "process_text";
 	agent_id: string;
-	worker_id: string;
+	process_type: ProcessType;
+	process_id: string;
+	channel_id: string | null;
 	text: string;
 }
 
@@ -324,7 +356,7 @@ export type ApiEvent =
 	| ToolCompletedEvent
 	| ToolOutputEvent
 	| OpenCodePartUpdatedEvent
-	| WorkerTextEvent
+	| ProcessTextEvent
 	| CortexChatMessageEvent;
 
 // -- Timeline types (discriminated union parts) --
@@ -1701,6 +1733,25 @@ export const api = {
 	},
 	workerDetail: (agentId: string, workerId: string) =>
 		fetchJson<Types.WorkerDetailResponse>(`/agents/workers/detail?agent_id=${encodeURIComponent(agentId)}&worker_id=${encodeURIComponent(workerId)}`),
+	processesList: (
+		agentId: string,
+		params: {limit?: number; offset?: number; status?: string; kind?: ProcessKind} = {},
+	) => {
+		const search = new URLSearchParams({agent_id: agentId});
+		if (params.limit) search.set("limit", String(params.limit));
+		if (params.offset) search.set("offset", String(params.offset));
+		if (params.status) search.set("status", params.status);
+		if (params.kind) search.set("kind", params.kind);
+		return fetchJson<ProcessListResponse>(`/agents/processes?${search}`);
+	},
+	processDetail: (agentId: string, kind: ProcessKind, processId: string) => {
+		const search = new URLSearchParams({
+			agent_id: agentId,
+			kind,
+			process_id: processId,
+		});
+		return fetchJson<ProcessRun>(`/agents/processes/detail?${search}`);
+	},
 	agentMemories: (agentId: string, params: MemoryGraphParams = {}) => {
 		const search = new URLSearchParams({ agent_id: agentId });
 		if (params.limit) search.set("limit", String(params.limit));

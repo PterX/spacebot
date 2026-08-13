@@ -458,8 +458,6 @@ pub enum TimelineItem {
 }
 
 /// Persists branch and worker run records for channel timeline history.
-///
-/// All write methods are fire-and-forget, same pattern as ConversationLogger.
 #[derive(Debug, Clone)]
 pub struct ProcessRunLogger {
     pool: SqlitePool,
@@ -470,51 +468,70 @@ impl ProcessRunLogger {
         Self { pool }
     }
 
-    /// Record a branch starting. Fire-and-forget.
-    pub fn log_branch_started(
+    /// Record a branch before its execution task is spawned.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn log_branch_started(
         &self,
         channel_id: &ChannelId,
         branch_id: BranchId,
         description: &str,
-    ) {
-        let pool = self.pool.clone();
-        let id = branch_id.to_string();
-        let channel_id = channel_id.to_string();
-        let description = description.to_string();
-
-        tokio::spawn(async move {
-            if let Err(error) = sqlx::query(
-                "INSERT OR IGNORE INTO branch_runs (id, channel_id, description) VALUES (?, ?, ?)",
-            )
-            .bind(&id)
-            .bind(&channel_id)
-            .bind(&description)
-            .execute(&pool)
-            .await
-            {
-                tracing::warn!(%error, branch_id = %id, "failed to persist branch start");
-            }
-        });
+        input: &str,
+        profile: &str,
+        model: &str,
+        max_turns: usize,
+    ) -> crate::error::Result<()> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO branch_runs \
+             (id, channel_id, description, input, status, profile, model, max_turns) \
+             VALUES (?, ?, ?, ?, 'running', ?, ?, ?)",
+        )
+        .bind(branch_id.to_string())
+        .bind(channel_id.as_ref())
+        .bind(description)
+        .bind(input)
+        .bind(profile)
+        .bind(model)
+        .bind(i64::try_from(max_turns).unwrap_or(i64::MAX))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+        Ok(())
     }
 
-    /// Record a branch completing with its conclusion. Fire-and-forget.
-    pub fn log_branch_completed(&self, branch_id: BranchId, conclusion: &str) {
-        let pool = self.pool.clone();
-        let id = branch_id.to_string();
-        let conclusion = conclusion.to_string();
+    /// Commit a branch terminal outcome if the run is still active.
+    ///
+    /// Returns `true` when this call won the terminal transition. Once a row
+    /// leaves `running`, duplicate completion or cancellation events are inert.
+    pub async fn log_branch_terminal(
+        &self,
+        branch_id: BranchId,
+        conclusion: &str,
+        status: &str,
+        transcript: Option<&[u8]>,
+        tool_calls: i64,
+    ) -> crate::error::Result<bool> {
+        if !matches!(status, "done" | "failed" | "cancelled") {
+            return Err(
+                anyhow::anyhow!("can't complete branch: invalid terminal status {status}").into(),
+            );
+        }
 
-        tokio::spawn(async move {
-            if let Err(error) = sqlx::query(
-                "UPDATE branch_runs SET conclusion = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?"
-            )
-            .bind(&conclusion)
-            .bind(&id)
-            .execute(&pool)
-            .await
-            {
-                tracing::warn!(%error, branch_id = %id, "failed to persist branch completion");
-            }
-        });
+        let result = sqlx::query(
+            "UPDATE branch_runs \
+             SET conclusion = ?, status = ?, transcript = ?, tool_calls = ?, \
+                 completed_at = CURRENT_TIMESTAMP \
+             WHERE id = ? AND status = 'running'",
+        )
+        .bind(conclusion)
+        .bind(status)
+        .bind(transcript)
+        .bind(tool_calls)
+        .bind(branch_id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+        Ok(result.rows_affected() == 1)
     }
 
     /// Record a worker starting. Fire-and-forget.
@@ -1282,6 +1299,158 @@ impl ProcessRunLogger {
                 .unwrap_or(None),
         }))
     }
+
+    /// List branch and worker runs in a uniform shape, newest first.
+    pub async fn list_process_runs(
+        &self,
+        agent_id: &str,
+        limit: i64,
+        offset: i64,
+        status_filter: Option<&str>,
+        kind_filter: Option<&str>,
+    ) -> crate::error::Result<(Vec<ProcessRunRow>, i64)> {
+        if kind_filter.is_some_and(|kind| !matches!(kind, "branch" | "worker")) {
+            return Err(
+                anyhow::anyhow!("can't list processes: kind must be branch or worker").into(),
+            );
+        }
+
+        let union = "SELECT 'worker' AS kind, w.id, w.task AS input, w.result AS output, \
+                            w.status, w.worker_type AS process_type, NULL AS profile, \
+                            w.channel_id, c.display_name AS channel_name, w.started_at, \
+                            w.completed_at, w.transcript IS NOT NULL AS has_transcript, \
+                            w.tool_calls, NULL AS model, NULL AS max_turns, \
+                            w.opencode_session_id, w.opencode_port, w.directory, \
+                            w.interactive, w.project_id \
+                     FROM worker_runs w \
+                     LEFT JOIN channels c ON w.channel_id = c.id \
+                     WHERE w.agent_id = ?1 \
+                     UNION ALL \
+                     SELECT 'branch' AS kind, b.id, b.input, b.conclusion AS output, \
+                            b.status, b.profile AS process_type, b.profile, \
+                            b.channel_id, c.display_name AS channel_name, b.started_at, \
+                            b.completed_at, b.transcript IS NOT NULL AS has_transcript, \
+                            b.tool_calls, b.model, b.max_turns, \
+                            NULL AS opencode_session_id, NULL AS opencode_port, \
+                            NULL AS directory, 0 AS interactive, NULL AS project_id \
+                     FROM branch_runs b \
+                     LEFT JOIN channels c ON b.channel_id = c.id";
+        let filters = "WHERE (?2 IS NULL OR status = ?2) AND (?3 IS NULL OR kind = ?3)";
+        let count_query = format!("SELECT COUNT(*) AS total FROM ({union}) processes {filters}");
+        let list_query = format!(
+            "SELECT * FROM ({union}) processes {filters} \
+             ORDER BY started_at DESC LIMIT ?4 OFFSET ?5"
+        );
+
+        let total = sqlx::query(&count_query)
+            .bind(agent_id)
+            .bind(status_filter)
+            .bind(kind_filter)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?
+            .try_get("total")
+            .unwrap_or(0);
+        let rows = sqlx::query(&list_query)
+            .bind(agent_id)
+            .bind(status_filter)
+            .bind(kind_filter)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?
+            .into_iter()
+            .map(|row| process_run_from_row(&row))
+            .collect::<Vec<_>>();
+
+        Ok((rows, total))
+    }
+
+    /// Get one branch or worker run, including its compressed transcript.
+    pub async fn get_process_detail(
+        &self,
+        agent_id: &str,
+        kind: &str,
+        process_id: &str,
+    ) -> crate::error::Result<Option<ProcessDetailRow>> {
+        let query = match kind {
+            "worker" => {
+                "SELECT 'worker' AS kind, w.id, w.task AS input, w.result AS output, \
+                        w.status, w.worker_type AS process_type, NULL AS profile, \
+                        w.channel_id, c.display_name AS channel_name, w.started_at, \
+                        w.completed_at, w.transcript, w.transcript IS NOT NULL AS has_transcript, \
+                        w.tool_calls, NULL AS model, \
+                        NULL AS max_turns, w.opencode_session_id, w.opencode_port, \
+                        w.directory, w.interactive, w.project_id \
+                 FROM worker_runs w LEFT JOIN channels c ON w.channel_id = c.id \
+                 WHERE w.agent_id = ?1 AND w.id = ?2"
+            }
+            "branch" => {
+                "SELECT 'branch' AS kind, b.id, b.input, b.conclusion AS output, \
+                        b.status, b.profile AS process_type, b.profile, \
+                        b.channel_id, c.display_name AS channel_name, b.started_at, \
+                        b.completed_at, b.transcript, b.transcript IS NOT NULL AS has_transcript, \
+                        b.tool_calls, b.model, \
+                        b.max_turns, NULL AS opencode_session_id, NULL AS opencode_port, \
+                        NULL AS directory, 0 AS interactive, NULL AS project_id \
+                 FROM branch_runs b LEFT JOIN channels c ON b.channel_id = c.id \
+                 WHERE ?1 IS NOT NULL AND b.id = ?2"
+            }
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "can't get process detail: kind must be branch or worker"
+                )
+                .into());
+            }
+        };
+
+        let row = sqlx::query(query)
+            .bind(agent_id)
+            .bind(process_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+
+        Ok(row.map(|row| ProcessDetailRow {
+            run: process_run_from_row(&row),
+            transcript_blob: row
+                .try_get::<Option<Vec<u8>>, _>("transcript")
+                .unwrap_or(None)
+                .filter(|blob| !blob.is_empty()),
+        }))
+    }
+}
+
+fn process_run_from_row(row: &sqlx::sqlite::SqliteRow) -> ProcessRunRow {
+    ProcessRunRow {
+        kind: row.try_get("kind").unwrap_or_default(),
+        id: row.try_get("id").unwrap_or_default(),
+        input: row.try_get("input").unwrap_or_default(),
+        output: row.try_get("output").ok().flatten(),
+        status: row.try_get("status").unwrap_or_default(),
+        process_type: row.try_get("process_type").unwrap_or_default(),
+        profile: row.try_get("profile").ok().flatten(),
+        channel_id: row.try_get("channel_id").ok().flatten(),
+        channel_name: row.try_get("channel_name").ok().flatten(),
+        started_at: row
+            .try_get::<chrono::DateTime<chrono::Utc>, _>("started_at")
+            .map(|time| time.to_rfc3339())
+            .unwrap_or_default(),
+        completed_at: row
+            .try_get::<chrono::DateTime<chrono::Utc>, _>("completed_at")
+            .ok()
+            .map(|time| time.to_rfc3339()),
+        has_transcript: row.try_get("has_transcript").unwrap_or(false),
+        tool_calls: row.try_get("tool_calls").unwrap_or(0),
+        model: row.try_get("model").ok().flatten(),
+        max_turns: row.try_get("max_turns").ok().flatten(),
+        opencode_session_id: row.try_get("opencode_session_id").ok().flatten(),
+        opencode_port: row.try_get("opencode_port").ok().flatten(),
+        directory: row.try_get("directory").ok().flatten(),
+        interactive: row.try_get("interactive").unwrap_or(false),
+        project_id: row.try_get("project_id").ok().flatten(),
+    }
 }
 
 /// A worker run row without the transcript blob (for list queries).
@@ -1339,9 +1508,43 @@ pub struct WorkerDetailRow {
     pub directory: Option<String>,
 }
 
+/// A branch or worker run without its transcript blob.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessRunRow {
+    pub kind: String,
+    pub id: String,
+    pub input: String,
+    pub output: Option<String>,
+    pub status: String,
+    pub process_type: String,
+    pub profile: Option<String>,
+    pub channel_id: Option<String>,
+    pub channel_name: Option<String>,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub has_transcript: bool,
+    pub tool_calls: i64,
+    pub model: Option<String>,
+    pub max_turns: Option<i64>,
+    pub opencode_session_id: Option<String>,
+    pub opencode_port: Option<i32>,
+    pub directory: Option<String>,
+    pub interactive: bool,
+    pub project_id: Option<String>,
+}
+
+/// A branch or worker run with its compressed transcript blob.
+#[derive(Debug, Clone)]
+pub struct ProcessDetailRow {
+    pub run: ProcessRunRow,
+    pub transcript_blob: Option<Vec<u8>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ProcessRunLogger, TimelineCursor, TimelineItem, timeline_item_id};
+    use crate::conversation::worker_transcript::{ActionContent, TranscriptStep};
+    use std::sync::Arc;
 
     async fn setup_worker_runs_table() -> sqlx::SqlitePool {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -1364,6 +1567,163 @@ mod tests {
         .expect("failed to create worker_runs table");
 
         pool
+    }
+
+    async fn setup_process_runs_tables() -> sqlx::SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("failed to create sqlite memory pool");
+        sqlx::raw_sql(
+            "CREATE TABLE channels (
+                id TEXT PRIMARY KEY,
+                display_name TEXT
+            );
+            CREATE TABLE branch_runs (
+                id TEXT PRIMARY KEY,
+                channel_id TEXT NOT NULL,
+                description TEXT NOT NULL,
+                input TEXT NOT NULL,
+                conclusion TEXT,
+                status TEXT NOT NULL DEFAULT 'running',
+                transcript BLOB,
+                tool_calls INTEGER NOT NULL DEFAULT 0,
+                profile TEXT NOT NULL DEFAULT 'default',
+                model TEXT,
+                max_turns INTEGER,
+                started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP
+            );
+            CREATE TABLE worker_runs (
+                id TEXT PRIMARY KEY,
+                channel_id TEXT,
+                task TEXT NOT NULL,
+                result TEXT,
+                status TEXT NOT NULL DEFAULT 'running',
+                worker_type TEXT NOT NULL DEFAULT 'builtin',
+                agent_id TEXT,
+                transcript BLOB,
+                tool_calls INTEGER NOT NULL DEFAULT 0,
+                opencode_session_id TEXT,
+                opencode_port INTEGER,
+                directory TEXT,
+                interactive INTEGER NOT NULL DEFAULT 0,
+                project_id TEXT,
+                started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("failed to create process tables");
+        sqlx::query("INSERT INTO channels (id, display_name) VALUES ('channel-1', 'Test Channel')")
+            .execute(&pool)
+            .await
+            .expect("failed to insert channel");
+        pool
+    }
+
+    #[tokio::test]
+    async fn branch_detail_round_trip_includes_transcript_and_metadata() {
+        let pool = setup_process_runs_tables().await;
+        let logger = ProcessRunLogger::new(pool);
+        let branch_id = uuid::Uuid::new_v4();
+        let channel_id: crate::ChannelId = Arc::from("channel-1");
+        logger
+            .log_branch_started(
+                &channel_id,
+                branch_id,
+                "Investigating",
+                "actual branch prompt",
+                "memory_persistence",
+                "claude-test",
+                12,
+            )
+            .await
+            .unwrap();
+        let steps = vec![TranscriptStep::Action {
+            content: vec![
+                ActionContent::Text {
+                    text: "thinking".to_string(),
+                },
+                ActionContent::ToolCall {
+                    id: "call-1".to_string(),
+                    name: "memory_recall".to_string(),
+                    args: "{}".to_string(),
+                },
+            ],
+        }];
+        let transcript = crate::conversation::worker_transcript::serialize_steps(&steps);
+        assert!(
+            logger
+                .log_branch_terminal(branch_id, "finished", "done", Some(&transcript), 1,)
+                .await
+                .unwrap()
+        );
+
+        let detail = logger
+            .get_process_detail("agent", "branch", &branch_id.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.run.kind, "branch");
+        assert_eq!(detail.run.input, "actual branch prompt");
+        assert_eq!(detail.run.output.as_deref(), Some("finished"));
+        assert_eq!(detail.run.status, "done");
+        assert_eq!(detail.run.profile.as_deref(), Some("memory_persistence"));
+        assert_eq!(detail.run.model.as_deref(), Some("claude-test"));
+        assert_eq!(detail.run.max_turns, Some(12));
+        assert_eq!(detail.run.tool_calls, 1);
+        assert_eq!(detail.run.channel_name.as_deref(), Some("Test Channel"));
+        let restored = crate::conversation::worker_transcript::deserialize_transcript(
+            detail.transcript_blob.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_branch_terminal_write_preserves_first_outcome() {
+        let pool = setup_process_runs_tables().await;
+        let logger = ProcessRunLogger::new(pool);
+        let branch_id = uuid::Uuid::new_v4();
+        let channel_id: crate::ChannelId = Arc::from("channel-1");
+        logger
+            .log_branch_started(
+                &channel_id,
+                branch_id,
+                "Branch",
+                "prompt",
+                "default",
+                "model",
+                10,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            logger
+                .log_branch_terminal(branch_id, "cancelled first", "cancelled", None, 0)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !logger
+                .log_branch_terminal(branch_id, "completed late", "done", None, 3)
+                .await
+                .unwrap()
+        );
+
+        let detail = logger
+            .get_process_detail("agent", "branch", &branch_id.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.run.status, "cancelled");
+        assert_eq!(detail.run.output.as_deref(), Some("cancelled first"));
+        assert_eq!(detail.run.tool_calls, 0);
+        assert!(detail.run.completed_at.is_some());
     }
 
     #[tokio::test]

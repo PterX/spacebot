@@ -43,8 +43,8 @@ use std::sync::{Arc, Weak};
 use tokio::sync::broadcast;
 use tokio::sync::{RwLock, mpsc};
 
-/// Shared cache of in-flight worker transcript steps, keyed by worker ID.
-pub type LiveWorkerTranscripts =
+/// Shared cache of in-flight branch and worker transcript steps.
+pub type LiveProcessTranscripts =
     Arc<RwLock<HashMap<String, Vec<crate::conversation::worker_transcript::TranscriptStep>>>>;
 
 /// A background process result waiting to be relayed to the user via retrigger.
@@ -497,7 +497,7 @@ pub struct ChannelState {
     /// This Arc is shared with `ApiState` — the event loop populates it from
     /// `ToolStarted`/`ToolCompleted` events as they flow through the system.
     /// Defaults to a standalone empty map when the API layer is not active.
-    pub live_worker_transcripts: LiveWorkerTranscripts,
+    pub live_process_transcripts: LiveProcessTranscripts,
     /// Worker context settings inherited from conversation settings.
     /// Determines what context workers spawned from this channel receive.
     pub worker_context_settings: Arc<RwLock<crate::conversation::settings::WorkerContextMode>>,
@@ -591,10 +591,10 @@ impl ChannelState {
         // cache. persist_transcript() inside the worker's run() method will
         // never execute after abort, so we compensate here.
         let live_steps = self
-            .live_worker_transcripts
+            .live_process_transcripts
             .write()
             .await
-            .remove(&worker_id.to_string());
+            .remove(&ProcessId::Worker(worker_id).to_string());
 
         // Persist whatever transcript was accumulated from ToolStarted/ToolCompleted
         // events. This is a best-effort snapshot — it won't include the worker's
@@ -717,13 +717,27 @@ impl ChannelState {
         } else {
             format!("{BRANCH_CANCELLED_PREFIX} {reason}")
         };
-        self.process_run_logger
-            .log_branch_completed(branch_id, &conclusion);
+        let live_steps = self
+            .live_process_transcripts
+            .write()
+            .await
+            .remove(&ProcessId::Branch(branch_id).to_string());
+        let transcript = live_steps.as_deref().and_then(|steps| {
+            (!steps.is_empty())
+                .then(|| crate::conversation::worker_transcript::serialize_steps(steps))
+        });
+        let tool_calls = live_steps
+            .as_deref()
+            .map(count_transcript_tool_calls)
+            .unwrap_or(0);
         if let Err(error) = self.deps.event_tx.send(ProcessEvent::BranchResult {
             agent_id: self.deps.agent_id.clone(),
             branch_id,
             channel_id: self.channel_id.clone(),
             conclusion,
+            status: "cancelled".to_string(),
+            transcript,
+            tool_calls,
         }) {
             tracing::warn!(
                 %error,
@@ -735,6 +749,27 @@ impl ChannelState {
         }
         Ok(())
     }
+}
+
+fn count_transcript_tool_calls(
+    steps: &[crate::conversation::worker_transcript::TranscriptStep],
+) -> i64 {
+    steps
+        .iter()
+        .map(|step| match step {
+            crate::conversation::worker_transcript::TranscriptStep::Action { content } => content
+                .iter()
+                .filter(|content| {
+                    matches!(
+                        content,
+                        crate::conversation::worker_transcript::ActionContent::ToolCall { .. }
+                    )
+                })
+                .count()
+                as i64,
+            _ => 0,
+        })
+        .sum()
 }
 
 #[derive(Clone)]
@@ -1074,7 +1109,7 @@ impl Channel {
         screenshot_dir: std::path::PathBuf,
         logs_dir: std::path::PathBuf,
         prompt_snapshot_store: Option<Arc<crate::agent::prompt_snapshot::PromptSnapshotStore>>,
-        live_worker_transcripts: Option<LiveWorkerTranscripts>,
+        live_process_transcripts: Option<LiveProcessTranscripts>,
         resolved_settings: ResolvedConversationSettings,
         cron_outcome: Option<crate::cron::CronOutcome>,
         autonomy_run: Option<crate::agent::autonomy::AutonomyRunHandle>,
@@ -1139,7 +1174,7 @@ impl Channel {
             screenshot_dir,
             logs_dir,
             prompt_snapshot_store,
-            live_worker_transcripts: live_worker_transcripts
+            live_process_transcripts: live_process_transcripts
                 .unwrap_or_else(|| Arc::new(RwLock::new(HashMap::new()))),
             worker_context_settings: Arc::new(RwLock::new(
                 resolved_settings.worker_context.clone(),
@@ -3925,12 +3960,9 @@ impl Channel {
         match &event {
             ProcessEvent::BranchStarted {
                 branch_id,
-                channel_id,
-                description,
                 reply_to_message_id,
                 ..
             } => {
-                run_logger.log_branch_started(channel_id, *branch_id, description);
                 if let Some(message_id) = reply_to_message_id {
                     self.branch_reply_targets
                         .insert(*branch_id, message_id.clone());
@@ -3939,8 +3971,24 @@ impl Channel {
             ProcessEvent::BranchResult {
                 branch_id,
                 conclusion,
+                status,
+                transcript,
+                tool_calls,
                 ..
             } => {
+                let committed = run_logger
+                    .log_branch_terminal(
+                        *branch_id,
+                        conclusion,
+                        status,
+                        transcript.as_deref(),
+                        *tool_calls,
+                    )
+                    .await?;
+                if !committed {
+                    tracing::debug!(branch_id = %branch_id, "duplicate branch terminal event ignored");
+                    return Ok(());
+                }
                 let reply_target_message_id = self.branch_reply_targets.get(branch_id).cloned();
                 let was_active = self
                     .state
@@ -3960,8 +4008,6 @@ impl Channel {
                     self.branch_reply_targets.remove(branch_id);
                     return Ok(());
                 }
-
-                run_logger.log_branch_completed(*branch_id, conclusion);
 
                 #[cfg(feature = "metrics")]
                 crate::telemetry::Metrics::global()
@@ -5056,6 +5102,9 @@ mod tests {
             branch_id: uuid::Uuid::new_v4(),
             channel_id: channel_id.clone(),
             conclusion: "done".to_string(),
+            status: "done".to_string(),
+            transcript: None,
+            tool_calls: 0,
         };
 
         assert!(should_process_event_for_channel(&event, &channel_id));

@@ -324,6 +324,7 @@ async fn spawn_branch(
     branch_options: BranchSpawnOptions,
 ) -> std::result::Result<BranchId, AgentError> {
     let BranchSpawnOptions { profile } = branch_options;
+    let profile_name = profile.name().to_string();
     let memory_persistence_contract = match &profile {
         BranchToolProfile::MemoryPersistence { contract_state, .. } => Some(contract_state.clone()),
         BranchToolProfile::Default => None,
@@ -364,6 +365,19 @@ async fn spawn_branch(
         state.deps.sandbox.clone(),
     );
     let branch_max_turns = **state.deps.runtime_config.branch_max_turns.load();
+    let model_override = state
+        .model_overrides
+        .resolve_model("branch")
+        .map(String::from);
+    let model_name = model_override.clone().unwrap_or_else(|| {
+        state
+            .deps
+            .runtime_config
+            .routing
+            .load()
+            .resolve(ProcessType::Branch, None)
+            .to_string()
+    });
 
     let branch = Branch::new(
         state.channel_id.clone(),
@@ -376,14 +390,25 @@ async fn spawn_branch(
             max_turns: branch_max_turns,
             memory_persistence_contract,
         },
-        state
-            .model_overrides
-            .resolve_model("branch")
-            .map(String::from),
+        model_override,
     );
 
     let branch_id = branch.id;
     let prompt = prompt.to_owned();
+
+    state
+        .process_run_logger
+        .log_branch_started(
+            &state.channel_id,
+            branch_id,
+            description,
+            &prompt,
+            &profile_name,
+            &model_name,
+            branch_max_turns,
+        )
+        .await
+        .map_err(|error| AgentError::Other(anyhow::anyhow!(error)))?;
 
     // Capture what the spawned task needs to notify the channel on failure.
     // branch.run() only sends BranchResult on the success path, so the
@@ -404,6 +429,27 @@ async fn spawn_branch(
     // Without this, a fast-completing branch sends BranchResult before the
     // insert, causing `was_active` to be false and suppressing the retrigger.
     let mut branches = state.active_branches.write().await;
+    {
+        let mut status = state.status_block.write().await;
+        status.add_branch(branch_id, status_label);
+    }
+
+    state
+        .deps
+        .event_tx
+        .send(crate::ProcessEvent::BranchStarted {
+            agent_id: state.deps.agent_id.clone(),
+            branch_id,
+            channel_id: state.channel_id.clone(),
+            description: status_label.to_string(),
+            input: prompt.clone(),
+            profile: profile_name,
+            model: model_name,
+            max_turns: branch_max_turns,
+            reply_to_message_id: state.reply_target_message_id.read().await.clone(),
+        })
+        .ok();
+
     let handle = tokio::spawn(
         async move {
             if let Err(error) = branch.run(&prompt).await {
@@ -424,6 +470,9 @@ async fn spawn_branch(
                     branch_id,
                     channel_id,
                     conclusion,
+                    status: "failed".to_string(),
+                    transcript: None,
+                    tool_calls: 0,
                 });
             }
         }
@@ -431,11 +480,6 @@ async fn spawn_branch(
     );
     branches.insert(branch_id, handle);
     drop(branches);
-
-    {
-        let mut status = state.status_block.write().await;
-        status.add_branch(branch_id, status_label);
-    }
 
     #[cfg(feature = "metrics")]
     {
@@ -449,18 +493,6 @@ async fn spawn_branch(
             .with_label_values(&[&*state.deps.agent_id])
             .inc();
     }
-
-    state
-        .deps
-        .event_tx
-        .send(crate::ProcessEvent::BranchStarted {
-            agent_id: state.deps.agent_id.clone(),
-            branch_id,
-            channel_id: state.channel_id.clone(),
-            description: status_label.to_string(),
-            reply_to_message_id: state.reply_target_message_id.read().await.clone(),
-        })
-        .ok();
 
     tracing::info!(branch_id = %branch_id, description = %status_label, "branch spawned");
 

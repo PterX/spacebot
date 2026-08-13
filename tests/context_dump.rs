@@ -314,7 +314,7 @@ async fn dump_channel_context() {
         logs_dir: std::path::PathBuf::from("/tmp/logs"),
         reply_target_message_id: Arc::new(tokio::sync::RwLock::new(None)),
         prompt_snapshot_store: None,
-        live_worker_transcripts: Arc::new(tokio::sync::RwLock::new(
+        live_process_transcripts: Arc::new(tokio::sync::RwLock::new(
             std::collections::HashMap::new(),
         )),
         worker_context_settings: Arc::new(tokio::sync::RwLock::new(Default::default())),
@@ -573,7 +573,7 @@ async fn dump_all_contexts() {
         logs_dir: std::path::PathBuf::from("/tmp/logs"),
         reply_target_message_id: Arc::new(tokio::sync::RwLock::new(None)),
         prompt_snapshot_store: None,
-        live_worker_transcripts: Arc::new(tokio::sync::RwLock::new(
+        live_process_transcripts: Arc::new(tokio::sync::RwLock::new(
             std::collections::HashMap::new(),
         )),
         worker_context_settings: Arc::new(tokio::sync::RwLock::new(Default::default())),

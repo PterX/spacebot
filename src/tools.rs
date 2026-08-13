@@ -323,6 +323,15 @@ pub enum BranchToolProfile {
     },
 }
 
+impl BranchToolProfile {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::MemoryPersistence { .. } => "memory_persistence",
+        }
+    }
+}
+
 /// Deserialize a `u64` that may arrive as either a JSON number or a JSON string.
 ///
 /// LLMs sometimes send `"timeout_seconds": "400"` instead of `"timeout_seconds": 400`.

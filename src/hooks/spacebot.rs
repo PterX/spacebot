@@ -1119,9 +1119,9 @@ where
             };
         }
 
-        // Emit text content from worker completion responses so the live
-        // transcript can show the model's reasoning between tool calls.
-        if self.process_type == ProcessType::Worker {
+        // Emit branch and worker text so live process transcripts include the
+        // model's reasoning between tool calls. Channel text uses streaming events.
+        if matches!(self.process_type, ProcessType::Branch | ProcessType::Worker) {
             let text: String = response
                 .choice
                 .iter()
@@ -1140,12 +1140,10 @@ where
                 .collect::<Vec<_>>()
                 .join("\n\n");
 
-            if !text.is_empty()
-                && let ProcessId::Worker(worker_id) = &self.process_id
-            {
-                let event = ProcessEvent::WorkerText {
+            if !text.is_empty() {
+                let event = ProcessEvent::ProcessText {
                     agent_id: self.agent_id.clone(),
-                    worker_id: *worker_id,
+                    process_id: self.process_id.clone(),
                     channel_id: self.channel_id.clone(),
                     text,
                 };

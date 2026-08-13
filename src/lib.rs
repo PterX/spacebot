@@ -185,6 +185,10 @@ pub enum ProcessEvent {
         branch_id: BranchId,
         channel_id: ChannelId,
         description: String,
+        input: String,
+        profile: String,
+        model: String,
+        max_turns: usize,
         reply_to_message_id: Option<String>,
     },
     BranchResult {
@@ -192,6 +196,9 @@ pub enum ProcessEvent {
         branch_id: BranchId,
         channel_id: ChannelId,
         conclusion: String,
+        status: String,
+        transcript: Option<Vec<u8>>,
+        tool_calls: i64,
     },
     WorkerStarted {
         agent_id: AgentId,
@@ -364,11 +371,11 @@ pub enum ProcessEvent {
         content: String,
         tool_calls_json: Option<String>,
     },
-    /// A worker emitted text content (model reasoning between tool calls).
+    /// A branch or worker emitted text content between tool calls.
     /// Sent once per completion response, containing the full text for that turn.
-    WorkerText {
+    ProcessText {
         agent_id: AgentId,
-        worker_id: WorkerId,
+        process_id: ProcessId,
         channel_id: Option<ChannelId>,
         text: String,
     },

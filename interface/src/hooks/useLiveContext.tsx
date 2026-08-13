@@ -1,6 +1,6 @@
 import { createContext, useContext, useCallback, useEffect, useRef, useState, useMemo, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, type AgentMessageEvent, type ChannelInfo, type ToolStartedEvent, type ToolCompletedEvent, type ToolOutputEvent, type OpenCodePart, type OpenCodePartUpdatedEvent, type WorkerTextEvent } from "@/api/client";
+import { api, type AgentMessageEvent, type ChannelInfo, type ToolStartedEvent, type ToolCompletedEvent, type ToolOutputEvent, type OpenCodePart, type OpenCodePartUpdatedEvent, type ProcessTextEvent } from "@/api/client";
 import type { TranscriptStep as SchemaTranscriptStep } from "@/api/types";
 
 type ToolResultStatus = "pending" | "final" | "waiting_for_input";
@@ -11,7 +11,7 @@ type TranscriptStep = SchemaTranscriptStep & {
 	status?: ToolResultStatus;
 };
 import { useEventSource, type ConnectionState } from "@/hooks/useEventSource";
-import { useChannelLiveState, type ChannelLiveState, type ActiveWorker } from "@/hooks/useChannelLiveState";
+import { useChannelLiveState, type ChannelLiveState, type ActiveBranch, type ActiveWorker } from "@/hooks/useChannelLiveState";
 import { useServer } from "@/hooks/useServer";
 import { NOTIFICATIONS_QUERY_KEY } from "@/hooks/useNotifications";
 
@@ -25,11 +25,13 @@ interface LiveContextValue {
 	activeLinks: Set<string>;
 	/** Flat map of all active workers across all channels, keyed by worker_id. */
 	activeWorkers: Record<string, ActiveWorker & { channelId?: string; agentId: string }>;
+	/** Flat map of all active branches across all channels, keyed by branch ID. */
+	activeBranches: Record<string, ActiveBranch & {channelId: string; agentId: string}>;
 	/** Monotonically increasing counter, bumped on every worker lifecycle SSE event. */
 	workerEventVersion: number;
 	/** Monotonically increasing counter, bumped on every task lifecycle SSE event. */
 	taskEventVersion: number;
-	/** Live transcript steps for running workers, keyed by worker_id. Built from SSE tool events. */
+	/** Live transcript steps for running branches and workers, keyed by process ID. */
 	liveTranscripts: Record<string, TranscriptStep[]>;
 	/** Live OpenCode parts for running workers, keyed by worker_id. Parts are insertion-ordered Maps keyed by part ID. */
 	liveOpenCodeParts: Record<string, Map<string, OpenCodePart>>;
@@ -43,6 +45,7 @@ const LiveContext = createContext<LiveContextValue>({
 	loadOlderMessages: () => {},
 	activeLinks: new Set(),
 	activeWorkers: {},
+	activeBranches: {},
 	workerEventVersion: 0,
 	taskEventVersion: 0,
 	liveTranscripts: {},
@@ -93,8 +96,7 @@ export function LiveContextProvider({ children, onBootstrapped }: { children: Re
 	const [taskEventVersion, setTaskEventVersion] = useState(0);
 	const bumpTaskVersion = useCallback(() => setTaskEventVersion((v) => v + 1), []);
 
-	// Live transcript accumulator: builds TranscriptStep[] from SSE tool events
-	// for running workers. Cleared when worker completes.
+	// Live transcript accumulator for branch and worker process events.
 	const [liveTranscripts, setLiveTranscripts] = useState<Record<string, TranscriptStep[]>>({});
 
 	// Live OpenCode parts: per-worker insertion-ordered Map keyed by part ID.
@@ -110,6 +112,19 @@ export function LiveContextProvider({ children, onBootstrapped }: { children: Re
 			if (!channelAgentId) continue;
 			for (const [workerId, worker] of Object.entries(state.workers)) {
 				map[workerId] = { ...worker, channelId, agentId: channelAgentId };
+			}
+		}
+		return map;
+	}, [liveStates, channels]);
+
+	const activeBranches = useMemo(() => {
+		const channelAgentIds = new Map(channels.map((channel) => [channel.id, channel.agent_id]));
+		const map: Record<string, ActiveBranch & {channelId: string; agentId: string}> = {};
+		for (const [channelId, state] of Object.entries(liveStates)) {
+			const agentId = channelAgentIds.get(channelId);
+			if (!agentId) continue;
+			for (const [branchId, branch] of Object.entries(state.branches)) {
+				map[branchId] = {...branch, channelId, agentId};
 			}
 		}
 		return map;
@@ -168,6 +183,12 @@ export function LiveContextProvider({ children, onBootstrapped }: { children: Re
 		bumpWorkerVersion();
 	}, [channelHandlers, bumpWorkerVersion]);
 
+	const wrappedBranchStarted = useCallback((data: unknown) => {
+		channelHandlers.branch_started(data);
+		const event = data as {branch_id: string};
+		setLiveTranscripts((previous) => ({...previous, [event.branch_id]: []}));
+	}, [channelHandlers]);
+
 	const wrappedWorkerStatus = useCallback((data: unknown) => {
 		channelHandlers.worker_status(data);
 		// Status text comes from set_status tool calls which already appear as
@@ -196,7 +217,7 @@ export function LiveContextProvider({ children, onBootstrapped }: { children: Re
 	const wrappedToolStarted = useCallback((data: unknown) => {
 		channelHandlers.tool_started(data);
 		const event = data as ToolStartedEvent;
-		if (event.process_type === "worker") {
+		if (event.process_type === "worker" || event.process_type === "branch") {
 			const callId = event.call_id || `${event.process_id}:${event.tool_name}:started`;
 			setLiveTranscripts((prev) => {
 				const steps = prev[event.process_id] ?? [];
@@ -235,14 +256,14 @@ export function LiveContextProvider({ children, onBootstrapped }: { children: Re
 						: [...nextSteps, step],
 				};
 			});
-			bumpWorkerVersion();
+			if (event.process_type === "worker") bumpWorkerVersion();
 		}
 	}, [channelHandlers, bumpWorkerVersion]);
 
 	const wrappedToolCompleted = useCallback((data: unknown) => {
 		channelHandlers.tool_completed(data);
 		const event = data as ToolCompletedEvent;
-		if (event.process_type === "worker") {
+		if (event.process_type === "worker" || event.process_type === "branch") {
 			const callId = event.call_id || `${event.process_id}:${event.tool_name}:completed`;
 			setLiveTranscripts((prev) => {
 				const steps = prev[event.process_id] ?? [];
@@ -263,13 +284,13 @@ export function LiveContextProvider({ children, onBootstrapped }: { children: Re
 				}
 				return { ...prev, [event.process_id]: [...steps, step] };
 			});
-			bumpWorkerVersion();
+			if (event.process_type === "worker") bumpWorkerVersion();
 		}
 	}, [channelHandlers, bumpWorkerVersion]);
 
 	const handleToolOutput = useCallback((data: unknown) => {
 		const event = data as ToolOutputEvent;
-		if (event.process_type === "worker") {
+		if (event.process_type === "worker" || event.process_type === "branch") {
 			setLiveTranscripts((prev) => {
 				const steps = prev[event.process_id] ?? [];
 				// Use the stable call_id from the event to find or create the result step
@@ -302,7 +323,7 @@ export function LiveContextProvider({ children, onBootstrapped }: { children: Re
 				};
 				return { ...prev, [event.process_id]: [...steps, step] };
 			});
-			bumpWorkerVersion();
+			if (event.process_type === "worker") bumpWorkerVersion();
 		}
 	}, [bumpWorkerVersion]);
 
@@ -318,18 +339,19 @@ export function LiveContextProvider({ children, onBootstrapped }: { children: Re
 		bumpWorkerVersion();
 	}, [bumpWorkerVersion]);
 
-	// Handle worker text — model reasoning text emitted between tool calls
-	const handleWorkerText = useCallback((data: unknown) => {
-		const event = data as WorkerTextEvent;
+	// Model text emitted by a branch or worker between tool calls.
+	const handleProcessText = useCallback((data: unknown) => {
+		const event = data as ProcessTextEvent;
+		if (event.process_type !== "worker" && event.process_type !== "branch") return;
 		setLiveTranscripts((prev) => {
-			const steps = prev[event.worker_id] ?? [];
+			const steps = prev[event.process_id] ?? [];
 			const step: TranscriptStep = {
 				type: "action",
 				content: [{ type: "text", text: event.text }],
 			};
-			return { ...prev, [event.worker_id]: [...steps, step] };
+			return { ...prev, [event.process_id]: [...steps, step] };
 		});
-		bumpWorkerVersion();
+		if (event.process_type === "worker") bumpWorkerVersion();
 	}, [bumpWorkerVersion]);
 
 	const handleCortexChatMessage = useCallback((data: unknown) => {
@@ -350,6 +372,7 @@ export function LiveContextProvider({ children, onBootstrapped }: { children: Re
 	const handlers = useMemo(
 		() => ({
 			...channelHandlers,
+			branch_started: wrappedBranchStarted,
 			worker_started: wrappedWorkerStarted,
 			worker_status: wrappedWorkerStatus,
 			worker_idle: wrappedWorkerIdle,
@@ -358,7 +381,7 @@ export function LiveContextProvider({ children, onBootstrapped }: { children: Re
 			tool_completed: wrappedToolCompleted,
 			tool_output: handleToolOutput,
 			opencode_part_updated: handleOpenCodePartUpdated,
-			worker_text: handleWorkerText,
+			process_text: handleProcessText,
 			agent_message_sent: handleAgentMessage,
 			agent_message_received: handleAgentMessage,
 			task_updated: bumpTaskVersion,
@@ -366,7 +389,7 @@ export function LiveContextProvider({ children, onBootstrapped }: { children: Re
 			notification_created: handleNotificationCreated,
 			notification_updated: handleNotificationUpdated,
 		}),
-		[channelHandlers, wrappedWorkerStarted, wrappedWorkerStatus, wrappedWorkerIdle, wrappedWorkerCompleted, wrappedToolStarted, wrappedToolCompleted, handleToolOutput, handleOpenCodePartUpdated, handleWorkerText, handleAgentMessage, bumpTaskVersion, handleCortexChatMessage, handleNotificationCreated, handleNotificationUpdated],
+		[channelHandlers, wrappedBranchStarted, wrappedWorkerStarted, wrappedWorkerStatus, wrappedWorkerIdle, wrappedWorkerCompleted, wrappedToolStarted, wrappedToolCompleted, handleToolOutput, handleOpenCodePartUpdated, handleProcessText, handleAgentMessage, bumpTaskVersion, handleCortexChatMessage, handleNotificationCreated, handleNotificationUpdated],
 	);
 
 	const onReconnect = useCallback(() => {
@@ -405,7 +428,7 @@ export function LiveContextProvider({ children, onBootstrapped }: { children: Re
 	}, [hasData, onBootstrapped]);
 
 	return (
-		<LiveContext.Provider value={{ liveStates, channels, connectionState, hasData, loadOlderMessages, activeLinks, activeWorkers, workerEventVersion, taskEventVersion, liveTranscripts, liveOpenCodeParts }}>
+		<LiveContext.Provider value={{ liveStates, channels, connectionState, hasData, loadOlderMessages, activeLinks, activeWorkers, activeBranches, workerEventVersion, taskEventVersion, liveTranscripts, liveOpenCodeParts }}>
 			{children}
 		</LiveContext.Provider>
 	);

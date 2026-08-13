@@ -32,7 +32,7 @@ use tokio::sync::{RwLock, broadcast, mpsc};
 
 const MAX_LIVE_TOOL_OUTPUT_BYTES: usize = 50_000;
 const LIVE_TOOL_OUTPUT_REDACTION: &str = "[REDACTED:potential-secret]";
-const MAX_COMPLETED_WORKER_TOMBSTONES: usize = 4_096;
+const MAX_COMPLETED_PROCESS_TOMBSTONES: usize = 4_096;
 
 fn worker_tool_result_status(result: &str) -> ToolResultStatus {
     if result.contains("\"waiting_for_input\":true")
@@ -327,16 +327,16 @@ pub struct ApiState {
     pub agent_groups: ArcSwap<Vec<crate::config::GroupDef>>,
     /// Org-level humans for the topology UI.
     pub agent_humans: ArcSwap<Vec<crate::config::HumanDef>>,
-    /// Live transcript cache for running workers. Accumulates `TranscriptStep`s
+    /// Live transcript cache for running branches and workers. Accumulates `TranscriptStep`s
     /// from `ToolStarted`/`ToolCompleted` events so that page refreshes can
     /// recover the transcript without waiting for the worker to complete.
-    /// Keyed by worker_id, cleared on worker completion.
-    pub live_worker_transcripts: Arc<RwLock<HashMap<String, Vec<TranscriptStep>>>>,
-    /// Bounded tombstone set of recently completed worker IDs.
+    /// Keyed by process kind and ID, cleared on process completion.
+    pub live_process_transcripts: Arc<RwLock<HashMap<String, Vec<TranscriptStep>>>>,
+    /// Bounded tombstone set of recently completed process keys.
     ///
     /// Prevents late/lagged `ToolOutput` events from recreating transcript
     /// entries after `WorkerComplete` has already cleared them.
-    pub completed_worker_tombstones: Arc<RwLock<HashSet<String>>>,
+    pub completed_process_tombstones: Arc<RwLock<HashSet<String>>>,
     /// In-memory cache of tool calls for running channel turns (direct mode).
     /// Keyed by channel_id, drained when the bot message is persisted.
     pub live_channel_tool_calls: Arc<RwLock<HashMap<String, Vec<ChannelToolCallEntry>>>>,
@@ -504,10 +504,12 @@ pub enum ApiEvent {
         worker_id: String,
         part: crate::opencode::types::OpenCodePart,
     },
-    /// A worker emitted text content (model reasoning between tool calls).
-    WorkerText {
+    /// A branch or worker emitted text content between tool calls.
+    ProcessText {
         agent_id: String,
-        worker_id: String,
+        process_type: String,
+        process_id: String,
+        channel_id: Option<String>,
         text: String,
     },
     /// A cortex chat auto-triggered response (e.g. after a worker result was
@@ -614,8 +616,8 @@ impl ApiState {
             agent_links: ArcSwap::from_pointee(Vec::new()),
             agent_groups: ArcSwap::from_pointee(Vec::new()),
             agent_humans: ArcSwap::from_pointee(Vec::new()),
-            live_worker_transcripts: Arc::new(RwLock::new(HashMap::new())),
-            completed_worker_tombstones: Arc::new(RwLock::new(HashSet::new())),
+            live_process_transcripts: Arc::new(RwLock::new(HashMap::new())),
+            completed_process_tombstones: Arc::new(RwLock::new(HashSet::new())),
             live_channel_tool_calls: Arc::new(RwLock::new(HashMap::new())),
             ssh_mutex: tokio::sync::Mutex::new(()),
         }
@@ -648,14 +650,14 @@ impl ApiState {
         self.channel_states.write().await.remove(channel_id);
     }
 
-    /// Retrieve the live transcript cache for a running worker.
+    /// Retrieve the live transcript cache for a running branch or worker.
     ///
     /// Returns `Some` with the accumulated transcript steps if the worker is
     /// currently running and has emitted tool calls. Returns `None` if no
     /// cached transcript exists (worker completed or never started).
-    pub async fn get_live_transcript(&self, worker_id: &str) -> Option<Vec<TranscriptStep>> {
-        let guard = self.live_worker_transcripts.read().await;
-        guard.get(worker_id).cloned()
+    pub async fn get_live_transcript(&self, process_id: &ProcessId) -> Option<Vec<TranscriptStep>> {
+        let guard = self.live_process_transcripts.read().await;
+        guard.get(&process_id.to_string()).cloned()
     }
 
     /// Register an agent's event stream. Spawns a task that forwards
@@ -666,8 +668,8 @@ impl ApiState {
         mut agent_event_rx: broadcast::Receiver<ProcessEvent>,
     ) {
         let api_tx = self.event_tx.clone();
-        let live_transcripts = self.live_worker_transcripts.clone();
-        let completed_worker_tombstones = self.completed_worker_tombstones.clone();
+        let live_transcripts = self.live_process_transcripts.clone();
+        let completed_process_tombstones = self.completed_process_tombstones.clone();
         let live_channel_tools = self.live_channel_tool_calls.clone();
         // Snapshot the notification store at registration time. It is set once
         // at startup before any agents register, so the snapshot is always valid.
@@ -686,13 +688,14 @@ impl ApiState {
                                 interactive,
                                 ..
                             } => {
-                                let worker_key = worker_id.to_string();
-                                let mut completed_guard = completed_worker_tombstones.write().await;
-                                completed_guard.remove(&worker_key);
+                                let process_key = ProcessId::Worker(*worker_id).to_string();
+                                let mut completed_guard =
+                                    completed_process_tombstones.write().await;
+                                completed_guard.remove(&process_key);
                                 live_transcripts
                                     .write()
                                     .await
-                                    .entry(worker_key)
+                                    .entry(process_key)
                                     .or_default();
                                 api_tx
                                     .send(ApiEvent::WorkerStarted {
@@ -757,6 +760,15 @@ impl ApiState {
                                 description,
                                 ..
                             } => {
+                                let process_key = ProcessId::Branch(*branch_id).to_string();
+                                let mut completed_guard =
+                                    completed_process_tombstones.write().await;
+                                completed_guard.remove(&process_key);
+                                live_transcripts
+                                    .write()
+                                    .await
+                                    .entry(process_key)
+                                    .or_default();
                                 api_tx
                                     .send(ApiEvent::BranchStarted {
                                         agent_id: agent_id.clone(),
@@ -801,13 +813,14 @@ impl ApiState {
                                 success,
                                 ..
                             } => {
-                                let worker_key = worker_id.to_string();
-                                let mut completed_guard = completed_worker_tombstones.write().await;
-                                if completed_guard.len() >= MAX_COMPLETED_WORKER_TOMBSTONES {
+                                let process_key = ProcessId::Worker(*worker_id).to_string();
+                                let mut completed_guard =
+                                    completed_process_tombstones.write().await;
+                                if completed_guard.len() >= MAX_COMPLETED_PROCESS_TOMBSTONES {
                                     completed_guard.clear();
                                 }
-                                completed_guard.insert(worker_key.clone());
-                                live_transcripts.write().await.remove(&worker_key);
+                                completed_guard.insert(process_key.clone());
+                                live_transcripts.write().await.remove(&process_key);
                                 api_tx
                                     .send(ApiEvent::WorkerCompleted {
                                         agent_id: agent_id.clone(),
@@ -867,6 +880,14 @@ impl ApiState {
                                 conclusion,
                                 ..
                             } => {
+                                let process_key = ProcessId::Branch(*branch_id).to_string();
+                                let mut completed_guard =
+                                    completed_process_tombstones.write().await;
+                                if completed_guard.len() >= MAX_COMPLETED_PROCESS_TOMBSTONES {
+                                    completed_guard.clear();
+                                }
+                                completed_guard.insert(process_key.clone());
+                                live_transcripts.write().await.remove(&process_key);
                                 api_tx
                                     .send(ApiEvent::BranchCompleted {
                                         agent_id: agent_id.clone(),
@@ -885,11 +906,11 @@ impl ApiState {
                                 ..
                             } => {
                                 let (process_type, id_str) = process_id_info(process_id);
-                                // Accumulate tool call into live transcript for workers.
-                                if let ProcessId::Worker(worker_id) = process_id {
-                                    let worker_key = worker_id.to_string();
+                                // Accumulate tool calls into branch and worker transcripts.
+                                if is_observable_process(process_id) {
+                                    let process_key = process_id.to_string();
                                     let mut guard = live_transcripts.write().await;
-                                    if let Some(steps) = guard.get_mut(&worker_key) {
+                                    if let Some(steps) = guard.get_mut(&process_key) {
                                         push_live_tool_call(
                                             steps,
                                             call_id.clone(),
@@ -938,11 +959,11 @@ impl ApiState {
                                 ..
                             } => {
                                 let (process_type, id_str) = process_id_info(process_id);
-                                // Accumulate tool result into live transcript for workers.
-                                if let ProcessId::Worker(worker_id) = process_id {
-                                    let worker_key = worker_id.to_string();
+                                // Accumulate tool results into branch and worker transcripts.
+                                if is_observable_process(process_id) {
+                                    let process_key = process_id.to_string();
                                     let mut guard = live_transcripts.write().await;
-                                    if let Some(steps) = guard.get_mut(&worker_key) {
+                                    if let Some(steps) = guard.get_mut(&process_key) {
                                         upsert_final_tool_result(
                                             steps,
                                             call_id.clone(),
@@ -1064,23 +1085,29 @@ impl ApiState {
                                     })
                                     .ok();
                             }
-                            ProcessEvent::WorkerText {
-                                worker_id, text, ..
+                            ProcessEvent::ProcessText {
+                                process_id,
+                                channel_id,
+                                text,
+                                ..
                             } => {
                                 // Accumulate into live transcript cache
                                 let step = TranscriptStep::Action {
                                     content: vec![ActionContent::Text { text: text.clone() }],
                                 };
                                 let mut guard = live_transcripts.write().await;
-                                if let Some(steps) = guard.get_mut(&worker_id.to_string()) {
+                                if let Some(steps) = guard.get_mut(&process_id.to_string()) {
                                     steps.push(step);
                                 }
                                 drop(guard);
 
+                                let (process_type, process_id) = process_id_info(process_id);
                                 api_tx
-                                    .send(ApiEvent::WorkerText {
+                                    .send(ApiEvent::ProcessText {
                                         agent_id: agent_id.clone(),
-                                        worker_id: worker_id.to_string(),
+                                        process_type,
+                                        process_id,
+                                        channel_id: channel_id.as_deref().map(str::to_string),
                                         text: text.clone(),
                                     })
                                     .ok();
@@ -1140,8 +1167,8 @@ impl ApiState {
         mut tool_output_rx: broadcast::Receiver<ProcessEvent>,
     ) {
         let api_tx = self.event_tx.clone();
-        let live_transcripts = self.live_worker_transcripts.clone();
-        let completed_worker_tombstones = self.completed_worker_tombstones.clone();
+        let live_transcripts = self.live_process_transcripts.clone();
+        let completed_process_tombstones = self.completed_process_tombstones.clone();
         tokio::spawn(async move {
             loop {
                 match tool_output_rx.recv().await {
@@ -1158,13 +1185,13 @@ impl ApiState {
                         {
                             let sanitized_line = sanitize_live_tool_output_line(line);
                             let (process_type, id_str) = process_id_info(process_id);
-                            // Accumulate streaming output into live transcript for workers.
-                            if let ProcessId::Worker(worker_id) = process_id {
-                                let worker_key = worker_id.to_string();
-                                let completed_guard = completed_worker_tombstones.write().await;
-                                if !completed_guard.contains(&worker_key) {
+                            // Accumulate streaming output for active branches and workers.
+                            if is_observable_process(process_id) {
+                                let process_key = process_id.to_string();
+                                let completed_guard = completed_process_tombstones.read().await;
+                                if !completed_guard.contains(&process_key) {
                                     let mut guard = live_transcripts.write().await;
-                                    let steps = guard.entry(worker_key).or_default();
+                                    let steps = guard.entry(process_key).or_default();
                                     upsert_pending_tool_output(
                                         steps,
                                         call_id.clone(),
@@ -1428,6 +1455,10 @@ fn process_id_info(id: &ProcessId) -> (String, String) {
     }
 }
 
+fn is_observable_process(process_id: &ProcessId) -> bool {
+    matches!(process_id, ProcessId::Branch(_) | ProcessId::Worker(_))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1512,7 +1543,6 @@ mod tests {
         let agent_id: crate::AgentId = Arc::from("agent");
         let worker_id = uuid::Uuid::new_v4();
         let process_id = ProcessId::Worker(worker_id);
-        let worker_key = worker_id.to_string();
 
         let _ = tool_output_tx.send(ProcessEvent::ToolOutput {
             agent_id: agent_id.clone(),
@@ -1526,7 +1556,7 @@ mod tests {
 
         let early_cached = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if let Some(steps) = api_state.get_live_transcript(&worker_key).await
+                if let Some(steps) = api_state.get_live_transcript(&process_id).await
                     && steps.iter().any(|step| {
                         matches!(
                             step,
@@ -1557,7 +1587,7 @@ mod tests {
 
         let removed_after_complete = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if api_state.get_live_transcript(&worker_key).await.is_none() {
+                if api_state.get_live_transcript(&process_id).await.is_none() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1571,7 +1601,7 @@ mod tests {
 
         let _ = tool_output_tx.send(ProcessEvent::ToolOutput {
             agent_id,
-            process_id,
+            process_id: process_id.clone(),
             channel_id: None,
             call_id: "shell_call_late".to_string(),
             tool_name: "shell".to_string(),
@@ -1581,8 +1611,103 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         assert!(
-            api_state.get_live_transcript(&worker_key).await.is_none(),
+            api_state.get_live_transcript(&process_id).await.is_none(),
             "late output should not recreate cache after worker completion"
         );
+    }
+
+    #[tokio::test]
+    async fn branch_transcript_accumulates_and_late_output_does_not_recreate_it() {
+        let (provider_setup_tx, _provider_setup_rx) = tokio::sync::mpsc::channel(1);
+        let (agent_tx, _agent_rx) = tokio::sync::mpsc::channel(1);
+        let (agent_remove_tx, _agent_remove_rx) = tokio::sync::mpsc::channel(1);
+        let (injection_tx, _injection_rx) = tokio::sync::mpsc::channel(1);
+        let api_state = super::ApiState::new_with_provider_sender(
+            provider_setup_tx,
+            agent_tx,
+            agent_remove_tx,
+            injection_tx,
+        );
+        let (control_tx, control_rx) = tokio::sync::broadcast::channel(16);
+        let (tool_output_tx, tool_output_rx) = tokio::sync::broadcast::channel(16);
+        api_state.register_agent_events("agent".to_string(), control_rx);
+        api_state.register_tool_output_stream("agent".to_string(), tool_output_rx);
+
+        let agent_id: crate::AgentId = Arc::from("agent");
+        let channel_id: crate::ChannelId = Arc::from("channel");
+        let branch_id = uuid::Uuid::new_v4();
+        let process_id = ProcessId::Branch(branch_id);
+        let _ = control_tx.send(ProcessEvent::BranchStarted {
+            agent_id: agent_id.clone(),
+            branch_id,
+            channel_id: channel_id.clone(),
+            description: "thinking".to_string(),
+            input: "prompt".to_string(),
+            profile: "default".to_string(),
+            model: "model".to_string(),
+            max_turns: 10,
+            reply_to_message_id: None,
+        });
+        let _ = control_tx.send(ProcessEvent::ProcessText {
+            agent_id: agent_id.clone(),
+            process_id: process_id.clone(),
+            channel_id: Some(channel_id.clone()),
+            text: "reasoning".to_string(),
+        });
+        let _ = control_tx.send(ProcessEvent::ToolStarted {
+            agent_id: agent_id.clone(),
+            process_id: process_id.clone(),
+            channel_id: Some(channel_id.clone()),
+            call_id: "call-1".to_string(),
+            tool_name: "memory_recall".to_string(),
+            args: "{}".to_string(),
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if api_state
+                    .get_live_transcript(&process_id)
+                    .await
+                    .is_some_and(|steps| steps.len() >= 2)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("branch transcript should accumulate");
+
+        let _ = control_tx.send(ProcessEvent::BranchResult {
+            agent_id: agent_id.clone(),
+            branch_id,
+            channel_id: channel_id.clone(),
+            conclusion: "done".to_string(),
+            status: "done".to_string(),
+            transcript: None,
+            tool_calls: 1,
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if api_state.get_live_transcript(&process_id).await.is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("branch completion should clear transcript");
+
+        let _ = tool_output_tx.send(ProcessEvent::ToolOutput {
+            agent_id,
+            process_id: process_id.clone(),
+            channel_id: Some(channel_id),
+            call_id: "call-late".to_string(),
+            tool_name: "memory_recall".to_string(),
+            line: "late".to_string(),
+            stream: "stdout".to_string(),
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(api_state.get_live_transcript(&process_id).await.is_none());
     }
 }

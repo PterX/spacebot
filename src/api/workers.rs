@@ -2,6 +2,7 @@
 
 use super::state::ApiState;
 
+use crate::ProcessId;
 use crate::conversation::history::ProcessRunLogger;
 use crate::conversation::worker_transcript;
 
@@ -87,6 +88,55 @@ pub(super) struct WorkerDetailResponse {
     interactive: bool,
     /// Working directory for OpenCode workers.
     directory: Option<String>,
+}
+
+#[derive(Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
+pub(super) struct ProcessListQuery {
+    agent_id: String,
+    #[serde(default = "default_limit")]
+    limit: i64,
+    #[serde(default)]
+    offset: i64,
+    status: Option<String>,
+    kind: Option<String>,
+}
+
+#[derive(Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
+pub(super) struct ProcessDetailQuery {
+    agent_id: String,
+    kind: String,
+    process_id: String,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub(super) struct ProcessListResponse {
+    processes: Vec<ProcessResponse>,
+    total: i64,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub(super) struct ProcessResponse {
+    kind: String,
+    id: String,
+    input: String,
+    output: Option<String>,
+    status: String,
+    process_type: String,
+    profile: Option<String>,
+    channel_id: Option<String>,
+    channel_name: Option<String>,
+    started_at: String,
+    completed_at: Option<String>,
+    has_transcript: bool,
+    transcript: Option<Vec<worker_transcript::TranscriptStep>>,
+    tool_calls: i64,
+    model: Option<String>,
+    max_turns: Option<i64>,
+    opencode_session_id: Option<String>,
+    opencode_port: Option<i32>,
+    directory: Option<String>,
+    interactive: bool,
+    project_id: Option<String>,
 }
 
 /// List worker runs for an agent, with live status merged from StatusBlocks.
@@ -246,7 +296,13 @@ pub(super) async fn worker_detail(
         None => {
             // No persisted transcript yet — check the live transcript cache
             // so page refreshes can recover in-progress worker transcripts.
-            state.get_live_transcript(&query.worker_id).await
+            let worker_id = query.worker_id.parse().map_err(|error| {
+                tracing::warn!(%error, worker_id = %query.worker_id, "invalid worker ID");
+                StatusCode::BAD_REQUEST
+            })?;
+            state
+                .get_live_transcript(&ProcessId::Worker(worker_id))
+                .await
         }
     };
 
@@ -267,4 +323,123 @@ pub(super) async fn worker_detail(
         interactive: detail.interactive,
         directory: detail.directory,
     }))
+}
+
+/// List branch and worker runs for an agent.
+#[utoipa::path(
+    get,
+    path = "/agents/processes",
+    params(ProcessListQuery),
+    responses(
+        (status = 200, body = ProcessListResponse),
+        (status = 404, description = "Agent not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "workers",
+)]
+pub(super) async fn list_processes(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<ProcessListQuery>,
+) -> Result<Json<ProcessListResponse>, StatusCode> {
+    let pools = state.agent_pools.load();
+    let pool = pools.get(&query.agent_id).ok_or(StatusCode::NOT_FOUND)?;
+    let logger = ProcessRunLogger::new(pool.clone());
+    let (rows, total) = logger
+        .list_process_runs(
+            &query.agent_id,
+            query.limit.clamp(1, 200),
+            query.offset.max(0),
+            query.status.as_deref(),
+            query.kind.as_deref(),
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "failed to list process runs");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let processes = rows
+        .into_iter()
+        .map(|run| process_response(run, None))
+        .collect();
+    Ok(Json(ProcessListResponse { processes, total }))
+}
+
+/// Get one branch or worker run with its transcript.
+#[utoipa::path(
+    get,
+    path = "/agents/processes/detail",
+    params(ProcessDetailQuery),
+    responses(
+        (status = 200, body = ProcessResponse),
+        (status = 404, description = "Agent or process not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "workers",
+)]
+pub(super) async fn process_detail(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<ProcessDetailQuery>,
+) -> Result<Json<ProcessResponse>, StatusCode> {
+    let pools = state.agent_pools.load();
+    let pool = pools.get(&query.agent_id).ok_or(StatusCode::NOT_FOUND)?;
+    let logger = ProcessRunLogger::new(pool.clone());
+    let detail = logger
+        .get_process_detail(&query.agent_id, &query.kind, &query.process_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, process_id = %query.process_id, "failed to load process detail");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let process_id = match query.kind.as_str() {
+        "branch" => ProcessId::Branch(
+            query
+                .process_id
+                .parse()
+                .map_err(|_| StatusCode::BAD_REQUEST)?,
+        ),
+        "worker" => ProcessId::Worker(
+            query
+                .process_id
+                .parse()
+                .map_err(|_| StatusCode::BAD_REQUEST)?,
+        ),
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    let transcript = match detail.transcript_blob.as_deref() {
+        Some(blob) => worker_transcript::deserialize_transcript(blob).ok(),
+        None => state.get_live_transcript(&process_id).await,
+    };
+
+    Ok(Json(process_response(detail.run, transcript)))
+}
+
+fn process_response(
+    run: crate::conversation::ProcessRunRow,
+    transcript: Option<Vec<worker_transcript::TranscriptStep>>,
+) -> ProcessResponse {
+    ProcessResponse {
+        kind: run.kind,
+        id: run.id,
+        input: run.input,
+        output: run.output,
+        status: run.status,
+        process_type: run.process_type,
+        profile: run.profile,
+        channel_id: run.channel_id,
+        channel_name: run.channel_name,
+        started_at: run.started_at,
+        completed_at: run.completed_at,
+        has_transcript: run.has_transcript,
+        transcript,
+        tool_calls: run.tool_calls,
+        model: run.model,
+        max_turns: run.max_turns,
+        opencode_session_id: run.opencode_session_id,
+        opencode_port: run.opencode_port,
+        directory: run.directory,
+        interactive: run.interactive,
+        project_id: run.project_id,
+    }
 }

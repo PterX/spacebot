@@ -129,6 +129,7 @@ impl Branch {
             .build();
 
         let mut current_prompt = prompt;
+        let mut transcript_history = Vec::new();
         let mut overflow_retries = 0;
         let mut memory_contract_retries = 0;
         let enforce_memory_contract = self.memory_persistence_contract.is_some();
@@ -137,11 +138,17 @@ impl Branch {
             if enforce_memory_contract {
                 self.hook.set_completion_contract_request_active(true);
             }
-            match self
+            let history_len_before_attempt = self.history.len();
+            let result = self
                 .hook
                 .prompt_once(&agent, &mut self.history, &current_prompt)
-                .await
-            {
+                .await;
+            transcript_history.extend_from_slice(
+                self.history
+                    .get(history_len_before_attempt..)
+                    .unwrap_or_default(),
+            );
+            match result {
                 Ok(response) => break response,
                 Err(rig::completion::PromptError::MaxTurnsError { .. }) => {
                     self.hook.set_completion_contract_request_active(false);
@@ -242,7 +249,7 @@ impl Branch {
                         self.hook.set_completion_contract_request_active(false);
                     }
                     tracing::error!(branch_id = %self.id, %error, "branch LLM call failed");
-                    return Err(crate::error::AgentError::Other(error.into()).into());
+                    break format!("Branch failed: {error}");
                 }
             }
         };
@@ -262,12 +269,31 @@ impl Branch {
         };
         let conclusion = crate::secrets::scrub::scrub_leaks(&conclusion);
 
+        let transcript_steps =
+            crate::conversation::worker_transcript::transcript_steps(&transcript_history);
+        let tool_calls = transcript_steps
+            .iter()
+            .map(|step| match step {
+                crate::conversation::worker_transcript::TranscriptStep::Action { content } => content
+                    .iter()
+                    .filter(|content| matches!(content, crate::conversation::worker_transcript::ActionContent::ToolCall { .. }))
+                    .count() as i64,
+                _ => 0,
+            })
+            .sum();
+        let transcript = (!transcript_steps.is_empty())
+            .then(|| crate::conversation::worker_transcript::serialize_steps(&transcript_steps));
+        let status = classify_branch_status(&conclusion).to_string();
+
         // Send conclusion back to the channel
         let _ = self.deps.event_tx.send(ProcessEvent::BranchResult {
             agent_id: self.deps.agent_id.clone(),
             branch_id: self.id,
             channel_id: self.channel_id.clone(),
             conclusion: conclusion.clone(),
+            status,
+            transcript,
+            tool_calls,
         });
 
         // Flush accumulated token usage.
@@ -361,5 +387,39 @@ impl Branch {
              Continue with the information available.]"
         );
         self.history.insert(0, rig::message::Message::from(marker));
+    }
+}
+
+pub(crate) fn classify_branch_status(conclusion: &str) -> &'static str {
+    if conclusion.starts_with("Branch cancelled:")
+        || conclusion.starts_with("Branch was cancelled:")
+    {
+        "cancelled"
+    } else if conclusion.starts_with("Branch failed:") {
+        "failed"
+    } else {
+        "done"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_branch_status;
+
+    #[test]
+    fn branch_terminal_status_matches_legacy_conclusion_prefixes() {
+        assert_eq!(classify_branch_status("Finished the investigation"), "done");
+        assert_eq!(
+            classify_branch_status("Branch failed: provider error"),
+            "failed"
+        );
+        assert_eq!(
+            classify_branch_status("Branch cancelled: user requested"),
+            "cancelled"
+        );
+        assert_eq!(
+            classify_branch_status("Branch was cancelled: timeout"),
+            "cancelled"
+        );
     }
 }

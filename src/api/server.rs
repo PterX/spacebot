@@ -102,6 +102,8 @@ pub fn api_router() -> OpenApiRouter<Arc<ApiState>> {
         // Worker routes
         .routes(routes!(workers::list_workers))
         .routes(routes!(workers::worker_detail))
+        .routes(routes!(workers::list_processes))
+        .routes(routes!(workers::process_detail))
         // Memory routes
         .routes(routes!(memories::list_memories))
         .routes(routes!(memories::search_memories))
