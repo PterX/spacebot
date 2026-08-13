@@ -15,13 +15,43 @@ export interface ProcessSelection {
 	id: string;
 }
 
+/**
+ * Process data available from live events and channel timelines. API-fetched
+ * process details remain full ProcessRun records.
+ */
+export interface ProcessRunDisplay {
+	kind: ProcessKind;
+	id: string;
+	input: string;
+	status: string;
+	started_at: string;
+	tool_calls?: number;
+	output?: string | null;
+	completed_at?: string | null;
+	transcript?: TranscriptStep[] | null;
+	process_type?: string;
+	profile?: string | null;
+	channel_name?: string | null;
+	model?: string | null;
+	max_turns?: number | null;
+	directory?: string | null;
+	interactive?: boolean;
+	project_id?: string | null;
+}
+
+export function branchRunStatus(conclusion: string | null): string {
+	if (conclusion?.startsWith("Branch failed:")) return "failed";
+	if (conclusion?.startsWith("Branch cancelled:") || conclusion?.startsWith("Branch was cancelled:")) return "cancelled";
+	return "done";
+}
+
 interface ProcessCardProps {
 	kind: ProcessKind;
 	id: string;
 	title: string;
 	status: string;
 	startedAt: string;
-	toolCalls: number;
+	toolCalls?: number;
 	currentTool?: string | null;
 	processType?: string;
 	selected: boolean;
@@ -103,8 +133,8 @@ export function ProcessCard({
 						</div>
 						<p className="mt-1 line-clamp-2 text-sm font-medium leading-5 text-ink">{title}</p>
 						<div className="mt-1.5 flex min-w-0 items-center gap-2 text-tiny text-ink-faint">
-							{toolCalls > 0 && <span>{toolCalls} tool call{toolCalls === 1 ? "" : "s"}</span>}
-							{toolCalls > 0 && currentTool && <span>·</span>}
+							{toolCalls !== undefined && toolCalls > 0 && <span>{toolCalls} tool call{toolCalls === 1 ? "" : "s"}</span>}
+							{toolCalls !== undefined && toolCalls > 0 && currentTool && <span>·</span>}
 							{currentTool && <span className="truncate">{currentTool}</span>}
 						</div>
 					</div>
@@ -141,7 +171,7 @@ function withoutDuplicateOutput(transcript: TranscriptStep[] | null, output: str
 interface ProcessDetailProps {
 	agentId: string;
 	selection: ProcessSelection;
-	fallback: ProcessRun;
+	fallback: ProcessRunDisplay;
 	liveTranscript?: TranscriptStep[];
 	onClose: () => void;
 }
@@ -153,7 +183,7 @@ export function ProcessDetail({agentId, selection, fallback, liveTranscript, onC
 		queryFn: () => api.processDetail(agentId, selection.kind, selection.id),
 		refetchInterval: active ? 1500 : false,
 	});
-	const detail = detailQuery.data ?? fallback;
+	const detail: ProcessRun | ProcessRunDisplay = detailQuery.data ?? fallback;
 	const isLive = detail.status === "running" || detail.status === "idle";
 	const rawTranscript = isLive && liveTranscript?.length ? liveTranscript : detail.transcript;
 	const transcript = useMemo(() => withoutDuplicateOutput(rawTranscript ?? null, detail.output), [rawTranscript, detail.output]);
@@ -169,7 +199,7 @@ export function ProcessDetail({agentId, selection, fallback, liveTranscript, onC
 		["Profile", detail.profile],
 		["Model", detail.model],
 		["Max turns", detail.max_turns?.toString()],
-		["Mode", detail.interactive ? "interactive" : detail.kind === "worker" ? "one-shot" : null],
+		["Mode", detail.interactive === true ? "interactive" : detail.interactive === false && detail.kind === "worker" ? "one-shot" : null],
 		["Directory", detail.directory],
 		["Project", detail.project_id],
 	].filter((entry): entry is [string, string] => Boolean(entry[1]));
@@ -190,8 +220,8 @@ export function ProcessDetail({agentId, selection, fallback, liveTranscript, onC
 				</button>
 			</div>
 			<div className="mt-3 flex flex-wrap gap-x-3 gap-y-1 text-tiny text-ink-faint">
-				{isLive ? <span>Running for <LiveDuration startMs={new Date(detail.started_at).getTime()} /></span> : <span>{durationBetween(detail.started_at, detail.completed_at)}</span>}
-				<span>{detail.tool_calls} tool call{detail.tool_calls === 1 ? "" : "s"}</span>
+				{isLive ? <span>Running for <LiveDuration startMs={new Date(detail.started_at).getTime()} /></span> : detail.completed_at && <span>{durationBetween(detail.started_at, detail.completed_at)}</span>}
+				{detail.tool_calls !== undefined && <span>{detail.tool_calls} tool call{detail.tool_calls === 1 ? "" : "s"}</span>}
 				{detail.channel_name && <span>{detail.channel_name}</span>}
 			</div>
 		</div>

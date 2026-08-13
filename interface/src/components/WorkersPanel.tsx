@@ -12,6 +12,7 @@ import {api, type ProcessRun} from "@/api/client";
 import {
 	ProcessCard,
 	ProcessDetail,
+	type ProcessRunDisplay,
 	type ProcessSelection,
 } from "@/components/processes/ProcessRunView";
 import {useLiveContext} from "@/hooks/useLiveContext";
@@ -20,7 +21,7 @@ type Tab = "active" | "history";
 
 interface SelectedProcess extends ProcessSelection {
 	agentId: string;
-	fallback: ProcessRun;
+	fallback: ProcessRunDisplay;
 }
 
 export function WorkersPanelButton() {
@@ -75,7 +76,7 @@ export function WorkersPanelContent() {
 	});
 
 	const history = useMemo(() => {
-		const rows: Array<ProcessRun & {agentId: string; agentName: string}> = [];
+		const rows: Array<ProcessRunDisplay & {agentId: string; agentName: string}> = [];
 		for (let index = 0; index < agents.length; index++) {
 			const agent = agents[index];
 			if (!agent) continue;
@@ -87,30 +88,17 @@ export function WorkersPanelContent() {
 	}, [agents, agentNames, processQueries]);
 
 	const active = useMemo(() => {
-		const rows: Array<ProcessRun & {agentId: string; agentName: string}> = [];
+		const rows: Array<ProcessRunDisplay & {agentId: string; agentName: string}> = [];
 		for (const worker of Object.values(activeWorkers)) {
 			rows.push({
 				kind: "worker",
 				id: worker.id,
 				input: worker.task,
-				output: null,
 				status: worker.isIdle ? "idle" : "running",
 				process_type: worker.workerType,
-				profile: null,
-				channel_id: worker.channelId ?? null,
-				channel_name: null,
 				started_at: new Date(worker.startedAt).toISOString(),
-				completed_at: null,
-				has_transcript: false,
-				transcript: null,
 				tool_calls: worker.toolCalls,
-				model: null,
-				max_turns: null,
-				opencode_session_id: null,
-				opencode_port: null,
-				directory: null,
 				interactive: worker.interactive,
-				project_id: null,
 				agentId: worker.agentId,
 				agentName: agentNames[worker.agentId] ?? worker.agentId,
 			});
@@ -120,24 +108,9 @@ export function WorkersPanelContent() {
 				kind: "branch",
 				id: branch.id,
 				input: branch.description,
-				output: null,
 				status: "running",
-				process_type: "branch",
-				profile: null,
-				channel_id: branch.channelId,
-				channel_name: null,
 				started_at: new Date(branch.startedAt).toISOString(),
-				completed_at: null,
-				has_transcript: false,
-				transcript: null,
 				tool_calls: branch.toolCalls,
-				model: null,
-				max_turns: null,
-				opencode_session_id: null,
-				opencode_port: null,
-				directory: null,
-				interactive: false,
-				project_id: null,
 				agentId: branch.agentId,
 				agentName: agentNames[branch.agentId] ?? branch.agentId,
 			});

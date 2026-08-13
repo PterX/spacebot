@@ -3,7 +3,6 @@ import { Link } from "@tanstack/react-router";
 import {
   api,
   type ChannelInfo,
-  type ProcessRun,
   type TimelineItem,
   type TimelineBranchRun,
   type TimelineCheckpoint,
@@ -21,6 +20,8 @@ import { PromptInspectModal } from "@/components/PromptInspectModal";
 import {
   ProcessCard,
   ProcessDetail,
+  branchRunStatus,
+  type ProcessRunDisplay,
   type ProcessSelection,
 } from "@/components/processes/ProcessRunView";
 import { formatTimestamp, platformIcon, platformColor } from "@/lib/format";
@@ -95,13 +96,9 @@ function LiveWorkerRunItem({
 }
 
 function BranchRunItem({ item, selected, onSelect }: { item: TimelineBranchRun; selected: boolean; onSelect: () => void }) {
-  const status = item.conclusion?.startsWith("Branch failed:")
-    ? "failed"
-    : item.conclusion?.startsWith("Branch cancelled:") || item.conclusion?.startsWith("Branch was cancelled:")
-      ? "cancelled"
-      : "done";
+  const status = branchRunStatus(item.conclusion);
   return (
-    <ProcessCard kind="branch" id={item.id} title={item.description} status={status} startedAt={item.started_at} toolCalls={0} selected={selected} onSelect={onSelect} />
+    <ProcessCard kind="branch" id={item.id} title={item.description} status={status} startedAt={item.started_at} selected={selected} onSelect={onSelect} />
   );
 }
 
@@ -115,7 +112,7 @@ function WorkerRunItem({
   onSelect: () => void;
 }) {
   return (
-    <ProcessCard kind="worker" id={item.id} title={item.task} status={item.status} startedAt={item.started_at} toolCalls={0} processType={isOpenCodeWorker({task: item.task}) ? "opencode" : "builtin"} selected={selected} onSelect={onSelect} />
+    <ProcessCard kind="worker" id={item.id} title={item.task} status={item.status} startedAt={item.started_at} processType={isOpenCodeWorker({task: item.task}) ? "opencode" : "builtin"} selected={selected} onSelect={onSelect} />
   );
 }
 
@@ -286,9 +283,8 @@ function processFallback(
   timeline: TimelineItem[],
   workers: Record<string, ActiveWorker>,
   branches: Record<string, ActiveBranch>,
-  channelId: string,
   channelName: string | null,
-): ProcessRun | null {
+): ProcessRunDisplay | null {
   const item = timeline.find(
     (candidate) =>
       candidate.id === selection.id &&
@@ -297,36 +293,17 @@ function processFallback(
 
   if (item?.type === "branch_run") {
     const live = branches[item.id];
-    const status = live
-      ? "running"
-      : item.conclusion?.startsWith("Branch failed:")
-        ? "failed"
-        : item.conclusion?.startsWith("Branch cancelled:") ||
-            item.conclusion?.startsWith("Branch was cancelled:")
-          ? "cancelled"
-          : "done";
+    const status = live ? "running" : branchRunStatus(item.conclusion);
     return {
       kind: "branch",
       id: item.id,
       input: item.description,
       output: item.conclusion ?? null,
       status,
-      process_type: "branch",
-      profile: null,
-      channel_id: channelId,
       channel_name: channelName,
       started_at: item.started_at,
-      completed_at: item.completed_at ?? null,
-      has_transcript: false,
-      transcript: null,
-      tool_calls: live?.toolCalls ?? 0,
-      model: null,
-      max_turns: null,
-      opencode_session_id: null,
-      opencode_port: null,
-      directory: null,
-      interactive: false,
-      project_id: null,
+      completed_at: item.completed_at,
+      tool_calls: live?.toolCalls,
     };
   }
 
@@ -338,24 +315,12 @@ function processFallback(
       input: item.task,
       output: item.result ?? null,
       status: live ? (live.isIdle ? "idle" : "running") : item.status,
-      process_type:
-        live?.workerType ??
-        (isOpenCodeWorker({task: item.task}) ? "opencode" : "builtin"),
-      profile: null,
-      channel_id: channelId,
+      process_type: live?.workerType,
       channel_name: channelName,
       started_at: item.started_at,
-      completed_at: item.completed_at ?? null,
-      has_transcript: false,
-      transcript: null,
-      tool_calls: live?.toolCalls ?? 0,
-      model: null,
-      max_turns: null,
-      opencode_session_id: null,
-      opencode_port: null,
-      directory: null,
-      interactive: live?.interactive ?? false,
-      project_id: null,
+      completed_at: item.completed_at,
+      tool_calls: live?.toolCalls,
+      interactive: live?.interactive,
     };
   }
 
@@ -392,11 +357,10 @@ export function ChannelDetail({
             timeline,
             workers,
             branches,
-            channelId,
             channel?.display_name ?? null,
           )
         : null,
-    [selection, timeline, workers, branches, channelId, channel?.display_name],
+    [selection, timeline, workers, branches, channel?.display_name],
   );
 
   const scrollRef = useRef<HTMLDivElement>(null);
