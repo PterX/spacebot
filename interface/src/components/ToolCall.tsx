@@ -197,6 +197,8 @@ export function isErrorResult(
 interface ToolRenderer {
 	/** One-line summary shown in the collapsed header (after tool name) */
 	summary(pair: ToolCallPair): string | null;
+	/** Render as a transcript line rather than an expandable tool card */
+	inlineView?(pair: ToolCallPair): React.ReactNode | null;
 	/** Custom args display (return null to use default JSON) */
 	argsView?(pair: ToolCallPair): React.ReactNode | null;
 	/** Custom result display (return null to use default text) */
@@ -568,13 +570,22 @@ const toolRenderers: Record<string, ToolRenderer> = {
 	set_status: {
 		summary(pair) {
 			const kind = pair.args?.kind;
-			const message = pair.args?.message;
+			const status = pair.args?.status;
 			if (kind === "outcome") {
-				return message
-					? `Outcome: ${truncate(String(message), 50)}`
+				return status
+					? `Outcome: ${truncate(String(status), 50)}`
 					: "Outcome set";
 			}
-			return message ? truncate(String(message), 60) : null;
+			return status ? truncate(String(status), 60) : null;
+		},
+		inlineView(pair) {
+			const status = pair.args?.status;
+			if (!status) return null;
+			return (
+				<p className="px-1 text-xs text-ink-dull">
+					{String(status)}
+				</p>
+			);
 		},
 		resultView() {
 			// set_status results are not interesting — just "ok"
@@ -1052,9 +1063,12 @@ function toolCategory(name: string): string | null {
 export function ToolCall({pair}: {pair: ToolCallPair}) {
 	const [expanded, setExpanded] = useState(false);
 	const renderer = getRenderer(pair.name);
+	const inlineView = renderer.inlineView?.(pair);
 	const summary = renderer.summary(pair);
 	const category = toolCategory(pair.name);
 	const displayName = formatToolName(pair.name);
+
+	if (inlineView) return inlineView;
 
 	return (
 		<div

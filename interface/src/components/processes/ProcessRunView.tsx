@@ -206,32 +206,31 @@ export function ProcessDetail({agentId, selection, fallback, liveTranscript, onC
 
 	return (
 		<div className="flex h-full min-h-0 flex-col bg-app-dark-box/95">
-		<div className="border-b border-app-line/50 px-5 py-4">
-			<div className="flex items-start gap-3">
+		<div className="border-b border-app-line/50 px-5 py-3">
+			<div className="flex items-center gap-3">
 				<ProcessActivity kind={detail.kind} active={isLive && detail.status !== "idle"} />
 				<div className="min-w-0 flex-1">
 					<div className="flex items-center gap-2 text-tiny font-medium uppercase tracking-[0.12em] text-ink-faint">
 						<span>{detail.kind}</span><span>·</span><span>{detail.status}</span>
 					</div>
-					<h2 className="mt-1 text-sm font-medium leading-5 text-ink">{detail.input}</h2>
+					<div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-tiny text-ink-faint">
+						{isLive ? <span>Running for <LiveDuration startMs={new Date(detail.started_at).getTime()} /></span> : detail.completed_at && <span>{durationBetween(detail.started_at, detail.completed_at)}</span>}
+						{detail.tool_calls !== undefined && <span>{detail.tool_calls} tool call{detail.tool_calls === 1 ? "" : "s"}</span>}
+						{detail.channel_name && <span>{detail.channel_name}</span>}
+					</div>
 				</div>
 				<button type="button" onClick={onClose} className="rounded-md p-1.5 text-ink-faint hover:bg-app-hover hover:text-ink" aria-label="Close process detail">
 					<X className="size-4" />
 				</button>
 			</div>
-			<div className="mt-3 flex flex-wrap gap-x-3 gap-y-1 text-tiny text-ink-faint">
-				{isLive ? <span>Running for <LiveDuration startMs={new Date(detail.started_at).getTime()} /></span> : detail.completed_at && <span>{durationBetween(detail.started_at, detail.completed_at)}</span>}
-				{detail.tool_calls !== undefined && <span>{detail.tool_calls} tool call{detail.tool_calls === 1 ? "" : "s"}</span>}
-				{detail.channel_name && <span>{detail.channel_name}</span>}
-			</div>
 		</div>
 
 		<div ref={transcriptRef} className="flex-1 overflow-y-auto">
 			{metadata.length > 0 && (
-				<section className="border-b border-app-line/40 px-5 py-4">
-					<h3 className="mb-3 text-tiny font-medium uppercase tracking-wider text-ink-faint">Configuration</h3>
-					<dl className="grid grid-cols-2 gap-x-4 gap-y-3">
-						{metadata.map(([label, value]) => <div key={label} className={label === "Directory" ? "col-span-2 min-w-0" : "min-w-0"}><dt className="text-[10px] uppercase tracking-wide text-ink-faint">{label}</dt><dd className="mt-0.5 truncate text-xs text-ink-dull" title={value}>{value}</dd></div>)}
+				<section className="border-b border-app-line/40 px-5 py-2.5">
+					<h3 className="mb-1.5 text-tiny font-medium text-ink-faint">Configuration</h3>
+					<dl className="flex flex-wrap gap-x-4 gap-y-1">
+						{metadata.map(([label, value]) => <div key={label} className={cx("flex min-w-0 gap-1 text-tiny", label === "Directory" && "basis-full")}><dt className="text-ink-faint">{label}:</dt><dd className="truncate text-ink-dull" title={value}>{value}</dd></div>)}
 					</dl>
 				</section>
 			)}
@@ -242,16 +241,21 @@ export function ProcessDetail({agentId, selection, fallback, liveTranscript, onC
 				</section>
 			)}
 			<section className="px-5 py-4">
-				<h3 className="mb-3 text-tiny font-medium uppercase tracking-wider text-ink-faint">{isLive ? "Live transcript" : "Transcript"}</h3>
-				{transcript?.length ? (
-					<div className="flex flex-col gap-3">
+				<div className="flex flex-col gap-3">
+					<div>
+						<p className="mb-1 text-tiny font-medium text-ink-faint">Input</p>
+						<div className="text-xs leading-5 text-ink"><Markdown>{detail.input}</Markdown></div>
+					</div>
+					{transcript?.length ? (
+						<>
 						{pairTranscriptSteps(transcript).map((item, index) => (
 							<motion.div key={item.kind === "tool" ? item.pair.id : `text-${index}`} initial={{opacity: 0, y: 4}} animate={{opacity: 1, y: 0}}>
 								{item.kind === "tool" ? <ToolCall pair={item.pair} /> : <div className="text-xs text-ink-dull"><Markdown>{item.text.replace(/ {3,}/g, "  ")}</Markdown></div>}
 							</motion.div>
 						))}
-					</div>
-				) : detailQuery.isLoading ? <p className="text-xs text-ink-faint">Loading transcript...</p> : <p className="text-xs text-ink-faint">{isLive ? "Waiting for the first tool call..." : "No transcript recorded."}</p>}
+						</>
+					) : detailQuery.isLoading ? <p className="text-xs text-ink-faint">Loading transcript...</p> : <p className="text-xs text-ink-faint">{isLive ? "Waiting for the first tool call..." : "No transcript recorded."}</p>}
+				</div>
 			</section>
 		</div>
 		</div>
