@@ -263,6 +263,9 @@ pub struct Chronicler {
     fence: Arc<HistoryFence>,
     /// One in-flight cut per channel.
     cutting: Arc<AtomicBool>,
+    /// One in-flight rollup per channel. Rollups only begin after a checkpoint
+    /// commits, never from an idle timer.
+    rolling_up: Arc<AtomicBool>,
 }
 
 impl Chronicler {
@@ -282,6 +285,7 @@ impl Chronicler {
             model_override,
             fence,
             cutting: Arc::new(AtomicBool::new(false)),
+            rolling_up: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -402,6 +406,7 @@ impl Chronicler {
             config,
             // Captured before the LLM call; re-checked before commit and trim.
             entry: self.fence.snapshot(),
+            rolling_up: self.rolling_up.clone(),
         };
         let cutting = self.cutting.clone();
 
@@ -577,6 +582,7 @@ struct CutContext {
     model_override: Option<String>,
     config: ChronicleConfig,
     entry: FenceSnapshot,
+    rolling_up: Arc<AtomicBool>,
 }
 
 impl CutContext {
@@ -685,6 +691,7 @@ impl CutContext {
 
         emit_checkpoint_event(&self.deps, &self.channel_id, &checkpoint);
         self.trim_live_history(&checkpoint).await;
+        self.spawn_rollup_if_needed();
 
         tracing::info!(
             channel_id = %self.channel_id,
@@ -694,6 +701,28 @@ impl CutContext {
         );
 
         Ok(())
+    }
+
+    fn spawn_rollup_if_needed(&self) {
+        if self.rolling_up.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let context = RollupContext {
+            channel_id: self.channel_id.clone(),
+            deps: self.deps.clone(),
+            store: self.store.clone(),
+            model_override: self.model_override.clone(),
+            config: self.config,
+        };
+        let rolling_up = self.rolling_up.clone();
+
+        tokio::spawn(async move {
+            let _release = CuttingGuard(rolling_up);
+            if let Err(error) = context.run().await {
+                tracing::error!(channel_id = %context.channel_id, %error, "chronicle rollup failed");
+            }
+        });
     }
 
     /// Build the summary text for a span.
@@ -770,6 +799,113 @@ impl CutContext {
             checkpoint,
         )
         .await;
+    }
+}
+
+struct RollupContext {
+    channel_id: ChannelId,
+    deps: AgentDeps,
+    store: ChronicleStore,
+    model_override: Option<String>,
+    config: ChronicleConfig,
+}
+
+impl RollupContext {
+    async fn run(&self) -> Result<()> {
+        let unrolled = self
+            .store
+            .list_unrolled(&self.channel_id, 0, self.config.rollup_threshold as i64)
+            .await?;
+        if unrolled.len() < self.config.rollup_threshold {
+            return Ok(());
+        }
+
+        let sources = &unrolled[..self.config.rollup_batch];
+        let prompt_engine = self.deps.runtime_config.prompts.load();
+        let preamble = prompt_engine.render_static("chronicle_rollup")?;
+        let routing = self.deps.runtime_config.routing.load();
+        let model_name = self
+            .model_override
+            .clone()
+            .unwrap_or_else(|| routing.resolve(ProcessType::Compactor, None).to_string());
+        let model = SpacebotModel::make(&self.deps.llm_manager, &model_name)
+            .with_context(&*self.deps.agent_id, "chronicle_rollup")
+            .with_routing((**routing).clone());
+        let agent = AgentBuilder::new(model)
+            .preamble(&preamble)
+            .default_max_turns(1)
+            .build();
+        let hook = SpacebotHook::new(
+            self.deps.agent_id.clone(),
+            ProcessId::Worker(Uuid::new_v4()),
+            ProcessType::Compactor,
+            Some(self.channel_id.clone()),
+            self.deps.event_tx.clone(),
+        );
+        let prompt = build_rollup_prompt(sources);
+        let mut history = Vec::new();
+        let response = hook.prompt_once(&agent, &mut history, &prompt).await;
+        let fallback_title = format!(
+            "{} to {}",
+            sources.first().expect("sources is non-empty").title,
+            sources.last().expect("sources is non-empty").title
+        );
+        let (title, summary, model) = match response {
+            Ok(text) => {
+                let (title, summary) = parse_checkpoint_response(&text);
+                (title.unwrap_or(fallback_title), summary, Some(model_name))
+            }
+            Err(error) => {
+                tracing::warn!(%error, channel_id = %self.channel_id, "chronicle rollup summarization failed");
+                return Ok(());
+            }
+        };
+
+        let first = sources.first().expect("sources is non-empty");
+        let last = sources.last().expect("sources is non-empty");
+        let source_ids: Vec<String> = sources
+            .iter()
+            .map(|checkpoint| checkpoint.id.clone())
+            .collect();
+        let outcome = self
+            .store
+            .commit_rollup(
+                NewCheckpoint {
+                    channel_id: self.channel_id.to_string(),
+                    level: 1,
+                    kind: CheckpointKind::Rollup,
+                    title,
+                    summary: summary.clone(),
+                    covers_from: first.start_boundary(),
+                    covers_to: last.end_boundary(),
+                    covers_from_at: first.covers_from_at,
+                    covers_to_at: last.covers_to_at,
+                    covers_from_message_id: first.covers_from_message_id.clone(),
+                    covers_to_message_id: last.covers_to_message_id.clone(),
+                    message_count: sources
+                        .iter()
+                        .map(|checkpoint| checkpoint.message_count)
+                        .sum(),
+                    token_estimate: estimate_text_tokens(&summary) as i64,
+                    rolls_up_from_seq: Some(first.seq),
+                    rolls_up_to_seq: Some(last.seq),
+                    model,
+                },
+                &source_ids,
+            )
+            .await?;
+
+        if let CommitOutcome::Committed(checkpoint) = outcome {
+            emit_checkpoint_event(&self.deps, &self.channel_id, &checkpoint);
+            tracing::info!(
+                channel_id = %self.channel_id,
+                seq = checkpoint.seq,
+                source_count = sources.len(),
+                "chronicle rollup committed"
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -974,6 +1110,25 @@ fn build_cut_prompt(
     prompt
 }
 
+fn build_rollup_prompt(sources: &[ChronicleCheckpoint]) -> String {
+    let mut prompt = String::from(
+        "## Earlier chronicle entries to roll up\n\nSummarize this contiguous run into one \
+         durable index entry. Preserve decisions, commitments, active work, and emotional context. \
+         Do not invent details or describe entries outside this range.\n\n",
+    );
+    for checkpoint in sources {
+        prompt.push_str(&format!(
+            "### #{} {}\n{} → {}\n\n{}\n\n",
+            checkpoint.seq,
+            checkpoint.title,
+            checkpoint.covers_from_at.format("%Y-%m-%d %H:%M"),
+            checkpoint.covers_to_at.format("%Y-%m-%d %H:%M"),
+            checkpoint.summary,
+        ));
+    }
+    prompt
+}
+
 /// Render logged messages for the summarizer.
 pub(crate) fn render_log_transcript(messages: &[ConversationMessage]) -> String {
     let mut output = String::new();
@@ -1017,23 +1172,12 @@ pub async fn render_chronicle_view(
     let window = Duration::try_hours(config.recent_window_hours)
         .unwrap_or_else(|| Duration::hours(ChronicleConfig::default().recent_window_hours));
     let since = now - window;
-    let recent = store
-        .list_since(channel_id, 0, since, config.max_recent as i64)
+    let entries = store
+        .list_renderable(channel_id, (config.max_recent + config.max_older) as i64)
         .await?;
-
-    let older = match recent.first() {
-        Some(first) => {
-            store
-                .list_before_seq(channel_id, 0, first.seq, config.max_older as i64)
-                .await?
-        }
-        None => store
-            .list(channel_id, 0, config.max_older as i64)
-            .await?
-            .into_iter()
-            .rev()
-            .collect(),
-    };
+    let split = entries.partition_point(|checkpoint| checkpoint.covers_to_at < since);
+    let older = entries[..split].to_vec();
+    let recent = entries[split..].to_vec();
 
     Ok(Some(compose_view(
         &stats,

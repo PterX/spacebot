@@ -805,6 +805,10 @@ pub struct ChronicleConfig {
     pub expand_message_limit: i64,
     /// Raw messages a single checkpoint summarization may read.
     pub max_messages_per_checkpoint: i64,
+    /// Number of unrolled level-0 checkpoints that trigger a level-1 rollup.
+    pub rollup_threshold: usize,
+    /// Oldest unrolled level-0 checkpoints included in one rollup.
+    pub rollup_batch: usize,
 }
 
 impl Default for ChronicleConfig {
@@ -818,6 +822,8 @@ impl Default for ChronicleConfig {
             context_token_budget: 2000,
             expand_message_limit: 100,
             max_messages_per_checkpoint: 400,
+            rollup_threshold: 12,
+            rollup_batch: 8,
         }
     }
 }

@@ -80,6 +80,10 @@ fn resolve_compaction_config(
                     max_messages_per_checkpoint: c
                         .max_messages_per_checkpoint
                         .unwrap_or(base.chronicle.max_messages_per_checkpoint),
+                    rollup_threshold: c
+                        .rollup_threshold
+                        .unwrap_or(base.chronicle.rollup_threshold),
+                    rollup_batch: c.rollup_batch.unwrap_or(base.chronicle.rollup_batch),
                 })
                 .unwrap_or(base.chronicle),
         ),
@@ -111,6 +115,8 @@ fn clamp_chronicle_config(mut config: ChronicleConfig) -> ChronicleConfig {
     config.max_messages_per_checkpoint = config
         .max_messages_per_checkpoint
         .clamp(1, MAX_MESSAGES_PER_CHECKPOINT);
+    config.rollup_threshold = config.rollup_threshold.max(1);
+    config.rollup_batch = config.rollup_batch.clamp(1, config.rollup_threshold);
     config
 }
 
