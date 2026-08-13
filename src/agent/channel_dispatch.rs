@@ -156,6 +156,7 @@ fn outcome_kind(kind: WorkerCompletionKind) -> WorkerOutcomeKind {
 }
 
 /// Normalize a worker outcome (or terminal error) into event payload fields.
+#[cfg(test)]
 pub(crate) fn map_worker_completion(
     outcome: std::result::Result<WorkerOutcome, WorkerCompletionError>,
 ) -> (String, bool, bool) {
@@ -1285,6 +1286,7 @@ async fn spawn_opencode_worker_inner(
 /// The result text is scrubbed through the secret store's tool secret values
 /// before being sent via the event — tool secret values are replaced with
 /// `[REDACTED:<name>]` so they never propagate to channel context.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_worker_task<F>(
     worker_id: WorkerId,
     event_tx: broadcast::Sender<ProcessEvent>,

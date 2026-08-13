@@ -121,7 +121,7 @@ pub(super) async fn get_chronicle_history(
             .cmp(&left.day)
             .then_with(|| left.agent_id.cmp(&right.agent_id))
     });
-    checkpoints.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    checkpoints.sort_by_key(|checkpoint| std::cmp::Reverse(checkpoint.created_at));
     checkpoints.truncate(limit);
 
     Ok(Json(ChronicleHistoryResponse {

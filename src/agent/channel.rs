@@ -4005,13 +4005,11 @@ impl Channel {
         match &event {
             ProcessEvent::BranchStarted {
                 branch_id,
-                reply_to_message_id,
+                reply_to_message_id: Some(message_id),
                 ..
             } => {
-                if let Some(message_id) = reply_to_message_id {
-                    self.branch_reply_targets
-                        .insert(*branch_id, message_id.clone());
-                }
+                self.branch_reply_targets
+                    .insert(*branch_id, message_id.clone());
             }
             ProcessEvent::BranchResult {
                 branch_id,

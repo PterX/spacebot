@@ -874,7 +874,6 @@ impl ProcessRunLogger {
             ))
         })
         .transpose()
-        .map_err(Into::into)
     }
 
     /// Link a worker run to a project and/or worktree. Fire-and-forget.
