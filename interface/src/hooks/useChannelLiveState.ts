@@ -315,7 +315,7 @@ export function useChannelLiveState(channels: ChannelInfo[]) {
       pushItem(event.channel_id, {
         type: "message",
         id: `in-${generateId()}`,
-        role: "user",
+        role: event.system ? "system" : "user",
         sender_name: event.sender_name ?? event.sender_id,
         sender_id: event.sender_id,
         content: event.text,

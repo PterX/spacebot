@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import {
+  faClock,
   faCodeBranch,
   faExternalLinkAlt,
   faRobot,
@@ -13,6 +14,81 @@ import {
 } from "@fortawesome/free-solid-svg-icons";
 import { Badge, Popover, SelectPill, OptionList, OptionListItem } from "@spacedrive/primitives";
 import { api, type TaskItem } from "@/api/client";
+
+export interface TaskEnrichment {
+  at: string;
+  detail: string;
+}
+
+export function taskEnrichments(runs: Awaited<ReturnType<typeof api.autonomyRuns>>["runs"]) {
+  const enrichments = new Map<number, TaskEnrichment>();
+  for (const run of runs) {
+    for (const action of run.actions) {
+      if (action.kind !== "enriched" || action.task_number === null) continue;
+      const at = run.finished_at ?? run.started_at;
+      const current = enrichments.get(action.task_number);
+      if (!current || at > current.at) {
+        enrichments.set(action.task_number, {at, detail: action.detail});
+      }
+    }
+  }
+  return enrichments;
+}
+
+function formatRelativeTime(iso: string) {
+  const seconds = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
+  if (seconds < 60) return "just now";
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86_400) return `${Math.floor(seconds / 3600)}h ago`;
+  return `${Math.floor(seconds / 86_400)}d ago`;
+}
+
+export function TaskMetadataBadges({
+  task,
+  enrichment,
+}: {
+  task: TaskItem;
+  enrichment?: TaskEnrichment;
+}) {
+  return (
+    <div className="flex min-w-0 flex-wrap items-center gap-1">
+      {enrichment && (
+        <Badge
+          variant="info"
+          size="sm"
+          title={`Researched ${formatRelativeTime(enrichment.at)}: ${enrichment.detail}`}
+        >
+          <FontAwesomeIcon icon={faClock} className="text-[9px]" />
+          <span>Researched {formatRelativeTime(enrichment.at)}</span>
+        </Badge>
+      )}
+      {task.depends_on.map((edge) => (
+        <Badge
+          key={`${edge.kind}-${edge.depends_on_task_number}`}
+          variant={edge.satisfied ? "success" : "warning"}
+          size="sm"
+          title={`${edge.depends_on_title} - ${edge.depends_on_status}`}
+        >
+          <FontAwesomeIcon
+            icon={edge.kind === "stack" ? faLayerGroup : edge.satisfied ? faLockOpen : faLock}
+            className="text-[9px]"
+          />
+          <span>{edge.kind === "stack" ? "Stacks on" : "Blocked by"} SPC-{edge.depends_on_task_number}</span>
+        </Badge>
+      ))}
+    </div>
+  );
+}
+
+export function taskListTitle(task: TaskItem, enrichment?: TaskEnrichment) {
+  const activity = [
+    enrichment && "researched",
+    ...task.depends_on.map((edge) =>
+      edge.kind === "stack" ? `stacks on SPC-${edge.depends_on_task_number}` : `after SPC-${edge.depends_on_task_number}`,
+    ),
+  ].filter(Boolean);
+  return activity.length === 0 ? task.title : `${task.title} · ${activity.join(" · ")}`;
+}
 
 // ---------------------------------------------------------------------------
 // GitHub metadata helpers

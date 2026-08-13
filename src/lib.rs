@@ -180,6 +180,13 @@ pub struct ChronicleCheckpointPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProcessEvent {
+    /// A system-originated message was accepted by a channel outside the
+    /// adapter relay, such as an autonomy briefing.
+    ChannelSystemMessage {
+        agent_id: AgentId,
+        channel_id: ChannelId,
+        text: String,
+    },
     BranchStarted {
         agent_id: AgentId,
         branch_id: BranchId,

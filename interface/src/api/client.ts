@@ -144,6 +144,7 @@ export interface InboundMessageEvent {
 	sender_name?: string | null;
 	sender_id: string;
 	text: string;
+	system: boolean;
 	attachments?: AttachmentMeta[];
 }
 
@@ -372,7 +373,7 @@ export interface AttachmentMeta {
 export interface TimelineMessage {
 	type: "message";
 	id: string;
-	role: "user" | "assistant";
+	role: "user" | "assistant" | "system";
 	sender_name: string | null;
 	sender_id: string | null;
 	content: string;

@@ -563,7 +563,8 @@ pub(crate) fn event_is_for_channel(event: &ProcessEvent, channel_id: &ChannelId)
             channel_id: event_channel,
             ..
         } => event_channel == channel_id,
-        ProcessEvent::OpenCodePartUpdated { .. }
+        ProcessEvent::ChannelSystemMessage { .. }
+        | ProcessEvent::OpenCodePartUpdated { .. }
         | ProcessEvent::StatusUpdate { .. }
         | ProcessEvent::TaskUpdated { .. }
         | ProcessEvent::ProcessText { .. }

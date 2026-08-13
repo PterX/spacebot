@@ -2253,6 +2253,19 @@ impl Channel {
         let mut batch_has_invoke = false;
 
         for message in &messages {
+            if message.source == "autonomy" {
+                if let Err(error) =
+                    self.deps
+                        .event_tx
+                        .send(crate::ProcessEvent::ChannelSystemMessage {
+                            agent_id: self.deps.agent_id.clone(),
+                            channel_id: self.state.channel_id.clone(),
+                            text: message.content.to_string(),
+                        })
+                {
+                    tracing::debug!(channel_id = %self.id, %error, "failed to emit autonomy briefing for live timeline");
+                }
+            }
             if message.source != "system" {
                 let sender_name = participant_display_name(message);
 
@@ -2315,13 +2328,19 @@ impl Channel {
                     message.metadata.clone()
                 };
 
-                self.state.conversation_logger.log_user_message(
-                    &self.state.channel_id,
-                    &sender_name,
-                    &message.sender_id,
-                    &raw_text,
-                    &metadata,
-                );
+                if message.source == "autonomy" {
+                    self.state
+                        .conversation_logger
+                        .log_system_message(&self.state.channel_id, &raw_text);
+                } else {
+                    self.state.conversation_logger.log_user_message(
+                        &self.state.channel_id,
+                        &sender_name,
+                        &message.sender_id,
+                        &raw_text,
+                        &metadata,
+                    );
+                }
                 self.state
                     .channel_store
                     .upsert(&message.conversation_id, &metadata);

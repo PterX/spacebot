@@ -590,6 +590,7 @@ impl Worker {
 
         // Create per-worker ToolServer with task tools
         let interactive = self.input_rx.is_some();
+        self.hook = self.hook.clone().with_terminate_on_outcome(!interactive);
         let worker_tool_server = crate::tools::create_worker_tool_server(
             self.deps.agent_id.clone(),
             self.id,
@@ -762,6 +763,16 @@ impl Worker {
                         );
                     }
                     Err(rig::completion::PromptError::PromptCancelled { reason, .. }) => {
+                        if reason == SpacebotHook::WORKER_OUTCOME_RECORDED_REASON {
+                            tracing::info!(
+                                worker_id = %self.id,
+                                "one-shot worker stopped after recording terminal outcome"
+                            );
+                            self.persist_transcript(&compacted_history, &history).await;
+                            return Ok(WorkerOutcome::Success {
+                                result: "Worker reported a terminal outcome.".to_string(),
+                            });
+                        }
                         self.state = WorkerState::Failed;
                         self.hook.send_status("cancelled");
                         self.write_failure_log(&history, &format!("cancelled: {reason}"));

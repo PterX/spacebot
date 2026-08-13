@@ -1906,6 +1906,7 @@ async fn run(
                         sender_name,
                         sender_id: message.sender_id.clone(),
                         text: message.content.to_string(),
+                        system: false,
                         attachments: inbound_attachments,
                     }).ok();
 

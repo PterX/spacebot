@@ -207,7 +207,7 @@ function TimelineEntry({
       return (
         <div
           className={`flex gap-3 rounded-md px-3 py-2 ${
-            item.role === "user" ? "bg-app-dark-box/30" : ""
+            item.role === "user" ? "bg-app-dark-box/30" : item.role === "system" ? "border border-app-line/40 bg-app-box/30" : ""
           }`}
         >
           <span className="flex-shrink-0 pt-0.5 text-tiny text-ink-faint">
@@ -218,11 +218,15 @@ function TimelineEntry({
               className={`text-sm font-medium ${
                 item.role === "user"
                   ? "text-accent-faint"
+                  : item.role === "system"
+                    ? "text-ink-faint"
                   : "text-status-success"
               }`}
             >
               {item.role === "user"
                 ? (item.sender_name ?? "user")
+                : item.role === "system"
+                  ? "system"
                 : (item.sender_name ?? "bot")}
             </span>
             <div className="mt-0.5 text-sm text-ink-dull">
