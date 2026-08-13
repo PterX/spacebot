@@ -15,7 +15,7 @@ use crate::conversation::{
     WorkerTerminalOutcome, WorkerTerminalOwner, WorkerTransitionResult,
 };
 use crate::error::{AgentError, Error as SpacebotError};
-use crate::tools::{BranchToolProfile, MemoryPersistenceContractState};
+use crate::tools::{BranchDelegationState, BranchToolProfile, MemoryPersistenceContractState};
 use crate::{AgentDeps, BranchId, ChannelId, ProcessEvent, ProcessType, WorkerId};
 use futures::FutureExt as _;
 use std::sync::Arc;
@@ -349,6 +349,15 @@ async fn spawn_branch(
     dispatch_type: &'static str,
     branch_options: BranchSpawnOptions,
 ) -> std::result::Result<BranchId, AgentError> {
+    if state
+        .autonomy_run
+        .as_ref()
+        .is_some_and(crate::agent::autonomy::AutonomyRunHandle::finish_requested)
+    {
+        return Err(AgentError::Other(anyhow::anyhow!(
+            "can't spawn branch: autonomy run is settling"
+        )));
+    }
     let BranchSpawnOptions { profile } = branch_options;
     let profile_name = profile.name().to_string();
     let memory_persistence_contract = match &profile {
@@ -373,6 +382,9 @@ async fn spawn_branch(
         h.clone()
     };
 
+    let branch_id = crate::BranchId::new_v4();
+    let branch_delegation = matches!(&profile, BranchToolProfile::Default)
+        .then(|| Arc::new(BranchDelegationState::new(branch_id)));
     let tool_server = crate::tools::create_branch_tool_server(
         Some(state.clone()),
         state.deps.agent_id.clone(),
@@ -389,6 +401,7 @@ async fn spawn_branch(
         state.deps.api_state.clone(),
         state.deps.wiki_store.clone(),
         state.deps.sandbox.clone(),
+        branch_delegation.clone(),
     );
     let branch_max_turns = **state.deps.runtime_config.branch_max_turns.load();
     let model_override = state
@@ -406,6 +419,7 @@ async fn spawn_branch(
     });
 
     let branch = Branch::new(
+        branch_id,
         state.channel_id.clone(),
         description,
         state.deps.clone(),
@@ -415,11 +429,11 @@ async fn spawn_branch(
         BranchExecutionConfig {
             max_turns: branch_max_turns,
             memory_persistence_contract,
+            branch_delegation,
         },
         model_override,
     );
 
-    let branch_id = branch.id;
     let prompt = prompt.to_owned();
 
     state
@@ -691,7 +705,17 @@ pub async fn spawn_worker_from_state(
     suggested_skills: &[&str],
     required_skills: &[&str],
     worker_context: &WorkerContextMode,
+    origin_branch_id: Option<BranchId>,
 ) -> std::result::Result<WorkerId, AgentError> {
+    if state
+        .autonomy_run
+        .as_ref()
+        .is_some_and(crate::agent::autonomy::AutonomyRunHandle::finish_requested)
+    {
+        return Err(AgentError::Other(anyhow::anyhow!(
+            "can't spawn worker: autonomy run is settling"
+        )));
+    }
     check_worker_limit(state).await?;
     let task = task.into();
     reserve_task_if_unique(state, &task).await?;
@@ -704,6 +728,7 @@ pub async fn spawn_worker_from_state(
         suggested_skills,
         required_skills,
         worker_context,
+        origin_branch_id,
     )
     .await;
 
@@ -723,6 +748,7 @@ async fn spawn_worker_inner(
     suggested_skills: &[&str],
     required_skills: &[&str],
     worker_context: &WorkerContextMode,
+    origin_branch_id: Option<BranchId>,
 ) -> std::result::Result<WorkerId, AgentError> {
     let rc = &state.deps.runtime_config;
     let prompt_engine = rc.prompts.load();
@@ -942,7 +968,7 @@ async fn spawn_worker_inner(
                 .autonomy_run
                 .as_ref()
                 .map(|autonomy_run| autonomy_run.run_id.as_str()),
-            None,
+            origin_branch_id,
         )
         .await
         .map_err(|error| AgentError::Other(anyhow::anyhow!(error)))?;
@@ -1014,6 +1040,7 @@ pub async fn spawn_opencode_worker_from_state(
     directory: &str,
     interactive: bool,
     required_skills: &[&str],
+    origin_branch_id: Option<BranchId>,
 ) -> std::result::Result<crate::WorkerId, AgentError> {
     if !interactive {
         return Err(AgentError::Other(anyhow::anyhow!(
@@ -1026,8 +1053,15 @@ pub async fn spawn_opencode_worker_from_state(
     reserve_task_if_unique(state, &task).await?;
     ensure_dispatch_readiness(state, "opencode_worker");
 
-    let result =
-        spawn_opencode_worker_inner(state, &task, directory, interactive, required_skills).await;
+    let result = spawn_opencode_worker_inner(
+        state,
+        &task,
+        directory,
+        interactive,
+        required_skills,
+        origin_branch_id,
+    )
+    .await;
 
     // Release the reservation regardless of success or failure.
     release_task_reservation(state, &task).await;
@@ -1043,6 +1077,7 @@ async fn spawn_opencode_worker_inner(
     directory: &str,
     interactive: bool,
     required_skills: &[&str],
+    origin_branch_id: Option<BranchId>,
 ) -> std::result::Result<crate::WorkerId, AgentError> {
     let directory = expand_tilde(directory);
 
@@ -1164,7 +1199,7 @@ async fn spawn_opencode_worker_inner(
                 .autonomy_run
                 .as_ref()
                 .map(|autonomy_run| autonomy_run.run_id.as_str()),
-            None,
+            origin_branch_id,
         )
         .await
         .map_err(|error| AgentError::Other(anyhow::anyhow!(error)))?;

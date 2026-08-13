@@ -183,7 +183,8 @@ pub use spacebot_docs::{
     SpacebotDocContent, SpacebotDocsArgs, SpacebotDocsError, SpacebotDocsOutput, SpacebotDocsTool,
 };
 pub use spawn_worker::{
-    DetachedSpawnWorkerTool, SpawnWorkerArgs, SpawnWorkerError, SpawnWorkerOutput, SpawnWorkerTool,
+    BranchDelegationState, DetachedSpawnWorkerTool, SpawnWorkerArgs, SpawnWorkerError,
+    SpawnWorkerOutput, SpawnWorkerTool,
 };
 pub use task_create::{TaskCreateArgs, TaskCreateError, TaskCreateOutput, TaskCreateTool};
 pub use task_list::{TaskListArgs, TaskListError, TaskListOutput, TaskListTool};
@@ -1014,6 +1015,7 @@ pub fn create_branch_tool_server(
     api_state: Option<Arc<crate::api::ApiState>>,
     wiki_store: Option<Arc<crate::wiki::WikiStore>>,
     sandbox: Arc<crate::sandbox::Sandbox>,
+    branch_delegation: Option<Arc<BranchDelegationState>>,
 ) -> ToolServerHandle {
     let mut memory_save = memory_save_with_events(
         memory_search.clone(),
@@ -1053,7 +1055,6 @@ pub fn create_branch_tool_server(
         .tool(ChannelRecallTool::new(conversation_logger, channel_store))
         .tool(SpacebotDocsTool::new())
         .tool(EmailSearchTool::new(runtime_config.clone()))
-        .tool(worker_inspect)
         .tool(task_create)
         .tool(TaskListTool::new(task_store.clone(), agent_id.to_string()))
         .tool(TaskUpdateTool::for_branch(task_store, agent_id.clone()))
@@ -1062,6 +1063,16 @@ pub fn create_branch_tool_server(
             runtime_config.workspace_dir.clone(),
             sandbox,
         ));
+
+    if matches!(
+        &profile,
+        BranchToolProfile::MemoryPersistence {
+            skill_reflection: true,
+            ..
+        }
+    ) {
+        server = server.tool(worker_inspect);
+    }
 
     // Branches carry the expand capability: raw transcript is curated here and
     // reaches the channel as a conclusion, never as rows. Scoped to the
@@ -1153,7 +1164,10 @@ pub fn create_branch_tool_server(
     }
 
     if let Some(state) = state {
-        server = server.tool(SpawnWorkerTool::new(state));
+        server = server.tool(match branch_delegation {
+            Some(delegation) => SpawnWorkerTool::for_branch(state, delegation),
+            None => SpawnWorkerTool::new(state),
+        });
     }
 
     if let Some(lifecycle) = api_state

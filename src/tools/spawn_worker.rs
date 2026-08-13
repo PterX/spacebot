@@ -14,18 +14,57 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::Instrument as _;
+
+/// Records the first successful delegation made by a normal branch.
+#[derive(Debug)]
+pub struct BranchDelegationState {
+    branch_id: crate::BranchId,
+    delegation: Mutex<Option<BranchDelegation>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BranchDelegation {
+    pub worker_id: WorkerId,
+    pub task: String,
+    pub interactive: bool,
+}
+
+impl BranchDelegationState {
+    pub fn new(branch_id: crate::BranchId) -> Self {
+        Self {
+            branch_id,
+            delegation: Mutex::new(None),
+        }
+    }
+
+    pub async fn delegation(&self) -> Option<BranchDelegation> {
+        self.delegation.lock().await.clone()
+    }
+}
 
 /// Tool for spawning workers.
 #[derive(Debug, Clone)]
 pub struct SpawnWorkerTool {
     state: ChannelState,
+    branch_delegation: Option<Arc<BranchDelegationState>>,
 }
 
 impl SpawnWorkerTool {
     /// Create a new spawn worker tool with access to channel state.
     pub fn new(state: ChannelState) -> Self {
-        Self { state }
+        Self {
+            state,
+            branch_delegation: None,
+        }
+    }
+
+    pub fn for_branch(state: ChannelState, branch_delegation: Arc<BranchDelegationState>) -> Self {
+        Self {
+            state,
+            branch_delegation: Some(branch_delegation),
+        }
     }
 
     /// Load a task's execution plan and resolve it to spawn parameters.
@@ -426,6 +465,41 @@ impl Tool for SpawnWorkerTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        if let Some(branch_delegation) = &self.branch_delegation {
+            let mut delegation = branch_delegation.delegation.lock().await;
+            if let Some(existing) = delegation.as_ref() {
+                return Ok(SpawnWorkerOutput {
+                    worker_id: existing.worker_id,
+                    spawned: false,
+                    interactive: existing.interactive,
+                    message: format!(
+                        "Worker {} is already delegated for: {}",
+                        existing.worker_id, existing.task
+                    ),
+                });
+            }
+
+            let task = args.task.clone();
+            let output = self.call_untracked(args).await?;
+            if output.spawned {
+                *delegation = Some(BranchDelegation {
+                    worker_id: output.worker_id,
+                    task,
+                    interactive: output.interactive,
+                });
+            }
+            return Ok(output);
+        }
+
+        self.call_untracked(args).await
+    }
+}
+
+impl SpawnWorkerTool {
+    async fn call_untracked(
+        &self,
+        args: SpawnWorkerArgs,
+    ) -> Result<SpawnWorkerOutput, SpawnWorkerError> {
         let readiness = self.state.deps.runtime_config.work_readiness();
 
         // A task-bound spawn loads the task's execution plan; plan fields win
@@ -524,6 +598,7 @@ impl Tool for SpawnWorkerTool {
                 directory,
                 true,
                 &required_skills,
+                self.branch_delegation.as_ref().map(|state| state.branch_id),
             )
             .await
             .map_err(|e| SpawnWorkerError(format!("{e}")))?
@@ -545,6 +620,7 @@ impl Tool for SpawnWorkerTool {
                     .collect::<Vec<_>>(),
                 &required_skills,
                 &worker_context,
+                self.branch_delegation.as_ref().map(|state| state.branch_id),
             )
             .await
             .map_err(|e| SpawnWorkerError(format!("{e}")))?
@@ -635,6 +711,19 @@ impl Tool for SpawnWorkerTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn branch_delegation_returns_its_first_worker() {
+        let state = BranchDelegationState::new(uuid::Uuid::new_v4());
+        let worker_id = uuid::Uuid::new_v4();
+        *state.delegation.lock().await = Some(BranchDelegation {
+            worker_id,
+            task: "inspect the repository".to_string(),
+            interactive: false,
+        });
+
+        assert_eq!(state.delegation().await.unwrap().worker_id, worker_id);
+    }
 
     #[test]
     fn task_number_wire_values_preserve_ad_hoc_spawns() {

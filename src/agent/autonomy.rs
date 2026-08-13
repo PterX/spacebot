@@ -15,8 +15,8 @@ use crate::wakes::{AutonomyRunStatus, AutonomyRunStore};
 use crate::{AgentDeps, InboundMessage, MessageContent, RoutedResponse};
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Conversation id (and channel id) for the autonomy channel. One per agent.
@@ -46,6 +46,13 @@ pub struct AutonomyRunHandle {
     pub run_id: String,
     pub store: Arc<AutonomyRunStore>,
     completed: Arc<AtomicBool>,
+    finish_request: Arc<Mutex<Option<AutonomyFinishRequest>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AutonomyFinishRequest {
+    pub summary: String,
+    pub actions: Vec<crate::wakes::AutonomyAction>,
 }
 
 impl AutonomyRunHandle {
@@ -54,6 +61,7 @@ impl AutonomyRunHandle {
             run_id,
             store,
             completed: Arc::new(AtomicBool::new(false)),
+            finish_request: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -64,6 +72,36 @@ impl AutonomyRunHandle {
 
     pub fn completed(&self) -> bool {
         self.completed.load(Ordering::Acquire)
+    }
+
+    /// Store the first finish request so duplicate tool calls cannot replace
+    /// the summary that will be committed after child workers settle.
+    pub fn request_finish(&self, request: AutonomyFinishRequest) -> bool {
+        let mut finish_request = self
+            .finish_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if finish_request.is_some() {
+            return false;
+        }
+        *finish_request = Some(request);
+        true
+    }
+
+    pub fn finish_requested(&self) -> bool {
+        let finish_request = self
+            .finish_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        finish_request.is_some()
+    }
+
+    pub fn finish_request(&self) -> Option<AutonomyFinishRequest> {
+        let finish_request = self
+            .finish_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        finish_request.clone()
     }
 }
 
@@ -226,6 +264,7 @@ pub async fn run_autonomy_channel(
     run_id: String,
     config: AutonomyConfig,
 ) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
     // Consume pending wake events at run start. A crash after this point does
     // not replay events — crash semantics for tasks are handled by task
     // status, not event replay.
@@ -391,8 +430,23 @@ pub async fn run_autonomy_channel(
         None => None,
     };
 
-    // Record the run outcome if autonomy_complete didn't already.
-    if !handle.completed() {
+    // A finish request closes dispatch before the channel exits. Wait for the
+    // durable child rows instead of cancelling useful work to make closure fit
+    // the parent deadline.
+    let settled = settle_owned_children(&handle, deadline).await?;
+
+    // Record the run outcome after owned noninteractive children settled, or
+    // after the configured hard deadline. The latter retains child attribution
+    // and lets their normal terminal paths finish without parent cancellation.
+    if let Some(request) = handle.finish_request() {
+        let recorded = deps
+            .autonomy_run_store
+            .complete_run_if_children_settled(&run_id, &request.summary, &request.actions, !settled)
+            .await?;
+        if recorded {
+            handle.mark_completed();
+        }
+    } else if !handle.completed() {
         if let Some(failure) = &channel_failed {
             deps.autonomy_run_store
                 .finish_run_status(&run_id, AutonomyRunStatus::Failed, Some(failure))
@@ -428,6 +482,25 @@ pub async fn run_autonomy_channel(
 
     tracing::info!(run_id = %run_id, timed_out, completed = handle.completed(), "autonomy run finished");
     Ok(())
+}
+
+async fn settle_owned_children(
+    handle: &AutonomyRunHandle,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<bool> {
+    loop {
+        if !handle
+            .store
+            .has_active_noninteractive_children(&handle.run_id)
+            .await?
+        {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 fn system_message(deps: &AgentDeps, text: String) -> InboundMessage {

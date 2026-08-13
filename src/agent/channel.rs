@@ -1862,6 +1862,7 @@ impl Channel {
                 // fallback summary if the budget is exhausted.
                 if let Some(run) = self.state.autonomy_run.clone()
                     && !run.completed()
+                    && !run.finish_requested()
                     && self.autonomy_contract_retries
                         < crate::agent::autonomy::AUTONOMY_CONTRACT_MAX_RETRIES
                 {

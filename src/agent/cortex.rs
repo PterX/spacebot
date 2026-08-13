@@ -2770,7 +2770,6 @@ mod tests {
     use crate::ProcessEvent;
     use crate::agent::process_control::ControlActionResult;
     use crate::memory::MemoryType;
-    use futures::FutureExt;
     use std::collections::VecDeque;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};

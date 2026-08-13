@@ -4,13 +4,14 @@ use crate::error::Result;
 use crate::hooks::SpacebotHook;
 use crate::llm::SpacebotModel;
 use crate::llm::routing::is_context_overflow_error;
-use crate::tools::{MemoryPersistenceContractState, MemoryPersistenceTerminalOutcome};
+use crate::tools::{
+    BranchDelegationState, MemoryPersistenceContractState, MemoryPersistenceTerminalOutcome,
+};
 use crate::{AgentDeps, BranchId, ChannelId, ProcessEvent, ProcessId, ProcessType};
 use rig::agent::AgentBuilder;
 use rig::completion::CompletionModel;
 use rig::tool::server::ToolServerHandle;
 use std::sync::Arc;
-use uuid::Uuid;
 
 /// Max consecutive context overflow recoveries before giving up.
 const MAX_OVERFLOW_RETRIES: usize = 2;
@@ -34,6 +35,7 @@ pub struct Branch {
     pub max_turns: usize,
     /// Optional completion contract state used only by silent memory-persistence branches.
     pub memory_persistence_contract: Option<Arc<MemoryPersistenceContractState>>,
+    pub branch_delegation: Option<Arc<BranchDelegationState>>,
     /// Model override from conversation settings (per-process or blanket).
     pub model_override: Option<String>,
 }
@@ -42,12 +44,14 @@ pub struct Branch {
 pub struct BranchExecutionConfig {
     pub max_turns: usize,
     pub memory_persistence_contract: Option<Arc<MemoryPersistenceContractState>>,
+    pub branch_delegation: Option<Arc<BranchDelegationState>>,
 }
 
 impl Branch {
     /// Create a new branch from a channel.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        id: BranchId,
         channel_id: ChannelId,
         description: impl Into<String>,
         deps: AgentDeps,
@@ -57,7 +61,6 @@ impl Branch {
         execution_config: BranchExecutionConfig,
         model_override: Option<String>,
     ) -> Self {
-        let id = Uuid::new_v4();
         let process_id = ProcessId::Branch(id);
         let mut hook = SpacebotHook::new(
             deps.agent_id.clone(),
@@ -68,6 +71,9 @@ impl Branch {
         );
         if let Some(contract_state) = &execution_config.memory_persistence_contract {
             hook = hook.with_memory_persistence_contract(contract_state.clone());
+        }
+        if let Some(delegation) = &execution_config.branch_delegation {
+            hook = hook.with_branch_delegation(delegation.clone());
         }
 
         Self {
@@ -81,6 +87,7 @@ impl Branch {
             tool_server,
             max_turns: execution_config.max_turns,
             memory_persistence_contract: execution_config.memory_persistence_contract,
+            branch_delegation: execution_config.branch_delegation,
             model_override,
         }
     }
@@ -176,6 +183,15 @@ impl Branch {
                         "memory persistence branch reached terminal outcome"
                     );
                     break self.memory_persistence_conclusion();
+                }
+                Err(rig::completion::PromptError::PromptCancelled { reason, .. })
+                    if SpacebotHook::is_branch_delegated_reason(&reason) =>
+                {
+                    let delegation = self
+                        .branch_delegation_conclusion()
+                        .await
+                        .expect("branch delegation termination requires a delegation");
+                    break delegation;
                 }
                 Err(rig::completion::PromptError::PromptCancelled { reason, .. })
                     if enforce_memory_contract
@@ -337,6 +353,14 @@ impl Branch {
         }
     }
 
+    async fn branch_delegation_conclusion(&self) -> Option<String> {
+        let delegation = self.branch_delegation.as_ref()?.delegation().await?;
+        Some(format_branch_delegation_conclusion(
+            delegation.worker_id,
+            &delegation.task,
+        ))
+    }
+
     /// Compact history down to what the context window has left once this
     /// branch's own preamble and prompt are accounted for, dropping the oldest
     /// half of the messages at a time until it fits.
@@ -390,6 +414,10 @@ impl Branch {
     }
 }
 
+fn format_branch_delegation_conclusion(worker_id: crate::WorkerId, task: &str) -> String {
+    format!("Delegated task to worker {worker_id}: {task}")
+}
+
 pub(crate) fn classify_branch_status(conclusion: &str) -> &'static str {
     if conclusion.starts_with("Branch cancelled:")
         || conclusion.starts_with("Branch was cancelled:")
@@ -404,7 +432,7 @@ pub(crate) fn classify_branch_status(conclusion: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::classify_branch_status;
+    use super::{classify_branch_status, format_branch_delegation_conclusion};
 
     #[test]
     fn branch_terminal_status_matches_legacy_conclusion_prefixes() {
@@ -420,6 +448,15 @@ mod tests {
         assert_eq!(
             classify_branch_status("Branch was cancelled: timeout"),
             "cancelled"
+        );
+    }
+
+    #[test]
+    fn delegated_branch_conclusion_is_deterministic() {
+        let worker_id = uuid::Uuid::nil();
+        assert_eq!(
+            format_branch_delegation_conclusion(worker_id, "inspect the repository"),
+            "Delegated task to worker 00000000-0000-0000-0000-000000000000: inspect the repository"
         );
     }
 }

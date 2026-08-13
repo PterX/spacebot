@@ -1,7 +1,9 @@
 //! SpacebotHook: Prompt hook for channels, branches, and workers.
 
 use crate::hooks::loop_guard::{LoopGuard, LoopGuardConfig, LoopGuardVerdict};
-use crate::tools::{MemoryPersistenceContractState, MemoryPersistenceTerminalOutcome};
+use crate::tools::{
+    BranchDelegationState, MemoryPersistenceContractState, MemoryPersistenceTerminalOutcome,
+};
 use crate::{AgentId, ChannelId, ProcessEvent, ProcessId, ProcessType};
 use futures::StreamExt;
 use rig::agent::{HookAction, PromptHook, ToolCallHookAction};
@@ -66,6 +68,7 @@ pub struct SpacebotHook {
     /// append the messages to history before re-prompting.
     injected_messages: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     memory_persistence_contract: Option<Arc<MemoryPersistenceContractState>>,
+    branch_delegation: Option<Arc<BranchDelegationState>>,
     tool_call_registry: Option<crate::tools::ToolCallRegistry>,
     reply_tool_delta_state:
         std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, ReplyToolDeltaState>>>,
@@ -133,6 +136,7 @@ impl SpacebotHook {
             inject_rx: None,
             injected_messages: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             memory_persistence_contract: None,
+            branch_delegation: None,
             tool_call_registry: None,
             reply_tool_delta_state: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -151,6 +155,11 @@ impl SpacebotHook {
         contract_state: Arc<MemoryPersistenceContractState>,
     ) -> Self {
         self.memory_persistence_contract = Some(contract_state);
+        self
+    }
+
+    pub fn with_branch_delegation(mut self, delegation: Arc<BranchDelegationState>) -> Self {
+        self.branch_delegation = Some(delegation);
         self
     }
 
@@ -266,6 +275,10 @@ impl SpacebotHook {
     /// run recorded its terminal outcome and stopped deliberately.
     pub fn is_memory_persistence_complete_reason(reason: &str) -> bool {
         reason == Self::MEMORY_PERSISTENCE_COMPLETE_REASON
+    }
+
+    pub fn is_branch_delegated_reason(reason: &str) -> bool {
+        reason == "spacebot_branch_delegated"
     }
 
     /// Drain and return all buffered injected messages.
@@ -1425,6 +1438,25 @@ where
             contract_state.set_terminal_outcome(outcome);
             return HookAction::Terminate {
                 reason: Self::MEMORY_PERSISTENCE_COMPLETE_REASON.into(),
+            };
+        }
+
+        // An autonomy finish request closes admission for new delegated work.
+        // The channel remains alive to consume existing worker completions, but
+        // the model does not need another turn after recording its summary.
+        if !is_tool_error && tool_name == "autonomy_complete" {
+            return HookAction::Terminate {
+                reason: "spacebot_autonomy_finish_requested".into(),
+            };
+        }
+
+        if !is_tool_error
+            && tool_name == "spawn_worker"
+            && let Some(delegation) = &self.branch_delegation
+            && delegation.delegation().await.is_some()
+        {
+            return HookAction::Terminate {
+                reason: "spacebot_branch_delegated".into(),
             };
         }
 
