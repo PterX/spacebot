@@ -446,6 +446,10 @@ async fn spawn_branch(
             &profile_name,
             &model_name,
             branch_max_turns,
+            state
+                .autonomy_run
+                .as_ref()
+                .map(|autonomy_run| autonomy_run.run_id.as_str()),
         )
         .await
         .map_err(|error| AgentError::Other(anyhow::anyhow!(error)))?;

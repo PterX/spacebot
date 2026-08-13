@@ -736,11 +736,12 @@ impl ProcessRunLogger {
         profile: &str,
         model: &str,
         max_turns: usize,
+        run_id: Option<&str>,
     ) -> crate::error::Result<()> {
         sqlx::query(
             "INSERT OR IGNORE INTO branch_runs \
-             (id, channel_id, description, input, status, profile, model, max_turns) \
-             VALUES (?, ?, ?, ?, 'running', ?, ?, ?)",
+             (id, channel_id, description, input, status, profile, model, max_turns, run_id) \
+             VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?)",
         )
         .bind(branch_id.to_string())
         .bind(channel_id.as_ref())
@@ -749,6 +750,7 @@ impl ProcessRunLogger {
         .bind(profile)
         .bind(model)
         .bind(i64::try_from(max_turns).unwrap_or(i64::MAX))
+        .bind(run_id)
         .execute(&self.pool)
         .await
         .map_err(|error| anyhow::anyhow!(error))?;
@@ -840,6 +842,39 @@ impl ProcessRunLogger {
             run_id: row.try_get("run_id").ok().flatten(),
             origin_branch_id: row.try_get("origin_branch_id").ok().flatten(),
         })
+    }
+
+    /// Return the worker directly delegated by a branch, if it was persisted
+    /// before a branch replayed after process restart.
+    pub async fn worker_for_origin_branch(
+        &self,
+        branch_id: BranchId,
+    ) -> crate::error::Result<Option<(WorkerId, String, bool)>> {
+        let row = sqlx::query(
+            "SELECT id, task, interactive FROM worker_runs \
+             WHERE origin_branch_id = ? ORDER BY started_at ASC LIMIT 1",
+        )
+        .bind(branch_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+        row.map(|row| {
+            let worker_id = row
+                .try_get::<String, _>("id")
+                .map_err(|error| anyhow::anyhow!(error))?
+                .parse()
+                .map_err(|error| anyhow::anyhow!("invalid persisted worker ID: {error}"))?;
+            Ok::<(WorkerId, String, bool), crate::error::Error>((
+                worker_id,
+                row.try_get("task")
+                    .map_err(|error| anyhow::anyhow!(error))?,
+                row.try_get("interactive")
+                    .map_err(|error| anyhow::anyhow!(error))?,
+            ))
+        })
+        .transpose()
+        .map_err(Into::into)
     }
 
     /// Link a worker run to a project and/or worktree. Fire-and-forget.
@@ -2819,6 +2854,10 @@ mod tests {
             row.try_get::<String, _>("origin_branch_id").unwrap(),
             branch_id.to_string()
         );
+        assert_eq!(
+            logger.worker_for_origin_branch(branch_id).await.unwrap(),
+            Some((worker_id, "owned task".to_string(), false))
+        );
     }
 
     #[tokio::test]
@@ -2836,6 +2875,7 @@ mod tests {
                 "memory_persistence",
                 "claude-test",
                 12,
+                Some("run-7"),
             )
             .await
             .unwrap();
@@ -2871,6 +2911,7 @@ mod tests {
         assert_eq!(detail.run.profile.as_deref(), Some("memory_persistence"));
         assert_eq!(detail.run.model.as_deref(), Some("claude-test"));
         assert_eq!(detail.run.max_turns, Some(12));
+        assert_eq!(detail.run.run_id.as_deref(), Some("run-7"));
         assert_eq!(detail.run.tool_calls, 1);
         assert_eq!(detail.run.channel_name.as_deref(), Some("Test Channel"));
         let restored = crate::conversation::worker_transcript::deserialize_transcript(
@@ -2895,6 +2936,7 @@ mod tests {
                 "default",
                 "model",
                 10,
+                None,
             )
             .await
             .unwrap();

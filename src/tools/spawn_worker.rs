@@ -466,6 +466,21 @@ impl Tool for SpawnWorkerTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         if let Some(branch_delegation) = &self.branch_delegation {
+            if let Some((worker_id, task, interactive)) = self
+                .state
+                .process_run_logger
+                .worker_for_origin_branch(branch_delegation.branch_id)
+                .await
+                .map_err(|error| SpawnWorkerError(error.to_string()))?
+            {
+                return Ok(SpawnWorkerOutput {
+                    worker_id,
+                    spawned: false,
+                    interactive,
+                    message: format!("Worker {worker_id} is already delegated for: {task}"),
+                });
+            }
+
             let mut delegation = branch_delegation.delegation.lock().await;
             if let Some(existing) = delegation.as_ref() {
                 return Ok(SpawnWorkerOutput {
