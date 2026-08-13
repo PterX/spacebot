@@ -140,7 +140,8 @@ impl AutonomyRunStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Complete a run only after its owned noninteractive workers are terminal.
+    /// Complete a run only after its owned noninteractive workers and branches
+    /// are terminal.
     /// `allow_active_children` is used only after the configured run deadline;
     /// it preserves `run_id` attribution without cancelling those workers.
     pub async fn complete_run_if_children_settled(
@@ -155,17 +156,21 @@ impl AutonomyRunStore {
         let result = sqlx::query(
             "UPDATE autonomy_runs SET status = 'completed', summary = ?, actions = ?, \
              finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
-             duration_secs = CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) \
-             WHERE id = ? AND status = 'running' AND (? OR NOT EXISTS (\
-                 SELECT 1 FROM worker_runs \
-                 WHERE run_id = ? AND interactive = FALSE \
-                 AND lifecycle NOT IN ('succeeded', 'partial', 'cancelled', 'timed_out', 'blocked', 'failed')\
-             ))",
+              duration_secs = CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) \
+              WHERE id = ? AND status = 'running' AND (? OR NOT EXISTS (\
+                  SELECT 1 FROM worker_runs \
+                  WHERE run_id = ? AND interactive = FALSE \
+                  AND lifecycle NOT IN ('succeeded', 'partial', 'cancelled', 'timed_out', 'blocked', 'failed')\
+              ) AND NOT EXISTS (\
+                  SELECT 1 FROM branch_runs \
+                  WHERE run_id = ? AND status = 'running'\
+              ))",
         )
         .bind(summary)
         .bind(&actions_json)
         .bind(run_id)
         .bind(allow_active_children)
+        .bind(run_id)
         .bind(run_id)
         .execute(&self.pool)
         .await
@@ -173,12 +178,18 @@ impl AutonomyRunStore {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn has_active_noninteractive_children(&self, run_id: &str) -> Result<bool> {
+    pub async fn has_active_owned_children(&self, run_id: &str) -> Result<bool> {
         let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM worker_runs \
-             WHERE run_id = ? AND interactive = FALSE \
-             AND lifecycle NOT IN ('succeeded', 'partial', 'cancelled', 'timed_out', 'blocked', 'failed')",
+            "SELECT (\
+                SELECT COUNT(*) FROM worker_runs \
+                WHERE run_id = ? AND interactive = FALSE \
+                AND lifecycle NOT IN ('succeeded', 'partial', 'cancelled', 'timed_out', 'blocked', 'failed')\
+            ) + (\
+                SELECT COUNT(*) FROM branch_runs \
+                WHERE run_id = ? AND status = 'running'\
+            )",
         )
+        .bind(run_id)
         .bind(run_id)
         .fetch_one(&self.pool)
         .await
@@ -410,6 +421,25 @@ mod tests {
         .expect("add worker");
     }
 
+    async fn add_branch(store: &AutonomyRunStore, run_id: &str, branch_id: &str) {
+        sqlx::query(
+            "INSERT OR IGNORE INTO channels (id, platform, display_name) \
+             VALUES ('autonomy', 'system', 'Autonomy')",
+        )
+        .execute(&store.pool)
+        .await
+        .expect("add channel");
+        sqlx::query(
+            "INSERT INTO branch_runs (id, channel_id, description, input, status, profile, max_turns, run_id) \
+             VALUES (?, 'autonomy', 'branch', 'prompt', 'running', 'default', 10, ?)",
+        )
+        .bind(branch_id)
+        .bind(run_id)
+        .execute(&store.pool)
+        .await
+        .expect("add branch");
+    }
+
     #[tokio::test]
     async fn active_owned_child_prevents_completion() {
         let store = store().await;
@@ -418,7 +448,7 @@ mod tests {
 
         assert!(
             store
-                .has_active_noninteractive_children(&run_id)
+                .has_active_owned_children(&run_id)
                 .await
                 .expect("active children")
         );
@@ -431,6 +461,41 @@ mod tests {
 
         let recent = store.recent(1).await.expect("recent");
         assert_eq!(recent[0].status, AutonomyRunStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn active_owned_branch_prevents_completion() {
+        let store = store().await;
+        let run_id = store.begin_run().await.expect("begin");
+        add_branch(&store, &run_id, "branch-1").await;
+
+        assert!(
+            store
+                .has_active_owned_children(&run_id)
+                .await
+                .expect("active children")
+        );
+        assert!(
+            !store
+                .complete_run_if_children_settled(&run_id, "summary", &[], false)
+                .await
+                .expect("complete")
+        );
+
+        sqlx::query(
+            "UPDATE branch_runs SET status = 'done', completed_at = CURRENT_TIMESTAMP \
+             WHERE id = 'branch-1' AND status = 'running'",
+        )
+        .execute(&store.pool)
+        .await
+        .expect("complete branch");
+
+        assert!(
+            store
+                .complete_run_if_children_settled(&run_id, "summary", &[], false)
+                .await
+                .expect("complete after branch")
+        );
     }
 
     #[tokio::test]

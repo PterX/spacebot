@@ -522,7 +522,7 @@ async fn settle_owned_children(
     loop {
         if !handle
             .store
-            .has_active_noninteractive_children(&handle.run_id)
+            .has_active_owned_children(&handle.run_id)
             .await?
         {
             return Ok(true);
