@@ -441,7 +441,7 @@ pub(super) async fn update_task(
     }
 
     let update = store
-        .update_with_status_transition(
+        .update_with_status_override(
             number,
             crate::tasks::UpdateTaskInput {
                 title: request.title,

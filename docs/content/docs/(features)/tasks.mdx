@@ -74,7 +74,7 @@ Five columns on the board:
 
 ### Status Transitions
 
-Transitions are validated. You can't skip steps or go backwards (except to `backlog`, which is always allowed as a "re-shelve" action).
+Agent tools and autonomous execution validate transitions. They can't skip steps or go backwards except to `backlog`, which is always allowed as a re-shelve action.
 
 ```
 pending_approval → ready         (approval)
@@ -86,7 +86,7 @@ in_progress → ready              (worker failure, re-queued)
 done → backlog                   (reopen)
 ```
 
-Attempting an invalid transition (e.g., `pending_approval → in_progress`, `ready → done`) returns an error.
+The UI, CLI, and operator API can set any status directly. This lets a human reconcile work completed outside Spacebot without fabricating approval or execution history. Directly marking a task done sets `completed_at`; it does not set `approved_at` unless the task was actually approved.
 
 ## Priority
 

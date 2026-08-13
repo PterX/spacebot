@@ -77,11 +77,6 @@ export function AgentTasks({agentId}: {agentId: string}) {
 		onSuccess: () => void invalidate(),
 	});
 
-	const executeMutation = useMutation({
-		mutationFn: (taskNumber: number) => api.executeTask(taskNumber),
-		onSuccess: () => void invalidate(),
-	});
-
 	const deleteMutation = useMutation({
 		mutationFn: (taskNumber: number) => api.deleteTask(taskNumber),
 		onSuccess: () => {
@@ -101,16 +96,14 @@ export function AgentTasks({agentId}: {agentId: string}) {
 	const handleStatusChange = useCallback(
 		(task: Task, status: UiTaskStatus) => {
 			const t = task as unknown as TaskItem;
-			// Route approve/execute through their dedicated endpoints
+			// Approval records the human authority that moved the task to ready.
 			if (t.status === "pending_approval" && status === "ready") {
 				approveMutation.mutate(t.task_number);
-			} else if (t.status === "backlog" && status === "in_progress") {
-				executeMutation.mutate(t.task_number);
 			} else {
 				updateMutation.mutate({taskNumber: t.task_number, status});
 			}
 		},
-		[updateMutation, approveMutation, executeMutation],
+		[updateMutation, approveMutation],
 	);
 
 	const handleDelete = useCallback(

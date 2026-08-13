@@ -153,11 +153,6 @@ export function GlobalTasks() {
 		onSuccess: () => void invalidate(),
 	});
 
-	const executeMutation = useMutation({
-		mutationFn: (taskNumber: number) => api.executeTask(taskNumber),
-		onSuccess: () => void invalidate(),
-	});
-
 	const deleteMutation = useMutation({
 		mutationFn: (taskNumber: number) => api.deleteTask(taskNumber),
 		onSuccess: () => {
@@ -179,13 +174,11 @@ export function GlobalTasks() {
 			const t = task as unknown as TaskItem;
 			if (t.status === "pending_approval" && status === "ready") {
 				approveMutation.mutate(t.task_number);
-			} else if (t.status === "backlog" && status === "in_progress") {
-				executeMutation.mutate(t.task_number);
 			} else {
 				updateMutation.mutate({taskNumber: t.task_number, status});
 			}
 		},
-		[updateMutation, approveMutation, executeMutation],
+		[updateMutation, approveMutation],
 	);
 
 	const handleDelete = useCallback(

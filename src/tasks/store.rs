@@ -853,6 +853,27 @@ impl TaskStore {
         task_number: i64,
         input: UpdateTaskInput,
     ) -> Result<Option<TaskUpdateResult>> {
+        self.update_with_status_policy(task_number, input, StatusTransitionPolicy::Enforce)
+            .await
+    }
+
+    /// Update a task from an operator-facing API without enforcing agent
+    /// lifecycle transitions. This reconciles work completed outside Spacebot.
+    pub async fn update_with_status_override(
+        &self,
+        task_number: i64,
+        input: UpdateTaskInput,
+    ) -> Result<Option<TaskUpdateResult>> {
+        self.update_with_status_policy(task_number, input, StatusTransitionPolicy::Override)
+            .await
+    }
+
+    async fn update_with_status_policy(
+        &self,
+        task_number: i64,
+        input: UpdateTaskInput,
+        status_policy: StatusTransitionPolicy,
+    ) -> Result<Option<TaskUpdateResult>> {
         let mut tx = self
             .pool
             .begin_with("BEGIN IMMEDIATE")
@@ -876,7 +897,8 @@ impl TaskStore {
 
         let current = task_from_row(row)?;
         let previous_status = current.status;
-        let task = Self::update_current_in_tx(&mut tx, task_number, current, input).await?;
+        let task =
+            Self::update_current_in_tx(&mut tx, task_number, current, input, status_policy).await?;
 
         tx.commit()
             .await
@@ -931,7 +953,14 @@ impl TaskStore {
 
         let current = task_from_row(row)?;
         let previous_status = current.status;
-        let task = Self::update_current_in_tx(&mut tx, task_number, current, input).await?;
+        let task = Self::update_current_in_tx(
+            &mut tx,
+            task_number,
+            current,
+            input,
+            StatusTransitionPolicy::Enforce,
+        )
+        .await?;
 
         tx.commit()
             .await
@@ -950,8 +979,10 @@ impl TaskStore {
         task_number: i64,
         current: Task,
         input: UpdateTaskInput,
+        status_policy: StatusTransitionPolicy,
     ) -> Result<Task> {
         if let Some(next_status) = input.status
+            && status_policy == StatusTransitionPolicy::Enforce
             && !can_transition(current.status, next_status)
         {
             return Err(crate::error::Error::Other(anyhow::anyhow!(
@@ -994,9 +1025,10 @@ impl TaskStore {
             None
         };
 
-        let completed_at = if next_status == TaskStatus::Done {
+        let completed_at = if current.status != TaskStatus::Done && next_status == TaskStatus::Done
+        {
             Some("SET")
-        } else if current.completed_at.is_some() && next_status != TaskStatus::Done {
+        } else if current.status == TaskStatus::Done && next_status != TaskStatus::Done {
             Some("NULL")
         } else {
             None
@@ -1154,6 +1186,12 @@ impl TaskStore {
 
         row.map(task_from_row).transpose()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusTransitionPolicy {
+    Enforce,
+    Override,
 }
 
 /// Column list used by all SELECT queries. Kept in sync with `task_from_row`.
@@ -1777,6 +1815,68 @@ mod tests {
 
         assert_eq!(result.previous_status, TaskStatus::InProgress);
         assert_eq!(result.task.status, TaskStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn operator_override_accepts_status_outside_agent_lifecycle() {
+        let store = setup_store().await;
+        let created = store
+            .create(CreateTaskInput {
+                created_by: "human".to_string(),
+                ..self_assigned_input("completed elsewhere", TaskStatus::PendingApproval)
+            })
+            .await
+            .expect("task should be created");
+
+        let result = store
+            .update_with_status_override(
+                created.task_number,
+                UpdateTaskInput {
+                    status: Some(TaskStatus::Done),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("operator override should succeed")
+            .expect("task should exist");
+
+        assert_eq!(result.previous_status, TaskStatus::PendingApproval);
+        assert_eq!(result.task.status, TaskStatus::Done);
+        assert!(result.task.completed_at.is_some());
+        assert!(result.task.approved_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn repeated_operator_done_override_preserves_completion_time() {
+        let store = setup_store().await;
+        let created = store
+            .create(self_assigned_input("already done", TaskStatus::Backlog))
+            .await
+            .expect("task should be created");
+        let first = store
+            .update_with_status_override(
+                created.task_number,
+                UpdateTaskInput {
+                    status: Some(TaskStatus::Done),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("first override should succeed")
+            .expect("task should exist");
+        let second = store
+            .update_with_status_override(
+                created.task_number,
+                UpdateTaskInput {
+                    status: Some(TaskStatus::Done),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("repeated override should succeed")
+            .expect("task should exist");
+
+        assert_eq!(first.task.completed_at, second.task.completed_at);
     }
 
     #[tokio::test]
