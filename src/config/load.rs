@@ -302,19 +302,10 @@ impl CortexConfig {
             tick_interval_secs: overrides
                 .tick_interval_secs
                 .unwrap_or(defaults.tick_interval_secs),
-            worker_timeout_secs: overrides
-                .worker_timeout_secs
-                .unwrap_or(defaults.worker_timeout_secs),
             worker_wall_clock_timeout_secs,
             cron_default_timeout_secs: overrides
                 .cron_default_timeout_secs
                 .or(defaults.cron_default_timeout_secs),
-            branch_timeout_secs: overrides
-                .branch_timeout_secs
-                .unwrap_or(defaults.branch_timeout_secs),
-            supervisor_kill_budget_per_tick: overrides
-                .supervisor_kill_budget_per_tick
-                .unwrap_or(defaults.supervisor_kill_budget_per_tick),
             circuit_breaker_threshold: overrides
                 .circuit_breaker_threshold
                 .unwrap_or(defaults.circuit_breaker_threshold),

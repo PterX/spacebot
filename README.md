@@ -392,6 +392,11 @@ Single binary, no server dependencies. All data lives in embedded databases in a
 | [Config Reference](<docs/content/docs/(configuration)/config.mdx>)   | Full `config.toml` reference                              |
 | [Architecture](<docs/content/docs/(core)/architecture.mdx>)          | Process types, tool access, data layer, multi-agent       |
 | [Memory](<docs/content/docs/(core)/memory.mdx>)                      | Memory system design                                      |
+| [Chronicles](<docs/content/docs/(core)/chronicles.mdx>)              | Durable, navigable session history                        |
+| [Autonomy](<docs/content/docs/(features)/autonomy.mdx>)              | Goals, wakes, and background task execution               |
+| [Goals](<docs/content/docs/(features)/goals.mdx>)                    | Persistent direction for task and autonomy work            |
+| [Wakes](<docs/content/docs/(features)/wakes.mdx>)                    | Schedules, webhooks, and event-driven autonomous work     |
+| [Commands](<docs/content/docs/(features)/commands.mdx>)              | Cross-platform commands and authority rules                |
 | [Tasks](<docs/content/docs/(features)/tasks.mdx>)                    | Task system, specs, and execution                         |
 | [Tools](<docs/content/docs/(features)/tools.mdx>)                    | All available LLM tools                                   |
 | [Routing](<docs/content/docs/(core)/routing.mdx>)                    | Model routing and fallback chains                         |

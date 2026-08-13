@@ -1022,7 +1022,6 @@ startup_delay_secs = 2
         let toml = r#"
 [defaults.cortex]
 tick_interval_secs = 45
-supervisor_kill_budget_per_tick = 12
 maintenance_interval_secs = 1200
 maintenance_prune_threshold = 0.21
 maintenance_min_age_days = 17
@@ -1031,8 +1030,6 @@ maintenance_min_age_days = 17
 id = "main"
 
 [agents.cortex]
-branch_timeout_secs = 77
-supervisor_kill_budget_per_tick = 3
 association_max_per_pass = 55
 maintenance_decay_rate = 0.33
 "#;
@@ -1041,14 +1038,11 @@ maintenance_decay_rate = 0.33
         let resolved = config.agents[0].resolve(&config.instance_dir, &config.defaults);
 
         assert_eq!(config.defaults.cortex.tick_interval_secs, 45);
-        assert_eq!(config.defaults.cortex.supervisor_kill_budget_per_tick, 12);
         assert_eq!(config.defaults.cortex.maintenance_interval_secs, 1200);
         assert_eq!(config.defaults.cortex.maintenance_prune_threshold, 0.21);
         assert_eq!(config.defaults.cortex.maintenance_min_age_days, 17);
 
         assert_eq!(resolved.cortex.tick_interval_secs, 45);
-        assert_eq!(resolved.cortex.branch_timeout_secs, 77);
-        assert_eq!(resolved.cortex.supervisor_kill_budget_per_tick, 3);
         assert_eq!(resolved.cortex.maintenance_interval_secs, 1200);
         assert_eq!(resolved.cortex.maintenance_decay_rate, 0.33);
         assert_eq!(resolved.cortex.maintenance_prune_threshold, 0.21);

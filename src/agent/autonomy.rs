@@ -445,26 +445,39 @@ pub async fn run_autonomy_channel(
             .await?;
         if recorded {
             handle.mark_completed();
+            publish_terminal_summary(deps, &request.summary);
         }
     } else if !handle.completed() {
         if let Some(failure) = &channel_failed {
-            deps.autonomy_run_store
+            let recorded = deps
+                .autonomy_run_store
                 .finish_run_status(&run_id, AutonomyRunStatus::Failed, Some(failure))
                 .await?;
+            if recorded {
+                publish_terminal_summary(deps, failure);
+            }
         } else if timed_out {
-            deps.autonomy_run_store
+            let recorded = deps
+                .autonomy_run_store
                 .finish_run_status(
                     &run_id,
                     AutonomyRunStatus::Timeout,
                     Some(AUTONOMY_FALLBACK_SUMMARY),
                 )
                 .await?;
+            if recorded {
+                publish_terminal_summary(deps, AUTONOMY_FALLBACK_SUMMARY);
+            }
         } else {
             // The channel-side contract retries were exhausted without a
             // completion call — record the run with a synthesized summary.
-            deps.autonomy_run_store
+            let recorded = deps
+                .autonomy_run_store
                 .complete_run(&run_id, AUTONOMY_FALLBACK_SUMMARY, &[])
                 .await?;
+            if recorded {
+                publish_terminal_summary(deps, AUTONOMY_FALLBACK_SUMMARY);
+            }
         }
     }
 
@@ -482,6 +495,24 @@ pub async fn run_autonomy_channel(
 
     tracing::info!(run_id = %run_id, timed_out, completed = handle.completed(), "autonomy run finished");
     Ok(())
+}
+
+/// The run table transition is the idempotency boundary. Only the caller that
+/// changes a run from `running` may add its conclusion to the channel record.
+fn publish_terminal_summary(deps: &AgentDeps, summary: &str) {
+    let channel_id: crate::ChannelId = Arc::from(AUTONOMY_CONVERSATION_ID);
+    crate::conversation::ConversationLogger::new(deps.sqlite_pool.clone())
+        .log_bot_message(&channel_id, summary);
+    if let Err(error) = deps
+        .event_tx
+        .send(crate::ProcessEvent::ChannelAssistantMessage {
+            agent_id: deps.agent_id.clone(),
+            channel_id,
+            text: summary.to_string(),
+        })
+    {
+        tracing::debug!(%error, "failed to emit autonomy outcome for live timeline");
+    }
 }
 
 async fn settle_owned_children(

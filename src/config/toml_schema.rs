@@ -413,11 +413,8 @@ pub(super) struct TomlChronicleConfig {
 pub(super) struct TomlCortexConfig {
     pub(super) mode: Option<crate::config::CortexMode>,
     pub(super) tick_interval_secs: Option<u64>,
-    pub(super) worker_timeout_secs: Option<u64>,
     pub(super) worker_wall_clock_timeout_secs: Option<u64>,
     pub(super) cron_default_timeout_secs: Option<u64>,
-    pub(super) branch_timeout_secs: Option<u64>,
-    pub(super) supervisor_kill_budget_per_tick: Option<usize>,
     pub(super) circuit_breaker_threshold: Option<u8>,
     pub(super) maintenance_interval_secs: Option<u64>,
     pub(super) maintenance_decay_rate: Option<f32>,

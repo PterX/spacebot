@@ -280,9 +280,7 @@ pub struct Worker {
     pub wiki_write: bool,
     /// Model override from conversation settings (per-process or blanket).
     pub model_override: Option<String>,
-    /// Wall-clock budget for the entire `run()` invocation. Distinct from
-    /// the supervisor's `CortexConfig.worker_timeout_secs` (which is an
-    /// idle-kill bound measured from `last_activity_at`). Resolution chain
+    /// Wall-clock budget for the entire `run()` invocation. Resolution chain
     /// at construction: agent `CortexConfig.worker_wall_clock_timeout_secs`
     /// → `DEFAULT_WORKER_WALL_CLOCK_TIMEOUT_SECS`.
     pub worker_wall_clock_timeout_secs: u64,

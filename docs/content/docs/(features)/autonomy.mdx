@@ -1,0 +1,80 @@
+---
+title: Autonomy
+description: Goal-oriented task execution driven by durable wakes and run history.
+---
+
+# Autonomy
+
+Autonomy gives an agent a durable operating model between conversations. Goals provide direction. Tasks hold executable work. Wakes tell the agent when to inspect and advance that work.
+
+The autonomy channel is separate from a user-facing conversation. On wake, it receives the agent identity, active goals, task state, queued wake events, recent activity, and recent run summaries. It records a durable outcome before the run settles.
+
+## Authority Levels
+
+Each agent has an autonomy level:
+
+| Level | Behavior |
+| --- | --- |
+| `off` | Does not run autonomous work. |
+| `observe` | Inspects state and records findings without proposing or executing work. |
+| `suggest` | Creates or enriches work for operator approval. |
+| `act` | Executes approved, ready work within its configured limits. |
+
+The instance can apply a ceiling that limits every agent regardless of its individual setting.
+
+## Goals and Tasks
+
+Goals are standing direction. They remain active until an operator closes them. Tasks are the concrete units of work linked to those goals.
+
+The autonomy channel can enrich proposed tasks, select ready tasks, delegate execution, and record findings. Work that needs approval stays in `pending_approval`. `act` executes approved tasks only. Task state, not an informal status file, is the recovery point after a restart or failed run.
+
+See [Tasks](/docs/tasks) for task statuses, execution plans, and dependency gates.
+
+## Wakes
+
+A wake defines a trigger, instructions, and the minimum authority level required to respond. Wakes can be scheduled, webhook-driven, or internal events such as task approval and task comments.
+
+Wake events queue while an autonomy run is inactive. Multiple events are consumed by one run, avoiding a separate LLM call for every inbound webhook or comment. Each run records which wakes caused it.
+
+## Home Channel and Questions
+
+An agent can have a home channel for findings that require attention. Routine execution remains in the task and run records. When the agent needs an operator decision, the `ask` tool creates a durable pending question. Answers correlate back even when they arrive later or from another messaging platform.
+
+Set the home channel from the intended chat with `/sethome`. Clear it through `DELETE /api/agents/autonomy/home?agent_id=...`. An agent without a home channel keeps its findings in task and run history instead of sending proactive messages.
+
+## Operations
+
+The dashboard presents a fleet view with each agent's configured level, effective level, next interval wake, pending events, current run, home channel, and recent outcome. The control API exposes the same state:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/agents/autonomy?agent_id=...` | Read one agent's autonomy status. |
+| `GET` | `/api/agents/autonomy/fleet` | Read the instance ceiling and every active agent. |
+| `PUT` | `/api/agents/autonomy/ceiling` | Apply an instance-wide autonomy ceiling. |
+| `GET` | `/api/agents/autonomy/runs` | List recent runs, optionally filtered by `agent_id`. |
+| `DELETE` | `/api/agents/autonomy/home?agent_id=...` | Clear an agent's home channel. |
+
+The effective level is the lower of the agent's configured level and the instance ceiling. Updating the agent's level or run limits uses the normal agent-config API.
+
+## Configuration
+
+```toml
+[defaults.autonomy]
+level = "off"
+interval_secs = 1800
+max_turns = 20
+max_tasks_per_run = 2
+timeout_secs = 600
+warn_secs = 480
+run_history_count = 5
+claim_unowned = true
+```
+
+`interval_secs` must be at least 60 seconds. `timeout_secs` must not exceed the interval. `active_hours`, when configured, uses the agent's cron timezone.
+
+## Related Documentation
+
+- [Goals](/docs/goals)
+- [Wakes](/docs/wakes)
+- [Questions](/docs/questions)
+- [Commands](/docs/commands)

@@ -453,16 +453,8 @@ fn config_rows(config: AgentConfigResponse) -> Vec<Vec<String>> {
         config.cortex.maintenance_interval_secs.to_string(),
     );
     push(
-        "cortex.worker_timeout_secs",
-        config.cortex.worker_timeout_secs.to_string(),
-    );
-    push(
-        "cortex.branch_timeout_secs",
-        config.cortex.branch_timeout_secs.to_string(),
-    );
-    push(
-        "cortex.supervisor_kill_budget_per_tick",
-        config.cortex.supervisor_kill_budget_per_tick.to_string(),
+        "cortex.worker_wall_clock_timeout_secs",
+        config.cortex.worker_wall_clock_timeout_secs.to_string(),
     );
     push(
         "cortex.circuit_breaker_threshold",

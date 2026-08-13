@@ -1207,19 +1207,13 @@ pub struct CortexConfig {
     /// active vs dormant trade-off.
     pub mode: CortexMode,
     pub tick_interval_secs: u64,
-    /// Supervisor idle-kill bound: max seconds since `last_activity_at`
-    /// before the cortex supervisor terminates a stuck worker.
-    pub worker_timeout_secs: u64,
     /// Wall-clock budget for an entire `Worker::run` invocation. Distinct
-    /// from `worker_timeout_secs` (which is idle-shaped). Catches the
-    /// slow-drift case where a worker stays "active" but never completes.
+    /// Catches the slow-drift case where a worker stays active but never completes.
     pub worker_wall_clock_timeout_secs: u64,
     /// Per-agent default for cron job timeouts. `None` falls back to the
     /// system default (`crate::cron::scheduler::DEFAULT_CRON_TIMEOUT_SECS`).
     /// A per-job `timeout_secs` always wins over this default.
     pub cron_default_timeout_secs: Option<u64>,
-    pub branch_timeout_secs: u64,
-    pub supervisor_kill_budget_per_tick: usize,
     pub circuit_breaker_threshold: u8,
     /// Interval in seconds between memory bulletin refreshes.
     /// Target word count for the memory bulletin.
@@ -1258,12 +1252,9 @@ impl Default for CortexConfig {
         Self {
             mode: CortexMode::Active,
             tick_interval_secs: 30,
-            worker_timeout_secs: 600,
             worker_wall_clock_timeout_secs:
                 crate::agent::worker::DEFAULT_WORKER_WALL_CLOCK_TIMEOUT_SECS,
             cron_default_timeout_secs: None,
-            branch_timeout_secs: 600,
-            supervisor_kill_budget_per_tick: 8,
             circuit_breaker_threshold: 3,
             maintenance_interval_secs: 3600,
             maintenance_decay_rate: 0.05,

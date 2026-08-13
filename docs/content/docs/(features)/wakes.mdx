@@ -1,0 +1,65 @@
+---
+title: Wakes
+description: Durable trigger definitions for autonomous agent runs.
+---
+
+# Wakes
+
+A wake is a named condition that can advance an autonomy run. It combines a trigger, instructions, a minimum autonomy level, and optional delivery behavior. Definitions and queued events persist in SQLite, so a restart does not discard work that arrived while an agent was inactive.
+
+## Trigger Types
+
+| Trigger | Behavior |
+| --- | --- |
+| Schedule | Fires on a five-field cron expression or a minimum 60-second interval. |
+| Webhook | Accepts an authenticated HTTP payload at a unique per-wake URL. |
+| Event | Subscribes to a typed Spacebot event. |
+
+Supported system events are `task.approved`, `task.commented`, `goal.created`, `goal.updated`, `worker.completed`, `worker.failed`, `agent.message`, `cortex.observation`, and `ingest.file_added`.
+
+## Queueing and Authority
+
+Wake events queue until the agent starts an autonomy run. One run consumes the accumulated events together, so a burst of webhook requests or comments does not produce one LLM call per event.
+
+Every wake has a minimum autonomy level. Events from a wake above the agent's effective level remain durable and visible as observations, but its instructions do not authorize work. The instance-wide autonomy ceiling can further cap an agent's level.
+
+## Configuration
+
+Define config-owned wakes under an agent. Each entry must set exactly one trigger.
+
+```toml
+[[agents.wakes]]
+id = "morning-review"
+name = "Morning review"
+schedule = "0 9 * * 1-5"
+instructions = "Review active goals and ready tasks. Report only decisions that need attention."
+min_level = "observe"
+
+[[agents.wakes]]
+id = "deploy-hook"
+name = "Deployment webhook"
+webhook = true
+instructions = "Inspect the deployment payload and create or update work only when action is needed."
+min_level = "suggest"
+
+[[agents.wakes]]
+id = "approved-work"
+name = "Approved task"
+event = "task.approved"
+instructions = "Review the approved task and start eligible work."
+min_level = "act"
+```
+
+Config reconciliation updates config-owned wakes by ID while preserving schedule cursors and webhook tokens. Built-in and operator-created wakes are not overwritten by config changes.
+
+## Webhooks
+
+List wakes with `GET /api/agents/wakes?agent_id=...`. Webhook wakes return their ingress path as `webhook_url`. Send a `POST` request to that path with the generated token in the URL. Payloads are limited to 64 KiB and are stored with the queued event.
+
+The authenticated API also supports updating, deleting, and test-firing wakes. The interval survey is a virtual built-in wake controlled by the agent autonomy dial, so it cannot be edited independently.
+
+## Related Documentation
+
+- [Autonomy](/docs/autonomy)
+- [Goals](/docs/goals)
+- [Tasks](/docs/tasks)

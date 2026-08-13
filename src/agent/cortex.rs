@@ -6,7 +6,6 @@
 //! channel prompt renders that store directly, so the cortex never authors
 //! prompt content at read time.
 
-use crate::agent::process_control::ControlActionResult;
 use crate::error::Result;
 use crate::hooks::CortexHook;
 use crate::llm::SpacebotModel;
@@ -343,33 +342,6 @@ async fn collect_synthesis_task(
     }
 }
 
-const BRANCH_LATENCY_WINDOW_SIZE: usize = 32;
-
-#[derive(Debug, Clone)]
-struct WorkerTracker {
-    worker_id: WorkerId,
-    channel_id: Option<ChannelId>,
-    worker_type: String,
-    started_at: Instant,
-    last_activity_at: Instant,
-    /// When true the worker is idle (waiting for follow-up input) and should
-    /// NOT be killed by the supervisor timeout.
-    is_idle: bool,
-}
-
-#[derive(Debug, Clone)]
-struct BranchTracker {
-    branch_id: BranchId,
-    channel_id: ChannelId,
-    started_at: Instant,
-}
-
-#[derive(Debug, Clone)]
-enum KillTarget {
-    Worker(WorkerTracker),
-    Branch(BranchTracker),
-}
-
 #[derive(Debug, Clone, Default)]
 struct BreakerState {
     failure_count: u32,
@@ -384,85 +356,11 @@ struct BreakerTripEvent {
 
 #[derive(Debug, Default)]
 struct HealthRuntimeState {
-    worker_trackers: HashMap<WorkerId, WorkerTracker>,
-    branch_trackers: HashMap<BranchId, BranchTracker>,
-    branch_latency_window_ms: VecDeque<u64>,
     breaker_state: HashMap<String, BreakerState>,
     pending_breaker_trip_events: Vec<BreakerTripEvent>,
-    lagged_control_since_last_tick: bool,
 }
 
 impl HealthRuntimeState {
-    fn track_worker_start(
-        &mut self,
-        worker_id: WorkerId,
-        channel_id: Option<ChannelId>,
-        worker_type: String,
-    ) {
-        let now = Instant::now();
-        self.worker_trackers.insert(
-            worker_id,
-            WorkerTracker {
-                worker_id,
-                channel_id,
-                worker_type,
-                started_at: now,
-                last_activity_at: now,
-                is_idle: false,
-            },
-        );
-    }
-
-    fn track_worker_idle(&mut self, worker_id: WorkerId) {
-        if let Some(tracker) = self.worker_trackers.get_mut(&worker_id) {
-            tracker.is_idle = true;
-        }
-    }
-
-    fn track_worker_activity(&mut self, worker_id: WorkerId) {
-        if let Some(tracker) = self.worker_trackers.get_mut(&worker_id) {
-            tracker.last_activity_at = Instant::now();
-            // Any activity means the worker is no longer idle.
-            tracker.is_idle = false;
-        }
-    }
-
-    fn track_worker_complete(&mut self, worker_id: WorkerId, success: bool, threshold: u8) {
-        let Some(worker_type) = self
-            .worker_trackers
-            .remove(&worker_id)
-            .map(|tracker| tracker.worker_type)
-        else {
-            return;
-        };
-        self.update_breaker(
-            format!("worker_type:{worker_type}"),
-            !success,
-            threshold.max(1),
-        );
-    }
-
-    fn track_branch_start(&mut self, branch_id: BranchId, channel_id: ChannelId) {
-        self.branch_trackers.insert(
-            branch_id,
-            BranchTracker {
-                branch_id,
-                channel_id,
-                started_at: Instant::now(),
-            },
-        );
-    }
-
-    fn track_branch_complete(&mut self, branch_id: BranchId) {
-        if let Some(tracker) = self.branch_trackers.remove(&branch_id) {
-            let elapsed = tracker.started_at.elapsed().as_millis() as u64;
-            self.branch_latency_window_ms.push_back(elapsed);
-            while self.branch_latency_window_ms.len() > BRANCH_LATENCY_WINDOW_SIZE {
-                self.branch_latency_window_ms.pop_front();
-            }
-        }
-    }
-
     fn track_tool_completed(&mut self, tool_name: &str, result: &str, threshold: u8) {
         let Some(structured_success) = parse_structured_success_flag(result) else {
             return;
@@ -473,10 +371,6 @@ impl HealthRuntimeState {
             !structured_success,
             threshold.max(1),
         );
-    }
-
-    fn mark_control_receiver_lag(&mut self) {
-        self.lagged_control_since_last_tick = true;
     }
 
     fn update_breaker(&mut self, key: String, failure: bool, threshold: u8) {
@@ -510,58 +404,6 @@ fn parse_structured_success_flag(result: &str) -> Option<bool> {
         return Some(success);
     }
     object.get("ok").and_then(|value| value.as_bool())
-}
-
-fn kill_target_last_activity(target: &KillTarget) -> Instant {
-    match target {
-        KillTarget::Worker(tracker) => tracker.last_activity_at,
-        KillTarget::Branch(tracker) => tracker.started_at,
-    }
-}
-
-fn kill_target_id(target: &KillTarget) -> u128 {
-    match target {
-        KillTarget::Worker(tracker) => tracker.worker_id.as_u128(),
-        KillTarget::Branch(tracker) => tracker.branch_id.as_u128(),
-    }
-}
-
-fn build_kill_targets(
-    overdue_workers: Vec<WorkerTracker>,
-    overdue_branches: Vec<BranchTracker>,
-) -> Vec<KillTarget> {
-    let mut targets = Vec::with_capacity(overdue_workers.len() + overdue_branches.len());
-    targets.extend(overdue_workers.into_iter().map(KillTarget::Worker));
-    targets.extend(overdue_branches.into_iter().map(KillTarget::Branch));
-    targets.sort_by(|left, right| {
-        let left_activity = kill_target_last_activity(left);
-        let right_activity = kill_target_last_activity(right);
-        if left_activity == right_activity {
-            kill_target_id(left).cmp(&kill_target_id(right))
-        } else {
-            left_activity.cmp(&right_activity)
-        }
-    });
-    targets
-}
-
-fn is_terminal_control_result(result: ControlActionResult) -> bool {
-    matches!(
-        result,
-        ControlActionResult::Cancelled
-            | ControlActionResult::AlreadyTerminal
-            | ControlActionResult::NotFound
-    )
-}
-
-fn is_cancelled_control_result(result: ControlActionResult) -> bool {
-    matches!(result, ControlActionResult::Cancelled)
-}
-
-fn take_lagged_control_flag(state: &mut HealthRuntimeState) -> bool {
-    let lagged = state.lagged_control_since_last_tick;
-    state.lagged_control_since_last_tick = false;
-    lagged
 }
 
 /// The cortex observes system-wide activity and writes to the memory store.
@@ -899,111 +741,25 @@ impl Cortex {
         let mut state = self.health_runtime_state.write().await;
 
         match event {
-            ProcessEvent::WorkerStarted {
-                worker_id,
-                channel_id,
-                worker_type,
-                ..
-            } => state.track_worker_start(*worker_id, channel_id.clone(), worker_type.clone()),
-            ProcessEvent::WorkerComplete {
-                worker_id, success, ..
-            } => state.track_worker_complete(*worker_id, *success, threshold),
-            ProcessEvent::WorkerIdle { worker_id, .. } => state.track_worker_idle(*worker_id),
-            ProcessEvent::WorkerStatus { worker_id, .. } => {
-                state.track_worker_activity(*worker_id);
-            }
-            ProcessEvent::ToolStarted {
-                process_id: ProcessId::Worker(worker_id),
-                ..
-            } => {
-                state.track_worker_activity(*worker_id);
-            }
-            ProcessEvent::ToolOutput {
-                process_id: ProcessId::Worker(worker_id),
-                ..
-            } => {
-                state.track_worker_activity(*worker_id);
-            }
             ProcessEvent::ToolCompleted {
-                process_id,
-                tool_name,
-                result,
-                ..
-            } => {
-                if let ProcessId::Worker(worker_id) = process_id {
-                    state.track_worker_activity(*worker_id);
-                }
-                state.track_tool_completed(tool_name, result, threshold);
-            }
-            ProcessEvent::BranchStarted {
-                branch_id,
-                channel_id,
-                ..
-            } => state.track_branch_start(*branch_id, channel_id.clone()),
-            ProcessEvent::BranchResult { branch_id, .. } => state.track_branch_complete(*branch_id),
+                tool_name, result, ..
+            } => state.track_tool_completed(tool_name, result, threshold),
             _ => {}
         }
     }
 
-    pub async fn mark_control_receiver_lag(&self) {
-        self.health_runtime_state
-            .write()
-            .await
-            .mark_control_receiver_lag();
-    }
-
-    /// Run one supervision tick: emit pending breaker trips and enforce
-    /// lag-aware timeout cancellation with a bounded kill budget.
+    /// Run one health tick and emit pending circuit-breaker observations.
     pub async fn run_health_tick(&self, logger: &CortexLogger) -> Result<()> {
         let cortex_config = **self.deps.runtime_config.cortex.load();
-        let worker_timeout = Duration::from_secs(cortex_config.worker_timeout_secs.max(1));
-        let branch_timeout = Duration::from_secs(cortex_config.branch_timeout_secs.max(1));
-        let kill_budget = cortex_config.supervisor_kill_budget_per_tick;
-
         let pruned_dead_channels = self
             .deps
             .process_control_registry
             .prune_dead_channels()
             .await;
 
-        let now = Instant::now();
-        let (lagged_control, pending_breaker_trips, overdue_workers, overdue_branches) = {
+        let pending_breaker_trips = {
             let mut state = self.health_runtime_state.write().await;
-            let lagged_control = take_lagged_control_flag(&mut state);
-
-            let pending_breaker_trips = std::mem::take(&mut state.pending_breaker_trip_events);
-
-            let overdue_workers = if lagged_control {
-                Vec::new()
-            } else {
-                state
-                    .worker_trackers
-                    .values()
-                    .filter(|tracker| {
-                        !tracker.is_idle
-                            && now.duration_since(tracker.last_activity_at) >= worker_timeout
-                    })
-                    .cloned()
-                    .collect()
-            };
-
-            let overdue_branches = if lagged_control {
-                Vec::new()
-            } else {
-                state
-                    .branch_trackers
-                    .values()
-                    .filter(|tracker| now.duration_since(tracker.started_at) >= branch_timeout)
-                    .cloned()
-                    .collect()
-            };
-
-            (
-                lagged_control,
-                pending_breaker_trips,
-                overdue_workers,
-                overdue_branches,
-            )
+            std::mem::take(&mut state.pending_breaker_trip_events)
         };
 
         for trip in pending_breaker_trips {
@@ -1019,123 +775,14 @@ impl Cortex {
             );
         }
 
-        if lagged_control {
-            logger.log(
-                "health_check",
-                "Skipped timeout cancellation due to lagged control receiver",
-                Some(serde_json::json!({
-                    "kill_skipped_due_to_lag": true,
-                    "kill_budget": kill_budget,
-                    "pruned_dead_channels": pruned_dead_channels,
-                })),
-            );
-            return Ok(());
-        }
-
-        let targets = build_kill_targets(overdue_workers, overdue_branches);
-
-        let mut terminal_worker_ids = Vec::new();
-        let mut terminal_branch_ids = Vec::new();
-        let mut kill_attempts = 0_usize;
-        let mut kill_actions = 0_usize;
-
-        for target in targets.into_iter().take(kill_budget) {
-            kill_attempts = kill_attempts.saturating_add(1);
-            let result = match target.clone() {
-                KillTarget::Worker(tracker) => {
-                    let idle_secs = now.duration_since(tracker.last_activity_at).as_secs();
-                    let reason = format!(
-                        "idle for {}s, exceeded {}s timeout (supervisor)",
-                        idle_secs,
-                        worker_timeout.as_secs()
-                    );
-                    if let Some(channel_id) = &tracker.channel_id {
-                        self.deps
-                            .process_control_registry
-                            .cancel_channel_worker(channel_id, tracker.worker_id, &reason)
-                            .await
-                    } else {
-                        ControlActionResult::NotFound
-                    }
-                }
-                KillTarget::Branch(tracker) => {
-                    let reason =
-                        format!("timed out after {}s (supervisor)", branch_timeout.as_secs());
-                    self.deps
-                        .process_control_registry
-                        .cancel_channel_branch(&tracker.channel_id, tracker.branch_id, &reason)
-                        .await
-                }
-            };
-
-            if !is_terminal_control_result(result) {
-                continue;
-            }
-
-            match target {
-                KillTarget::Worker(tracker) => {
-                    terminal_worker_ids.push(tracker.worker_id);
-                    if is_cancelled_control_result(result) {
-                        let idle_secs = now.duration_since(tracker.last_activity_at).as_secs();
-                        let lifetime_secs = now.duration_since(tracker.started_at).as_secs();
-                        logger.log(
-                            "worker_killed",
-                            &format!("Worker {} cancelled by supervisor", tracker.worker_id),
-                            Some(serde_json::json!({
-                                "worker_id": tracker.worker_id.to_string(),
-                                "channel_id": tracker.channel_id.as_deref(),
-                                "idle_secs": idle_secs,
-                                "lifetime_secs": lifetime_secs,
-                                "timeout_secs": worker_timeout.as_secs(),
-                                "reason": "idle_timeout",
-                            })),
-                        );
-                        kill_actions = kill_actions.saturating_add(1);
-                    }
-                }
-                KillTarget::Branch(tracker) => {
-                    terminal_branch_ids.push(tracker.branch_id);
-                    if is_cancelled_control_result(result) {
-                        logger.log(
-                            "branch_killed",
-                            &format!("Branch {} cancelled by supervisor", tracker.branch_id),
-                            Some(serde_json::json!({
-                                "branch_id": tracker.branch_id.to_string(),
-                                "channel_id": tracker.channel_id.as_ref(),
-                                "timeout_secs": branch_timeout.as_secs(),
-                                "reason": "timeout",
-                            })),
-                        );
-                        kill_actions = kill_actions.saturating_add(1);
-                    }
-                }
-            };
-        }
-
-        if !terminal_worker_ids.is_empty() || !terminal_branch_ids.is_empty() {
-            let mut state = self.health_runtime_state.write().await;
-            for worker_id in terminal_worker_ids {
-                state.worker_trackers.remove(&worker_id);
-            }
-            for branch_id in terminal_branch_ids {
-                state.branch_trackers.remove(&branch_id);
-            }
-        }
-
-        // Only log health ticks when something actually happened.
-        if kill_actions > 0 || pruned_dead_channels > 0 {
+        if pruned_dead_channels > 0 {
             logger.log(
                 "health_check",
                 &format!(
-                    "Cortex supervision: killed {} processes, pruned {} dead channels",
-                    kill_actions, pruned_dead_channels
+                    "Cortex health check pruned {} dead channels",
+                    pruned_dead_channels
                 ),
                 Some(serde_json::json!({
-                    "kill_budget": kill_budget,
-                    "kill_attempts": kill_attempts,
-                    "kill_actions": kill_actions,
-                    "worker_timeout_secs": worker_timeout.as_secs(),
-                    "branch_timeout_secs": branch_timeout.as_secs(),
                     "pruned_dead_channels": pruned_dead_channels,
                 })),
             );
@@ -1332,6 +979,7 @@ fn signal_from_event(event: ProcessEvent) -> Option<Signal> {
         // durable and reachable through the timeline and the chronicle tool,
         // so they do not also need a slot in the signal buffer.
         ProcessEvent::ChannelSystemMessage { .. }
+        | ProcessEvent::ChannelAssistantMessage { .. }
         | ProcessEvent::CompactionStarted { .. }
         | ProcessEvent::CompactionCompleted { .. }
         | ProcessEvent::ChronicleCheckpoint { .. }
@@ -1747,7 +1395,6 @@ async fn run_cortex_loop(
                 ) {
                     CortexReceiverOutcome::Observe(event) => cortex.observe(event).await,
                     CortexReceiverOutcome::Lagged { dropped } => {
-                        cortex.mark_control_receiver_lag().await;
                         #[cfg(feature = "metrics")]
                         crate::telemetry::Metrics::global()
                             .event_receiver_lagged_events_total
@@ -2759,17 +2406,14 @@ async fn fetch_memories_for_association(
 #[cfg(test)]
 mod tests {
     use super::{
-        BranchTracker, CortexReceiverOutcome, HealthRuntimeState,
-        MAINTENANCE_TASK_CANCEL_GRACE_SECS, MaintenanceTimeoutAction, ReceiverClosedBehavior,
-        Signal, SynthesisTaskBackoff, WorkerTracker, apply_cancelled_warmup_status,
-        build_kill_targets, collect_synthesis_task, handle_cortex_receiver_result,
-        has_completed_initial_warmup, is_cancelled_control_result, is_terminal_control_result,
-        maintenance_task_timeout, maintenance_timeout_action, maybe_spawn_synthesis_task,
-        parse_structured_success_flag, push_signal_into_buffer, should_execute_warmup,
-        signal_from_event, summarize_signal_text, take_lagged_control_flag,
+        CortexReceiverOutcome, HealthRuntimeState, MAINTENANCE_TASK_CANCEL_GRACE_SECS,
+        MaintenanceTimeoutAction, ReceiverClosedBehavior, Signal, SynthesisTaskBackoff,
+        apply_cancelled_warmup_status, collect_synthesis_task, handle_cortex_receiver_result,
+        has_completed_initial_warmup, maintenance_task_timeout, maintenance_timeout_action,
+        maybe_spawn_synthesis_task, parse_structured_success_flag, push_signal_into_buffer,
+        should_execute_warmup, signal_from_event, summarize_signal_text,
     };
     use crate::ProcessEvent;
-    use crate::agent::process_control::ControlActionResult;
     use crate::memory::MemoryType;
     use std::collections::VecDeque;
     use std::sync::Arc;
@@ -3367,124 +3011,6 @@ mod tests {
             ),
             MaintenanceTimeoutAction::None,
         );
-    }
-
-    #[test]
-    fn take_lagged_control_flag_clears_after_one_tick() {
-        let mut state = HealthRuntimeState::default();
-        state.mark_control_receiver_lag();
-
-        assert!(take_lagged_control_flag(&mut state));
-        assert!(!take_lagged_control_flag(&mut state));
-    }
-
-    #[test]
-    fn build_kill_targets_orders_oldest_first_and_stable_by_id() {
-        let base = Instant::now();
-        let older = base - Duration::from_secs(20);
-        let newer = base - Duration::from_secs(5);
-        let shared_start = base - Duration::from_secs(10);
-
-        let worker_a = WorkerTracker {
-            worker_id: uuid::Uuid::parse_str("00000000-0000-0000-0000-00000000000a")
-                .expect("valid uuid"),
-            channel_id: Some(Arc::from("channel-a")),
-            worker_type: "builtin".to_string(),
-            started_at: shared_start,
-            last_activity_at: shared_start,
-            is_idle: false,
-        };
-        let worker_b = WorkerTracker {
-            worker_id: uuid::Uuid::parse_str("00000000-0000-0000-0000-00000000000b")
-                .expect("valid uuid"),
-            channel_id: Some(Arc::from("channel-a")),
-            worker_type: "builtin".to_string(),
-            started_at: shared_start,
-            last_activity_at: shared_start,
-            is_idle: false,
-        };
-        let branch_oldest = BranchTracker {
-            branch_id: uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001")
-                .expect("valid uuid"),
-            channel_id: Arc::from("channel-a"),
-            started_at: older,
-        };
-        let branch_newest = BranchTracker {
-            branch_id: uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000002")
-                .expect("valid uuid"),
-            channel_id: Arc::from("channel-a"),
-            started_at: newer,
-        };
-
-        let targets = build_kill_targets(
-            vec![worker_b.clone(), worker_a.clone()],
-            vec![branch_newest.clone(), branch_oldest.clone()],
-        );
-
-        let ordered_ids: Vec<String> = targets
-            .iter()
-            .map(|target| match target {
-                super::KillTarget::Worker(tracker) => tracker.worker_id.to_string(),
-                super::KillTarget::Branch(tracker) => tracker.branch_id.to_string(),
-            })
-            .collect();
-
-        assert_eq!(
-            ordered_ids,
-            vec![
-                branch_oldest.branch_id.to_string(),
-                worker_a.worker_id.to_string(),
-                worker_b.worker_id.to_string(),
-                branch_newest.branch_id.to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn worker_activity_resets_idle_clock() {
-        let mut state = HealthRuntimeState::default();
-        let worker_id = uuid::Uuid::new_v4();
-        state.track_worker_start(worker_id, Some(Arc::from("ch")), "builtin".to_string());
-
-        let tracker_before = state.worker_trackers.get(&worker_id).unwrap().clone();
-        // Simulate time passing by checking that activity updates the timestamp.
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        state.track_worker_activity(worker_id);
-
-        let tracker_after = state.worker_trackers.get(&worker_id).unwrap();
-        assert!(
-            tracker_after.last_activity_at > tracker_before.last_activity_at,
-            "last_activity_at should advance after track_worker_activity"
-        );
-        assert_eq!(
-            tracker_after.started_at, tracker_before.started_at,
-            "started_at should not change"
-        );
-    }
-
-    #[test]
-    fn worker_activity_noop_for_unknown_worker() {
-        let mut state = HealthRuntimeState::default();
-        // Should not panic on unknown worker ID.
-        state.track_worker_activity(uuid::Uuid::new_v4());
-    }
-
-    #[test]
-    fn terminal_control_result_includes_not_found_and_already_terminal() {
-        assert!(is_terminal_control_result(ControlActionResult::Cancelled));
-        assert!(is_terminal_control_result(ControlActionResult::NotFound));
-        assert!(is_terminal_control_result(
-            ControlActionResult::AlreadyTerminal
-        ));
-    }
-
-    #[test]
-    fn cancelled_control_result_only_matches_cancelled() {
-        assert!(is_cancelled_control_result(ControlActionResult::Cancelled));
-        assert!(!is_cancelled_control_result(ControlActionResult::NotFound));
-        assert!(!is_cancelled_control_result(
-            ControlActionResult::AlreadyTerminal
-        ));
     }
 
     #[test]

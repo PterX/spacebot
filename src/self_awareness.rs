@@ -222,8 +222,7 @@ pub fn runtime_snapshot_value(agent_id: &str, runtime_config: &RuntimeConfig) ->
         },
         "cortex": {
             "tick_interval_secs": cortex.tick_interval_secs,
-            "worker_timeout_secs": cortex.worker_timeout_secs,
-            "branch_timeout_secs": cortex.branch_timeout_secs,
+            "worker_wall_clock_timeout_secs": cortex.worker_wall_clock_timeout_secs,
             "circuit_breaker_threshold": cortex.circuit_breaker_threshold,
             "association_interval_secs": cortex.association_interval_secs,
             "association_similarity_threshold": cortex.association_similarity_threshold,

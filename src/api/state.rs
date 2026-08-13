@@ -697,6 +697,17 @@ impl ApiState {
                                     })
                                     .ok();
                             }
+                            ProcessEvent::ChannelAssistantMessage {
+                                channel_id, text, ..
+                            } => {
+                                api_tx
+                                    .send(ApiEvent::OutboundMessage {
+                                        agent_id: agent_id.clone(),
+                                        channel_id: channel_id.to_string(),
+                                        text: text.clone(),
+                                    })
+                                    .ok();
+                            }
                             ProcessEvent::WorkerStarted {
                                 worker_id,
                                 channel_id,

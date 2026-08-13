@@ -11,7 +11,7 @@ User-defined scheduled jobs. A cron job is a prompt that fires on a timer, gets 
 
 OpenClaw has a single heartbeat: one HEARTBEAT.md file, one timer, one LLM call that tries to do everything in a single turn. It runs in the main session, competes for context, and if it does too much work it triggers compaction. Two things can't run at different intervals. Everything is serialized.
 
-Spacebot separates the concerns. The cortex is the system's heartbeat — it runs on a fixed interval, monitors processes, and maintains the memory bulletin. Cron jobs are user-defined recurring tasks, each with its own interval, prompt, and delivery target. When a cron job fires, it gets a fresh short-lived channel — the same kind of channel that handles user conversations, with full branching and worker capabilities. Multiple cron jobs run concurrently without blocking each other or the cortex.
+Spacebot separates the concerns. The cortex runs per-agent maintenance and operational coordination. Cron jobs are user-defined recurring tasks, each with its own interval, prompt, and delivery target. When a cron job fires, it gets a fresh short-lived channel with full branching and worker capabilities. Multiple cron jobs run concurrently without blocking each other or the cortex.
 
 ## How It Works
 

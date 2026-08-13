@@ -1,4 +1,22 @@
 {
   "title": "Features",
-  "pages": ["workers", "tasks", "opencode", "tools", "browser", "cron", "skills", "ingestion", "wiki", "notifications", "portal", "projects"]
+  "pages": [
+    "autonomy",
+    "goals",
+    "wakes",
+    "questions",
+    "commands",
+    "workers",
+    "tasks",
+    "opencode",
+    "tools",
+    "browser",
+    "cron",
+    "skills",
+    "ingestion",
+    "wiki",
+    "notifications",
+    "portal",
+    "projects"
+  ]
 }

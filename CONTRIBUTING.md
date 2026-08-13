@@ -158,11 +158,11 @@ SQLite migrations are **immutable**. Never edit an existing migration file. Alwa
 
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design. The short version: five process types, each with one job.
+See the [architecture docs](docs/content/docs/(core)/architecture.mdx) for the full design. The short version: five process types, each with one job.
 
 - **Channels** — user-facing LLM, stays responsive, never blocks on work
 - **Branches** — fork channel context to think, return conclusion, get deleted
-- **Workers** — independent task execution with focused tools, no conversation context
+- **Workers** — independent task execution with focused tools and bounded channel context
 - **Compactor** — programmatic context monitor, triggers compaction before channels fill up
 - **Cortex** — system observer, generates memory bulletins, supervises processes
 

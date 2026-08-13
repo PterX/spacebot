@@ -190,7 +190,7 @@ There's a transient-error retry budget (`MAX_TRANSIENT_RETRIES = 5`, `worker.rs:
 
 ### Design
 
-**Naming.** `CortexConfig.worker_timeout_secs` (`config/types.rs:1043`, default 600s) already exists as the supervisor's idle-kill bound, measured from `last_activity_at`. The new wall-clock bound is a different mechanism; pick a non-colliding name. Use `worker_wall_clock_timeout_secs` (or rename the supervisor field to `worker_idle_timeout_secs`).
+**Naming.** Use `CortexConfig.worker_wall_clock_timeout_secs` for the per-worker execution bound.
 
 **Structured outcome surface.** Today `Worker::run` returns `Result<String>` (`worker.rs:325`). There is no `WorkerOutcome` enum; the LLM signals completion via `set_status(kind: Outcome)` and the cron-only `SetOutcomeTool` writes `CronOutcome { content: String }` for scheduler delivery. This phase invents the structured surface from scratch — it's the shared substrate phase 4 also needs (see [§4](#4-browser-captcha--blocked-detection)).
 

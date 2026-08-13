@@ -57,8 +57,8 @@ Controls how the agent's memory system interacts with this channel.
 
 | Mode | Context Injected | Auto-Persistence | Memory Tools |
 |------|-----------------|-------------------|--------------|
-| **Full** (default) | Knowledge synthesis + working memory + channel activity | Yes | Yes (via branches) |
-| **Ambient** | Same context injected | No | No |
+| **Full** (default) | Deterministic memory-store render and active goals | Yes | Yes (via branches) |
+| **Ambient** | Same read-only context | No | No |
 | **Off** | None | No | No |
 
 Use **Ambient** for channels where the agent should be aware of its memories but shouldn't create new ones from the conversation. Use **Off** for ephemeral or test channels.
@@ -92,7 +92,7 @@ Controls what context workers receive when spawned from this channel.
 | Mode | What the worker gets |
 |------|---------------------|
 | **None** (default) | No memory context |
-| **Ambient** | Knowledge synthesis + working memory in system prompt (read-only) |
+| **Ambient** | Deterministic memory context in the worker prompt (read-only) |
 | **Tools** | Ambient context + memory recall tool (read-only) |
 | **Full** | Ambient context + full memory tools (recall, save, delete) |
 

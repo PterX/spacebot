@@ -5,6 +5,7 @@
     "architecture",
     "agents",
     "memory",
+    "chronicles",
     "routing",
     "channels",
     "cortex",

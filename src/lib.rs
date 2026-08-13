@@ -187,6 +187,13 @@ pub enum ProcessEvent {
         channel_id: ChannelId,
         text: String,
     },
+    /// A channel-local assistant record produced without adapter delivery,
+    /// such as an autonomy run's terminal summary.
+    ChannelAssistantMessage {
+        agent_id: AgentId,
+        channel_id: ChannelId,
+        text: String,
+    },
     BranchStarted {
         agent_id: AgentId,
         branch_id: BranchId,

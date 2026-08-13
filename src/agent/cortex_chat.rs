@@ -730,15 +730,12 @@ impl CortexChatSession {
         let thread_id = thread_id.to_string();
         let channel_context_id = channel_context_id.map(|s| s.to_string());
         let store = self.store.clone();
-        // Cortex chat is an interactive admin session that can do complex multi-step
-        // work (agent creation, memory audits, etc). Use worker_timeout_secs (default
-        // 600s) rather than branch_timeout_secs (60s) which is far too short.
         let prompt_timeout = Duration::from_secs(
             self.deps
                 .runtime_config
                 .cortex
                 .load()
-                .worker_timeout_secs
+                .worker_wall_clock_timeout_secs
                 .max(60),
         );
 
