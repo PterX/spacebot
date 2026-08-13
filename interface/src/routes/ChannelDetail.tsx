@@ -297,7 +297,7 @@ function processFallback(
 
   if (item?.type === "branch_run") {
     const live = branches[item.id];
-    const status = live ? "running" : branchRunStatus(item.conclusion);
+    const status = live ? "running" : branchRunStatus(item.conclusion ?? null);
     return {
       kind: "branch",
       id: item.id,

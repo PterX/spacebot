@@ -186,7 +186,7 @@ export function ProcessDetail({agentId, selection, fallback, liveTranscript, onC
 	const detail: ProcessRun | ProcessRunDisplay = detailQuery.data ?? fallback;
 	const isLive = detail.status === "running" || detail.status === "idle";
 	const rawTranscript = isLive && liveTranscript?.length ? liveTranscript : detail.transcript;
-	const transcript = useMemo(() => withoutDuplicateOutput(rawTranscript ?? null, detail.output), [rawTranscript, detail.output]);
+	const transcript = useMemo(() => withoutDuplicateOutput(rawTranscript ?? null, detail.output ?? null), [rawTranscript, detail.output]);
 	const transcriptRef = useRef<HTMLDivElement>(null);
 
 	useEffect(() => {

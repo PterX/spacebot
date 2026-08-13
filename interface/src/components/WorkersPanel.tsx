@@ -8,7 +8,7 @@ import {
 	PopoverTrigger,
 } from "@spacedrive/primitives";
 import {cx} from "class-variance-authority";
-import {api, type ProcessRun} from "@/api/client";
+import {api} from "@/api/client";
 import {
 	ProcessCard,
 	ProcessDetail,
