@@ -1,7 +1,7 @@
 //! Worker transcript inspection tool for branches.
 //!
-//! Allows a branch to retrieve the full transcript of a completed worker run,
-//! or list recent worker runs to find the right one.
+//! Allows a branch to retrieve the full durable transcript of a completed worker
+//! run, or list recent worker runs to find the right one.
 
 use crate::conversation::history::ProcessRunLogger;
 use crate::conversation::worker_transcript;
@@ -106,6 +106,12 @@ impl Tool for WorkerInspectTool {
             .await
             .map_err(|e| WorkerInspectError(format!("Failed to query worker: {e}")))?
             .ok_or_else(|| WorkerInspectError(format!("No worker found with ID {worker_id}")))?;
+
+        if matches!(detail.status.as_str(), "running" | "idle") {
+            return Err(WorkerInspectError(format!(
+                "Worker {worker_id} is still running; its durable transcript is not available yet"
+            )));
+        }
 
         let mut summary = format!(
             "## Worker {}\n\n**Task:** {}\n**Status:** {}\n**Started:** {}\n",
