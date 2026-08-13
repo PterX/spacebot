@@ -308,18 +308,11 @@ export function PortalTimeline({
     refetchInterval: 2000,
   });
 
-  // Filter workers for this conversation.
+  // Resolve complete worker records when polling has caught up. Timeline rows
+  // still render immediately through `synthesizeWorker`.
   const conversationWorkers = (workersQuery.data?.workers ?? []).filter(
     (w) => w.channel_id === conversationId,
   );
-  const workerIds = new Set(conversationWorkers.map((w) => w.id));
-
-  // Filter worker_run items to only those matching workers we've seen.
-  // Messages and other item types always render.
-  const visibleItems = timeline.filter((item) => {
-    if (item.type !== "worker_run") return true;
-    return workerIds.has(item.id);
-  });
 
   // Smart auto-scroll: only when near bottom
   useEffect(() => {
@@ -327,7 +320,7 @@ export function PortalTimeline({
     if (!element) return;
 
     const previousLength = previousLengthRef.current;
-    const currentLength = visibleItems.length;
+    const currentLength = timeline.length;
     const distanceFromBottom =
       element.scrollHeight - element.scrollTop - element.clientHeight;
     const isNearBottom = distanceFromBottom < 160;
@@ -342,7 +335,7 @@ export function PortalTimeline({
     }
 
     previousLengthRef.current = currentLength;
-  }, [visibleItems.length, isTyping]);
+  }, [timeline.length, isTyping]);
 
   // Always scroll to bottom when the user sends a message.
   useEffect(() => {
@@ -361,7 +354,7 @@ export function PortalTimeline({
   return (
     <div ref={scrollRef} className="flex-1 overflow-x-hidden overflow-y-auto">
       <div className="mx-auto flex max-w-3xl flex-col gap-2 px-4 py-6 pb-[180px]">
-        {visibleItems.map((item) => {
+        {timeline.map((item) => {
           if (item.type === "message") {
             const attachments = item.attachments ?? [];
             if (item.role === "user" && attachments.length > 0) {

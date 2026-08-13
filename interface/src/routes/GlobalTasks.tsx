@@ -24,8 +24,7 @@ import {
 } from "@spacedrive/ai";
 import {
 	ExecutionPlanSection,
-	GithubMetadataBadges,
-	getGithubReferences,
+	GithubSection,
 } from "@/components/TaskUtils";
 
 const TASK_LIMIT = 200;
@@ -313,20 +312,6 @@ export function GlobalTasks() {
 					/>
 				</div>
 			)}
-		</div>
-	);
-}
-
-function GithubSection({metadata}: {metadata: Record<string, unknown>}) {
-	const refs = getGithubReferences(metadata);
-	if (refs.length === 0) return null;
-
-	return (
-		<div className="border-t border-app-line/40 px-4 py-3">
-			<h3 className="mb-2 text-xs font-medium uppercase tracking-wide text-ink-dull">
-				GitHub Links
-			</h3>
-			<GithubMetadataBadges references={refs} />
 		</div>
 	);
 }

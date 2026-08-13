@@ -132,6 +132,24 @@ export function GithubMetadataBadges({
   );
 }
 
+export function GithubSection({
+  metadata,
+}: {
+  metadata: Record<string, unknown>;
+}) {
+  const references = getGithubReferences(metadata);
+  if (references.length === 0) return null;
+
+  return (
+    <div className="border-t border-app-line/40 px-4 py-3">
+      <h3 className="mb-2 text-xs font-medium uppercase tracking-wide text-ink-dull">
+        GitHub Links
+      </h3>
+      <GithubMetadataBadges references={references} />
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Execution plan — where and how a task's work runs
 // ---------------------------------------------------------------------------

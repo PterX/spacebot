@@ -25,9 +25,6 @@
 //! - `set_status` — per-worker instance, registered at creation
 //! - `restart` when the daemon lifecycle handle is available
 //!
-//! **Cortex ToolServer** (one per agent):
-//! - `memory_save` — registered at startup
-//!
 //! **Cortex Chat ToolServer** (interactive admin chat):
 //! - branch + worker tool superset plus `spacebot_docs`, `config_inspect`, `spawn_worker`,
 //!   and `restart`
@@ -1307,26 +1304,6 @@ pub fn create_worker_tool_server(
     }
 
     server.run()
-}
-
-/// Create a ToolServer for the cortex process.
-///
-/// Retained for potential future use. The compactor no longer uses this
-/// (Phase 5b removed compactor memory_save).
-#[allow(dead_code)]
-pub fn create_cortex_tool_server(
-    agent_id: AgentId,
-    memory_event_tx: broadcast::Sender<ProcessEvent>,
-    memory_search: Arc<MemorySearch>,
-) -> ToolServerHandle {
-    ToolServer::new()
-        .tool(memory_save_with_events(
-            memory_search,
-            agent_id,
-            memory_event_tx,
-            None,
-        ))
-        .run()
 }
 
 /// Create a ToolServer for cortex chat sessions.
