@@ -78,13 +78,24 @@ labeled region rebuilt for every run:
 - Recent autonomy run summaries.
 - Current task state.
 - Active goals.
-- Active workers.
+- Workers still running, including owner, lifecycle, last progress, and
+  recovery state.
+- Worker outcomes delivered since the prior autonomy run, including the bound
+  task, terminal outcome, bounded result, and transcript reference.
 - The autonomy channel's own chronicle view.
 - The configured home channel's chronicle view.
 
 These are database-backed observations. They are context, not instructions from
 a participant. Wake instructions are data from an allowed wake definition and
 remain explicitly labelled as such.
+
+Worker continuity uses a durable outcome inbox, not channel history or an
+in-memory status block. An autonomy channel may exit while its workers continue
+under supervisor ownership. If one completes before the next wake, it is no
+longer an active worker and the original channel cannot process its completion
+event. The next run must therefore claim and render its unacknowledged terminal
+outcome from durable state. This remains separate from the live completion
+retrigger used while the current channel is still resident.
 
 ### Ephemeral trigger
 

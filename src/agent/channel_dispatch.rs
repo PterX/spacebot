@@ -1308,7 +1308,11 @@ where
     let terminal_notify = Arc::new(tokio::sync::Notify::new());
     let task_terminal_notify = terminal_notify.clone();
     let task_transcript_snapshot = transcript_snapshot.clone();
+    // The parent owns cancellation authority, but its teardown must detach a
+    // worker rather than turn a dropped sender into a cancellation request.
+    let task_cancel_tx = cancel_tx.clone();
     let handle = tokio::spawn(async move {
+        let _task_cancel_tx = task_cancel_tx;
         #[cfg(feature = "metrics")]
         let worker_start = std::time::Instant::now();
 
@@ -1323,12 +1327,10 @@ where
         let raw = tokio::select! {
             result = &mut worker_future => result,
             changed = cancel_rx.changed() => {
-                let reason = if changed.is_ok() && *cancel_rx.borrow() {
-                    "cancelled by supervisor"
-                } else {
-                    "worker cancellation channel closed"
-                };
-                Ok(Ok(WorkerOutcome::Cancelled { reason: reason.to_string() }))
+                debug_assert!(changed.is_ok(), "worker task retains cancellation sender");
+                Ok(Ok(WorkerOutcome::Cancelled {
+                    reason: "cancelled by supervisor".to_string(),
+                }))
             }
         };
         let scrub = |text: String| -> String {
@@ -2053,6 +2055,51 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn dropping_parent_control_does_not_cancel_worker() {
+        let (event_tx, mut event_rx) = broadcast::channel(8);
+        let worker_id = Uuid::new_v4();
+        let run_logger = setup_worker(worker_id, "detached-channel").await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+
+        let control = spawn_worker_task(
+            worker_id,
+            event_tx,
+            Arc::<str>::from("agent"),
+            Some(Arc::<str>::from("detached-channel")),
+            run_logger,
+            crate::agent::worker::new_worker_transcript_snapshot(),
+            None,
+            None,
+            "builtin",
+            async move {
+                started_tx.send(()).expect("test receiver remains active");
+                finish_rx.await.expect("test sender remains active");
+                Ok::<WorkerOutcome, crate::Error>(WorkerOutcome::Success {
+                    result: "completed after parent exit".to_string(),
+                })
+            },
+        );
+
+        started_rx.await.expect("worker should start");
+        drop(control);
+        finish_tx.send(()).expect("worker should still be running");
+
+        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("worker completion event should be delivered")
+            .expect("broadcast receive should succeed");
+        let ProcessEvent::WorkerComplete {
+            result, success, ..
+        } = event
+        else {
+            panic!("expected worker completion");
+        };
+        assert_eq!(result, "completed after parent exit");
+        assert!(success);
     }
 
     #[tokio::test]

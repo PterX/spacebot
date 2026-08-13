@@ -1,4 +1,23 @@
 import {useState} from "react";
+import {
+	BookOpen,
+	Camera,
+	Check,
+	Code,
+	Copy,
+	CursorClick,
+	File,
+	FileMagnifyingGlass,
+	FolderOpen,
+	Globe,
+	Keyboard,
+	ListChecks,
+	MagnifyingGlass,
+	PencilSimple,
+	Terminal,
+	Wrench,
+} from "@phosphor-icons/react";
+import {DialogContent, DialogRoot, DialogTitle} from "@spacedrive/primitives";
 import {cx} from "class-variance-authority";
 import type {OpenCodePart} from "@/api/client";
 import type { TranscriptStep as SchemaTranscriptStep } from "@/api/types";
@@ -344,7 +363,7 @@ const toolRenderers: Record<string, ToolRenderer> = {
 					<p className="mb-1 text-tiny font-medium text-ink-faint">
 						JavaScript
 					</p>
-					<pre className="max-h-40 overflow-auto font-mono text-tiny text-ink-dull">
+					<pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words font-mono text-tiny text-ink-dull">
 						{String(expression)}
 					</pre>
 				</div>
@@ -384,7 +403,7 @@ const toolRenderers: Record<string, ToolRenderer> = {
 
 	shell: {
 		summary(pair) {
-			const command = pair.args?.command;
+			const command = toolStringArg(pair, "command");
 			if (!command) return null;
 			// If we have a parsed result, append exit code info
 			if (pair.result && typeof pair.result.exit_code === "number") {
@@ -395,11 +414,11 @@ const toolRenderers: Record<string, ToolRenderer> = {
 			return truncate(String(command), 60);
 		},
 		argsView(pair) {
-			const command = pair.args?.command;
+			const command = toolStringArg(pair, "command");
 			if (!command) return null;
 			return (
 				<div className="border-b border-app-line/20 px-3 py-2">
-					<pre className="max-h-40 overflow-auto font-mono text-tiny text-ink-dull">
+					<pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words font-mono text-tiny text-ink-dull">
 						<span className="select-none text-ink-faint">$ </span>
 						{String(command)}
 					</pre>
@@ -554,7 +573,7 @@ const toolRenderers: Record<string, ToolRenderer> = {
 			}
 			return (
 				<div className="border-b border-app-line/20 px-3 py-2">
-					<pre className="max-h-40 overflow-auto font-mono text-tiny text-ink-dull">
+					<pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words font-mono text-tiny text-ink-dull">
 						<span className="select-none text-ink-faint">$ </span>
 						{parts.join(" ")}
 					</pre>
@@ -699,7 +718,7 @@ const toolRenderers: Record<string, ToolRenderer> = {
 	bash: {
 		summary(pair) {
 			if (pair.title) return pair.title;
-			const command = pair.args?.command;
+			const command = toolStringArg(pair, "command");
 			if (!command) return null;
 			if (pair.result && typeof pair.result.exit_code === "number") {
 				const code = pair.result.exit_code;
@@ -709,11 +728,11 @@ const toolRenderers: Record<string, ToolRenderer> = {
 			return truncate(String(command), 60);
 		},
 		argsView(pair) {
-			const command = pair.args?.command;
+			const command = toolStringArg(pair, "command");
 			if (!command) return null;
 			return (
 				<div className="border-b border-app-line/20 px-3 py-2">
-					<pre className="max-h-40 overflow-auto font-mono text-tiny text-ink-dull">
+			<pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words font-mono text-tiny text-ink-dull">
 						<span className="select-none text-ink-faint">$ </span>
 						{String(command)}
 					</pre>
@@ -900,7 +919,7 @@ function ResultLine({text}: {text: string}) {
 function ResultText({text}: {text: string | null}) {
 	if (!text) return null;
 	return (
-		<pre className="max-h-60 overflow-auto whitespace-pre-wrap px-3 py-2 font-mono text-tiny text-ink-dull">
+		<pre className="max-h-60 overflow-auto whitespace-pre-wrap break-words px-3 py-2 font-mono text-tiny text-ink-dull">
 			{text}
 		</pre>
 	);
@@ -923,7 +942,7 @@ function CollapsiblePre({
 
 	return (
 		<div>
-			<pre className="max-h-80 overflow-auto whitespace-pre-wrap px-3 py-2 font-mono text-tiny text-ink-dull">
+			<pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words px-3 py-2 font-mono text-tiny text-ink-dull">
 				{displayText}
 			</pre>
 			{needsCollapse && (
@@ -1011,19 +1030,30 @@ function ShellResultView({pair}: {pair: ToolCallPair}) {
 // Status display helpers
 // ---------------------------------------------------------------------------
 
-const STATUS_ICONS: Record<ToolCallStatus, string> = {
-	running: "\u25B6", // ▶
-	completed: "\u2713", // ✓
-	error: "\u2717", // ✗
-	waiting_for_input: "!",
-};
-
 const STATUS_COLORS: Record<ToolCallStatus, string> = {
 	running: "text-accent",
-	completed: "text-status-success",
+	completed: "text-ink-faint",
 	error: "text-status-error",
 	waiting_for_input: "text-blue-500",
 };
+
+function ToolIcon({name}: {name: string}) {
+	if (name === "shell" || name === "bash" || name === "exec") return <Terminal weight="fill" />;
+	if (name === "read" || name === "file_read") return <FileMagnifyingGlass weight="fill" />;
+	if (name === "write" || name === "edit" || name === "file_write" || name === "file_edit") return <PencilSimple weight="fill" />;
+	if (name === "glob" || name === "file_list") return <FolderOpen weight="fill" />;
+	if (name === "grep" || name === "web_search") return <MagnifyingGlass weight="fill" />;
+	if (name === "webfetch" || name === "browser_navigate" || name === "browser_launch" || name === "browser_close") return <Globe weight="fill" />;
+	if (name === "browser_click") return <CursorClick weight="fill" />;
+	if (name === "browser_type" || name === "browser_press_key") return <Keyboard weight="fill" />;
+	if (name === "browser_screenshot" || name === "browser_snapshot") return <Camera weight="fill" />;
+	if (name === "browser_evaluate") return <Code weight="fill" />;
+	if (name === "spacebot_docs" || name === "read_skill") return <BookOpen weight="fill" />;
+	if (name === "todowrite" || name === "task") return <ListChecks weight="fill" />;
+	if (name.startsWith("browser_")) return <Globe weight="fill" />;
+	if (name.startsWith("file_")) return <File weight="fill" />;
+	return <Wrench weight="fill" />;
+}
 
 /** Human-readable tool name: browser_navigate → Navigate */
 function formatToolName(name: string): string {
@@ -1062,15 +1092,22 @@ function toolCategory(name: string): string | null {
 
 export function ToolCall({pair}: {pair: ToolCallPair}) {
 	const [expanded, setExpanded] = useState(false);
+	const [copied, setCopied] = useState(false);
+	const [skillOpen, setSkillOpen] = useState(false);
 	const renderer = getRenderer(pair.name);
 	const inlineView = renderer.inlineView?.(pair);
 	const summary = renderer.summary(pair);
 	const category = toolCategory(pair.name);
 	const displayName = formatToolName(pair.name);
+	const command = pair.name === "shell" || pair.name === "bash"
+		? toolStringArg(pair, "command")
+		: null;
+	const skillName = pair.name === "read_skill" ? toolStringArg(pair, "name") : null;
+	const skillContent = pair.name === "read_skill" ? pair.resultRaw : null;
 
 	if (inlineView) return inlineView;
 
-	return (
+	return <>
 		<div
 			className={cx(
 				"rounded-md border bg-app-dark-box/30",
@@ -1081,18 +1118,16 @@ export function ToolCall({pair}: {pair: ToolCallPair}) {
 						: "border-app-line/50",
 			)}
 		>
-			{/* Header — always visible */}
-			<button
-				onClick={() => setExpanded(!expanded)}
-				className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs"
-			>
+			<div className="flex items-center">
+			<button onClick={() => setExpanded(!expanded)} className="flex min-w-0 flex-1 items-center gap-2 px-3 py-2 text-left text-xs">
 				<span
 					className={cx(
+						"flex size-5 shrink-0 items-center justify-center [&>svg]:size-[18px]",
 						STATUS_COLORS[pair.status],
 						pair.status === "running" ? "animate-pulse" : "",
 					)}
 				>
-					{STATUS_ICONS[pair.status]}
+					<ToolIcon name={pair.name} />
 				</span>
 				{category && (
 					<span className="text-tiny text-ink-faint">{category}</span>
@@ -1108,6 +1143,25 @@ export function ToolCall({pair}: {pair: ToolCallPair}) {
 					<span className="text-tiny text-blue-500">Waiting for input</span>
 				)}
 			</button>
+			{command && <button
+				type="button"
+				title={copied ? "Copied" : "Copy command"}
+				onClick={() => void navigator.clipboard.writeText(command).then(() => {
+					setCopied(true);
+					window.setTimeout(() => setCopied(false), 1500);
+				})}
+				className="mr-2 flex size-7 shrink-0 items-center justify-center rounded text-ink-faint hover:bg-app-hover hover:text-ink"
+			>
+				{copied ? <Check className="size-4" weight="bold" /> : <Copy className="size-4" weight="bold" />}
+			</button>}
+			{skillContent && <button
+				type="button"
+				onClick={() => setSkillOpen(true)}
+				className="mr-2 shrink-0 rounded px-2 py-1 text-tiny font-medium text-ink-faint hover:bg-app-hover hover:text-ink"
+			>
+				View skill
+			</button>}
+			</div>
 
 			{/* Expanded body */}
 			{expanded && (
@@ -1119,7 +1173,17 @@ export function ToolCall({pair}: {pair: ToolCallPair}) {
 				</div>
 			)}
 		</div>
-	);
+		{skillContent && <DialogRoot open={skillOpen} onOpenChange={setSkillOpen}>
+			<DialogContent className="!flex max-h-[80vh] w-full max-w-3xl !flex-col !gap-0 overflow-hidden !p-0">
+				<div className="border-b border-app-line/50 px-5 py-4">
+					<DialogTitle className="text-sm font-semibold text-ink">{skillName ?? "Skill"}</DialogTitle>
+				</div>
+				<div className="overflow-y-auto p-5">
+					<pre className="whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-ink-dull">{skillContent}</pre>
+				</div>
+			</DialogContent>
+		</DialogRoot>}
+	</>;
 }
 
 function renderArgs(
@@ -1153,7 +1217,7 @@ function renderArgs(
 	if (pair.argsRaw && pair.argsRaw !== "{}" && pair.argsRaw.trim().length > 0) {
 		return (
 			<div className="border-b border-app-line/20 px-3 py-2">
-				<pre className="max-h-40 overflow-auto font-mono text-tiny text-ink-dull">
+				<pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words font-mono text-tiny text-ink-dull">
 					{pair.argsRaw}
 				</pre>
 			</div>
@@ -1239,6 +1303,40 @@ function formatArgValue(key: string, value: unknown): string {
 		return String(value);
 	}
 	return JSON.stringify(value);
+}
+
+function toolStringArg(pair: ToolCallPair, key: string): string | null {
+	const parsed = pair.args?.[key];
+	if (typeof parsed === "string") return parsed;
+
+	const prefix = new RegExp(`"${key}"\\s*:\\s*"`).exec(pair.argsRaw);
+	if (!prefix) return null;
+
+	let value = "";
+	for (let index = prefix.index + prefix[0].length; index < pair.argsRaw.length; index++) {
+		const character = pair.argsRaw[index];
+		if (character === '"') return value;
+		if (character !== "\\") {
+			value += character;
+			continue;
+		}
+
+		const escaped = pair.argsRaw[++index];
+		if (escaped === undefined) break;
+		const escapes: Record<string, string> = {
+			'"': '"',
+			"\\": "\\",
+			"/": "/",
+			b: "\b",
+			f: "\f",
+			n: "\n",
+			r: "\r",
+			t: "\t",
+		};
+		value += escapes[escaped] ?? escaped;
+	}
+
+	return value || null;
 }
 
 function truncate(text: string, maxLen: number): string {

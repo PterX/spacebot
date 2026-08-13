@@ -126,6 +126,42 @@ Live SSE data improves freshness. It is not the only source of truth. The
 durable detail endpoint must render useful state after a restart before any
 worker has resumed.
 
+## Autonomy Continuity
+
+An autonomy run is allowed to end while its workers continue under supervisor
+ownership. The next run must receive the outcomes that arrived in the gap.
+Current active-worker rendering is insufficient: it only shows workers still
+running when the next briefing is built. A worker that completed after the
+previous channel exited has a durable `worker_runs` result, but no active row,
+no channel event handler to enqueue a wake, and no representation in the next
+run's context.
+
+Each terminal worker commit therefore creates a durable, owner-addressed outcome
+inbox entry. The entry includes the worker ID, task and autonomy run ownership,
+outcome kind, bounded result summary, transcript/checkpoint reference, and
+outcome version. Its creation is part of the terminal transaction or a
+transactional outbox consumed from that commit. It must not depend on a live
+channel receiving `WorkerComplete`.
+
+At the start of an autonomy run, the driver claims unacknowledged inbox entries
+for that agent before rendering the system context. It renders two separate
+sections:
+
+- **Workers still running**: worker ID, task, owner, lifecycle, last progress,
+  and recovery state. This prevents duplicate work.
+- **Worker outcomes since the previous run**: task, outcome, bounded result,
+  and the next action required. This lets the model finish follow-up work,
+  update task state, or report a blocker.
+
+Claiming is idempotent by worker ID and outcome version. The run records the
+claimed entry IDs with its provenance. If it crashes before its own terminal
+summary commits, a later run can reclaim those entries. A completed worker is
+never hidden merely because it completed between autonomy runs.
+
+The current run may still receive a live completion retrigger. That is a
+latency optimization only. The durable inbox is the source of truth for every
+completion that arrives after the parent channel exits or misses an event.
+
 ## Delivery Phases
 
 ### Phase 1: Stop terminalizing recoverable conditions
@@ -158,7 +194,14 @@ supervisor instead of orphaning or cancelling them.
 Expose checkpoints, attempts, recovery state, and transcript cursors through
 the worker API and `worker_inspect`. Retain live SSE as an additional view.
 
-### Phase 6: Retire legacy termination controls
+### Phase 6: Deliver outcomes across autonomy runs
+
+Create the transactional worker-outcome inbox, render active workers and
+unacknowledged completed outcomes separately in each autonomy run, and record
+idempotent inbox consumption with the run. Move completion wake production from
+the parent channel event handler to durable terminal-outcome delivery.
+
+### Phase 7: Retire legacy termination controls
 
 Delete constants and branches that convert resource pressure or transient
 execution faults directly into terminal worker outcomes. Keep bounded artifact
@@ -177,5 +220,8 @@ size, retry scheduling, and repetition detection as recovery inputs.
 - Query worker detail before restart, after restart before recovery, and after
   recovery. Verify a durable transcript and recovery state are available in all
   three cases.
+- End an autonomy run with an owned worker still active, let the worker finish
+  before the next wake, and verify the next run receives its outcome from the
+  durable inbox and does not duplicate the task.
 - Verify explicit cancellation preserves the latest checkpoint and does not
   overwrite a concurrent successful completion.
