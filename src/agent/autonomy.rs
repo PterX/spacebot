@@ -236,7 +236,7 @@ pub async fn maybe_run_autonomy(deps: &AgentDeps) {
     tokio::spawn(async move {
         if let Err(error) = run_autonomy_channel(&deps, run_id.clone(), config).await {
             tracing::error!(%error, run_id = %run_id, "autonomy run failed");
-            if let Err(finish_error) = deps
+            match deps
                 .autonomy_run_store
                 .finish_run_status(
                     &run_id,
@@ -245,7 +245,13 @@ pub async fn maybe_run_autonomy(deps: &AgentDeps) {
                 )
                 .await
             {
-                tracing::warn!(%finish_error, run_id = %run_id, "failed to record autonomy run failure");
+                Ok(true) => {
+                    publish_terminal_summary(&deps, &run_id, &format!("run failed: {error}"))
+                }
+                Ok(false) => {}
+                Err(finish_error) => {
+                    tracing::warn!(%finish_error, run_id = %run_id, "failed to record autonomy run failure");
+                }
             }
         }
     });
@@ -445,7 +451,7 @@ pub async fn run_autonomy_channel(
             .await?;
         if recorded {
             handle.mark_completed();
-            publish_terminal_summary(deps, &request.summary);
+            publish_terminal_summary(deps, &run_id, &request.summary);
         }
     } else if !handle.completed() {
         if let Some(failure) = &channel_failed {
@@ -454,7 +460,7 @@ pub async fn run_autonomy_channel(
                 .finish_run_status(&run_id, AutonomyRunStatus::Failed, Some(failure))
                 .await?;
             if recorded {
-                publish_terminal_summary(deps, failure);
+                publish_terminal_summary(deps, &run_id, failure);
             }
         } else if timed_out {
             let recorded = deps
@@ -466,7 +472,7 @@ pub async fn run_autonomy_channel(
                 )
                 .await?;
             if recorded {
-                publish_terminal_summary(deps, AUTONOMY_FALLBACK_SUMMARY);
+                publish_terminal_summary(deps, &run_id, AUTONOMY_FALLBACK_SUMMARY);
             }
         } else {
             // The channel-side contract retries were exhausted without a
@@ -476,7 +482,7 @@ pub async fn run_autonomy_channel(
                 .complete_run(&run_id, AUTONOMY_FALLBACK_SUMMARY, &[])
                 .await?;
             if recorded {
-                publish_terminal_summary(deps, AUTONOMY_FALLBACK_SUMMARY);
+                publish_terminal_summary(deps, &run_id, AUTONOMY_FALLBACK_SUMMARY);
             }
         }
     }
@@ -499,10 +505,13 @@ pub async fn run_autonomy_channel(
 
 /// The run table transition is the idempotency boundary. Only the caller that
 /// changes a run from `running` may add its conclusion to the channel record.
-fn publish_terminal_summary(deps: &AgentDeps, summary: &str) {
+fn publish_terminal_summary(deps: &AgentDeps, run_id: &str, summary: &str) {
     let channel_id: crate::ChannelId = Arc::from(AUTONOMY_CONVERSATION_ID);
-    crate::conversation::ConversationLogger::new(deps.sqlite_pool.clone())
-        .log_bot_message(&channel_id, summary);
+    crate::conversation::ConversationLogger::new(deps.sqlite_pool.clone()).log_bot_message_with_id(
+        &channel_id,
+        &format!("autonomy-outcome:{run_id}"),
+        summary,
+    );
     if let Err(error) = deps
         .event_tx
         .send(crate::ProcessEvent::ChannelAssistantMessage {

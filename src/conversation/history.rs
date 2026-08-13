@@ -451,6 +451,36 @@ impl ConversationLogger {
         self.log_bot_message_with_metadata(channel_id, content, sender_name, None);
     }
 
+    /// Log an assistant message with a caller-owned id. Duplicate writes are
+    /// ignored so a durable terminal transition can safely retry publication.
+    pub fn log_bot_message_with_id(&self, channel_id: &ChannelId, id: &str, content: &str) {
+        let pool = self.pool.clone();
+        let id = id.to_string();
+        let channel_id = channel_id.to_string();
+        let content = content.to_string();
+
+        let pending = self.pending_writes.clone();
+        pending.begin();
+        tokio::spawn(async move {
+            let _finish = PendingWriteGuard(pending);
+            if let Err(error) = sqlx::query(
+                "INSERT OR IGNORE INTO conversation_messages \
+                 (id, channel_id, role, content, seq) \
+                 VALUES (?, ?, 'assistant', ?, \
+                    COALESCE((SELECT MAX(seq) FROM conversation_messages WHERE channel_id = ?), 0) + 1)",
+            )
+            .bind(&id)
+            .bind(&channel_id)
+            .bind(&content)
+            .bind(&channel_id)
+            .execute(&pool)
+            .await
+            {
+                tracing::warn!(%error, %id, "failed to persist bot message");
+            }
+        });
+    }
+
     /// Log a bot message with optional tool calls packed into metadata. Fire-and-forget.
     pub fn log_bot_message_with_metadata(
         &self,
