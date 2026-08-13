@@ -200,6 +200,25 @@ impl SpawnWorkerTool {
     }
 }
 
+fn normalize_task_number(task_number: Option<i64>) -> Result<Option<i64>, SpawnWorkerError> {
+    match task_number {
+        None | Some(0) => Ok(None),
+        Some(number) if number > 0 => Ok(Some(number)),
+        Some(number) => Err(SpawnWorkerError(format!(
+            "task_number must be positive when provided, got {number}; omit it or use null for ad-hoc work"
+        ))),
+    }
+}
+
+fn task_number_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": ["integer", "null"],
+        "minimum": 1,
+        "default": null,
+        "description": "Positive task-board number (#N) when this spawn executes an existing board task. Omit or use null for ad-hoc work. The task must be approved; its execution plan (worker type, project, worktree, required skills) is enforced over the other arguments, and the worker is bound to the task."
+    })
+}
+
 fn summarize_duplicate_task(task: &str) -> String {
     let trimmed = task.trim();
     if trimmed.is_empty() {
@@ -253,9 +272,9 @@ pub struct SpawnWorkerArgs {
     /// automatically set to the worktree path.
     #[serde(default)]
     pub worktree_id: Option<String>,
-    /// Task-board number this spawn executes. The task's execution plan
-    /// (worker type, project, worktree, required skills) is loaded and
-    /// enforced, and the worker is bound to the task.
+    /// Positive task-board number this spawn executes. Omit for ad-hoc work.
+    /// The task's execution plan (worker type, project, worktree, required
+    /// skills) is loaded and enforced, and the worker is bound to the task.
     #[serde(default)]
     pub task_number: Option<i64>,
 }
@@ -359,10 +378,7 @@ impl Tool for SpawnWorkerTool {
                 "items": { "type": "string" },
                 "description": "Skill names from <available_skills> that are likely relevant to this task. The worker sees all skills and decides what to read, but suggested skills are flagged as recommended."
             },
-            "task_number": {
-                "type": "integer",
-                "description": "Task-board number (#N) this spawn executes. The task must be approved; its execution plan (worker type, project, worktree, required skills) is enforced over the other arguments, and the worker is bound to the task."
-            }
+            "task_number": task_number_schema()
         });
 
         if opencode_enabled && let Some(obj) = properties.as_object_mut() {
@@ -414,7 +430,8 @@ impl Tool for SpawnWorkerTool {
 
         // A task-bound spawn loads the task's execution plan; plan fields win
         // over the equivalent arguments.
-        let planned = match args.task_number {
+        let task_number = normalize_task_number(args.task_number)?;
+        let planned = match task_number {
             Some(number) => Some(self.resolve_task_plan(number).await?),
             None => None,
         };
@@ -612,6 +629,55 @@ impl Tool for SpawnWorkerTool {
             interactive: effectively_interactive,
             message: format!("{message}{readiness_note}"),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_number_wire_values_preserve_ad_hoc_spawns() {
+        let omitted: SpawnWorkerArgs = serde_json::from_value(serde_json::json!({
+            "task": "inspect the repository"
+        }))
+        .expect("omitted task_number should deserialize");
+        let null: SpawnWorkerArgs = serde_json::from_value(serde_json::json!({
+            "task": "inspect the repository",
+            "task_number": null
+        }))
+        .expect("null task_number should deserialize");
+        let zero: SpawnWorkerArgs = serde_json::from_value(serde_json::json!({
+            "task": "inspect the repository",
+            "task_number": 0
+        }))
+        .expect("legacy zero task_number should deserialize");
+
+        assert_eq!(normalize_task_number(omitted.task_number).unwrap(), None);
+        assert_eq!(normalize_task_number(null.task_number).unwrap(), None);
+        assert_eq!(normalize_task_number(zero.task_number).unwrap(), None);
+    }
+
+    #[test]
+    fn task_number_normalization_accepts_only_positive_board_numbers() {
+        assert_eq!(normalize_task_number(Some(42)).unwrap(), Some(42));
+
+        let error = normalize_task_number(Some(-1)).unwrap_err();
+        assert!(error.to_string().contains("task_number must be positive"));
+    }
+
+    #[test]
+    fn task_number_schema_exposes_nullable_positive_integer() {
+        let schema = task_number_schema();
+
+        assert_eq!(schema["type"], serde_json::json!(["integer", "null"]));
+        assert_eq!(schema["minimum"], 1);
+        assert_eq!(schema["default"], serde_json::Value::Null);
+        assert!(
+            schema["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("Omit or use null for ad-hoc work"))
+        );
     }
 }
 

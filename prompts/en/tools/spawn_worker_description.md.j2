@@ -2,6 +2,6 @@ Spawn an independent worker process. By default uses a built-in agent with {tool
 
 If OpenCode is enabled and the task is coding-heavy (multi-file edits, debugging, refactors), set `worker_type` to `"opencode"` and include a `directory`.
 
-When the work executes a board task, pass `task_number` — the task's execution plan (worker type, project, worktree, required skills) is loaded and enforced over the other arguments, the worker is bound to the task, and an approved task moves to in-progress. A task with worktree_mode "create" gets its own worktree provisioned automatically.
+When the work executes an existing board task, pass its positive `task_number` — the task's execution plan (worker type, project, worktree, required skills) is loaded and enforced over the other arguments, the worker is bound to the task, and an approved task moves to in-progress. Omit `task_number` for ad-hoc work. A task with worktree_mode "create" gets its own worktree provisioned automatically.
 
 {sandbox_note}
