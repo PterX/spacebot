@@ -2250,11 +2250,8 @@ async fn initialize_agents(
             .collect(),
     );
 
-    // Wake-dispatch infrastructure for dormant-mode agents. Always spawned
-    // so active-mode agents can also participate (cron / message wake hooks
-    // are mode-agnostic — `cortex::wake_one` is a no-op contention with the
-    // active loop's pickup, harmless either way). The registry lives on
-    // `api_state` so runtime agent-create / agent-delete paths can keep it
+    // Wake-dispatch infrastructure for autonomy channels. The registry lives
+    // on `api_state` so runtime agent-create / agent-delete paths can keep it
     // in sync without going through main.
     let wake_registry = api_state.wake_registry.clone();
     let wake_tx = spacebot::agent::wake::spawn_wake_manager(wake_registry.clone());
@@ -3348,14 +3345,6 @@ async fn initialize_agents(
             spacebot::agent::cortex::spawn_association_loop(agent.deps.clone(), cortex_logger);
         cortex_handles.push(association_handle);
         tracing::info!(agent_id = %agent_id, "cortex association loop started");
-
-        let ready_task_handle = spacebot::agent::cortex::spawn_ready_task_loop(
-            agent.deps.clone(),
-            spacebot::agent::cortex::CortexLogger::new(agent.db.sqlite.clone())
-                .with_notifications(global_notification_store.clone(), agent_id.to_string()),
-        );
-        cortex_handles.push(ready_task_handle);
-        tracing::info!(agent_id = %agent_id, "cortex ready-task loop started");
     }
 
     // Spawn the instance-wide memory janitor when configured. Required for

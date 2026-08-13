@@ -1213,7 +1213,6 @@ pub struct CortexConfig {
     /// A per-job `timeout_secs` always wins over this default.
     pub cron_default_timeout_secs: Option<u64>,
     pub branch_timeout_secs: u64,
-    pub detached_worker_timeout_retry_limit: u8,
     pub supervisor_kill_budget_per_tick: usize,
     pub circuit_breaker_threshold: u8,
     /// Interval in seconds between memory bulletin refreshes.
@@ -1258,7 +1257,6 @@ impl Default for CortexConfig {
                 crate::agent::worker::DEFAULT_WORKER_WALL_CLOCK_TIMEOUT_SECS,
             cron_default_timeout_secs: None,
             branch_timeout_secs: 600,
-            detached_worker_timeout_retry_limit: 2,
             supervisor_kill_budget_per_tick: 8,
             circuit_breaker_threshold: 3,
             maintenance_interval_secs: 3600,

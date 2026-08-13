@@ -938,7 +938,10 @@ async fn spawn_worker_inner(
             &state.deps.agent_id,
             interactive,
             None,
-            None,
+            state
+                .autonomy_run
+                .as_ref()
+                .map(|autonomy_run| autonomy_run.run_id.as_str()),
             None,
         )
         .await
@@ -1157,7 +1160,10 @@ async fn spawn_opencode_worker_inner(
             &state.deps.agent_id,
             interactive,
             Some(&persist_directory),
-            None,
+            state
+                .autonomy_run
+                .as_ref()
+                .map(|autonomy_run| autonomy_run.run_id.as_str()),
             None,
         )
         .await

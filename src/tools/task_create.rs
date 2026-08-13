@@ -349,42 +349,29 @@ impl Tool for TaskCreateTool {
 
         let task = self
             .task_store
-            .create(CreateTaskInput {
-                owner_agent_id: self.agent_id.clone(),
-                assigned_agent_id: Some(self.agent_id.clone()),
-                title: args.title,
-                description: args.description,
-                status,
-                priority,
-                subtasks,
-                metadata: args.metadata.unwrap_or_else(|| serde_json::json!({})),
-                source_memory_id: None,
-                created_by: self.created_by.clone(),
-                worker_type,
-                project_id,
-                repo_id: args.repo_id,
-                worktree_mode,
-                worktree_id: args.worktree_id,
-                required_skills: args.required_skills,
-            })
+            .create_with_dependencies(
+                CreateTaskInput {
+                    owner_agent_id: self.agent_id.clone(),
+                    assigned_agent_id: Some(self.agent_id.clone()),
+                    title: args.title,
+                    description: args.description,
+                    status,
+                    priority,
+                    subtasks,
+                    metadata: args.metadata.unwrap_or_else(|| serde_json::json!({})),
+                    source_memory_id: None,
+                    created_by: self.created_by.clone(),
+                    worker_type,
+                    project_id,
+                    repo_id: args.repo_id,
+                    worktree_mode,
+                    worktree_id: args.worktree_id,
+                    required_skills: args.required_skills,
+                },
+                &depends_on,
+            )
             .await
             .map_err(|error| TaskCreateError(format!("{error}")))?;
-
-        // Edges attach after the row exists; a bad edge fails loudly rather
-        // than silently dropping the ordering.
-        let task = if depends_on.is_empty() {
-            task
-        } else {
-            self.task_store
-                .set_dependencies(task.task_number, &depends_on)
-                .await
-                .map_err(|error| {
-                    TaskCreateError(format!(
-                        "task #{} created, but dependencies were rejected: {error}",
-                        task.task_number
-                    ))
-                })?
-        };
 
         // Emit SSE event + notification so the dashboard updates in real time.
         if let Some(api_state) = &self.api_state {

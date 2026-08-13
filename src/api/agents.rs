@@ -1147,10 +1147,6 @@ pub async fn create_agent_internal(
     let _cortex_loop = crate::agent::cortex::spawn_cortex_loop(deps.clone(), cortex_logger.clone());
     let _association_loop =
         crate::agent::cortex::spawn_association_loop(deps.clone(), cortex_logger);
-    crate::agent::cortex::spawn_ready_task_loop(
-        deps.clone(),
-        make_cortex_logger(db.sqlite.clone()),
-    );
 
     let ingestion_config = **runtime_config.ingestion.load();
     if ingestion_config.enabled {

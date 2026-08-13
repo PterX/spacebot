@@ -277,19 +277,21 @@ impl Tool for TaskUpdateTool {
             required_skills: args.required_skills,
         };
 
-        if let Some(depends_on) = &args.depends_on {
-            let edges = crate::tools::task_create::parse_dependency_args(depends_on)
-                .map_err(TaskUpdateError)?;
-            self.task_store
-                .set_dependencies(task_number, &edges)
-                .await
-                .map_err(|error| TaskUpdateError(format!("{error}")))?;
-        }
+        let edges = args
+            .depends_on
+            .as_deref()
+            .map(crate::tools::task_create::parse_dependency_args)
+            .transpose()
+            .map_err(TaskUpdateError)?;
 
         let update_result = match &self.scope {
             TaskUpdateScope::Branch => self
                 .task_store
-                .update_with_status_transition(task_number, input)
+                .update_with_dependencies_and_status_transition(
+                    task_number,
+                    input,
+                    edges.as_deref(),
+                )
                 .await
                 .map_err(|error| TaskUpdateError(format!("{error}")))?
                 .ok_or_else(|| TaskUpdateError(format!("task #{} not found", task_number)))?,

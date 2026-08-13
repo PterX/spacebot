@@ -1,29 +1,15 @@
-//! Supervision control plane for channel and detached worker cancellation.
+//! Supervision control plane for channel cancellation.
 
 use crate::agent::channel::WeakChannelControlHandle;
-use crate::{AgentId, BranchId, ChannelId, WorkerId};
+use crate::{BranchId, ChannelId, WorkerId};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlActionResult {
     Cancelled,
     NotFound,
     AlreadyTerminal,
-}
-
-pub const DETACHED_WORKER_LIFECYCLE_ACTIVE: u8 = 0;
-pub const DETACHED_WORKER_LIFECYCLE_COMPLETING: u8 = 1;
-pub const DETACHED_WORKER_LIFECYCLE_KILLING: u8 = 2;
-pub const DETACHED_WORKER_LIFECYCLE_TERMINAL: u8 = 3;
-
-#[derive(Debug, Clone)]
-pub struct DetachedWorkerControlSnapshot {
-    pub worker_id: WorkerId,
-    pub agent_id: AgentId,
-    pub task_number: i64,
-    pub lifecycle: u8,
 }
 
 #[derive(Clone)]
@@ -38,35 +24,8 @@ enum ChannelLookupResult {
     Missing,
 }
 
-pub struct DetachedWorkerControl {
-    pub worker_id: WorkerId,
-    pub agent_id: AgentId,
-    pub task_number: i64,
-    pub cancel_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    pub lifecycle: Arc<AtomicU8>,
-}
-
-impl DetachedWorkerControl {
-    pub fn new(
-        worker_id: WorkerId,
-        agent_id: AgentId,
-        task_number: i64,
-        cancel_tx: tokio::sync::oneshot::Sender<()>,
-        lifecycle: Arc<AtomicU8>,
-    ) -> Self {
-        Self {
-            worker_id,
-            agent_id,
-            task_number,
-            cancel_tx: Mutex::new(Some(cancel_tx)),
-            lifecycle,
-        }
-    }
-}
-
 pub struct ProcessControlRegistry {
     channels: tokio::sync::RwLock<HashMap<ChannelId, ChannelControlEntry>>,
-    detached_workers: tokio::sync::RwLock<HashMap<WorkerId, DetachedWorkerControl>>,
     next_channel_registration: AtomicU64,
 }
 
@@ -80,7 +39,6 @@ impl ProcessControlRegistry {
     pub fn new() -> Self {
         Self {
             channels: tokio::sync::RwLock::new(HashMap::new()),
-            detached_workers: tokio::sync::RwLock::new(HashMap::new()),
             next_channel_registration: AtomicU64::new(1),
         }
     }
@@ -119,34 +77,6 @@ impl ProcessControlRegistry {
         let before = channels.len();
         channels.retain(|_, entry| entry.handle.upgrade().is_some());
         before.saturating_sub(channels.len())
-    }
-
-    pub async fn register_detached_worker(&self, control: DetachedWorkerControl) {
-        self.detached_workers
-            .write()
-            .await
-            .insert(control.worker_id, control);
-    }
-
-    pub async fn unregister_detached_worker(&self, worker_id: WorkerId) -> bool {
-        self.detached_workers
-            .write()
-            .await
-            .remove(&worker_id)
-            .is_some()
-    }
-
-    pub async fn detached_worker_snapshots(&self) -> Vec<DetachedWorkerControlSnapshot> {
-        let workers = self.detached_workers.read().await;
-        workers
-            .values()
-            .map(|control| DetachedWorkerControlSnapshot {
-                worker_id: control.worker_id,
-                agent_id: control.agent_id.clone(),
-                task_number: control.task_number,
-                lifecycle: control.lifecycle.load(Ordering::Acquire),
-            })
-            .collect()
     }
 
     /// Live control handle for a channel, when one is running. Prunes a
@@ -240,81 +170,13 @@ impl ProcessControlRegistry {
 
         should_remove
     }
-
-    pub async fn cancel_detached_worker(
-        &self,
-        worker_id: WorkerId,
-        reason: &str,
-    ) -> ControlActionResult {
-        let mut workers = self.detached_workers.write().await;
-        let Some(control) = workers.get_mut(&worker_id) else {
-            return ControlActionResult::NotFound;
-        };
-
-        if control
-            .lifecycle
-            .compare_exchange(
-                DETACHED_WORKER_LIFECYCLE_ACTIVE,
-                DETACHED_WORKER_LIFECYCLE_KILLING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
-            return ControlActionResult::AlreadyTerminal;
-        }
-
-        let mut cancel_tx_guard = control.cancel_tx.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(cancel_tx) = cancel_tx_guard.take()
-            && cancel_tx.send(()).is_err()
-        {
-            tracing::debug!(
-                worker_id = %worker_id,
-                "detached worker cancel signal receiver already dropped"
-            );
-        }
-
-        tracing::info!(
-            worker_id = %worker_id,
-            task_number = control.task_number,
-            reason,
-            "supervisor sent detached worker cancel signal"
-        );
-
-        ControlActionResult::Cancelled
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ControlActionResult, DETACHED_WORKER_LIFECYCLE_ACTIVE, DetachedWorkerControl,
-        DetachedWorkerControlSnapshot, ProcessControlRegistry,
-    };
+    use super::{ControlActionResult, ProcessControlRegistry};
     use crate::agent::channel::WeakChannelControlHandle;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    #[tokio::test]
-    async fn register_and_unregister_detached_worker() {
-        let registry = ProcessControlRegistry::new();
-        let worker_id = uuid::Uuid::new_v4();
-        let lifecycle = Arc::new(AtomicU8::new(DETACHED_WORKER_LIFECYCLE_ACTIVE));
-        let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel();
-
-        registry
-            .register_detached_worker(DetachedWorkerControl::new(
-                worker_id,
-                Arc::from("agent"),
-                7,
-                cancel_tx,
-                lifecycle,
-            ))
-            .await;
-
-        assert!(registry.unregister_detached_worker(worker_id).await);
-        assert!(!registry.unregister_detached_worker(worker_id).await);
-    }
 
     #[tokio::test]
     async fn prune_dead_channels_removes_stale_entries() {
@@ -387,10 +249,6 @@ mod tests {
                 .await,
             ControlActionResult::NotFound
         );
-        assert_eq!(
-            registry.cancel_detached_worker(worker_id, "test").await,
-            ControlActionResult::NotFound
-        );
     }
 
     #[tokio::test]
@@ -415,62 +273,5 @@ mod tests {
                 .await,
             "stale entry should be pruned during cancellation retry path"
         );
-    }
-
-    #[tokio::test]
-    async fn cancel_detached_worker_is_single_winner_and_idempotent() {
-        let registry = ProcessControlRegistry::new();
-        let worker_id = uuid::Uuid::new_v4();
-        let lifecycle = Arc::new(AtomicU8::new(DETACHED_WORKER_LIFECYCLE_ACTIVE));
-        let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
-
-        registry
-            .register_detached_worker(DetachedWorkerControl::new(
-                worker_id,
-                Arc::from("agent"),
-                42,
-                cancel_tx,
-                lifecycle.clone(),
-            ))
-            .await;
-
-        let first = registry.cancel_detached_worker(worker_id, "timeout").await;
-        assert_eq!(first, ControlActionResult::Cancelled);
-        assert!(cancel_rx.try_recv().is_ok());
-
-        let second = registry.cancel_detached_worker(worker_id, "timeout").await;
-        assert_eq!(second, ControlActionResult::AlreadyTerminal);
-
-        assert_eq!(
-            lifecycle.load(Ordering::Acquire),
-            super::DETACHED_WORKER_LIFECYCLE_KILLING
-        );
-    }
-
-    #[tokio::test]
-    async fn detached_worker_snapshots_capture_state() {
-        let registry = ProcessControlRegistry::new();
-        let worker_id = uuid::Uuid::new_v4();
-        let lifecycle = Arc::new(AtomicU8::new(DETACHED_WORKER_LIFECYCLE_ACTIVE));
-        let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel();
-
-        registry
-            .register_detached_worker(DetachedWorkerControl::new(
-                worker_id,
-                Arc::from("agent"),
-                99,
-                cancel_tx,
-                lifecycle,
-            ))
-            .await;
-
-        let snapshots = registry.detached_worker_snapshots().await;
-        assert_eq!(snapshots.len(), 1);
-
-        let snapshot: DetachedWorkerControlSnapshot = snapshots[0].clone();
-        assert_eq!(snapshot.worker_id, worker_id);
-        assert_eq!(snapshot.agent_id.as_ref(), "agent");
-        assert_eq!(snapshot.task_number, 99);
-        assert_eq!(snapshot.lifecycle, DETACHED_WORKER_LIFECYCLE_ACTIVE);
     }
 }

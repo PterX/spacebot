@@ -67,15 +67,6 @@ impl AutonomyRunHandle {
     }
 }
 
-/// Whether the cortex may pick up `ready` tasks for execution.
-///
-/// Execution without a user present is Act-only: `observe` surveys, `suggest`
-/// enriches and proposes, but only `act` runs approved work. `off` disables
-/// autonomous pickup entirely.
-pub fn ready_pickup_allowed(level: AutonomyLevel) -> bool {
-    level == AutonomyLevel::Act
-}
-
 /// Whether an autonomy run is due right now.
 ///
 /// Pure over its inputs so the decision is unit-testable: a run is due when
@@ -220,6 +211,11 @@ pub async fn maybe_run_autonomy(deps: &AgentDeps) {
             }
         }
     });
+}
+
+/// Handle an external wake by checking whether an autonomy run is due.
+pub async fn wake_one(deps: &AgentDeps) {
+    maybe_run_autonomy(deps).await;
 }
 
 /// Execute a single autonomy run: consume pending wake events, assemble the
@@ -416,13 +412,6 @@ pub async fn run_autonomy_channel(
                 .complete_run(&run_id, AUTONOMY_FALLBACK_SUMMARY, &[])
                 .await?;
         }
-    }
-
-    // Wake the ready-task pickup so side-effect tasks created during the run
-    // (delegations, follow-ups) are noticed promptly. Fired after the channel
-    // exits so the one-shot wake actually finds the rows.
-    if let Some(wake_tx) = deps.wake_tx.as_ref() {
-        crate::agent::wake::fire_wake(wake_tx, &deps.agent_id);
     }
 
     if let Err(error) = deps
@@ -793,14 +782,6 @@ mod tests {
             12,
             1800
         ));
-    }
-
-    #[test]
-    fn ready_pickup_is_act_only() {
-        assert!(!ready_pickup_allowed(AutonomyLevel::Off));
-        assert!(!ready_pickup_allowed(AutonomyLevel::Observe));
-        assert!(!ready_pickup_allowed(AutonomyLevel::Suggest));
-        assert!(ready_pickup_allowed(AutonomyLevel::Act));
     }
 
     fn task_with_assignment(assigned: Option<&str>) -> Task {

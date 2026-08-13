@@ -4,15 +4,13 @@
 //! spawn — the agent stays idle until an external event delivers a wake.
 //! Wake triggers send the receiving agent's ID over an unbounded mpsc;
 //! `WakeManager` consumes from that channel and dispatches to the agent's
-//! `cortex::wake()` entry point.
+//! `autonomy::wake_one()` entry point.
 //!
-//! Active-mode agents are also valid wake targets — wake is a no-op (idempotent)
-//! when the cortex's normal loops are already covering pickup. Triggers fire
-//! the same wake call regardless of mode; the receiving agent decides whether
-//! the wake is meaningful.
+//! Active-mode agents are also valid wake targets. Triggers fire the same wake
+//! call regardless of mode; the receiving agent decides whether a run is due.
 //!
 //! This module owns no business logic — it's purely the dispatch substrate.
-//! The "do work" happens in `cortex::wake_one`, which `WakeManager` calls.
+//! The "do work" happens in `autonomy::wake_one`, which `WakeManager` calls.
 
 use crate::AgentDeps;
 use crate::AgentId;
@@ -47,13 +45,7 @@ pub fn spawn_wake_manager(
                 continue;
             };
             tokio::spawn(async move {
-                if let Err(error) = crate::agent::cortex::wake_one(&deps).await {
-                    tracing::warn!(
-                        agent_id = %deps.agent_id,
-                        %error,
-                        "cortex wake failed",
-                    );
-                }
+                crate::agent::autonomy::wake_one(&deps).await;
             });
         }
         tracing::info!("wake manager exiting (channel closed)");

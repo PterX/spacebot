@@ -57,7 +57,6 @@ pub struct CortexSection {
     pub maintenance_interval_secs: u64,
     pub worker_timeout_secs: u64,
     pub branch_timeout_secs: u64,
-    pub detached_worker_timeout_retry_limit: u8,
     pub supervisor_kill_budget_per_tick: usize,
     pub circuit_breaker_threshold: u8,
     pub maintenance_decay_rate: f32,
@@ -241,7 +240,6 @@ pub(super) struct CortexUpdate {
     maintenance_interval_secs: Option<u64>,
     worker_timeout_secs: Option<u64>,
     branch_timeout_secs: Option<u64>,
-    detached_worker_timeout_retry_limit: Option<u8>,
     supervisor_kill_budget_per_tick: Option<usize>,
     circuit_breaker_threshold: Option<u8>,
     maintenance_decay_rate: Option<f32>,
@@ -399,7 +397,6 @@ pub(super) async fn get_agent_config(
             maintenance_interval_secs: cortex.maintenance_interval_secs,
             worker_timeout_secs: cortex.worker_timeout_secs,
             branch_timeout_secs: cortex.branch_timeout_secs,
-            detached_worker_timeout_retry_limit: cortex.detached_worker_timeout_retry_limit,
             supervisor_kill_budget_per_tick: cortex.supervisor_kill_budget_per_tick,
             circuit_breaker_threshold: cortex.circuit_breaker_threshold,
             maintenance_decay_rate: cortex.maintenance_decay_rate,
@@ -837,9 +834,6 @@ fn update_cortex_table(
     }
     if let Some(v) = cortex.branch_timeout_secs {
         table["branch_timeout_secs"] = toml_edit::value(to_i64_from_u64("branch_timeout_secs", v)?);
-    }
-    if let Some(v) = cortex.detached_worker_timeout_retry_limit {
-        table["detached_worker_timeout_retry_limit"] = toml_edit::value(i64::from(v));
     }
     if let Some(v) = cortex.supervisor_kill_budget_per_tick {
         table["supervisor_kill_budget_per_tick"] =
@@ -1340,7 +1334,6 @@ id = "main"
             maintenance_interval_secs: None,
             worker_timeout_secs: None,
             branch_timeout_secs: None,
-            detached_worker_timeout_retry_limit: None,
             supervisor_kill_budget_per_tick: Some(usize::MAX),
             circuit_breaker_threshold: None,
             maintenance_decay_rate: None,
@@ -1361,7 +1354,6 @@ id = "main"
             maintenance_interval_secs: None,
             worker_timeout_secs: None,
             branch_timeout_secs: None,
-            detached_worker_timeout_retry_limit: None,
             supervisor_kill_budget_per_tick: None,
             circuit_breaker_threshold: None,
             maintenance_decay_rate: None,
@@ -1392,7 +1384,6 @@ id = "main"
             maintenance_interval_secs: None,
             worker_timeout_secs: None,
             branch_timeout_secs: None,
-            detached_worker_timeout_retry_limit: None,
             supervisor_kill_budget_per_tick: None,
             circuit_breaker_threshold: None,
             maintenance_decay_rate: Some(1.1),
@@ -1410,7 +1401,6 @@ id = "main"
             maintenance_interval_secs: None,
             worker_timeout_secs: None,
             branch_timeout_secs: None,
-            detached_worker_timeout_retry_limit: None,
             supervisor_kill_budget_per_tick: None,
             circuit_breaker_threshold: None,
             maintenance_decay_rate: None,
@@ -1428,7 +1418,6 @@ id = "main"
             maintenance_interval_secs: Some(0),
             worker_timeout_secs: None,
             branch_timeout_secs: None,
-            detached_worker_timeout_retry_limit: None,
             supervisor_kill_budget_per_tick: None,
             circuit_breaker_threshold: None,
             maintenance_decay_rate: None,
@@ -1458,7 +1447,6 @@ id = "main"
             maintenance_interval_secs: Some(3_600),
             worker_timeout_secs: Some(321),
             branch_timeout_secs: Some(12),
-            detached_worker_timeout_retry_limit: Some(3),
             supervisor_kill_budget_per_tick: Some(12),
             circuit_breaker_threshold: Some(6),
             maintenance_decay_rate: Some(0.16),
@@ -1486,10 +1474,6 @@ id = "main"
         );
         assert_eq!(cortex["worker_timeout_secs"].as_integer(), Some(321));
         assert_eq!(cortex["branch_timeout_secs"].as_integer(), Some(12));
-        assert_eq!(
-            cortex["detached_worker_timeout_retry_limit"].as_integer(),
-            Some(3)
-        );
         assert_eq!(
             cortex["supervisor_kill_budget_per_tick"].as_integer(),
             Some(12)
@@ -1531,7 +1515,6 @@ id = "main"
             maintenance_interval_secs: None,
             worker_timeout_secs: None,
             branch_timeout_secs: None,
-            detached_worker_timeout_retry_limit: None,
             supervisor_kill_budget_per_tick: None,
             circuit_breaker_threshold: None,
             maintenance_decay_rate: None,
@@ -1547,7 +1530,6 @@ id = "main"
             maintenance_interval_secs: Some(4_800),
             worker_timeout_secs: None,
             branch_timeout_secs: None,
-            detached_worker_timeout_retry_limit: None,
             supervisor_kill_budget_per_tick: None,
             circuit_breaker_threshold: None,
             maintenance_decay_rate: Some(0.2),

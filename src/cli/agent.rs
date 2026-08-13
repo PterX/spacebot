@@ -453,13 +453,6 @@ fn config_rows(config: AgentConfigResponse) -> Vec<Vec<String>> {
         config.cortex.branch_timeout_secs.to_string(),
     );
     push(
-        "cortex.detached_worker_timeout_retry_limit",
-        config
-            .cortex
-            .detached_worker_timeout_retry_limit
-            .to_string(),
-    );
-    push(
         "cortex.supervisor_kill_budget_per_tick",
         config.cortex.supervisor_kill_budget_per_tick.to_string(),
     );

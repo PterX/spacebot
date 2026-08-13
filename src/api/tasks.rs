@@ -364,41 +364,32 @@ pub(super) async fn create_task(
         .unwrap_or_else(|| request.owner_agent_id.clone());
 
     let task = store
-        .create(crate::tasks::CreateTaskInput {
-            owner_agent_id: request.owner_agent_id,
-            assigned_agent_id: Some(assigned),
-            title: request.title,
-            description: request.description,
-            status,
-            priority,
-            subtasks: request.subtasks,
-            metadata: request.metadata.unwrap_or_else(|| serde_json::json!({})),
-            source_memory_id: request.source_memory_id,
-            created_by: request.created_by.unwrap_or_else(|| "human".to_string()),
-            worker_type: request.worker_type,
-            project_id: request.project_id,
-            repo_id: request.repo_id,
-            worktree_mode: request.worktree_mode,
-            worktree_id: request.worktree_id,
-            required_skills: request.required_skills,
-        })
+        .create_with_dependencies(
+            crate::tasks::CreateTaskInput {
+                owner_agent_id: request.owner_agent_id,
+                assigned_agent_id: Some(assigned),
+                title: request.title,
+                description: request.description,
+                status,
+                priority,
+                subtasks: request.subtasks,
+                metadata: request.metadata.unwrap_or_else(|| serde_json::json!({})),
+                source_memory_id: request.source_memory_id,
+                created_by: request.created_by.unwrap_or_else(|| "human".to_string()),
+                worker_type: request.worker_type,
+                project_id: request.project_id,
+                repo_id: request.repo_id,
+                worktree_mode: request.worktree_mode,
+                worktree_id: request.worktree_id,
+                required_skills: request.required_skills,
+            },
+            &dependency_edges(&request.depends_on),
+        )
         .await
         .map_err(|error| {
             tracing::warn!(%error, "failed to create task");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-
-    let task = if request.depends_on.is_empty() {
-        task
-    } else {
-        store
-            .set_dependencies(task.task_number, &dependency_edges(&request.depends_on))
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, task_number = task.task_number, "failed to set task dependencies");
-                StatusCode::BAD_REQUEST
-            })?
-    };
 
     finish_task_mutation(&state, &task, "created", None).await;
     Ok(Json(TaskResponse { task }))
@@ -430,18 +421,10 @@ pub(super) async fn update_task(
     let status = parse_status(request.status.as_deref())?;
     let priority = parse_priority(request.priority.as_deref())?;
 
-    if let Some(depends_on) = &request.depends_on {
-        store
-            .set_dependencies(number, &dependency_edges(depends_on))
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, task_number = number, "failed to set task dependencies");
-                StatusCode::BAD_REQUEST
-            })?;
-    }
+    let edges = request.depends_on.as_deref().map(dependency_edges);
 
     let update = store
-        .update_with_status_override(
+        .update_with_dependencies_and_status_override(
             number,
             crate::tasks::UpdateTaskInput {
                 title: request.title,
@@ -462,6 +445,7 @@ pub(super) async fn update_task(
                 worktree_id: request.worktree_id,
                 required_skills: request.required_skills,
             },
+            edges.as_deref(),
         )
         .await
         .map_err(|error| {

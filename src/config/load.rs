@@ -306,9 +306,6 @@ impl CortexConfig {
             branch_timeout_secs: overrides
                 .branch_timeout_secs
                 .unwrap_or(defaults.branch_timeout_secs),
-            detached_worker_timeout_retry_limit: overrides
-                .detached_worker_timeout_retry_limit
-                .unwrap_or(defaults.detached_worker_timeout_retry_limit),
             supervisor_kill_budget_per_tick: overrides
                 .supervisor_kill_budget_per_tick
                 .unwrap_or(defaults.supervisor_kill_budget_per_tick),
