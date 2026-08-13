@@ -232,6 +232,10 @@ pub enum ProcessEvent {
         result: String,
         notify: bool,
         success: bool,
+        outcome_kind: crate::conversation::WorkerOutcomeKind,
+        outcome_version: i64,
+        transcript_version: i64,
+        terminal_owner: Option<crate::conversation::WorkerTerminalOwner>,
     },
     ToolStarted {
         agent_id: AgentId,

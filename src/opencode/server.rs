@@ -549,6 +549,27 @@ pub struct OpenCodeServerPool {
     max_servers: usize,
 }
 
+pub struct OpenCodeDirectoryClaim {
+    pool: Arc<OpenCodeServerPool>,
+    directory: PathBuf,
+}
+
+impl OpenCodeDirectoryClaim {
+    pub fn new(pool: Arc<OpenCodeServerPool>, directory: PathBuf) -> Self {
+        Self { pool, directory }
+    }
+}
+
+impl Drop for OpenCodeDirectoryClaim {
+    fn drop(&mut self) {
+        let pool = self.pool.clone();
+        let directory = self.directory.clone();
+        tokio::spawn(async move {
+            pool.release_directory(&directory).await;
+        });
+    }
+}
+
 impl OpenCodeServerPool {
     /// Create a new server pool.
     pub fn new(

@@ -866,7 +866,26 @@ impl Tool for DetachedSpawnWorkerTool {
         let (worker, _input_tx) = worker;
         let worker_id = worker.id;
 
-        // Emit WorkerStarted event so the UI can track it.
+        // Log to worker_runs directly since there's no parent channel to do it.
+        let run_logger =
+            crate::conversation::history::ProcessRunLogger::new(self.deps.sqlite_pool.clone());
+        run_logger
+            .log_worker_started(
+                None,
+                worker_id,
+                &args.task,
+                "cortex",
+                &self.deps.agent_id,
+                false,
+                None,
+                None,
+                None,
+            )
+            .await
+            .map_err(|error| {
+                SpawnWorkerError(format!("failed to persist worker start: {error}"))
+            })?;
+
         let _ = self.deps.event_tx.send(crate::ProcessEvent::WorkerStarted {
             agent_id: self.deps.agent_id.clone(),
             worker_id,
@@ -886,19 +905,6 @@ impl Tool for DetachedSpawnWorkerTool {
             .importance(0.5)
             .record();
 
-        // Log to worker_runs directly since there's no parent channel to do it.
-        let run_logger =
-            crate::conversation::history::ProcessRunLogger::new(self.deps.sqlite_pool.clone());
-        run_logger.log_worker_started(
-            None,
-            worker_id,
-            &args.task,
-            "cortex",
-            &self.deps.agent_id,
-            false,
-            None,
-        );
-
         let secrets_store = rc.secrets.load().as_ref().clone();
         let worker_span = tracing::info_span!(
             "worker.run",
@@ -909,6 +915,9 @@ impl Tool for DetachedSpawnWorkerTool {
             worker_id,
             self.deps.event_tx.clone(),
             self.deps.agent_id.clone(),
+            None,
+            run_logger,
+            worker.transcript_snapshot(),
             None,
             secrets_store,
             "builtin",

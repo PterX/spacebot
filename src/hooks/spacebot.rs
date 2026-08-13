@@ -1252,8 +1252,8 @@ where
             guard.remove(_internal_call_id);
         }
         // Loop guard: check for repetitive tool calling before execution.
-        // Runs for all process types. Block → Skip (message becomes tool
-        // result), CircuitBreak → Terminate.
+        // Runs for all process types. Block becomes a tool result the model can
+        // recover from without terminating the process.
         if let Ok(mut guard) = self.loop_guard.lock() {
             match guard.check(tool_name, args) {
                 LoopGuardVerdict::Allow => {}
@@ -1264,14 +1264,6 @@ where
                         "loop guard blocked tool call"
                     );
                     return ToolCallHookAction::Skip { reason };
-                }
-                LoopGuardVerdict::CircuitBreak(reason) => {
-                    tracing::warn!(
-                        process_id = %self.process_id,
-                        tool_name = %tool_name,
-                        "loop guard circuit-breaking agent loop"
-                    );
-                    return ToolCallHookAction::Terminate { reason };
                 }
             }
         }

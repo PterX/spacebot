@@ -18,7 +18,9 @@ pub use chronicle::{
 };
 pub use history::{
     ConversationLogger, ProcessDetailRow, ProcessRunLogger, ProcessRunRow, TimelineItem,
-    WorkerDetailRow, WorkerRunRow,
+    WorkerCompletionCommit, WorkerDetailRow, WorkerLifecycle, WorkerOutcomeKind, WorkerRunRow,
+    WorkerStartResult, WorkerTerminalOutcome, WorkerTerminalOwner, WorkerTranscriptCommit,
+    WorkerTransitionResult,
 };
 pub use participants::{
     ActiveParticipant, participant_display_name, participant_memory_key, renderable_participants,

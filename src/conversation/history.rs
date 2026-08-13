@@ -2,11 +2,268 @@
 
 use crate::{BranchId, ChannelId, WorkerId};
 
-use serde::Serialize;
-use sqlx::{Row as _, SqlitePool};
+use serde::{Deserialize, Serialize};
+use sqlx::{Row as _, Sqlite, SqlitePool, Transaction};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerLifecycle {
+    Created,
+    Running,
+    WaitingForInput,
+    Cancelling,
+    TimingOut,
+    Completing,
+    Succeeded,
+    Partial,
+    Cancelled,
+    TimedOut,
+    Blocked,
+    Failed,
+}
+
+impl WorkerLifecycle {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Running => "running",
+            Self::WaitingForInput => "waiting_for_input",
+            Self::Cancelling => "cancelling",
+            Self::TimingOut => "timing_out",
+            Self::Completing => "completing",
+            Self::Succeeded => "succeeded",
+            Self::Partial => "partial",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded
+                | Self::Partial
+                | Self::Cancelled
+                | Self::TimedOut
+                | Self::Blocked
+                | Self::Failed
+        )
+    }
+
+    pub fn can_transition_to(self, target: Self) -> bool {
+        use WorkerLifecycle::{
+            Blocked, Cancelled, Cancelling, Completing, Created, Failed, Partial, Running,
+            Succeeded, TimedOut, TimingOut, WaitingForInput,
+        };
+
+        matches!(
+            (self, target),
+            (Created, Running)
+                | (
+                    Running,
+                    WaitingForInput | Cancelling | TimingOut | Completing | Failed
+                )
+                | (WaitingForInput, Running | Cancelling | Completing)
+                | (Cancelling, Cancelled | Succeeded | Partial)
+                | (TimingOut, TimedOut | Succeeded | Partial)
+                | (
+                    Completing,
+                    Succeeded | Partial | Cancelled | Blocked | Failed
+                )
+        )
+    }
+
+    fn display_status(self) -> &'static str {
+        match self {
+            Self::WaitingForInput => "idle",
+            Self::Succeeded | Self::Partial => "done",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut | Self::Blocked | Self::Failed => "failed",
+            Self::Created
+            | Self::Running
+            | Self::Cancelling
+            | Self::TimingOut
+            | Self::Completing => "running",
+        }
+    }
+}
+
+impl std::str::FromStr for WorkerLifecycle {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "created" => Ok(Self::Created),
+            "running" => Ok(Self::Running),
+            "waiting_for_input" => Ok(Self::WaitingForInput),
+            "cancelling" => Ok(Self::Cancelling),
+            "timing_out" => Ok(Self::TimingOut),
+            "completing" => Ok(Self::Completing),
+            "succeeded" => Ok(Self::Succeeded),
+            "partial" => Ok(Self::Partial),
+            "cancelled" => Ok(Self::Cancelled),
+            "timed_out" => Ok(Self::TimedOut),
+            "blocked" => Ok(Self::Blocked),
+            "failed" => Ok(Self::Failed),
+            _ => anyhow::bail!("can't parse worker lifecycle: unknown value {value}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerOutcomeKind {
+    Succeeded,
+    Partial,
+    Cancelled,
+    TimedOut,
+    Blocked,
+    Failed,
+}
+
+impl WorkerOutcomeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Partial => "partial",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn lifecycle(self) -> WorkerLifecycle {
+        match self {
+            Self::Succeeded => WorkerLifecycle::Succeeded,
+            Self::Partial => WorkerLifecycle::Partial,
+            Self::Cancelled => WorkerLifecycle::Cancelled,
+            Self::TimedOut => WorkerLifecycle::TimedOut,
+            Self::Blocked => WorkerLifecycle::Blocked,
+            Self::Failed => WorkerLifecycle::Failed,
+        }
+    }
+
+    pub fn is_success(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Partial)
+    }
+}
+
+impl std::str::FromStr for WorkerOutcomeKind {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "succeeded" => Ok(Self::Succeeded),
+            "partial" => Ok(Self::Partial),
+            "cancelled" => Ok(Self::Cancelled),
+            "timed_out" => Ok(Self::TimedOut),
+            "blocked" => Ok(Self::Blocked),
+            "failed" => Ok(Self::Failed),
+            _ => anyhow::bail!("can't parse worker outcome: unknown value {value}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerTerminalOwner {
+    Worker,
+    Cancel,
+    Timeout,
+    Supervisor,
+    Shutdown,
+    Reconcile,
+}
+
+impl WorkerTerminalOwner {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Worker => "worker",
+            Self::Cancel => "cancel",
+            Self::Timeout => "timeout",
+            Self::Supervisor => "supervisor",
+            Self::Shutdown => "shutdown",
+            Self::Reconcile => "reconcile",
+        }
+    }
+}
+
+impl std::str::FromStr for WorkerTerminalOwner {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "worker" => Ok(Self::Worker),
+            "cancel" => Ok(Self::Cancel),
+            "timeout" => Ok(Self::Timeout),
+            "supervisor" => Ok(Self::Supervisor),
+            "shutdown" => Ok(Self::Shutdown),
+            "reconcile" => Ok(Self::Reconcile),
+            _ => anyhow::bail!("can't parse worker terminal owner: unknown value {value}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerTransitionResult {
+    Applied {
+        previous: WorkerLifecycle,
+        current: WorkerLifecycle,
+    },
+    Conflict {
+        current: WorkerLifecycle,
+    },
+    NotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerStartResult {
+    Started,
+    Existing {
+        lifecycle: WorkerLifecycle,
+        run_id: Option<String>,
+        origin_branch_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerTranscriptCommit {
+    Applied {
+        transcript_version: i64,
+    },
+    Conflict {
+        lifecycle: WorkerLifecycle,
+        transcript_version: i64,
+    },
+    NotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerTerminalOutcome {
+    pub worker_id: String,
+    pub lifecycle: WorkerLifecycle,
+    pub outcome_kind: WorkerOutcomeKind,
+    pub outcome_summary: Option<String>,
+    pub result: String,
+    pub outcome_version: i64,
+    pub transcript_version: i64,
+    pub terminal_owner: Option<WorkerTerminalOwner>,
+    pub completed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerCompletionCommit {
+    Committed(WorkerTerminalOutcome),
+    Existing(WorkerTerminalOutcome),
+    Conflict { current: WorkerLifecycle },
+    NotFound,
+}
 
 /// Persists conversation messages (user and assistant) to SQLite.
 ///
@@ -534,9 +791,9 @@ impl ProcessRunLogger {
         Ok(result.rows_affected() == 1)
     }
 
-    /// Record a worker starting. Fire-and-forget.
+    /// Record a worker before its execution task is spawned.
     #[allow(clippy::too_many_arguments)]
-    pub fn log_worker_started(
+    pub async fn log_worker_started(
         &self,
         channel_id: Option<&ChannelId>,
         worker_id: WorkerId,
@@ -545,33 +802,44 @@ impl ProcessRunLogger {
         agent_id: &crate::AgentId,
         interactive: bool,
         directory: Option<&std::path::Path>,
-    ) {
-        let pool = self.pool.clone();
-        let id = worker_id.to_string();
-        let channel_id = channel_id.map(|c| c.to_string());
-        let task = task.to_string();
-        let worker_type = worker_type.to_string();
-        let agent_id = agent_id.to_string();
-        let directory = directory.map(|d| d.to_string_lossy().to_string());
+        run_id: Option<&str>,
+        origin_branch_id: Option<BranchId>,
+    ) -> crate::error::Result<WorkerStartResult> {
+        let worker_id = worker_id.to_string();
+        let result = sqlx::query(
+            "INSERT OR IGNORE INTO worker_runs \
+             (id, channel_id, task, worker_type, agent_id, interactive, directory, lifecycle, \
+              status, run_id, origin_branch_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'running', 'running', ?, ?)",
+        )
+        .bind(&worker_id)
+        .bind(channel_id.map(|channel_id| channel_id.as_ref()))
+        .bind(task)
+        .bind(worker_type)
+        .bind(agent_id.as_ref())
+        .bind(interactive)
+        .bind(directory.map(|directory| directory.to_string_lossy().to_string()))
+        .bind(run_id)
+        .bind(origin_branch_id.map(|branch_id| branch_id.to_string()))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
 
-        tokio::spawn(async move {
-            if let Err(error) = sqlx::query(
-                "INSERT OR IGNORE INTO worker_runs (id, channel_id, task, worker_type, agent_id, interactive, directory) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&id)
-            .bind(&channel_id)
-            .bind(&task)
-            .bind(&worker_type)
-            .bind(&agent_id)
-            .bind(interactive)
-            .bind(&directory)
-            .execute(&pool)
-            .await
-            {
-                tracing::warn!(%error, worker_id = %id, "failed to persist worker start");
-            }
-        });
+        if result.rows_affected() == 1 {
+            return Ok(WorkerStartResult::Started);
+        }
+
+        let row =
+            sqlx::query("SELECT lifecycle, run_id, origin_branch_id FROM worker_runs WHERE id = ?")
+                .bind(&worker_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|error| anyhow::anyhow!(error))?;
+        Ok(WorkerStartResult::Existing {
+            lifecycle: parse_lifecycle(&row, "lifecycle")?,
+            run_id: row.try_get("run_id").ok().flatten(),
+            origin_branch_id: row.try_get("origin_branch_id").ok().flatten(),
+        })
     }
 
     /// Link a worker run to a project and/or worktree. Fire-and-forget.
@@ -594,9 +862,8 @@ impl ProcessRunLogger {
         let worktree_id = worktree_id.map(|s| s.to_string());
 
         tokio::spawn(async move {
-            // The worker_run INSERT may not have committed yet (it's also
-            // fire-and-forget). Retry a few times with a short delay so we
-            // don't silently update 0 rows.
+            // Some callers link from a separate event loop before worker start has
+            // been observed. Retry a few times so the link is not silently lost.
             for attempt in 0..3u8 {
                 if attempt > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -625,7 +892,7 @@ impl ProcessRunLogger {
         });
     }
 
-    /// Update a worker's status. Fire-and-forget.
+    /// Update a worker's status.
     /// Most status text updates are transient — they're available via the
     /// in-memory StatusBlock for live workers and don't need to be persisted.
     /// The `status` column is reserved for the state enum (running/idle/done/failed).
@@ -633,78 +900,412 @@ impl ProcessRunLogger {
     /// The one exception: when an idle worker resumes (status contains
     /// "processing follow-up" or similar active-work indicators), we persist
     /// `running` to the DB so the frontend doesn't show stale "idle" state.
-    pub fn log_worker_status(&self, worker_id: WorkerId, status: &str) {
+    pub async fn log_worker_status(
+        &self,
+        worker_id: WorkerId,
+        status: &str,
+    ) -> crate::error::Result<Option<WorkerTransitionResult>> {
         // Detect when an idle worker resumes active work and persist the
         // transition. All other status text is transient.
         if status.starts_with("processing") || status == "running" {
-            self.log_worker_resumed(worker_id);
+            return self.log_worker_resumed(worker_id).await.map(Some);
         }
+        Ok(None)
     }
 
     /// Mark an interactive worker as idle (waiting for follow-up input).
     /// Persisted so the frontend shows "idle" instead of "running".
-    pub fn log_worker_idle(&self, worker_id: WorkerId) {
-        let pool = self.pool.clone();
-        let id = worker_id.to_string();
-
-        tokio::spawn(async move {
-            if let Err(error) = sqlx::query("UPDATE worker_runs SET status = 'idle' WHERE id = ?")
-                .bind(&id)
-                .execute(&pool)
-                .await
-            {
-                tracing::warn!(%error, worker_id = %id, "failed to persist worker idle state");
-            }
-        });
+    pub async fn log_worker_idle(
+        &self,
+        worker_id: WorkerId,
+    ) -> crate::error::Result<WorkerTransitionResult> {
+        self.transition_worker(
+            worker_id,
+            WorkerLifecycle::Running,
+            WorkerLifecycle::WaitingForInput,
+        )
+        .await
     }
 
     /// Mark an idle worker as running again (follow-up received).
-    pub fn log_worker_resumed(&self, worker_id: WorkerId) {
-        let pool = self.pool.clone();
-        let id = worker_id.to_string();
+    pub async fn log_worker_resumed(
+        &self,
+        worker_id: WorkerId,
+    ) -> crate::error::Result<WorkerTransitionResult> {
+        self.transition_worker(
+            worker_id,
+            WorkerLifecycle::WaitingForInput,
+            WorkerLifecycle::Running,
+        )
+        .await
+    }
 
-        tokio::spawn(async move {
-            if let Err(error) =
-                sqlx::query("UPDATE worker_runs SET status = 'running' WHERE id = ?")
-                    .bind(&id)
-                    .execute(&pool)
-                    .await
-            {
-                tracing::warn!(%error, worker_id = %id, "failed to persist worker resumed state");
-            }
-        });
+    pub async fn transition_worker(
+        &self,
+        worker_id: WorkerId,
+        expected: WorkerLifecycle,
+        target: WorkerLifecycle,
+    ) -> crate::error::Result<WorkerTransitionResult> {
+        if expected.is_terminal() || target.is_terminal() || !expected.can_transition_to(target) {
+            return self.worker_transition_conflict(worker_id).await;
+        }
+
+        let result = sqlx::query(
+            "UPDATE worker_runs SET lifecycle = ?, status = ? \
+             WHERE id = ? AND lifecycle = ? AND completed_at IS NULL",
+        )
+        .bind(target.as_str())
+        .bind(target.display_status())
+        .bind(worker_id.to_string())
+        .bind(expected.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+        if result.rows_affected() == 1 {
+            Ok(WorkerTransitionResult::Applied {
+                previous: expected,
+                current: target,
+            })
+        } else {
+            self.worker_transition_conflict(worker_id).await
+        }
+    }
+
+    pub async fn claim_worker_completion(
+        &self,
+        worker_id: WorkerId,
+        expected: WorkerLifecycle,
+    ) -> crate::error::Result<WorkerTransitionResult> {
+        self.transition_worker(worker_id, expected, WorkerLifecycle::Completing)
+            .await
+    }
+
+    pub async fn read_worker_lifecycle(
+        &self,
+        worker_id: WorkerId,
+    ) -> crate::error::Result<Option<WorkerLifecycle>> {
+        let row = sqlx::query("SELECT lifecycle FROM worker_runs WHERE id = ?")
+            .bind(worker_id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        row.map(|row| parse_lifecycle(&row, "lifecycle"))
+            .transpose()
+    }
+
+    async fn worker_transition_conflict(
+        &self,
+        worker_id: WorkerId,
+    ) -> crate::error::Result<WorkerTransitionResult> {
+        let row = sqlx::query("SELECT lifecycle FROM worker_runs WHERE id = ?")
+            .bind(worker_id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        match row {
+            Some(row) => Ok(WorkerTransitionResult::Conflict {
+                current: parse_lifecycle(&row, "lifecycle")?,
+            }),
+            None => Ok(WorkerTransitionResult::NotFound),
+        }
+    }
+
+    pub async fn checkpoint_worker_transcript(
+        &self,
+        worker_id: WorkerId,
+        expected: WorkerLifecycle,
+        transcript: &[u8],
+        tool_calls: i64,
+    ) -> crate::error::Result<WorkerTranscriptCommit> {
+        if expected.is_terminal() {
+            return self.worker_transcript_conflict(worker_id).await;
+        }
+        let result = sqlx::query(
+            "UPDATE worker_runs \
+             SET transcript = ?, tool_calls = ?, transcript_version = transcript_version + 1 \
+             WHERE id = ? AND lifecycle = ? AND completed_at IS NULL",
+        )
+        .bind(transcript)
+        .bind(tool_calls)
+        .bind(worker_id.to_string())
+        .bind(expected.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+        if result.rows_affected() == 1 {
+            let version = sqlx::query_scalar::<_, i64>(
+                "SELECT transcript_version FROM worker_runs WHERE id = ?",
+            )
+            .bind(worker_id.to_string())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+            Ok(WorkerTranscriptCommit::Applied {
+                transcript_version: version,
+            })
+        } else {
+            self.worker_transcript_conflict(worker_id).await
+        }
+    }
+
+    async fn worker_transcript_conflict(
+        &self,
+        worker_id: WorkerId,
+    ) -> crate::error::Result<WorkerTranscriptCommit> {
+        let row = sqlx::query("SELECT lifecycle, transcript_version FROM worker_runs WHERE id = ?")
+            .bind(worker_id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        match row {
+            Some(row) => Ok(WorkerTranscriptCommit::Conflict {
+                lifecycle: parse_lifecycle(&row, "lifecycle")?,
+                transcript_version: row.try_get("transcript_version").unwrap_or(0),
+            }),
+            None => Ok(WorkerTranscriptCommit::NotFound),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn complete_worker(
+        &self,
+        worker_id: WorkerId,
+        expected: WorkerLifecycle,
+        outcome_kind: WorkerOutcomeKind,
+        outcome_summary: Option<&str>,
+        result: &str,
+        transcript: Option<&[u8]>,
+        tool_calls: i64,
+        terminal_owner: WorkerTerminalOwner,
+    ) -> crate::error::Result<WorkerCompletionCommit> {
+        let terminal_lifecycle = outcome_kind.lifecycle();
+        if !expected.can_transition_to(terminal_lifecycle) {
+            return self.worker_completion_conflict(worker_id).await;
+        }
+
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let transcript_increment = i64::from(transcript.is_some());
+        let update = sqlx::query(
+            "UPDATE worker_runs \
+             SET lifecycle = ?, status = ?, outcome_kind = ?, outcome_summary = ?, result = ?, \
+                 transcript = CASE WHEN ? IS NULL THEN transcript ELSE ? END, \
+                  tool_calls = CASE WHEN ? IS NULL THEN tool_calls ELSE ? END, \
+                  outcome_version = outcome_version + 1, \
+                 transcript_version = transcript_version + ?, terminal_owner = ?, \
+                 completed_at = CURRENT_TIMESTAMP \
+             WHERE id = ? AND lifecycle = ? AND completed_at IS NULL AND outcome_version = 0",
+        )
+        .bind(terminal_lifecycle.as_str())
+        .bind(terminal_lifecycle.display_status())
+        .bind(outcome_kind.as_str())
+        .bind(outcome_summary)
+        .bind(result)
+        .bind(transcript)
+        .bind(transcript)
+        .bind(transcript)
+        .bind(tool_calls)
+        .bind(transcript_increment)
+        .bind(terminal_owner.as_str())
+        .bind(worker_id.to_string())
+        .bind(expected.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+        let existing = read_worker_terminal_in_transaction(&mut transaction, worker_id).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+
+        if update.rows_affected() == 1 {
+            Ok(WorkerCompletionCommit::Committed(existing.ok_or_else(
+                || anyhow::anyhow!("can't complete worker: committed outcome is missing"),
+            )?))
+        } else if let Some(outcome) = existing {
+            Ok(WorkerCompletionCommit::Existing(outcome))
+        } else {
+            self.worker_completion_conflict(worker_id).await
+        }
+    }
+
+    pub async fn read_worker_terminal(
+        &self,
+        worker_id: WorkerId,
+    ) -> crate::error::Result<Option<WorkerTerminalOutcome>> {
+        let row = sqlx::query(&worker_terminal_select("WHERE id = ?"))
+            .bind(worker_id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        row.map(|row| worker_terminal_from_row(&row)).transpose()
+    }
+
+    pub async fn reconcile_worker_terminal_display(
+        &self,
+        worker_id: WorkerId,
+    ) -> crate::error::Result<Option<WorkerTerminalOutcome>> {
+        let Some(outcome) = self.read_worker_terminal(worker_id).await? else {
+            return Ok(None);
+        };
+        sqlx::query("UPDATE worker_runs SET status = ? WHERE id = ? AND lifecycle = ?")
+            .bind(outcome.lifecycle.display_status())
+            .bind(worker_id.to_string())
+            .bind(outcome.lifecycle.as_str())
+            .execute(&self.pool)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        Ok(Some(outcome))
+    }
+
+    async fn worker_completion_conflict(
+        &self,
+        worker_id: WorkerId,
+    ) -> crate::error::Result<WorkerCompletionCommit> {
+        if let Some(outcome) = self.read_worker_terminal(worker_id).await? {
+            return Ok(WorkerCompletionCommit::Existing(outcome));
+        }
+        let row = sqlx::query("SELECT lifecycle FROM worker_runs WHERE id = ?")
+            .bind(worker_id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        match row {
+            Some(row) => Ok(WorkerCompletionCommit::Conflict {
+                current: parse_lifecycle(&row, "lifecycle")?,
+            }),
+            None => Ok(WorkerCompletionCommit::NotFound),
+        }
     }
 
     /// Record a worker completing with its result. Fire-and-forget.
     pub fn log_worker_completed(&self, worker_id: WorkerId, result: &str, success: bool) {
-        let status = if success { "done" } else { "failed" };
-        self.log_worker_completed_with_status(worker_id, result, status);
+        let outcome = if success {
+            WorkerOutcomeKind::Succeeded
+        } else {
+            WorkerOutcomeKind::Failed
+        };
+        self.log_worker_completed_with_outcome(
+            worker_id,
+            result,
+            outcome,
+            WorkerTerminalOwner::Worker,
+        );
     }
 
     /// Record a worker as cancelled. Fire-and-forget.
     pub fn log_worker_cancelled(&self, worker_id: WorkerId, result: &str) {
-        self.log_worker_completed_with_status(worker_id, result, "cancelled");
+        self.log_worker_completed_with_outcome(
+            worker_id,
+            result,
+            WorkerOutcomeKind::Cancelled,
+            WorkerTerminalOwner::Cancel,
+        );
     }
 
-    fn log_worker_completed_with_status(&self, worker_id: WorkerId, result: &str, status: &str) {
-        let pool = self.pool.clone();
-        let id = worker_id.to_string();
+    fn log_worker_completed_with_outcome(
+        &self,
+        worker_id: WorkerId,
+        result: &str,
+        outcome_kind: WorkerOutcomeKind,
+        terminal_owner: WorkerTerminalOwner,
+    ) {
+        let logger = self.clone();
         let result = result.to_string();
-        let status = status.to_string();
-
         tokio::spawn(async move {
-            if let Err(error) = sqlx::query(
-                "UPDATE worker_runs SET result = ?, status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ? AND completed_at IS NULL"
-            )
-            .bind(&result)
-            .bind(status)
-            .bind(&id)
-            .execute(&pool)
-            .await
+            if let Err(error) = logger
+                .complete_worker_compat(worker_id, &result, outcome_kind, terminal_owner)
+                .await
             {
-                tracing::warn!(%error, worker_id = %id, "failed to persist worker completion");
+                tracing::warn!(%error, %worker_id, "failed to persist worker completion");
             }
         });
+    }
+
+    async fn complete_worker_compat(
+        &self,
+        worker_id: WorkerId,
+        result: &str,
+        outcome_kind: WorkerOutcomeKind,
+        terminal_owner: WorkerTerminalOwner,
+    ) -> crate::error::Result<WorkerCompletionCommit> {
+        let Some((current, tool_calls)) = self.read_worker_state(worker_id).await? else {
+            return Ok(WorkerCompletionCommit::NotFound);
+        };
+        if current.is_terminal() {
+            return self.worker_completion_conflict(worker_id).await;
+        }
+
+        let expected = if outcome_kind == WorkerOutcomeKind::Succeeded {
+            if current != WorkerLifecycle::Completing {
+                match self.claim_worker_completion(worker_id, current).await? {
+                    WorkerTransitionResult::Applied { .. } => WorkerLifecycle::Completing,
+                    WorkerTransitionResult::Conflict { current } if current.is_terminal() => {
+                        return self.worker_completion_conflict(worker_id).await;
+                    }
+                    WorkerTransitionResult::Conflict { current } => current,
+                    WorkerTransitionResult::NotFound => {
+                        return Ok(WorkerCompletionCommit::NotFound);
+                    }
+                }
+            } else {
+                current
+            }
+        } else if outcome_kind == WorkerOutcomeKind::Cancelled
+            && matches!(
+                current,
+                WorkerLifecycle::Running | WorkerLifecycle::WaitingForInput
+            )
+        {
+            match self
+                .transition_worker(worker_id, current, WorkerLifecycle::Cancelling)
+                .await?
+            {
+                WorkerTransitionResult::Applied { .. } => WorkerLifecycle::Cancelling,
+                WorkerTransitionResult::Conflict { current } if current.is_terminal() => {
+                    return self.worker_completion_conflict(worker_id).await;
+                }
+                WorkerTransitionResult::Conflict { current } => current,
+                WorkerTransitionResult::NotFound => return Ok(WorkerCompletionCommit::NotFound),
+            }
+        } else {
+            current
+        };
+
+        self.complete_worker(
+            worker_id,
+            expected,
+            outcome_kind,
+            Some(result),
+            result,
+            None,
+            tool_calls,
+            terminal_owner,
+        )
+        .await
+    }
+
+    async fn read_worker_state(
+        &self,
+        worker_id: WorkerId,
+    ) -> crate::error::Result<Option<(WorkerLifecycle, i64)>> {
+        let row = sqlx::query("SELECT lifecycle, tool_calls FROM worker_runs WHERE id = ?")
+            .bind(worker_id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        row.map(|row| {
+            Ok((
+                parse_lifecycle(&row, "lifecycle")?,
+                row.try_get("tool_calls").unwrap_or(0),
+            ))
+        })
+        .transpose()
     }
 
     /// Record OpenCode session metadata on a worker run. Fire-and-forget.
@@ -712,9 +1313,8 @@ impl ProcessRunLogger {
     /// Stores the session ID and server port so the frontend can construct
     /// an iframe URL to the embedded OpenCode web UI.
     ///
-    /// The worker row is inserted by `log_worker_started` (also fire-and-forget),
-    /// which may not have committed yet when this runs. To handle the race we
-    /// retry with a short back-off when the UPDATE affects zero rows.
+    /// The worker start event may not have been observed when this runs, so a
+    /// zero-row update is retried with a short back-off.
     pub fn log_opencode_metadata(&self, worker_id: WorkerId, session_id: &str, port: u16) {
         let pool = self.pool.clone();
         let id = worker_id.to_string();
@@ -781,23 +1381,46 @@ impl ProcessRunLogger {
         agent_id: &str,
         failure_message: &str,
     ) -> crate::error::Result<u64> {
-        let result = sqlx::query(
-            "UPDATE worker_runs \
-             SET status = 'failed', \
-                 completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP), \
-                 result = CASE \
-                     WHEN result IS NULL OR result = '' THEN ? \
-                     ELSE result \
-                 END \
-             WHERE status = 'running' AND (agent_id = ? OR agent_id IS NULL)",
+        let workers = sqlx::query(
+            "SELECT id, result, tool_calls FROM worker_runs \
+             WHERE lifecycle = 'running' AND completed_at IS NULL \
+                   AND (agent_id = ? OR agent_id IS NULL)",
         )
-        .bind(failure_message)
         .bind(agent_id)
-        .execute(&self.pool)
+        .fetch_all(&self.pool)
         .await
         .map_err(|error| anyhow::anyhow!(error))?;
 
-        Ok(result.rows_affected())
+        let mut reconciled = 0;
+        for worker in workers {
+            let worker_id_text: String = worker.try_get("id").unwrap_or_default();
+            let worker_id = worker_id_text.parse().map_err(|error| {
+                anyhow::anyhow!("invalid persisted worker ID {worker_id_text}: {error}")
+            })?;
+            let result = worker
+                .try_get::<Option<String>, _>("result")
+                .unwrap_or(None)
+                .filter(|result| !result.is_empty())
+                .unwrap_or_else(|| failure_message.to_string());
+            let tool_calls = worker.try_get("tool_calls").unwrap_or(0);
+            if matches!(
+                self.complete_worker(
+                    worker_id,
+                    WorkerLifecycle::Running,
+                    WorkerOutcomeKind::Failed,
+                    Some(failure_message),
+                    &result,
+                    None,
+                    tool_calls,
+                    WorkerTerminalOwner::Reconcile,
+                )
+                .await?,
+                WorkerCompletionCommit::Committed(_)
+            ) {
+                reconciled += 1;
+            }
+        }
+        Ok(reconciled)
     }
 
     /// Load all idle interactive workers for an agent.
@@ -814,7 +1437,7 @@ impl ProcessRunLogger {
                     COALESCE(tool_calls, 0) AS tool_calls, \
                     opencode_session_id, opencode_port, directory \
              FROM worker_runs \
-             WHERE status = 'idle' AND interactive = TRUE \
+             WHERE lifecycle = 'waiting_for_input' AND completed_at IS NULL AND interactive = TRUE \
                    AND (agent_id = ? OR agent_id IS NULL)",
         )
         .bind(agent_id)
@@ -831,21 +1454,40 @@ impl ProcessRunLogger {
         worker_id: &str,
         reason: &str,
     ) -> crate::error::Result<()> {
-        sqlx::query(
-            "UPDATE worker_runs \
-             SET status = 'failed', \
-                 completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP), \
-                 result = CASE \
-                     WHEN result IS NULL OR result = '' THEN ? \
-                     ELSE result \
-                 END \
-             WHERE id = ? AND status = 'idle'",
-        )
-        .bind(reason)
-        .bind(worker_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|error| anyhow::anyhow!(error))?;
+        let row = sqlx::query("SELECT result, tool_calls FROM worker_runs WHERE id = ?")
+            .bind(worker_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let Some(row) = row else {
+            return Ok(());
+        };
+        let result = row
+            .try_get::<Option<String>, _>("result")
+            .unwrap_or(None)
+            .filter(|result| !result.is_empty())
+            .unwrap_or_else(|| reason.to_string());
+        let tool_calls = row.try_get("tool_calls").unwrap_or(0);
+        let worker_id = worker_id
+            .parse()
+            .map_err(|error| anyhow::anyhow!("invalid worker ID {worker_id}: {error}"))?;
+        if matches!(
+            self.claim_worker_completion(worker_id, WorkerLifecycle::WaitingForInput)
+                .await?,
+            WorkerTransitionResult::Applied { .. }
+        ) {
+            self.complete_worker(
+                worker_id,
+                WorkerLifecycle::Completing,
+                WorkerOutcomeKind::Failed,
+                Some(reason),
+                &result,
+                None,
+                tool_calls,
+                WorkerTerminalOwner::Reconcile,
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -855,16 +1497,39 @@ impl ProcessRunLogger {
     /// work successfully — only the follow-up session expired. The existing
     /// result and transcript are preserved.
     pub async fn retire_idle_worker(&self, worker_id: &str) -> crate::error::Result<()> {
-        sqlx::query(
-            "UPDATE worker_runs \
-             SET status = 'done', \
-                 completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP) \
-             WHERE id = ? AND status = 'idle'",
-        )
-        .bind(worker_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|error| anyhow::anyhow!(error))?;
+        let row = sqlx::query("SELECT result, tool_calls FROM worker_runs WHERE id = ?")
+            .bind(worker_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let Some(row) = row else {
+            return Ok(());
+        };
+        let result = row
+            .try_get::<Option<String>, _>("result")
+            .unwrap_or(None)
+            .unwrap_or_else(|| "Worker completed".to_string());
+        let tool_calls = row.try_get("tool_calls").unwrap_or(0);
+        let worker_id = worker_id
+            .parse()
+            .map_err(|error| anyhow::anyhow!("invalid worker ID {worker_id}: {error}"))?;
+        if matches!(
+            self.claim_worker_completion(worker_id, WorkerLifecycle::WaitingForInput)
+                .await?,
+            WorkerTransitionResult::Applied { .. }
+        ) {
+            self.complete_worker(
+                worker_id,
+                WorkerLifecycle::Completing,
+                WorkerOutcomeKind::Succeeded,
+                Some(&result),
+                &result,
+                None,
+                tool_calls,
+                WorkerTerminalOwner::Reconcile,
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -877,23 +1542,18 @@ impl ProcessRunLogger {
         channel_id: &str,
         worker_id: WorkerId,
     ) -> crate::error::Result<bool> {
-        let result = sqlx::query(
-            "UPDATE worker_runs \
-             SET result = CASE \
-                     WHEN result IS NULL OR result = '' THEN 'Worker cancelled' \
-                     ELSE result \
-                 END, \
-                 status = 'cancelled', \
-                 completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP) \
-             WHERE id = ? AND channel_id = ? AND status = 'running'",
-        )
-        .bind(worker_id.to_string())
-        .bind(channel_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|error| anyhow::anyhow!(error))?;
-
-        Ok(result.rows_affected() > 0)
+        let row = sqlx::query("SELECT lifecycle FROM worker_runs WHERE id = ? AND channel_id = ?")
+            .bind(worker_id.to_string())
+            .bind(channel_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        if row.is_none_or(|row| {
+            parse_lifecycle(&row, "lifecycle").ok() != Some(WorkerLifecycle::Running)
+        }) {
+            return Ok(false);
+        }
+        self.cancel_worker_from_running(worker_id).await
     }
 
     /// Mark a detached running worker (`channel_id IS NULL`) as cancelled.
@@ -903,22 +1563,46 @@ impl ProcessRunLogger {
         &self,
         worker_id: WorkerId,
     ) -> crate::error::Result<bool> {
-        let result = sqlx::query(
-            "UPDATE worker_runs \
-             SET result = CASE \
-                     WHEN result IS NULL OR result = '' THEN 'Worker cancelled' \
-                     ELSE result \
-                 END, \
-                 status = 'cancelled', \
-                 completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP) \
-             WHERE id = ? AND channel_id IS NULL AND status = 'running'",
-        )
-        .bind(worker_id.to_string())
-        .execute(&self.pool)
-        .await
-        .map_err(|error| anyhow::anyhow!(error))?;
+        let row =
+            sqlx::query("SELECT lifecycle FROM worker_runs WHERE id = ? AND channel_id IS NULL")
+                .bind(worker_id.to_string())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|error| anyhow::anyhow!(error))?;
+        if row.is_none_or(|row| {
+            parse_lifecycle(&row, "lifecycle").ok() != Some(WorkerLifecycle::Running)
+        }) {
+            return Ok(false);
+        }
+        self.cancel_worker_from_running(worker_id).await
+    }
 
-        Ok(result.rows_affected() > 0)
+    async fn cancel_worker_from_running(&self, worker_id: WorkerId) -> crate::error::Result<bool> {
+        if !matches!(
+            self.transition_worker(
+                worker_id,
+                WorkerLifecycle::Running,
+                WorkerLifecycle::Cancelling,
+            )
+            .await?,
+            WorkerTransitionResult::Applied { .. }
+        ) {
+            return Ok(false);
+        }
+        Ok(matches!(
+            self.complete_worker(
+                worker_id,
+                WorkerLifecycle::Cancelling,
+                WorkerOutcomeKind::Cancelled,
+                Some("Worker cancelled"),
+                "Worker cancelled",
+                None,
+                0,
+                WorkerTerminalOwner::Cancel,
+            )
+            .await?,
+            WorkerCompletionCommit::Committed(_)
+        ))
     }
 
     /// Load a unified timeline for a channel: messages, branch runs, and worker runs
@@ -1177,7 +1861,8 @@ impl ProcessRunLogger {
             "SELECT w.id, w.task, w.status, w.worker_type, w.channel_id, w.started_at, \
                     w.completed_at, w.transcript IS NOT NULL as has_transcript, \
                     w.tool_calls, w.opencode_port, w.opencode_session_id, w.directory, \
-                    w.interactive, \
+                     w.interactive, w.lifecycle, w.outcome_kind, w.outcome_version, \
+                     w.transcript_version, w.run_id, w.origin_branch_id, w.terminal_owner, \
                     c.display_name as channel_name, \
                     w.project_id \
              FROM worker_runs w \
@@ -1235,6 +1920,13 @@ impl ProcessRunLogger {
                 opencode_session_id: row.try_get("opencode_session_id").ok().flatten(),
                 directory: row.try_get("directory").ok().flatten(),
                 interactive: row.try_get::<bool, _>("interactive").unwrap_or(false),
+                lifecycle: row.try_get("lifecycle").unwrap_or_default(),
+                outcome_kind: row.try_get("outcome_kind").ok().flatten(),
+                outcome_version: row.try_get("outcome_version").unwrap_or(0),
+                transcript_version: row.try_get("transcript_version").unwrap_or(0),
+                run_id: row.try_get("run_id").ok().flatten(),
+                origin_branch_id: row.try_get("origin_branch_id").ok().flatten(),
+                terminal_owner: row.try_get("terminal_owner").ok().flatten(),
                 project_id: row.try_get("project_id").ok().flatten(),
                 // Resolved by caller via the global `ProjectStore` — see module note.
                 project_name: None,
@@ -1253,7 +1945,9 @@ impl ProcessRunLogger {
         let row = sqlx::query(
             "SELECT w.id, w.task, w.result, w.status, w.worker_type, w.channel_id, \
                     w.started_at, w.completed_at, w.transcript, w.tool_calls, \
-                    w.opencode_session_id, w.opencode_port, w.interactive, w.directory, \
+                     w.opencode_session_id, w.opencode_port, w.interactive, w.directory, \
+                     w.lifecycle, w.outcome_kind, w.outcome_version, w.transcript_version, \
+                     w.run_id, w.origin_branch_id, w.terminal_owner, \
                     c.display_name as channel_name \
              FROM worker_runs w \
              LEFT JOIN channels c ON w.channel_id = c.id \
@@ -1297,6 +1991,13 @@ impl ProcessRunLogger {
             directory: row
                 .try_get::<Option<String>, _>("directory")
                 .unwrap_or(None),
+            lifecycle: row.try_get("lifecycle").unwrap_or_default(),
+            outcome_kind: row.try_get("outcome_kind").ok().flatten(),
+            outcome_version: row.try_get("outcome_version").unwrap_or(0),
+            transcript_version: row.try_get("transcript_version").unwrap_or(0),
+            run_id: row.try_get("run_id").ok().flatten(),
+            origin_branch_id: row.try_get("origin_branch_id").ok().flatten(),
+            terminal_owner: row.try_get("terminal_owner").ok().flatten(),
         }))
     }
 
@@ -1321,7 +2022,9 @@ impl ProcessRunLogger {
                             w.completed_at, w.transcript IS NOT NULL AS has_transcript, \
                             w.tool_calls, NULL AS model, NULL AS max_turns, \
                             w.opencode_session_id, w.opencode_port, w.directory, \
-                            w.interactive, w.project_id \
+                             w.interactive, w.project_id, w.lifecycle, w.outcome_kind, \
+                             w.outcome_version, w.transcript_version, w.run_id, \
+                             w.origin_branch_id, w.terminal_owner \
                      FROM worker_runs w \
                      LEFT JOIN channels c ON w.channel_id = c.id \
                      WHERE w.agent_id = ?1 \
@@ -1332,7 +2035,10 @@ impl ProcessRunLogger {
                             b.completed_at, b.transcript IS NOT NULL AS has_transcript, \
                             b.tool_calls, b.model, b.max_turns, \
                             NULL AS opencode_session_id, NULL AS opencode_port, \
-                            NULL AS directory, 0 AS interactive, NULL AS project_id \
+                             NULL AS directory, 0 AS interactive, NULL AS project_id, \
+                             NULL AS lifecycle, NULL AS outcome_kind, 0 AS outcome_version, \
+                             0 AS transcript_version, b.run_id, b.origin_branch_id, \
+                             NULL AS terminal_owner \
                      FROM branch_runs b \
                      LEFT JOIN channels c ON b.channel_id = c.id";
         let filters = "WHERE (?2 IS NULL OR status = ?2) AND (?3 IS NULL OR kind = ?3)";
@@ -1382,7 +2088,9 @@ impl ProcessRunLogger {
                         w.completed_at, w.transcript, w.transcript IS NOT NULL AS has_transcript, \
                         w.tool_calls, NULL AS model, \
                         NULL AS max_turns, w.opencode_session_id, w.opencode_port, \
-                        w.directory, w.interactive, w.project_id \
+                        w.directory, w.interactive, w.project_id, w.lifecycle, w.outcome_kind, \
+                        w.outcome_version, w.transcript_version, w.run_id, w.origin_branch_id, \
+                        w.terminal_owner \
                  FROM worker_runs w LEFT JOIN channels c ON w.channel_id = c.id \
                  WHERE w.agent_id = ?1 AND w.id = ?2"
             }
@@ -1393,7 +2101,10 @@ impl ProcessRunLogger {
                         b.completed_at, b.transcript, b.transcript IS NOT NULL AS has_transcript, \
                         b.tool_calls, b.model, \
                         b.max_turns, NULL AS opencode_session_id, NULL AS opencode_port, \
-                        NULL AS directory, 0 AS interactive, NULL AS project_id \
+                        NULL AS directory, 0 AS interactive, NULL AS project_id, \
+                        NULL AS lifecycle, NULL AS outcome_kind, 0 AS outcome_version, \
+                        0 AS transcript_version, b.run_id, b.origin_branch_id, \
+                        NULL AS terminal_owner \
                  FROM branch_runs b LEFT JOIN channels c ON b.channel_id = c.id \
                  WHERE ?1 IS NOT NULL AND b.id = ?2"
             }
@@ -1420,6 +2131,75 @@ impl ProcessRunLogger {
                 .filter(|blob| !blob.is_empty()),
         }))
     }
+}
+
+fn worker_terminal_select(filter: &str) -> String {
+    format!(
+        "SELECT id, lifecycle, outcome_kind, outcome_summary, result, outcome_version, \
+                transcript_version, terminal_owner, completed_at \
+         FROM worker_runs {filter} AND completed_at IS NOT NULL AND outcome_version > 0"
+    )
+}
+
+async fn read_worker_terminal_in_transaction(
+    transaction: &mut Transaction<'_, Sqlite>,
+    worker_id: WorkerId,
+) -> crate::error::Result<Option<WorkerTerminalOutcome>> {
+    let row = sqlx::query(&worker_terminal_select("WHERE id = ?"))
+        .bind(worker_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+    row.map(|row| worker_terminal_from_row(&row)).transpose()
+}
+
+fn worker_terminal_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> crate::error::Result<WorkerTerminalOutcome> {
+    let lifecycle = parse_lifecycle(row, "lifecycle")?;
+    if !lifecycle.is_terminal() {
+        return Err(anyhow::anyhow!(
+            "can't read worker outcome: lifecycle {} is not terminal",
+            lifecycle.as_str()
+        )
+        .into());
+    }
+    let outcome_kind = row
+        .try_get::<String, _>("outcome_kind")
+        .map_err(|error| anyhow::anyhow!(error))?
+        .parse()
+        .map_err(crate::error::Error::from)?;
+    let terminal_owner = row
+        .try_get::<Option<String>, _>("terminal_owner")
+        .unwrap_or(None)
+        .map(|owner| owner.parse())
+        .transpose()
+        .map_err(crate::error::Error::from)?;
+    let completed_at = row
+        .try_get::<chrono::DateTime<chrono::Utc>, _>("completed_at")
+        .map(|time| time.to_rfc3339())
+        .map_err(|error| anyhow::anyhow!(error))?;
+    Ok(WorkerTerminalOutcome {
+        worker_id: row.try_get("id").unwrap_or_default(),
+        lifecycle,
+        outcome_kind,
+        outcome_summary: row.try_get("outcome_summary").ok().flatten(),
+        result: row.try_get("result").unwrap_or_default(),
+        outcome_version: row.try_get("outcome_version").unwrap_or(0),
+        transcript_version: row.try_get("transcript_version").unwrap_or(0),
+        terminal_owner,
+        completed_at,
+    })
+}
+
+fn parse_lifecycle(
+    row: &sqlx::sqlite::SqliteRow,
+    column: &str,
+) -> crate::error::Result<WorkerLifecycle> {
+    row.try_get::<String, _>(column)
+        .map_err(|error| anyhow::anyhow!(error))?
+        .parse()
+        .map_err(crate::error::Error::from)
 }
 
 fn process_run_from_row(row: &sqlx::sqlite::SqliteRow) -> ProcessRunRow {
@@ -1450,6 +2230,13 @@ fn process_run_from_row(row: &sqlx::sqlite::SqliteRow) -> ProcessRunRow {
         directory: row.try_get("directory").ok().flatten(),
         interactive: row.try_get("interactive").unwrap_or(false),
         project_id: row.try_get("project_id").ok().flatten(),
+        lifecycle: row.try_get("lifecycle").ok().flatten(),
+        outcome_kind: row.try_get("outcome_kind").ok().flatten(),
+        outcome_version: row.try_get("outcome_version").unwrap_or(0),
+        transcript_version: row.try_get("transcript_version").unwrap_or(0),
+        run_id: row.try_get("run_id").ok().flatten(),
+        origin_branch_id: row.try_get("origin_branch_id").ok().flatten(),
+        terminal_owner: row.try_get("terminal_owner").ok().flatten(),
     }
 }
 
@@ -1470,6 +2257,13 @@ pub struct WorkerRunRow {
     pub opencode_session_id: Option<String>,
     pub directory: Option<String>,
     pub interactive: bool,
+    pub lifecycle: String,
+    pub outcome_kind: Option<String>,
+    pub outcome_version: i64,
+    pub transcript_version: i64,
+    pub run_id: Option<String>,
+    pub origin_branch_id: Option<String>,
+    pub terminal_owner: Option<String>,
     pub project_id: Option<String>,
     pub project_name: Option<String>,
 }
@@ -1506,6 +2300,13 @@ pub struct WorkerDetailRow {
     pub opencode_port: Option<i32>,
     pub interactive: bool,
     pub directory: Option<String>,
+    pub lifecycle: String,
+    pub outcome_kind: Option<String>,
+    pub outcome_version: i64,
+    pub transcript_version: i64,
+    pub run_id: Option<String>,
+    pub origin_branch_id: Option<String>,
+    pub terminal_owner: Option<String>,
 }
 
 /// A branch or worker run without its transcript blob.
@@ -1531,6 +2332,13 @@ pub struct ProcessRunRow {
     pub directory: Option<String>,
     pub interactive: bool,
     pub project_id: Option<String>,
+    pub lifecycle: Option<String>,
+    pub outcome_kind: Option<String>,
+    pub outcome_version: i64,
+    pub transcript_version: i64,
+    pub run_id: Option<String>,
+    pub origin_branch_id: Option<String>,
+    pub terminal_owner: Option<String>,
 }
 
 /// A branch or worker run with its compressed transcript blob.
@@ -1542,9 +2350,15 @@ pub struct ProcessDetailRow {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProcessRunLogger, TimelineCursor, TimelineItem, timeline_item_id};
+    use super::{
+        ProcessRunLogger, TimelineCursor, TimelineItem, WorkerCompletionCommit, WorkerLifecycle,
+        WorkerOutcomeKind, WorkerStartResult, WorkerTerminalOwner, WorkerTransitionResult,
+        timeline_item_id,
+    };
     use crate::conversation::worker_transcript::{ActionContent, TranscriptStep};
+    use sqlx::Row as _;
     use std::sync::Arc;
+    use tokio::sync::Barrier;
 
     async fn setup_worker_runs_table() -> sqlx::SqlitePool {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -1552,20 +2366,14 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .expect("failed to create sqlite memory pool");
-
-        sqlx::query(
-            "CREATE TABLE worker_runs (
-                id TEXT PRIMARY KEY,
-                channel_id TEXT,
-                status TEXT NOT NULL,
-                result TEXT,
-                completed_at TIMESTAMP
-            )",
-        )
-        .execute(&pool)
-        .await
-        .expect("failed to create worker_runs table");
-
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        for channel_id in ["ch-1", "channel-1"] {
+            sqlx::query("INSERT INTO channels (id, platform) VALUES (?, 'test')")
+                .bind(channel_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
         pool
     }
 
@@ -1575,53 +2383,442 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .expect("failed to create sqlite memory pool");
-        sqlx::raw_sql(
-            "CREATE TABLE channels (
-                id TEXT PRIMARY KEY,
-                display_name TEXT
-            );
-            CREATE TABLE branch_runs (
-                id TEXT PRIMARY KEY,
-                channel_id TEXT NOT NULL,
-                description TEXT NOT NULL,
-                input TEXT NOT NULL,
-                conclusion TEXT,
-                status TEXT NOT NULL DEFAULT 'running',
-                transcript BLOB,
-                tool_calls INTEGER NOT NULL DEFAULT 0,
-                profile TEXT NOT NULL DEFAULT 'default',
-                model TEXT,
-                max_turns INTEGER,
-                started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                completed_at TIMESTAMP
-            );
-            CREATE TABLE worker_runs (
-                id TEXT PRIMARY KEY,
-                channel_id TEXT,
-                task TEXT NOT NULL,
-                result TEXT,
-                status TEXT NOT NULL DEFAULT 'running',
-                worker_type TEXT NOT NULL DEFAULT 'builtin',
-                agent_id TEXT,
-                transcript BLOB,
-                tool_calls INTEGER NOT NULL DEFAULT 0,
-                opencode_session_id TEXT,
-                opencode_port INTEGER,
-                directory TEXT,
-                interactive INTEGER NOT NULL DEFAULT 0,
-                project_id TEXT,
-                started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                completed_at TIMESTAMP
-            )",
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO channels (id, platform, display_name) \
+             VALUES ('channel-1', 'test', 'Test Channel')",
         )
         .execute(&pool)
         .await
-        .expect("failed to create process tables");
-        sqlx::query("INSERT INTO channels (id, display_name) VALUES ('channel-1', 'Test Channel')")
-            .execute(&pool)
-            .await
-            .expect("failed to insert channel");
+        .expect("failed to insert channel");
         pool
+    }
+
+    async fn start_worker(logger: &ProcessRunLogger, worker_id: uuid::Uuid, interactive: bool) {
+        let agent_id: crate::AgentId = Arc::from("agent-1");
+        assert_eq!(
+            logger
+                .log_worker_started(
+                    None,
+                    worker_id,
+                    "test task",
+                    "builtin",
+                    &agent_id,
+                    interactive,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap(),
+            WorkerStartResult::Started
+        );
+    }
+
+    async fn complete_succeeded(
+        logger: &ProcessRunLogger,
+        worker_id: uuid::Uuid,
+        result: &str,
+    ) -> WorkerCompletionCommit {
+        assert!(matches!(
+            logger
+                .claim_worker_completion(worker_id, WorkerLifecycle::Running)
+                .await
+                .unwrap(),
+            WorkerTransitionResult::Applied {
+                current: WorkerLifecycle::Completing,
+                ..
+            }
+        ));
+        logger
+            .complete_worker(
+                worker_id,
+                WorkerLifecycle::Completing,
+                WorkerOutcomeKind::Succeeded,
+                Some(result),
+                result,
+                Some(b"transcript"),
+                3,
+                WorkerTerminalOwner::Worker,
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn running_completing_succeeded_commits_terminal_payload() {
+        let pool = setup_worker_runs_table().await;
+        let logger = ProcessRunLogger::new(pool.clone());
+        let worker_id = uuid::Uuid::new_v4();
+        start_worker(&logger, worker_id, false).await;
+
+        let commit = complete_succeeded(&logger, worker_id, "finished").await;
+        let WorkerCompletionCommit::Committed(outcome) = commit else {
+            panic!("expected committed outcome, got {commit:?}");
+        };
+        assert_eq!(outcome.lifecycle, WorkerLifecycle::Succeeded);
+        assert_eq!(outcome.outcome_kind, WorkerOutcomeKind::Succeeded);
+        assert_eq!(outcome.outcome_version, 1);
+        assert_eq!(outcome.transcript_version, 1);
+        assert_eq!(outcome.terminal_owner, Some(WorkerTerminalOwner::Worker));
+
+        let row = sqlx::query("SELECT status, tool_calls FROM worker_runs WHERE id = ?")
+            .bind(worker_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.try_get::<String, _>("status").unwrap(), "done");
+        assert_eq!(row.try_get::<i64, _>("tool_calls").unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn running_cancelling_cancelled_commits_terminal_payload() {
+        let pool = setup_worker_runs_table().await;
+        let logger = ProcessRunLogger::new(pool);
+        let worker_id = uuid::Uuid::new_v4();
+        start_worker(&logger, worker_id, false).await;
+
+        assert!(matches!(
+            logger
+                .transition_worker(
+                    worker_id,
+                    WorkerLifecycle::Running,
+                    WorkerLifecycle::Cancelling,
+                )
+                .await
+                .unwrap(),
+            WorkerTransitionResult::Applied { .. }
+        ));
+        let commit = logger
+            .complete_worker(
+                worker_id,
+                WorkerLifecycle::Cancelling,
+                WorkerOutcomeKind::Cancelled,
+                Some("operator request"),
+                "Worker cancelled: operator request",
+                None,
+                0,
+                WorkerTerminalOwner::Cancel,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            commit,
+            WorkerCompletionCommit::Committed(ref outcome)
+                if outcome.lifecycle == WorkerLifecycle::Cancelled
+                    && outcome.outcome_version == 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn waiting_for_input_resumes_running() {
+        let pool = setup_worker_runs_table().await;
+        let logger = ProcessRunLogger::new(pool);
+        let worker_id = uuid::Uuid::new_v4();
+        start_worker(&logger, worker_id, true).await;
+
+        assert!(matches!(
+            logger
+                .transition_worker(
+                    worker_id,
+                    WorkerLifecycle::Running,
+                    WorkerLifecycle::WaitingForInput,
+                )
+                .await
+                .unwrap(),
+            WorkerTransitionResult::Applied { .. }
+        ));
+        assert_eq!(
+            logger
+                .transition_worker(
+                    worker_id,
+                    WorkerLifecycle::WaitingForInput,
+                    WorkerLifecycle::Running,
+                )
+                .await
+                .unwrap(),
+            WorkerTransitionResult::Applied {
+                previous: WorkerLifecycle::WaitingForInput,
+                current: WorkerLifecycle::Running,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn illegal_transition_returns_conflict() {
+        let pool = setup_worker_runs_table().await;
+        let logger = ProcessRunLogger::new(pool);
+        let worker_id = uuid::Uuid::new_v4();
+        start_worker(&logger, worker_id, false).await;
+
+        assert_eq!(
+            logger
+                .transition_worker(
+                    worker_id,
+                    WorkerLifecycle::Running,
+                    WorkerLifecycle::Created,
+                )
+                .await
+                .unwrap(),
+            WorkerTransitionResult::Conflict {
+                current: WorkerLifecycle::Running,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_idle_and_resume_cannot_overwrite_terminal_outcomes() {
+        for (terminal, terminal_kind, expected_source) in [
+            (
+                WorkerLifecycle::Succeeded,
+                WorkerOutcomeKind::Succeeded,
+                WorkerLifecycle::Completing,
+            ),
+            (
+                WorkerLifecycle::Cancelled,
+                WorkerOutcomeKind::Cancelled,
+                WorkerLifecycle::Cancelling,
+            ),
+        ] {
+            let pool = setup_worker_runs_table().await;
+            let logger = ProcessRunLogger::new(pool);
+            let worker_id = uuid::Uuid::new_v4();
+            start_worker(&logger, worker_id, false).await;
+            let intermediate = if terminal == WorkerLifecycle::Succeeded {
+                WorkerLifecycle::Completing
+            } else {
+                WorkerLifecycle::Cancelling
+            };
+            assert!(matches!(
+                logger
+                    .transition_worker(worker_id, WorkerLifecycle::Running, intermediate)
+                    .await
+                    .unwrap(),
+                WorkerTransitionResult::Applied { .. }
+            ));
+            logger
+                .complete_worker(
+                    worker_id,
+                    expected_source,
+                    terminal_kind,
+                    Some("first"),
+                    "first",
+                    None,
+                    0,
+                    WorkerTerminalOwner::Worker,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                logger
+                    .transition_worker(
+                        worker_id,
+                        WorkerLifecycle::Running,
+                        WorkerLifecycle::WaitingForInput,
+                    )
+                    .await
+                    .unwrap(),
+                WorkerTransitionResult::Conflict { current: terminal }
+            );
+            assert_eq!(
+                logger
+                    .transition_worker(
+                        worker_id,
+                        WorkerLifecycle::WaitingForInput,
+                        WorkerLifecycle::Running,
+                    )
+                    .await
+                    .unwrap(),
+                WorkerTransitionResult::Conflict { current: terminal }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_terminal_commit_preserves_first_outcome_and_version() {
+        let pool = setup_worker_runs_table().await;
+        let logger = ProcessRunLogger::new(pool);
+        let worker_id = uuid::Uuid::new_v4();
+        start_worker(&logger, worker_id, false).await;
+        let first = complete_succeeded(&logger, worker_id, "first").await;
+        assert!(matches!(first, WorkerCompletionCommit::Committed(_)));
+
+        let duplicate = logger
+            .complete_worker(
+                worker_id,
+                WorkerLifecycle::Completing,
+                WorkerOutcomeKind::Failed,
+                Some("second"),
+                "second",
+                Some(b"replacement"),
+                9,
+                WorkerTerminalOwner::Supervisor,
+            )
+            .await
+            .unwrap();
+        let WorkerCompletionCommit::Existing(outcome) = duplicate else {
+            panic!("expected existing outcome, got {duplicate:?}");
+        };
+        assert_eq!(outcome.result, "first");
+        assert_eq!(outcome.outcome_version, 1);
+        assert_eq!(outcome.transcript_version, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timeout_and_completion_competing_commits_choose_one_terminal_outcome() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let logger = ProcessRunLogger::new(pool);
+        let worker_id = uuid::Uuid::new_v4();
+        start_worker(&logger, worker_id, false).await;
+        assert!(matches!(
+            logger
+                .transition_worker(
+                    worker_id,
+                    WorkerLifecycle::Running,
+                    WorkerLifecycle::TimingOut,
+                )
+                .await
+                .unwrap(),
+            WorkerTransitionResult::Applied { .. }
+        ));
+        let barrier = Arc::new(Barrier::new(3));
+
+        let completion_logger = logger.clone();
+        let completion_barrier = barrier.clone();
+        let completion = tokio::spawn(async move {
+            completion_barrier.wait().await;
+            completion_logger
+                .complete_worker(
+                    worker_id,
+                    WorkerLifecycle::TimingOut,
+                    WorkerOutcomeKind::Succeeded,
+                    Some("completed before timeout committed"),
+                    "completed before timeout committed",
+                    None,
+                    1,
+                    WorkerTerminalOwner::Worker,
+                )
+                .await
+                .unwrap()
+        });
+        let timeout_logger = logger.clone();
+        let timeout_barrier = barrier.clone();
+        let timeout = tokio::spawn(async move {
+            timeout_barrier.wait().await;
+            timeout_logger
+                .complete_worker(
+                    worker_id,
+                    WorkerLifecycle::TimingOut,
+                    WorkerOutcomeKind::TimedOut,
+                    Some("timed out"),
+                    "timed out",
+                    None,
+                    1,
+                    WorkerTerminalOwner::Timeout,
+                )
+                .await
+                .unwrap()
+        });
+        barrier.wait().await;
+        let completion_result = completion.await.unwrap();
+        let timeout_result = timeout.await.unwrap();
+        assert!(matches!(
+            completion_result,
+            WorkerCompletionCommit::Committed(_) | WorkerCompletionCommit::Existing(_)
+        ));
+        assert!(matches!(
+            timeout_result,
+            WorkerCompletionCommit::Committed(_) | WorkerCompletionCommit::Existing(_)
+        ));
+        let outcome = logger
+            .read_worker_terminal(worker_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.outcome_version, 1);
+        assert!(matches!(
+            outcome.lifecycle,
+            WorkerLifecycle::Succeeded | WorkerLifecycle::TimedOut
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_worker_results_are_explicit() {
+        let pool = setup_worker_runs_table().await;
+        let logger = ProcessRunLogger::new(pool);
+        let worker_id = uuid::Uuid::new_v4();
+        assert_eq!(
+            logger
+                .transition_worker(
+                    worker_id,
+                    WorkerLifecycle::Running,
+                    WorkerLifecycle::WaitingForInput,
+                )
+                .await
+                .unwrap(),
+            WorkerTransitionResult::NotFound
+        );
+        assert!(matches!(
+            logger
+                .complete_worker(
+                    worker_id,
+                    WorkerLifecycle::Completing,
+                    WorkerOutcomeKind::Succeeded,
+                    None,
+                    "missing",
+                    None,
+                    0,
+                    WorkerTerminalOwner::Worker,
+                )
+                .await
+                .unwrap(),
+            WorkerCompletionCommit::NotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn worker_start_ownership_round_trip() {
+        let pool = setup_worker_runs_table().await;
+        let logger = ProcessRunLogger::new(pool.clone());
+        let worker_id = uuid::Uuid::new_v4();
+        let branch_id = uuid::Uuid::new_v4();
+        let agent_id: crate::AgentId = Arc::from("agent-1");
+        assert_eq!(
+            logger
+                .log_worker_started(
+                    None,
+                    worker_id,
+                    "owned task",
+                    "builtin",
+                    &agent_id,
+                    false,
+                    None,
+                    Some("run-7"),
+                    Some(branch_id),
+                )
+                .await
+                .unwrap(),
+            WorkerStartResult::Started
+        );
+
+        let row =
+            sqlx::query("SELECT lifecycle, run_id, origin_branch_id FROM worker_runs WHERE id = ?")
+                .bind(worker_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.try_get::<String, _>("lifecycle").unwrap(), "running");
+        assert_eq!(row.try_get::<String, _>("run_id").unwrap(), "run-7");
+        assert_eq!(
+            row.try_get::<String, _>("origin_branch_id").unwrap(),
+            branch_id.to_string()
+        );
     }
 
     #[tokio::test]
@@ -1732,7 +2929,7 @@ mod tests {
         let logger = ProcessRunLogger::new(pool.clone());
         let worker_id = uuid::Uuid::new_v4();
 
-        sqlx::query("INSERT INTO worker_runs (id, channel_id, status, result) VALUES (?, NULL, 'running', '')")
+        sqlx::query("INSERT INTO worker_runs (id, channel_id, task, status, lifecycle, result) VALUES (?, NULL, 'task', 'running', 'running', '')")
             .bind(worker_id.to_string())
             .execute(&pool)
             .await
@@ -1762,7 +2959,7 @@ mod tests {
         let logger = ProcessRunLogger::new(pool.clone());
         let worker_id = uuid::Uuid::new_v4();
 
-        sqlx::query("INSERT INTO worker_runs (id, channel_id, status, result) VALUES (?, 'ch-1', 'running', '')")
+        sqlx::query("INSERT INTO worker_runs (id, channel_id, task, status, lifecycle, result) VALUES (?, 'ch-1', 'task', 'running', 'running', '')")
             .bind(worker_id.to_string())
             .execute(&pool)
             .await
@@ -1815,7 +3012,7 @@ mod tests {
         let logger = ProcessRunLogger::new(pool.clone());
         let worker_id = uuid::Uuid::new_v4();
 
-        sqlx::query("INSERT INTO worker_runs (id, channel_id, status, result) VALUES (?, 'ch-1', 'running', '')")
+        sqlx::query("INSERT INTO worker_runs (id, channel_id, task, status, lifecycle, result) VALUES (?, 'ch-1', 'task', 'running', 'running', '')")
             .bind(worker_id.to_string())
             .execute(&pool)
             .await
@@ -1840,7 +3037,7 @@ mod tests {
         let logger = ProcessRunLogger::new(pool.clone());
         let worker_id = uuid::Uuid::new_v4();
 
-        sqlx::query("INSERT INTO worker_runs (id, channel_id, status, result) VALUES (?, 'ch-1', 'running', '')")
+        sqlx::query("INSERT INTO worker_runs (id, channel_id, task, status, lifecycle, result) VALUES (?, 'ch-1', 'task', 'running', 'running', '')")
             .bind(worker_id.to_string())
             .execute(&pool)
             .await
@@ -1858,7 +3055,7 @@ mod tests {
         let logger = ProcessRunLogger::new(pool.clone());
         let worker_id = uuid::Uuid::new_v4();
 
-        sqlx::query("INSERT INTO worker_runs (id, channel_id, status, result) VALUES (?, 'ch-1', 'running', '')")
+        sqlx::query("INSERT INTO worker_runs (id, channel_id, task, status, lifecycle, result) VALUES (?, 'ch-1', 'task', 'running', 'running', '')")
             .bind(worker_id.to_string())
             .execute(&pool)
             .await
@@ -2111,7 +3308,7 @@ mod tests {
         let worker_id = uuid::Uuid::new_v4();
 
         sqlx::query(
-            "INSERT INTO worker_runs (id, channel_id, status, result) VALUES (?, 'channel-1', 'running', '')",
+            "INSERT INTO worker_runs (id, channel_id, task, status, lifecycle, result) VALUES (?, 'channel-1', 'task', 'running', 'running', '')",
         )
         .bind(worker_id.to_string())
         .execute(&pool)

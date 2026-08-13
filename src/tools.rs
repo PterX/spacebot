@@ -1204,6 +1204,8 @@ pub fn create_worker_tool_server(
     wiki_store: Option<Arc<crate::wiki::WikiStore>>,
     blocked_signal: Option<crate::agent::worker::BlockSignal>,
     lifecycle: Option<crate::lifecycle::LifecycleHandle>,
+    process_run_logger: crate::conversation::ProcessRunLogger,
+    interactive: bool,
 ) -> ToolServerHandle {
     let mut server = ToolServer::new()
         .tool(
@@ -1221,8 +1223,14 @@ pub fn create_worker_tool_server(
             worker_id,
         ))
         .tool({
-            let mut status_tool =
-                SetStatusTool::new(agent_id.clone(), worker_id, channel_id, event_tx.clone());
+            let mut status_tool = SetStatusTool::new(
+                agent_id.clone(),
+                worker_id,
+                channel_id,
+                event_tx.clone(),
+                process_run_logger,
+                interactive,
+            );
             if let Some(store) = runtime_config.secrets.load().as_ref() {
                 status_tool = status_tool.with_tool_secrets(store.tool_secret_pairs(&agent_id));
             }

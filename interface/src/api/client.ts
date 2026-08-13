@@ -3023,6 +3023,9 @@ export const api = {
 		const query = qs.toString();
 		return fetchJson<ActivityResponse>(`/activity${query ? `?${query}` : ""}`);
 	},
+
+	chronicleHistory: (limit = 20) =>
+		fetchJson<ChronicleHistoryResponse>(`/chronicle?limit=${limit}`),
 }
 
 export interface UsageTotals {
@@ -3096,6 +3099,31 @@ export interface ActivityTotals {
 export interface ActivityResponse {
 	daily: ActivityDay[];
 	totals: ActivityTotals;
+}
+
+export interface AgentDailyBrief {
+	agent_id: string;
+	day: string;
+	summary: string;
+	event_count: number;
+	created_at: string;
+}
+
+export interface ChronicleHistoryItem {
+	id: string;
+	agent_id: string;
+	channel_id: string;
+	title: string;
+	summary: string;
+	message_count: number;
+	covers_from: string;
+	covers_to: string;
+	created_at: string;
+}
+
+export interface ChronicleHistoryResponse {
+	daily_briefs: AgentDailyBrief[];
+	checkpoints: ChronicleHistoryItem[];
 }
 
 // Wiki types

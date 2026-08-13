@@ -513,10 +513,27 @@ impl CortexChatSession {
                     continue;
                 };
 
-                // Persist completion to worker_runs (no channel handler does this
-                // for channel_id: None workers).
                 let run_logger = ProcessRunLogger::new(session.deps.sqlite_pool.clone());
-                run_logger.log_worker_completed(worker_id, &result, success);
+                let Some(terminal) = run_logger
+                    .read_worker_terminal(worker_id)
+                    .await
+                    .ok()
+                    .flatten()
+                else {
+                    tracing::warn!(%worker_id, "cortex chat worker completion was not durable");
+                    continue;
+                };
+                if terminal.outcome_version
+                    != match &event {
+                        ProcessEvent::WorkerComplete {
+                            outcome_version, ..
+                        } => *outcome_version,
+                        _ => 0,
+                    }
+                {
+                    tracing::warn!(%worker_id, "cortex chat worker completion version mismatch");
+                    continue;
+                }
 
                 tracing::info!(
                     %worker_id,

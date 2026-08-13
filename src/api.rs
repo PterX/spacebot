@@ -10,6 +10,7 @@ mod attachments;
 pub mod autonomy;
 pub mod bindings;
 pub mod channels;
+pub mod chronicle;
 pub mod config;
 mod cortex;
 pub mod cron;

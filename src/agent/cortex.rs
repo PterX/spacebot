@@ -2707,6 +2707,7 @@ enum DetachedRouting {
 #[allow(clippy::too_many_arguments)]
 async fn handle_detached_completion(
     routing: DetachedRouting,
+    outcome_kind: crate::conversation::WorkerOutcomeKind,
     task: &crate::tasks::Task,
     worker_id: WorkerId,
     result_text: &str,
@@ -2721,6 +2722,26 @@ async fn handle_detached_completion(
     injection_tx: &tokio::sync::mpsc::Sender<crate::ChannelInjection>,
 ) {
     let success = matches!(routing, DetachedRouting::Success);
+    let terminal = match crate::agent::channel_dispatch::commit_worker_outcome(
+        run_logger,
+        worker_id,
+        outcome_kind,
+        result_text,
+        None,
+        crate::conversation::WorkerTerminalOwner::Worker,
+    )
+    .await
+    {
+        Ok(Some((terminal, newly_committed))) => (terminal, newly_committed),
+        Ok(None) => {
+            tracing::error!(%worker_id, "detached worker terminal outcome was not persisted");
+            return;
+        }
+        Err(error) => {
+            tracing::error!(%error, %worker_id, "failed to persist detached worker terminal outcome");
+            return;
+        }
+    };
     let new_status = match routing {
         DetachedRouting::Success | DetachedRouting::Terminal => TaskStatus::Done,
         DetachedRouting::Requeue => TaskStatus::Ready,
@@ -2758,15 +2779,14 @@ async fn handle_detached_completion(
                     "routing": format!("{routing:?}"),
                 })),
             );
-            run_logger.log_worker_completed(worker_id, result_text, false);
-            let _ = event_tx.send(ProcessEvent::WorkerComplete {
-                agent_id: Arc::from(agent_id),
-                worker_id,
-                channel_id: None,
-                result: result_text.to_string(),
-                notify: true,
-                success: false,
-            });
+            if terminal.1 {
+                let _ = event_tx.send(crate::agent::channel_dispatch::worker_complete_event(
+                    Arc::from(agent_id),
+                    None,
+                    terminal.0,
+                    true,
+                ));
+            }
             return;
         }
         Err(error) => {
@@ -2776,7 +2796,6 @@ async fn handle_detached_completion(
                 routing = ?routing,
                 "failed to persist task status after worker completion"
             );
-            run_logger.log_worker_completed(worker_id, result_text, false);
             logger.log(
                 "task_pickup_persist_failure",
                 &format!(
@@ -2789,14 +2808,14 @@ async fn handle_detached_completion(
                     "routing": format!("{routing:?}"),
                 })),
             );
-            let _ = event_tx.send(ProcessEvent::WorkerComplete {
-                agent_id: Arc::from(agent_id),
-                worker_id,
-                channel_id: None,
-                result: result_text.to_string(),
-                notify: true,
-                success: false,
-            });
+            if terminal.1 {
+                let _ = event_tx.send(crate::agent::channel_dispatch::worker_complete_event(
+                    Arc::from(agent_id),
+                    None,
+                    terminal.0,
+                    true,
+                ));
+            }
             return;
         }
     };
@@ -2805,7 +2824,6 @@ async fn handle_detached_completion(
         return;
     }
 
-    run_logger.log_worker_completed(worker_id, result_text, success);
     let _ = event_tx.send(ProcessEvent::TaskUpdated {
         agent_id: Arc::from(agent_id),
         task_number: task.task_number,
@@ -2850,14 +2868,14 @@ async fn handle_detached_completion(
     )
     .await;
 
-    let _ = event_tx.send(ProcessEvent::WorkerComplete {
-        agent_id: Arc::from(agent_id),
-        worker_id,
-        channel_id: None,
-        result: result_text.to_string(),
-        notify: true,
-        success,
-    });
+    if terminal.1 {
+        let _ = event_tx.send(crate::agent::channel_dispatch::worker_complete_event(
+            Arc::from(agent_id),
+            None,
+            terminal.0,
+            true,
+        ));
+    }
 }
 
 /// One-shot wake for dormant agents.
@@ -3070,6 +3088,23 @@ async fn pickup_one_ready_task(deps: &AgentDeps, logger: &CortexLogger) -> anyho
 
     let task_description = format!("task #{}: {}", task.task_number, task.title);
 
+    // Log to worker_runs directly — task workers have no parent channel, so the
+    // channel event handler won't persist them.
+    let run_logger = crate::conversation::history::ProcessRunLogger::new(deps.sqlite_pool.clone());
+    run_logger
+        .log_worker_started(
+            None,
+            worker_id,
+            &task_description,
+            "task",
+            &deps.agent_id,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await?;
+
     let _ = deps.event_tx.send(ProcessEvent::WorkerStarted {
         agent_id: deps.agent_id.clone(),
         worker_id,
@@ -3079,19 +3114,6 @@ async fn pickup_one_ready_task(deps: &AgentDeps, logger: &CortexLogger) -> anyho
         interactive: false,
         directory: None,
     });
-
-    // Log to worker_runs directly — task workers have no parent channel, so the
-    // channel event handler won't persist them.
-    let run_logger = crate::conversation::history::ProcessRunLogger::new(deps.sqlite_pool.clone());
-    run_logger.log_worker_started(
-        None,
-        worker_id,
-        &task_description,
-        "task",
-        &deps.agent_id,
-        false,
-        None,
-    );
 
     let task_store = deps.task_store.clone();
     let agent_id_typed = deps.agent_id.clone();
@@ -3174,10 +3196,31 @@ async fn pickup_one_ready_task(deps: &AgentDeps, logger: &CortexLogger) -> anyho
                         | Ok(WorkerOutcome::Blocked { .. }) => DetachedRouting::Terminal,
                         Ok(WorkerOutcome::Failed { .. }) | Err(_) => DetachedRouting::Requeue,
                     };
+                    let outcome_kind = match &outcome_or_error {
+                        Ok(WorkerOutcome::Success { .. }) => {
+                            crate::conversation::WorkerOutcomeKind::Succeeded
+                        }
+                        Ok(WorkerOutcome::Partial { .. }) => {
+                            crate::conversation::WorkerOutcomeKind::Partial
+                        }
+                        Ok(WorkerOutcome::Cancelled { .. }) => {
+                            crate::conversation::WorkerOutcomeKind::Cancelled
+                        }
+                        Ok(WorkerOutcome::Timeout { .. }) => {
+                            crate::conversation::WorkerOutcomeKind::TimedOut
+                        }
+                        Ok(WorkerOutcome::Blocked { .. }) => {
+                            crate::conversation::WorkerOutcomeKind::Blocked
+                        }
+                        Ok(WorkerOutcome::Failed { .. }) | Err(_) => {
+                            crate::conversation::WorkerOutcomeKind::Failed
+                        }
+                    };
                     let (result_text, _notify, _success) = map_worker_completion(outcome_or_error);
                     let result_text = scrub(result_text);
                     handle_detached_completion(
                         routing,
+                        outcome_kind,
                         &task,
                         worker_id,
                         &result_text,
@@ -3223,6 +3266,23 @@ async fn pickup_one_ready_task(deps: &AgentDeps, logger: &CortexLogger) -> anyho
                     "Worker cancelled by supervisor timeout (attempt {} of {}).",
                     next_timeout_count, timeout_retry_limit
                 ));
+                let terminal = match crate::agent::channel_dispatch::commit_worker_outcome(
+                    &run_logger,
+                    worker_id,
+                    crate::conversation::WorkerOutcomeKind::TimedOut,
+                    &timeout_message,
+                    None,
+                    crate::conversation::WorkerTerminalOwner::Supervisor,
+                )
+                .await
+                {
+                    Ok(Some(terminal)) => Some(terminal),
+                    Ok(None) => None,
+                    Err(error) => {
+                        tracing::error!(%error, %worker_id, "failed to persist detached timeout outcome");
+                        None
+                    }
+                };
                 let update_result = task_store
                     .update(
                         task.task_number,
@@ -3240,7 +3300,6 @@ async fn pickup_one_ready_task(deps: &AgentDeps, logger: &CortexLogger) -> anyho
 
                 match update_result {
                     Ok(Some(_)) => {
-                        run_logger.log_worker_completed(worker_id, &timeout_message, false);
                         let _ = event_tx.send(ProcessEvent::TaskUpdated {
                             agent_id: Arc::from(agent_id.as_str()),
                             task_number: task.task_number,
@@ -3274,21 +3333,22 @@ async fn pickup_one_ready_task(deps: &AgentDeps, logger: &CortexLogger) -> anyho
                         )
                         .await;
 
-                        let _ = event_tx.send(ProcessEvent::WorkerComplete {
-                            agent_id: Arc::from(agent_id.as_str()),
-                            worker_id,
-                            channel_id: None,
-                            result: timeout_message,
-                            notify: true,
-                            success: false,
-                        });
+                        if let Some((terminal, true)) = terminal.clone() {
+                            let _ = event_tx.send(
+                                crate::agent::channel_dispatch::worker_complete_event(
+                                    Arc::from(agent_id.as_str()),
+                                    None,
+                                    terminal,
+                                    true,
+                                ),
+                            );
+                        }
                     }
                     Ok(None) => {
                         tracing::warn!(
                             task_number = task.task_number,
                             "failed to update task status after detached timeout cancellation: task missing"
                         );
-                        run_logger.log_worker_completed(worker_id, &timeout_message, false);
                         logger.log(
                                 "task_pickup_timeout_persist_failure",
                                 &format!(
@@ -3303,14 +3363,16 @@ async fn pickup_one_ready_task(deps: &AgentDeps, logger: &CortexLogger) -> anyho
                                     "retry_limit": timeout_retry_limit,
                                 })),
                             );
-                        let _ = event_tx.send(ProcessEvent::WorkerComplete {
-                            agent_id: Arc::from(agent_id.as_str()),
-                            worker_id,
-                            channel_id: None,
-                            result: timeout_message.clone(),
-                            notify: true,
-                            success: false,
-                        });
+                        if let Some((terminal, true)) = terminal.clone() {
+                            let _ = event_tx.send(
+                                crate::agent::channel_dispatch::worker_complete_event(
+                                    Arc::from(agent_id.as_str()),
+                                    None,
+                                    terminal,
+                                    true,
+                                ),
+                            );
+                        }
                     }
                     Err(update_error) => {
                         tracing::warn!(
@@ -3318,7 +3380,6 @@ async fn pickup_one_ready_task(deps: &AgentDeps, logger: &CortexLogger) -> anyho
                             task_number = task.task_number,
                             "failed to update task status after detached timeout cancellation"
                         );
-                        run_logger.log_worker_completed(worker_id, &timeout_message, false);
                         logger.log(
                             "task_pickup_timeout_persist_failure",
                             &format!(
@@ -3333,14 +3394,16 @@ async fn pickup_one_ready_task(deps: &AgentDeps, logger: &CortexLogger) -> anyho
                                 "retry_limit": timeout_retry_limit,
                             })),
                         );
-                        let _ = event_tx.send(ProcessEvent::WorkerComplete {
-                            agent_id: Arc::from(agent_id.as_str()),
-                            worker_id,
-                            channel_id: None,
-                            result: timeout_message.clone(),
-                            notify: true,
-                            success: false,
-                        });
+                        if let Some((terminal, true)) = terminal {
+                            let _ = event_tx.send(
+                                crate::agent::channel_dispatch::worker_complete_event(
+                                    Arc::from(agent_id.as_str()),
+                                    None,
+                                    terminal,
+                                    true,
+                                ),
+                            );
+                        }
                     }
                 }
             }
@@ -4013,6 +4076,10 @@ mod tests {
                 result: "ok".to_string(),
                 notify: false,
                 success: true,
+                outcome_kind: crate::conversation::WorkerOutcomeKind::Succeeded,
+                outcome_version: 1,
+                transcript_version: 0,
+                terminal_owner: Some(crate::conversation::WorkerTerminalOwner::Worker),
             },
             ProcessEvent::ToolStarted {
                 agent_id: agent_id.clone(),

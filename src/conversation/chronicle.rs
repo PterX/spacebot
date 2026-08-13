@@ -505,6 +505,20 @@ impl ChronicleStore {
         Ok(checkpoints_from_rows(rows))
     }
 
+    /// Most recently committed level-0 checkpoints across all channels.
+    pub async fn list_level_zero_recent(&self, limit: i64) -> Result<Vec<ChronicleCheckpoint>> {
+        let rows = sqlx::query(
+            "SELECT * FROM channel_chronicle_checkpoints \
+             WHERE level = 0 ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+        Ok(checkpoints_from_rows(rows))
+    }
+
     /// Checkpoints at a level with a sequence below `before_seq`, oldest first.
     /// Used to select the older-history portion of the prompt view.
     pub async fn list_before_seq(

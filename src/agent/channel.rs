@@ -463,8 +463,9 @@ pub struct ChannelState {
     pub history_fence: Arc<crate::agent::chronicle::HistoryFence>,
     pub active_branches: Arc<RwLock<HashMap<BranchId, tokio::task::JoinHandle<()>>>>,
     pub active_workers: Arc<RwLock<HashMap<WorkerId, Worker>>>,
-    /// Tokio task handles for running workers, used for cancellation via abort().
-    pub worker_handles: Arc<RwLock<HashMap<WorkerId, tokio::task::JoinHandle<()>>>>,
+    /// Runtime controls for active worker tasks.
+    pub worker_handles:
+        Arc<RwLock<HashMap<WorkerId, crate::agent::channel_dispatch::WorkerTaskControl>>>,
     /// Input senders for interactive workers, keyed by worker ID.
     /// Used by the route tool to deliver follow-up messages.
     pub worker_inputs: Arc<RwLock<HashMap<WorkerId, tokio::sync::mpsc::Sender<String>>>>,
@@ -543,110 +544,18 @@ impl ChannelState {
         self.history_fence.note_head_mutation();
     }
 
-    /// Cancel a running worker by aborting its tokio task and cleaning up state.
+    /// Cancel a running worker and converge with any completion already in flight.
     /// Returns an error message if the worker is not found.
     pub async fn cancel_worker(&self, worker_id: WorkerId) -> std::result::Result<(), String> {
         self.cancel_worker_with_reason(worker_id, "cancelled by channel")
             .await
     }
 
-    /// Cancel a running worker by aborting its tokio task.
-    /// Emits a synthetic terminal event so the event handler can clean up
-    /// worker_handles and trigger a retrigger with the cancellation reason.
     pub async fn cancel_worker_with_reason(
         &self,
         worker_id: WorkerId,
         reason: &str,
     ) -> std::result::Result<(), String> {
-        // Abort via read access so the handle stays in worker_handles.
-        // The WorkerComplete event handler will remove it and trigger a retrigger.
-        let aborted = {
-            let handles = self.worker_handles.read().await;
-            if let Some(handle) = handles.get(&worker_id) {
-                handle.abort();
-                true
-            } else {
-                false
-            }
-        };
-
-        // Stop routing messages to the dead worker immediately.
-        let removed_input = self
-            .worker_inputs
-            .write()
-            .await
-            .remove(&worker_id)
-            .is_some();
-        self.worker_injections.write().await.remove(&worker_id);
-
-        if !aborted {
-            let removed_status = self.status_block.write().await.remove_worker(worker_id);
-            if removed_input || removed_status {
-                return Ok(());
-            }
-            return Err(format!("Worker {worker_id} not found"));
-        }
-
-        // Now that the worker future is cancelled, drain the live transcript
-        // cache. persist_transcript() inside the worker's run() method will
-        // never execute after abort, so we compensate here.
-        let live_steps = self
-            .live_process_transcripts
-            .write()
-            .await
-            .remove(&ProcessId::Worker(worker_id).to_string());
-
-        // Persist whatever transcript was accumulated from ToolStarted/ToolCompleted
-        // events. This is a best-effort snapshot — it won't include the worker's
-        // internal reasoning text (which only exists in the Rig history) but it
-        // captures every tool call and result, which is the most useful part.
-        if let Some(steps) = &live_steps
-            && !steps.is_empty()
-        {
-            let transcript_blob = crate::conversation::worker_transcript::serialize_steps(steps);
-            let worker_id_str = worker_id.to_string();
-            let pool = self.deps.sqlite_pool.clone();
-            // Count tool calls from the transcript steps.
-            let tool_calls: i64 = steps
-                .iter()
-                .map(|step| match step {
-                    crate::conversation::worker_transcript::TranscriptStep::Action { content } => {
-                        content
-                            .iter()
-                            .filter(|c| {
-                                matches!(
-                                c,
-                                crate::conversation::worker_transcript::ActionContent::ToolCall {
-                                    ..
-                                }
-                            )
-                            })
-                            .count() as i64
-                    }
-                    _ => 0,
-                })
-                .sum();
-            // Fire-and-forget DB write (consistent with the existing pattern
-            // documented in AGENTS.md under "Fire-and-forget DB writes").
-            tokio::spawn(async move {
-                if let Err(error) = sqlx::query(
-                    "UPDATE worker_runs SET transcript = ?, tool_calls = ? WHERE id = ? AND transcript IS NULL",
-                )
-                .bind(&transcript_blob)
-                .bind(tool_calls)
-                .bind(&worker_id_str)
-                .execute(&pool)
-                .await
-                {
-                    tracing::warn!(
-                        %error,
-                        worker_id = %worker_id_str,
-                        "failed to persist cancelled worker transcript"
-                    );
-                }
-            });
-        }
-
         let reason = crate::summarize_first_non_empty_line(reason, crate::EVENT_SUMMARY_MAX_CHARS);
         let result = if reason.is_empty() {
             "Worker cancelled.".to_string()
@@ -654,26 +563,159 @@ impl ChannelState {
             format!("Worker cancelled: {reason}")
         };
 
-        self.process_run_logger
-            .log_worker_cancelled(worker_id, &result);
-        if let Err(error) = self.deps.event_tx.send(ProcessEvent::WorkerComplete {
-            agent_id: self.deps.agent_id.clone(),
-            worker_id,
-            channel_id: Some(self.channel_id.clone()),
-            result,
-            notify: true,
-            success: false,
-        }) {
-            tracing::warn!(
-                %error,
-                agent_id = %self.deps.agent_id,
-                worker_id = %worker_id,
-                channel_id = %self.channel_id,
-                "failed to emit synthetic worker completion event"
-            );
+        let mut control = self.worker_handles.write().await.remove(&worker_id);
+        let Some(lifecycle) = self
+            .process_run_logger
+            .read_worker_lifecycle(worker_id)
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Err(format!("Worker {worker_id} not found"));
+        };
+
+        if lifecycle.is_terminal() {
+            self.cleanup_worker_routing(worker_id).await;
+            return Ok(());
         }
 
+        let lifecycle = if lifecycle == crate::conversation::WorkerLifecycle::Completing {
+            lifecycle
+        } else {
+            match self
+                .process_run_logger
+                .transition_worker(
+                    worker_id,
+                    lifecycle,
+                    crate::conversation::WorkerLifecycle::Cancelling,
+                )
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                crate::conversation::WorkerTransitionResult::Applied { current, .. } => current,
+                crate::conversation::WorkerTransitionResult::Conflict { current } => current,
+                crate::conversation::WorkerTransitionResult::NotFound => {
+                    return Err(format!("Worker {worker_id} not found"));
+                }
+            }
+        };
+
+        if lifecycle == crate::conversation::WorkerLifecycle::Completing {
+            if let Some(control) = &control {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    control.terminal_notify.notified(),
+                )
+                .await;
+            }
+            if self
+                .process_run_logger
+                .read_worker_terminal(worker_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_some()
+            {
+                self.cleanup_worker_routing(worker_id).await;
+                return Ok(());
+            }
+        }
+        if let Some(control) = &mut control {
+            if let Some(opencode_cancellation) = &control.opencode_cancellation
+                && let Some(session) = opencode_cancellation.lock().await.clone()
+                && let Err(error) = session
+                    .server
+                    .lock()
+                    .await
+                    .abort_session(&session.session_id)
+                    .await
+            {
+                tracing::warn!(%error, %worker_id, "failed to abort OpenCode session");
+            }
+            control.cancel_tx.send_replace(true);
+            if tokio::time::timeout(std::time::Duration::from_millis(500), &mut control.handle)
+                .await
+                .is_err()
+            {
+                control.handle.abort();
+                if let Err(error) = (&mut control.handle).await
+                    && !error.is_cancelled()
+                {
+                    tracing::warn!(%error, %worker_id, "cancelled worker task failed while joining");
+                }
+            }
+            if self
+                .process_run_logger
+                .read_worker_terminal(worker_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_some()
+            {
+                self.cleanup_worker_routing(worker_id).await;
+                return Ok(());
+            }
+        }
+
+        let transcript = self
+            .live_worker_transcript_snapshot(worker_id)
+            .await
+            .or_else(|| {
+                control.as_ref().and_then(|control| {
+                    crate::agent::worker::read_worker_transcript_snapshot(
+                        &control.transcript_snapshot,
+                    )
+                })
+            });
+        let outcome_kind = if transcript.is_some()
+            && lifecycle == crate::conversation::WorkerLifecycle::Completing
+        {
+            crate::conversation::WorkerOutcomeKind::Partial
+        } else {
+            crate::conversation::WorkerOutcomeKind::Cancelled
+        };
+        let terminal = crate::agent::channel_dispatch::commit_worker_outcome(
+            &self.process_run_logger,
+            worker_id,
+            outcome_kind,
+            &result,
+            transcript.as_ref(),
+            crate::conversation::WorkerTerminalOwner::Cancel,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        if let Some((terminal, true)) = terminal {
+            self.deps
+                .event_tx
+                .send(crate::agent::channel_dispatch::worker_complete_event(
+                    self.deps.agent_id.clone(),
+                    Some(self.channel_id.clone()),
+                    terminal,
+                    true,
+                ))
+                .ok();
+        }
+        self.cleanup_worker_routing(worker_id).await;
         Ok(())
+    }
+
+    async fn cleanup_worker_routing(&self, worker_id: WorkerId) {
+        self.worker_inputs.write().await.remove(&worker_id);
+        self.worker_injections.write().await.remove(&worker_id);
+        self.active_workers.write().await.remove(&worker_id);
+    }
+
+    async fn live_worker_transcript_snapshot(
+        &self,
+        worker_id: WorkerId,
+    ) -> Option<crate::agent::worker::WorkerTranscriptPayload> {
+        let process_id = ProcessId::Worker(worker_id).to_string();
+        let live_transcripts = self.live_process_transcripts.read().await;
+        let steps = live_transcripts.get(&process_id)?;
+        if steps.is_empty() {
+            return None;
+        }
+        Some(crate::agent::worker::WorkerTranscriptPayload {
+            transcript: crate::conversation::worker_transcript::serialize_steps(steps),
+            tool_calls: count_transcript_tool_calls(steps),
+        })
     }
 
     /// Cancel a running branch by aborting its tokio task.
@@ -1004,6 +1046,7 @@ pub struct Channel {
     /// Background process results waiting to be embedded in the next retrigger.
     /// Accumulated during the debounce window and drained when the retrigger fires.
     pending_results: Vec<PendingResult>,
+    consumed_worker_outcomes: HashMap<WorkerId, i64>,
     /// Optional send_agent_message tool (only when agent has active links).
     send_agent_message_tool: Option<crate::tools::SendAgentMessageTool>,
     /// Backfilled conversation history rendered as a system-prompt fragment.
@@ -1247,6 +1290,7 @@ impl Channel {
             pending_retrigger_metadata: HashMap::new(),
             retrigger_deadline: None,
             pending_results: Vec::new(),
+            consumed_worker_outcomes: HashMap::new(),
             send_agent_message_tool,
             backfill_transcript: None,
             autonomy_contract_retries: 0,
@@ -4053,56 +4097,68 @@ impl Channel {
                 }
                 self.branch_reply_targets.remove(branch_id);
             }
-            ProcessEvent::WorkerStarted {
-                worker_id,
-                channel_id,
-                task,
-                worker_type,
-                interactive,
-                directory,
-                ..
-            } => {
-                run_logger.log_worker_started(
-                    channel_id.as_ref(),
-                    *worker_id,
-                    task,
-                    worker_type,
-                    &self.deps.agent_id,
-                    *interactive,
-                    directory.as_deref().map(std::path::Path::new),
-                );
-            }
+            ProcessEvent::WorkerStarted { .. } => {}
             ProcessEvent::WorkerStatus {
                 worker_id, status, ..
             } => {
-                run_logger.log_worker_status(*worker_id, status);
+                if let Some(crate::conversation::WorkerTransitionResult::Conflict { current }) =
+                    run_logger.log_worker_status(*worker_id, status).await?
+                    && !current.is_terminal()
+                    && current != crate::conversation::WorkerLifecycle::Running
+                {
+                    tracing::debug!(%worker_id, lifecycle = current.as_str(), "worker resume status arrived outside waiting state");
+                }
             }
             ProcessEvent::WorkerIdle { worker_id, .. } => {
-                run_logger.log_worker_idle(*worker_id);
+                if let crate::conversation::WorkerTransitionResult::Conflict { current } =
+                    run_logger.log_worker_idle(*worker_id).await?
+                    && !current.is_terminal()
+                    && current != crate::conversation::WorkerLifecycle::WaitingForInput
+                {
+                    tracing::debug!(%worker_id, lifecycle = current.as_str(), "worker idle event arrived outside running state");
+                }
             }
             ProcessEvent::WorkerComplete {
                 worker_id,
-                result,
                 notify,
-                success,
+                outcome_kind,
+                outcome_version,
+                transcript_version,
+                terminal_owner,
                 ..
             } => {
-                // Use worker_handles as the source of truth for active workers.
-                // (active_workers is never populated because Worker is consumed by .run())
-                if self
-                    .state
-                    .worker_handles
-                    .write()
-                    .await
-                    .remove(worker_id)
-                    .is_none()
-                {
+                if worker_outcome_already_consumed(
+                    &self.consumed_worker_outcomes,
+                    *worker_id,
+                    *outcome_version,
+                ) {
                     return Ok(());
                 }
 
-                run_logger.log_worker_completed(*worker_id, result, *success);
+                let Some(terminal) = run_logger.read_worker_terminal(*worker_id).await? else {
+                    tracing::warn!(%worker_id, outcome_version, "worker completion event has no durable terminal outcome");
+                    return Ok(());
+                };
+                if terminal.outcome_version != *outcome_version
+                    || terminal.transcript_version != *transcript_version
+                    || terminal.outcome_kind != *outcome_kind
+                    || terminal.terminal_owner != *terminal_owner
+                {
+                    tracing::warn!(
+                        %worker_id,
+                        event_outcome_version = outcome_version,
+                        durable_outcome_version = terminal.outcome_version,
+                        "worker completion event did not match durable terminal outcome"
+                    );
+                    return Ok(());
+                }
+                self.consumed_worker_outcomes
+                    .insert(*worker_id, terminal.outcome_version);
+                self.state.worker_handles.write().await.remove(worker_id);
+                let result = terminal.result;
+                let success = terminal.outcome_kind.is_success();
 
-                let worker_event = if *success {
+                let worker_event = if success {
                     crate::wakes::SystemEvent::WorkerCompleted
                 } else {
                     crate::wakes::SystemEvent::WorkerFailed
@@ -4113,9 +4169,9 @@ impl Channel {
                 let dedupe_key = format!("worker:{worker_id}");
                 let payload = serde_json::json!({
                     "worker_id": worker_id.to_string(),
-                    "success": *success,
+                    "success": success,
                     "summary": crate::summarize_first_non_empty_line(
-                        result,
+                        &result,
                         crate::EVENT_SUMMARY_MAX_CHARS,
                     ),
                 });
@@ -4135,8 +4191,8 @@ impl Channel {
                 // the session likely produced a reusable lesson.
                 let reflection = self.deps.runtime_config.skills_config.load().reflection;
                 if reflection.enabled {
-                    self.mark_reflection_worker(*worker_id, *success);
-                    if *success {
+                    self.mark_reflection_worker(*worker_id, success);
+                    if success {
                         // A worker can finish after the last user turn;
                         // check now so reflection doesn't sit pending
                         // until the next inbound message.
@@ -4154,7 +4210,7 @@ impl Channel {
                 } else {
                     result.clone()
                 };
-                let default_event_type = if *success {
+                let default_event_type = if success {
                     crate::memory::WorkingMemoryEventType::WorkerCompleted
                 } else {
                     crate::memory::WorkingMemoryEventType::Error
@@ -4168,7 +4224,7 @@ impl Channel {
                         format_conversational_event_summary(event_type, "Worker", &event_summary),
                     )
                     .channel(self.id.to_string())
-                    .importance(if *success { 0.6 } else { 0.8 })
+                    .importance(if success { 0.6 } else { 0.8 })
                     .record();
 
                 if *notify {
@@ -4178,7 +4234,7 @@ impl Channel {
                         process_type: "worker",
                         process_id: worker_id.to_string(),
                         result: result.clone(),
-                        success: *success,
+                        success,
                     });
                     should_retrigger = true;
                 }
@@ -4695,6 +4751,16 @@ impl Channel {
     }
 }
 
+fn worker_outcome_already_consumed(
+    consumed: &HashMap<WorkerId, i64>,
+    worker_id: WorkerId,
+    outcome_version: i64,
+) -> bool {
+    consumed
+        .get(&worker_id)
+        .is_some_and(|version| *version >= outcome_version)
+}
+
 fn compute_listen_mode_invocation(message: &InboundMessage, raw_text: &str) -> (bool, bool, bool) {
     let text = raw_text.trim();
     let invoked_by_command = text.starts_with('/');
@@ -4853,6 +4919,7 @@ mod tests {
         extract_decision_summary_from_reply, format_conversational_event_summary,
         is_dm_conversation_id, recv_channel_event, should_process_event_for_channel,
         should_send_discord_quiet_mode_ping_ack, should_send_quiet_mode_fallback,
+        worker_outcome_already_consumed,
     };
     use crate::memory::{MemoryType, WorkingMemoryEventType};
     use crate::{AgentId, ChannelId, InboundMessage, MessageContent, ProcessEvent, ProcessId};
@@ -5120,6 +5187,10 @@ mod tests {
             result: "done".to_string(),
             notify: true,
             success: true,
+            outcome_kind: crate::conversation::WorkerOutcomeKind::Succeeded,
+            outcome_version: 1,
+            transcript_version: 0,
+            terminal_owner: Some(crate::conversation::WorkerTerminalOwner::Worker),
         };
 
         assert!(should_process_event_for_channel(&event, &channel_id));
@@ -5135,6 +5206,10 @@ mod tests {
             result: "done".to_string(),
             notify: true,
             success: true,
+            outcome_kind: crate::conversation::WorkerOutcomeKind::Succeeded,
+            outcome_version: 1,
+            transcript_version: 0,
+            terminal_owner: Some(crate::conversation::WorkerTerminalOwner::Worker),
         };
 
         assert!(!should_process_event_for_channel(&event, &channel_id));
@@ -5150,9 +5225,23 @@ mod tests {
             result: "done".to_string(),
             notify: true,
             success: true,
+            outcome_kind: crate::conversation::WorkerOutcomeKind::Succeeded,
+            outcome_version: 1,
+            transcript_version: 0,
+            terminal_owner: Some(crate::conversation::WorkerTerminalOwner::Worker),
         };
 
         assert!(!should_process_event_for_channel(&event, &channel_id));
+    }
+
+    #[test]
+    fn duplicate_worker_outcome_version_is_consumed_once_without_handle_state() {
+        let worker_id = uuid::Uuid::new_v4();
+        let mut consumed = HashMap::new();
+        assert!(!worker_outcome_already_consumed(&consumed, worker_id, 1));
+        consumed.insert(worker_id, 1);
+        assert!(worker_outcome_already_consumed(&consumed, worker_id, 1));
+        assert!(!worker_outcome_already_consumed(&consumed, worker_id, 2));
     }
 
     #[test]

@@ -1583,6 +1583,10 @@ mod tests {
             result: "done".to_string(),
             notify: false,
             success: true,
+            outcome_kind: crate::conversation::WorkerOutcomeKind::Succeeded,
+            outcome_version: 1,
+            transcript_version: 0,
+            terminal_owner: Some(crate::conversation::WorkerTerminalOwner::Worker),
         });
 
         let removed_after_complete = tokio::time::timeout(Duration::from_secs(1), async {

@@ -2,6 +2,7 @@
 
 use crate::agent::compactor::estimate_history_tokens;
 use crate::config::BrowserConfig;
+use crate::conversation::history::{ProcessRunLogger, WorkerLifecycle};
 use crate::conversation::settings::WorkerMemoryMode;
 use crate::error::Result;
 use crate::hooks::SpacebotHook;
@@ -50,6 +51,25 @@ const MAX_SEGMENTS: usize = 10;
 
 /// Default wall-clock budget for a worker run when no agent override is set.
 pub const DEFAULT_WORKER_WALL_CLOCK_TIMEOUT_SECS: u64 = 1800;
+
+#[derive(Debug, Clone)]
+pub struct WorkerTranscriptPayload {
+    pub transcript: Vec<u8>,
+    pub tool_calls: i64,
+}
+
+pub type WorkerTranscriptSnapshot =
+    std::sync::Arc<std::sync::RwLock<Option<WorkerTranscriptPayload>>>;
+
+pub fn new_worker_transcript_snapshot() -> WorkerTranscriptSnapshot {
+    std::sync::Arc::new(std::sync::RwLock::new(None))
+}
+
+pub fn read_worker_transcript_snapshot(
+    snapshot: &WorkerTranscriptSnapshot,
+) -> Option<WorkerTranscriptPayload> {
+    snapshot.read().ok().and_then(|payload| payload.clone())
+}
 
 /// Reason a worker run was blocked by an external defense (captcha, login
 /// wall, rate-limit, fraud-detect WAF). Detection only — the agent fails
@@ -275,6 +295,7 @@ pub struct Worker {
     /// loop reads it at each iteration and short-circuits to
     /// `WorkerOutcome::Blocked` when populated.
     pub blocked_signal: BlockSignal,
+    pub transcript_snapshot: WorkerTranscriptSnapshot,
 }
 
 impl Worker {
@@ -340,6 +361,7 @@ impl Worker {
                 worker_wall_clock_timeout_secs,
                 segments_run: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 blocked_signal: new_block_signal(),
+                transcript_snapshot: new_worker_transcript_snapshot(),
             },
             inject_tx,
         )
@@ -537,6 +559,10 @@ impl Worker {
         }
     }
 
+    pub fn transcript_snapshot(&self) -> WorkerTranscriptSnapshot {
+        self.transcript_snapshot.clone()
+    }
+
     /// Run the worker's LLM agent loop until completion.
     ///
     /// Runs in segments of 25 turns. After each segment, checks context usage
@@ -563,6 +589,7 @@ impl Worker {
             .with_tool_call_registry(tool_call_registry.clone());
 
         // Create per-worker ToolServer with task tools
+        let interactive = self.input_rx.is_some();
         let worker_tool_server = crate::tools::create_worker_tool_server(
             self.deps.agent_id.clone(),
             self.id,
@@ -584,6 +611,8 @@ impl Worker {
             self.deps.wiki_store.clone(),
             Some(self.blocked_signal.clone()),
             self.deps.lifecycle(),
+            ProcessRunLogger::new(self.deps.sqlite_pool.clone()),
+            interactive,
         );
 
         let routing = self.deps.runtime_config.routing.load();
@@ -856,12 +885,22 @@ impl Worker {
                 // Resumed workers already did this in the preamble above.
                 self.state = WorkerState::WaitingForInput;
                 self.persist_transcript(&compacted_history, &history).await;
+                self.persist_lifecycle_transition(
+                    WorkerLifecycle::Running,
+                    WorkerLifecycle::WaitingForInput,
+                )
+                .await;
                 self.hook.send_status("waiting for input");
                 self.hook.send_worker_idle();
             }
 
             while let Some(follow_up) = input_rx.recv().await {
                 self.state = WorkerState::Running;
+                self.persist_lifecycle_transition(
+                    WorkerLifecycle::WaitingForInput,
+                    WorkerLifecycle::Running,
+                )
+                .await;
                 self.hook.send_status("processing follow-up");
 
                 // Honor a blocked signal that may have arrived while we were
@@ -1022,6 +1061,11 @@ impl Worker {
 
                 self.state = WorkerState::WaitingForInput;
                 self.persist_transcript(&compacted_history, &history).await;
+                self.persist_lifecycle_transition(
+                    WorkerLifecycle::Running,
+                    WorkerLifecycle::WaitingForInput,
+                )
+                .await;
                 self.hook.send_status("waiting for input");
                 self.hook.send_worker_idle();
             }
@@ -1184,7 +1228,6 @@ impl Worker {
         full_history.extend(history.iter().cloned());
         let transcript_blob =
             crate::conversation::worker_transcript::serialize_transcript(&full_history);
-        let worker_id = self.id.to_string();
 
         // Count tool calls from the Rig history (each ToolCall in an Assistant message)
         let tool_calls: i64 = full_history
@@ -1200,15 +1243,52 @@ impl Worker {
             })
             .sum();
 
-        if let Err(error) =
-            sqlx::query("UPDATE worker_runs SET transcript = ?, tool_calls = ? WHERE id = ?")
-                .bind(&transcript_blob)
-                .bind(tool_calls)
-                .bind(&worker_id)
-                .execute(&self.deps.sqlite_pool)
-                .await
+        if let Ok(mut snapshot) = self.transcript_snapshot.write() {
+            *snapshot = Some(WorkerTranscriptPayload {
+                transcript: transcript_blob.clone(),
+                tool_calls,
+            });
+        }
+
+        let logger = ProcessRunLogger::new(self.deps.sqlite_pool.clone());
+        let lifecycle = match logger.read_worker_lifecycle(self.id).await {
+            Ok(Some(lifecycle)) => lifecycle,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(%error, worker_id = %self.id, "failed to read worker lifecycle for transcript checkpoint");
+                return;
+            }
+        };
+        if matches!(
+            lifecycle,
+            WorkerLifecycle::Running | WorkerLifecycle::WaitingForInput
+        ) && let Err(error) = logger
+            .checkpoint_worker_transcript(self.id, lifecycle, &transcript_blob, tool_calls)
+            .await
         {
-            tracing::warn!(%error, worker_id, "failed to persist worker transcript");
+            tracing::warn!(%error, worker_id = %self.id, "failed to persist worker transcript checkpoint");
+        }
+    }
+
+    async fn persist_lifecycle_transition(
+        &self,
+        expected: WorkerLifecycle,
+        target: WorkerLifecycle,
+    ) {
+        let logger = ProcessRunLogger::new(self.deps.sqlite_pool.clone());
+        match logger.transition_worker(self.id, expected, target).await {
+            Ok(crate::conversation::WorkerTransitionResult::Applied { .. }) => {}
+            Ok(crate::conversation::WorkerTransitionResult::Conflict { current })
+                if current == target || current.is_terminal() => {}
+            Ok(crate::conversation::WorkerTransitionResult::Conflict { current }) => {
+                tracing::debug!(worker_id = %self.id, lifecycle = current.as_str(), target = target.as_str(), "worker lifecycle transition conflicted");
+            }
+            Ok(crate::conversation::WorkerTransitionResult::NotFound) => {
+                tracing::warn!(worker_id = %self.id, "worker lifecycle row was not found");
+            }
+            Err(error) => {
+                tracing::warn!(%error, worker_id = %self.id, "failed to persist worker lifecycle transition");
+            }
         }
     }
 
