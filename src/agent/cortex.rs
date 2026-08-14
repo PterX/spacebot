@@ -740,11 +740,11 @@ impl Cortex {
             .circuit_breaker_threshold;
         let mut state = self.health_runtime_state.write().await;
 
-        match event {
-            ProcessEvent::ToolCompleted {
-                tool_name, result, ..
-            } => state.track_tool_completed(tool_name, result, threshold),
-            _ => {}
+        if let ProcessEvent::ToolCompleted {
+            tool_name, result, ..
+        } = event
+        {
+            state.track_tool_completed(tool_name, result, threshold);
         }
     }
 
