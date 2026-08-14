@@ -1023,6 +1023,7 @@ impl Tool for DetachedSpawnWorkerTool {
             run_logger,
             worker.transcript_snapshot(),
             None,
+            None,
             secrets_store,
             "builtin",
             worker.run().instrument(worker_span),

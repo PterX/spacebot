@@ -367,6 +367,11 @@ impl OpenCodeWorker {
                     "OpenCode session created"
                 );
 
+                *self.cancellation_session.lock().await = Some(OpenCodeCancellationSession {
+                    server: server.clone(),
+                    session_id: session_id.clone(),
+                });
+
                 // Subscribe to SSE events before sending the prompt
                 let event_response = {
                     let guard = server.lock().await;
@@ -400,10 +405,12 @@ impl OpenCodeWorker {
                 (server, session_id, event_state, result_text)
             };
 
-        *self.cancellation_session.lock().await = Some(OpenCodeCancellationSession {
-            server: server.clone(),
-            session_id: session_id.clone(),
-        });
+        if resuming {
+            *self.cancellation_session.lock().await = Some(OpenCodeCancellationSession {
+                server: server.clone(),
+                session_id: session_id.clone(),
+            });
+        }
 
         // Interactive follow-up loop
         if let Some(mut input_rx) = self.input_rx.take() {

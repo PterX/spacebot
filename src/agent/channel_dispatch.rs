@@ -992,6 +992,7 @@ async fn spawn_worker_inner(
         state.process_run_logger.clone(),
         transcript_snapshot,
         None,
+        None,
         secrets_store,
         "builtin",
         worker.run().instrument(worker_span),
@@ -1225,10 +1226,10 @@ async fn spawn_opencode_worker_inner(
         state.process_run_logger.clone(),
         transcript_snapshot,
         Some(opencode_cancellation),
+        Some(directory_claim),
         oc_secrets_store,
         "opencode",
         async move {
-            let _directory_claim = directory_claim;
             let result = worker.run().await.map_err(SpacebotError::from);
             let result = result?;
 
@@ -1297,6 +1298,7 @@ pub(crate) fn spawn_worker_task<F>(
     opencode_cancellation: Option<
         Arc<tokio::sync::Mutex<Option<crate::opencode::worker::OpenCodeCancellationSession>>>,
     >,
+    opencode_directory_claim: Option<crate::opencode::server::OpenCodeDirectoryClaim>,
     secrets_store: Option<Arc<crate::secrets::store::SecretsStore>>,
     #[cfg_attr(not(feature = "metrics"), allow(unused_variables))] worker_type: &'static str,
     future: F,
@@ -1312,6 +1314,7 @@ where
     // worker rather than turn a dropped sender into a cancellation request.
     let task_cancel_tx = cancel_tx.clone();
     let handle = tokio::spawn(async move {
+        let opencode_directory_claim = opencode_directory_claim;
         let _task_cancel_tx = task_cancel_tx;
         #[cfg(feature = "metrics")]
         let worker_start = std::time::Instant::now();
@@ -1333,6 +1336,9 @@ where
                 }))
             }
         };
+        if let Some(directory_claim) = opencode_directory_claim {
+            directory_claim.release().await;
+        }
         let scrub = |text: String| -> String {
             let layer1 = if let Some(store) = &secrets_store {
                 crate::secrets::scrub::scrub_with_store(&text, store, &agent_id)
@@ -1687,6 +1693,14 @@ pub async fn resume_idle_worker_into_state(
             let server_pool = rc.opencode_server_pool.load().clone();
 
             let directory_str = directory.to_string_lossy().to_string();
+            server_pool
+                .claim_directory(&directory)
+                .await
+                .map_err(|error| error.to_string())?;
+            let directory_claim = crate::opencode::server::OpenCodeDirectoryClaim::new(
+                server_pool.clone(),
+                directory.clone(),
+            );
             let result = crate::opencode::OpenCodeWorker::resume_interactive(
                 worker_id,
                 Some(state.channel_id.clone()),
@@ -1734,6 +1748,7 @@ pub async fn resume_idle_worker_into_state(
                 state.process_run_logger.clone(),
                 transcript_snapshot,
                 Some(opencode_cancellation),
+                Some(directory_claim),
                 oc_secrets_store,
                 "opencode",
                 async move {
@@ -1862,6 +1877,7 @@ pub async fn resume_idle_worker_into_state(
                 Some(state.channel_id.clone()),
                 state.process_run_logger.clone(),
                 transcript_snapshot,
+                None,
                 None,
                 secrets_store,
                 "builtin",
@@ -2021,6 +2037,7 @@ mod tests {
             crate::agent::worker::new_worker_transcript_snapshot(),
             None,
             None,
+            None,
             "builtin",
             async {
                 Err::<WorkerOutcome, crate::Error>(
@@ -2074,6 +2091,7 @@ mod tests {
             crate::agent::worker::new_worker_transcript_snapshot(),
             None,
             None,
+            None,
             "builtin",
             async move {
                 started_tx.send(()).expect("test receiver remains active");
@@ -2116,6 +2134,7 @@ mod tests {
             Some(channel_id.clone()),
             run_logger,
             crate::agent::worker::new_worker_transcript_snapshot(),
+            None,
             None,
             None,
             "builtin",
@@ -2162,6 +2181,7 @@ mod tests {
             Some(Arc::<str>::from("durable-channel")),
             run_logger,
             crate::agent::worker::new_worker_transcript_snapshot(),
+            None,
             None,
             None,
             "builtin",

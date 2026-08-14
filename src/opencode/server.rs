@@ -551,22 +551,40 @@ pub struct OpenCodeServerPool {
 
 pub struct OpenCodeDirectoryClaim {
     pool: Arc<OpenCodeServerPool>,
-    directory: PathBuf,
+    directory: Option<PathBuf>,
 }
 
 impl OpenCodeDirectoryClaim {
     pub fn new(pool: Arc<OpenCodeServerPool>, directory: PathBuf) -> Self {
-        Self { pool, directory }
+        Self {
+            pool,
+            directory: Some(directory),
+        }
+    }
+
+    pub async fn release(mut self) {
+        if let Some(directory) = self.directory.take() {
+            self.pool.release_directory(&directory).await;
+        }
     }
 }
 
 impl Drop for OpenCodeDirectoryClaim {
     fn drop(&mut self) {
+        let Some(directory) = self.directory.take() else {
+            return;
+        };
         let pool = self.pool.clone();
-        let directory = self.directory.clone();
-        tokio::spawn(async move {
-            pool.release_directory(&directory).await;
-        });
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                pool.release_directory(&directory).await;
+            });
+        } else {
+            tracing::warn!(
+                directory = %directory.display(),
+                "could not schedule OpenCode directory release without a Tokio runtime"
+            );
+        }
     }
 }
 
