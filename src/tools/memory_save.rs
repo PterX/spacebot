@@ -8,11 +8,17 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Maximum allowed memory content length (bytes). Prevents oversized memories
 /// from bloating the database and embedding index.
 const MAX_MEMORY_CONTENT_BYTES: usize = 50_000;
+
+fn human_anchor_lock() -> Arc<tokio::sync::Mutex<()>> {
+    static LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+    LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
 
 /// Tool for saving memories to the store.
 #[derive(Debug, Clone)]
@@ -22,9 +28,7 @@ pub struct MemorySaveTool {
     contract_state: Option<Arc<super::memory_persistence_complete::MemoryPersistenceContractState>>,
     working_memory: Option<Arc<crate::memory::WorkingMemoryStore>>,
     runtime_config: Option<Arc<crate::config::RuntimeConfig>>,
-    /// Serializes human-anchor get-or-create across tool clones so two
-    /// concurrent saves for the same human cannot both miss the lookup and
-    /// create duplicate anchors.
+    /// Serializes human-anchor creation and merging across tool instances.
     anchor_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -43,7 +47,7 @@ impl MemorySaveTool {
             contract_state: None,
             working_memory: None,
             runtime_config: None,
-            anchor_lock: Arc::new(tokio::sync::Mutex::new(())),
+            anchor_lock: human_anchor_lock(),
         }
     }
 
@@ -326,15 +330,19 @@ impl Tool for MemorySaveTool {
         // person. `replaced_anchor` holds the pre-merge anchor for
         // compensation when a later pipeline step fails.
         let mut replaced_anchor: Option<Memory> = None;
+        // Keep the anchor lock through embedding storage so concurrent saves
+        // cannot leave the index with an earlier anchor revision.
+        let _anchor_guard = if memory_type == MemoryType::Human {
+            Some(self.anchor_lock.lock().await)
+        } else {
+            None
+        };
         if memory_type == MemoryType::Human {
             let Some(human_id) = args.human_id.as_deref() else {
                 return Err(MemorySaveError(
                     "human memories require human_id (the participant key of the person)".into(),
                 ));
             };
-            // Serialize get-or-create so concurrent saves for the same human
-            // cannot both miss the lookup and create duplicate anchors.
-            let _anchor_guard = self.anchor_lock.lock().await;
             match store
                 .get_human_anchor(human_id)
                 .await
@@ -343,6 +351,12 @@ impl Tool for MemorySaveTool {
                 Some(existing) => {
                     let mut merged = existing.clone();
                     merged.content = format!("{}\n{}", existing.content.trim_end(), args.content);
+                    if merged.content.len() > MAX_MEMORY_CONTENT_BYTES {
+                        return Err(MemorySaveError(format!(
+                            "merged human anchor exceeds maximum length of {MAX_MEMORY_CONTENT_BYTES} bytes (got {})",
+                            merged.content.len()
+                        )));
+                    }
                     merged.importance = existing.importance.max(memory.importance);
                     merged.updated_at = chrono::Utc::now();
                     store.update(&merged).await.map_err(|e| {
@@ -748,5 +762,30 @@ mod tests {
         // Both the create and the merge count toward the persistence contract.
         let recorded = contract_state.saved_memory_ids();
         assert!(recorded.contains(&created.memory_id));
+    }
+
+    #[tokio::test]
+    async fn human_anchor_merge_rejects_content_over_the_cap() {
+        let (memory_search, _dir) = memory_search_fixture().await;
+        let tool = MemorySaveTool::new(memory_search.clone());
+        let content = "a".repeat(MAX_MEMORY_CONTENT_BYTES);
+
+        let created = tool
+            .call(human_args(&content, "discord:123"))
+            .await
+            .expect("anchor create should succeed");
+        let error = tool
+            .call(human_args("b", "discord:123"))
+            .await
+            .expect_err("over-cap merge must fail");
+        assert!(error.to_string().contains("merged human anchor exceeds"));
+
+        let anchor = memory_search
+            .store()
+            .load(&created.memory_id)
+            .await
+            .unwrap()
+            .expect("anchor should remain");
+        assert_eq!(anchor.content, content);
     }
 }
