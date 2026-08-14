@@ -732,14 +732,29 @@ async fn close_browser_resources(
     // process cannot honour. Killing the child is what makes teardown final:
     // without it the process outlives its worker, holding its profile
     // directory open and its memory resident.
-    if !closed && let Some(Err(error)) = browser.kill().await {
-        tracing::warn!(%error, "failed to kill unresponsive browser process");
+    //
+    // A close that reports success is not proof the process exited, so the
+    // reaping wait below is also a kill trigger. `Browser::kill` waits for the
+    // child itself, which is why nothing waits again after it.
+    let mut killed = false;
+    if !closed {
+        killed = true;
+        if let Some(Err(error)) = browser.kill().await {
+            tracing::warn!(%error, "failed to kill unresponsive browser process");
+        }
     }
 
     // Reap the child so its profile directory is no longer in use before the
     // removal below.
-    if let Err(_elapsed) = tokio::time::timeout(BROWSER_EXIT_TIMEOUT, browser.wait()).await {
-        tracing::warn!("browser process did not exit; its profile directory may be left behind");
+    if !killed
+        && tokio::time::timeout(BROWSER_EXIT_TIMEOUT, browser.wait())
+            .await
+            .is_err()
+    {
+        tracing::warn!("browser closed but did not exit; killing it");
+        if let Some(Err(error)) = browser.kill().await {
+            tracing::warn!(%error, "failed to kill browser process after a clean close");
+        }
     }
 
     if let Some(task) = handler_task {

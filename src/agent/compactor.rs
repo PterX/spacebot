@@ -224,7 +224,7 @@ impl Compactor {
             return Ok(());
         }
 
-        let remove_count = advance_past_stranded_tool_results(&history, total / 2);
+        let remove_count = advance_past_stranded_tool_results(&history, total / 2, total - 2);
         if remove_count == 0 {
             return Ok(());
         }
@@ -418,12 +418,21 @@ pub(crate) fn opens_with_tool_result(message: &Message) -> bool {
 /// replays the same invalid history and fails on every subsequent message until
 /// it is rebuilt. Dropping the stranded results with the rest of their turn
 /// costs a little context and keeps the channel usable.
-pub(crate) fn advance_past_stranded_tool_results(history: &[Message], remove: usize) -> usize {
-    let mut aligned = remove;
+///
+/// `max_remove` is the largest prefix the caller may drop. Alignment only ever
+/// moves the cut forward, so a run of stranded results reaching past that bound
+/// leaves no valid cut and the result is 0: the caller keeps the history it has
+/// rather than dropping messages it promised to retain.
+pub(crate) fn advance_past_stranded_tool_results(
+    history: &[Message],
+    remove: usize,
+    max_remove: usize,
+) -> usize {
+    let mut aligned = remove.min(max_remove);
     while aligned < history.len() && opens_with_tool_result(&history[aligned]) {
         aligned += 1;
     }
-    aligned
+    if aligned > max_remove { 0 } else { aligned }
 }
 
 /// How many leading messages a fractional cut should remove.
@@ -438,10 +447,8 @@ pub(crate) fn aligned_fractional_cut(
     retain_floor: usize,
 ) -> usize {
     let total = history.len();
-    let remove_count = ((total as f32 * fraction) as usize)
-        .max(1)
-        .min(total.saturating_sub(retain_floor));
-    advance_past_stranded_tool_results(history, remove_count)
+    let remove_count = ((total as f32 * fraction) as usize).max(1);
+    advance_past_stranded_tool_results(history, remove_count, total.saturating_sub(retain_floor))
 }
 
 pub fn precompact_forked_history(
@@ -747,9 +754,24 @@ mod tests {
         assert_eq!(aligned_fractional_cut(&history, 0.50, 2), 2);
         assert_eq!(
             aligned_fractional_cut(&history, 0.75, 1),
-            4,
-            "advancing off a trailing result consumes the rest of the history"
+            0,
+            "advancing off the trailing result would drop the message the floor retains"
         );
+    }
+
+    /// A history whose tail is a run of tool results has no cut that both
+    /// honours the floor and leaves a valid head, so compaction declines rather
+    /// than draining every message it was told to keep.
+    #[test]
+    fn aligned_fractional_cut_never_drains_past_the_floor() {
+        let history: Vec<Message> = vec![
+            text_message(10),
+            assistant_tool_call("call_0"),
+            tool_result("call_0", 10),
+            tool_result("call_1", 10),
+        ];
+
+        assert_eq!(aligned_fractional_cut(&history, 0.50, 2), 0);
     }
 
     #[test]

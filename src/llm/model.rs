@@ -158,30 +158,39 @@ impl SpacebotModel {
     /// covers every caller regardless of which trim produced the history, and
     /// the warning names what went so a cut that keeps stranding results is
     /// still visible rather than silently absorbed.
-    fn repair_request_history(&self, request: &mut CompletionRequest) {
+    ///
+    /// A history that repairs to nothing has no request left to send: the
+    /// provider requires at least one message, so this reports the empty
+    /// history rather than spending a call that is certain to be rejected.
+    fn repair_request_history(
+        &self,
+        request: &mut CompletionRequest,
+    ) -> Result<(), CompletionError> {
         let Some((repaired, dropped)) =
             crate::llm::history_repair::repair_orphaned_tool_results(&request.chat_history)
         else {
-            return;
+            return Ok(());
         };
 
-        match OneOrMany::many(repaired) {
-            Ok(chat_history) => {
-                tracing::warn!(
-                    model = %self.full_model_name,
-                    dropped,
-                    "dropped tool results with no matching call from request history"
-                );
-                request.chat_history = chat_history;
-            }
-            Err(_) => {
-                tracing::error!(
-                    model = %self.full_model_name,
-                    dropped,
-                    "request history is entirely unpaired tool results; sending it unrepaired"
-                );
-            }
-        }
+        let Ok(chat_history) = OneOrMany::many(repaired) else {
+            tracing::error!(
+                model = %self.full_model_name,
+                dropped,
+                "request history is entirely unpaired tool results"
+            );
+            return Err(CompletionError::RequestError(
+                format!("request history is {dropped} unpaired tool results and nothing else")
+                    .into(),
+            ));
+        };
+
+        tracing::warn!(
+            model = %self.full_model_name,
+            dropped,
+            "dropped tool results with no matching call from request history"
+        );
+        request.chat_history = chat_history;
+        Ok(())
     }
 
     /// Direct call to the provider (no fallback logic).
@@ -419,7 +428,7 @@ impl CompletionModel for SpacebotModel {
         #[cfg(feature = "metrics")]
         let start = std::time::Instant::now();
 
-        self.repair_request_history(&mut request);
+        self.repair_request_history(&mut request)?;
 
         let result = async move {
             let Some(routing) = &self.routing else {
@@ -687,7 +696,7 @@ impl CompletionModel for SpacebotModel {
         &self,
         mut request: CompletionRequest,
     ) -> Result<StreamingCompletionResponse<RawStreamingResponse>, CompletionError> {
-        self.repair_request_history(&mut request);
+        self.repair_request_history(&mut request)?;
 
         let provider_config = self.provider_config_for_current_model().await?;
 

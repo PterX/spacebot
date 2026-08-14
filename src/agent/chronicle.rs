@@ -470,7 +470,8 @@ impl Chronicler {
             }
             let remove_count = advance_past_stranded_tool_results(
                 &history,
-                (total / 2).min(total - MIN_RETAINED_MESSAGES),
+                total / 2,
+                total - MIN_RETAINED_MESSAGES,
             );
             if remove_count == 0 {
                 return Ok(false);
@@ -949,10 +950,11 @@ pub(crate) async fn trim_live_history_to_boundary(
         return 0;
     }
 
-    // The retention floor is a raw message count, so clamping to it can land
-    // inside the turn that `droppable` was chosen to preserve.
+    // The retention floor is a raw message count, so it can land inside the turn
+    // that `droppable` was chosen to preserve. Pass it as the ceiling so the cut
+    // aligns within it or yields nothing.
     let floor = history.len().saturating_sub(MIN_RETAINED_MESSAGES);
-    let remove = advance_past_stranded_tool_results(&history, droppable.min(floor));
+    let remove = advance_past_stranded_tool_results(&history, droppable, floor);
     if remove == 0 {
         return 0;
     }
@@ -1358,7 +1360,7 @@ mod tests {
             user_text("newer"),
         ];
 
-        let aligned = advance_past_stranded_tool_results(&history, 2);
+        let aligned = advance_past_stranded_tool_results(&history, 2, 3);
 
         assert_eq!(
             aligned, 3,
@@ -1376,7 +1378,7 @@ mod tests {
             user_text("newer"),
         ];
 
-        assert_eq!(advance_past_stranded_tool_results(&history, 1), 3);
+        assert_eq!(advance_past_stranded_tool_results(&history, 1, 3), 3);
     }
 
     #[test]
@@ -1387,15 +1389,30 @@ mod tests {
             user_text("newer"),
         ];
 
-        assert_eq!(advance_past_stranded_tool_results(&history, 2), 2);
-        assert_eq!(advance_past_stranded_tool_results(&history, 0), 0);
+        assert_eq!(advance_past_stranded_tool_results(&history, 2, 2), 2);
+        assert_eq!(advance_past_stranded_tool_results(&history, 0, 2), 0);
+    }
+
+    /// Alignment only moves the cut forward, so a run of results reaching past
+    /// the caller's ceiling has no landing point inside it. Yielding no cut
+    /// keeps the retention floor intact; the retained head is left for the
+    /// send-boundary repair to make valid.
+    #[test]
+    fn a_run_of_results_past_the_ceiling_yields_no_cut() {
+        let history = vec![
+            assistant_tool_call("call_1"),
+            tool_result("call_1"),
+            tool_result("call_2"),
+        ];
+
+        assert_eq!(advance_past_stranded_tool_results(&history, 1, 2), 0);
     }
 
     #[test]
-    fn a_history_of_only_results_is_fully_dropped_rather_than_left_invalid() {
+    fn a_history_of_only_results_yields_no_cut_within_its_ceiling() {
         let history = vec![tool_result("call_1"), tool_result("call_2")];
 
-        assert_eq!(advance_past_stranded_tool_results(&history, 1), 2);
+        assert_eq!(advance_past_stranded_tool_results(&history, 1, 1), 0);
     }
 
     fn checkpoint(seq: i64, title: &str, summary: &str) -> ChronicleCheckpoint {

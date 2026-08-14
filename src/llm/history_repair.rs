@@ -219,6 +219,23 @@ mod tests {
         assert_eq!(content.iter().count(), 1);
     }
 
+    /// A history that is nothing but orphans repairs to no messages at all.
+    /// `OneOrMany` cannot represent that, so the caller has to turn it into an
+    /// error rather than send a request a provider will reject.
+    #[test]
+    fn an_orphan_only_history_repairs_to_nothing() {
+        let history = OneOrMany::many(vec![
+            results(vec![tool_result("call_gone", None)]),
+            results(vec![tool_result("call_also_gone", None)]),
+        ])
+        .expect("non-empty");
+
+        let (repaired, dropped) = repair_orphaned_tool_results(&history).expect("repair");
+        assert_eq!(dropped, 2);
+        assert!(repaired.is_empty());
+        assert!(OneOrMany::many(repaired).is_err());
+    }
+
     /// A turn that mixes a stranded result with real prompt text keeps the text.
     #[test]
     fn text_in_a_repaired_message_survives() {
