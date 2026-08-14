@@ -563,9 +563,11 @@ impl OpenCodeDirectoryClaim {
     }
 
     pub async fn release(mut self) {
-        if let Some(directory) = self.directory.take() {
-            self.pool.release_directory(&directory).await;
-        }
+        let Some(directory) = self.directory.as_ref() else {
+            return;
+        };
+        self.pool.release_directory(directory).await;
+        self.directory = None;
     }
 }
 
