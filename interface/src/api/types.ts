@@ -370,12 +370,36 @@ export type TaskSubtask = components["schemas"]["TaskSubtask"];
 export type TaskListResponse = components["schemas"]["TaskListResponse"];
 export type TaskResponse = components["schemas"]["TaskResponse"];
 export type TaskActionResponse = components["schemas"]["TaskActionResponse"];
+export type TaskErrorBody = components["schemas"]["TaskErrorBody"];
+
+// Discussion
+export type TaskAuthorKind = components["schemas"]["TaskAuthorKind"];
+export type TaskComment = components["schemas"]["TaskComment"];
+export type TaskCommentListResponse =
+  components["schemas"]["TaskCommentListResponse"];
+export type TaskCommentResponse = components["schemas"]["TaskCommentResponse"];
+
+// Revision history
+export type TaskMutationSource = components["schemas"]["TaskMutationSource"];
+export type TaskRevision = components["schemas"]["TaskRevision"];
+export type TaskRevisionSummary = components["schemas"]["TaskRevisionSummary"];
+export type TaskRevisionSnapshot =
+  components["schemas"]["TaskRevisionSnapshot"];
+export type TaskRevisionDiff = components["schemas"]["TaskRevisionDiff"];
+export type TaskFieldChange = components["schemas"]["TaskFieldChange"];
+export type TaskHistoryResponse = components["schemas"]["TaskHistoryResponse"];
+export type TaskRevisionResponse =
+  components["schemas"]["TaskRevisionResponse"];
 
 // Requests
 export type CreateTaskRequest = components["schemas"]["CreateTaskRequest"];
 export type UpdateTaskRequest = components["schemas"]["UpdateTaskRequest"];
 export type ApproveRequest = components["schemas"]["ApproveRequest"];
 export type AssignRequest = components["schemas"]["AssignRequest"];
+export type CreateTaskCommentRequest =
+  components["schemas"]["CreateTaskCommentRequest"];
+export type RestoreRevisionRequest =
+  components["schemas"]["RestoreRevisionRequest"];
 
 // =============================================================================
 // Messaging Types

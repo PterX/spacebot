@@ -104,15 +104,9 @@ fn classify_worker_completion(
             format!("Worker cancelled: {reason}"),
             WorkerCompletionKind::Cancelled,
         ),
-        Ok(WorkerOutcome::Timeout {
-            elapsed_secs,
-            segments_run,
-        }) => (
-            format!(
-                "Worker exceeded {elapsed_secs}s wall-clock timeout after {segments_run} segments."
-            ),
-            WorkerCompletionKind::Timeout,
-        ),
+        Ok(outcome @ WorkerOutcome::Timeout { .. }) => {
+            (outcome.into_text(), WorkerCompletionKind::Timeout)
+        }
         Ok(WorkerOutcome::Blocked { reason, url, .. }) => {
             let body = match url {
                 Some(url) => format!("Worker blocked: {} at {url}", reason.describe()),
@@ -1625,9 +1619,11 @@ where
         WorkerOutcome::Timeout {
             elapsed_secs,
             segments_run,
+            result,
         } => WorkerOutcome::Timeout {
             elapsed_secs,
             segments_run,
+            result: scrub(result),
         },
         WorkerOutcome::Blocked {
             reason,
@@ -1985,6 +1981,7 @@ mod tests {
         let (text, notify, success) = map_worker_completion(Ok(WorkerOutcome::Timeout {
             elapsed_secs: 1800,
             segments_run: 7,
+            result: String::new(),
         }));
         assert_eq!(
             text,
@@ -1992,6 +1989,19 @@ mod tests {
         );
         assert!(notify);
         assert!(!success);
+    }
+
+    /// A run that produced findings before its budget ran out relays them
+    /// rather than reporting only the timeout.
+    #[test]
+    fn timeout_outcome_relays_recovered_work() {
+        let (text, ..) = map_worker_completion(Ok(WorkerOutcome::Timeout {
+            elapsed_secs: 1800,
+            segments_run: 7,
+            result: "Found three candidate repositories.".to_string(),
+        }));
+        assert!(text.starts_with("Found three candidate repositories."));
+        assert!(text.contains("partial result"));
     }
 
     #[test]

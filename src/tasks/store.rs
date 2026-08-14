@@ -2,8 +2,14 @@
 //!
 //! Operates against the instance-level `tasks.db` database with globally
 //! unique task numbers and explicit owner/assigned agent relationships.
+//!
+//! Every path that materially changes a task goes through
+//! [`TaskStore::update_with_dependencies_and_status_policy`] or
+//! [`TaskStore::create_with_dependencies`], both of which write the task row,
+//! its immutable revision, and its dependency edges in one transaction.
 
-use crate::error::Result;
+use crate::error::{Result, TaskError};
+use crate::tasks::revisions::{TaskMutationContext, TaskRevisionSnapshot};
 
 use anyhow::Context as _;
 use schemars::JsonSchema;
@@ -187,7 +193,7 @@ impl std::fmt::Display for TaskWorktreeMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 pub struct TaskSubtask {
     pub title: String,
     pub completed: bool,
@@ -278,6 +284,9 @@ pub struct Task {
     /// the tasks row).
     #[serde(default)]
     pub depends_on: Vec<TaskDependencyEdge>,
+    /// Number of the task's latest revision, and the token a caller passes back
+    /// as `expected_revision` to prove it is editing the version it read.
+    pub revision: i64,
     pub created_by: String,
     pub approved_at: Option<String>,
     pub approved_by: Option<String>,
@@ -416,6 +425,8 @@ pub struct CreateTaskInput {
     pub worktree_mode: Option<TaskWorktreeMode>,
     pub worktree_id: Option<String>,
     pub required_skills: Vec<String>,
+    /// Attribution recorded on the task's revision 1.
+    pub context: TaskMutationContext,
 }
 
 impl Default for CreateTaskInput {
@@ -437,36 +448,58 @@ impl Default for CreateTaskInput {
             worktree_mode: None,
             worktree_id: None,
             required_skills: Vec::new(),
+            context: TaskMutationContext::default(),
         }
+    }
+}
+
+/// A nullable field in an update: absent leaves the stored value alone, present
+/// sets it — including to `None`, which restoring a revision that cleared the
+/// field depends on.
+pub type Patch<T> = Option<Option<T>>;
+
+/// Resolve a patch against the value currently stored.
+fn patch<T>(patch: Patch<T>, current: Option<T>) -> Option<T> {
+    match patch {
+        Some(next) => next,
+        None => current,
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct UpdateTaskInput {
     pub title: Option<String>,
-    pub description: Option<String>,
+    pub description: Patch<String>,
     pub status: Option<TaskStatus>,
     pub priority: Option<TaskPriority>,
     pub subtasks: Option<Vec<TaskSubtask>>,
     pub metadata: Option<Value>,
+    /// Replace metadata outright instead of deep-merging the patch into it.
+    /// Restore sets this so a key removed in the restored revision stays gone.
+    pub replace_metadata: bool,
     pub worker_id: Option<String>,
     pub clear_worker_id: bool,
     pub approved_by: Option<String>,
     pub complete_subtask: Option<usize>,
-    /// Reassign the task to a different agent.
-    pub assigned_agent_id: Option<String>,
-    pub worker_type: Option<TaskWorkerType>,
-    pub project_id: Option<String>,
-    pub repo_id: Option<String>,
-    pub worktree_mode: Option<TaskWorktreeMode>,
-    pub worktree_id: Option<String>,
+    /// Reassign the task to a different agent, or unassign it.
+    pub assigned_agent_id: Patch<String>,
+    pub worker_type: Patch<TaskWorkerType>,
+    pub project_id: Patch<String>,
+    pub repo_id: Patch<String>,
+    pub worktree_mode: Patch<TaskWorktreeMode>,
+    pub worktree_id: Patch<String>,
     pub required_skills: Option<Vec<String>>,
+    /// Attribution and optimistic-concurrency expectations for this mutation.
+    pub context: TaskMutationContext,
 }
 
 #[derive(Debug, Clone)]
 pub struct TaskUpdateResult {
     pub previous_status: TaskStatus,
     pub task: Task,
+    /// The revision this mutation appended, or `None` when nothing material
+    /// changed and no history was written.
+    pub new_revision: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -500,7 +533,6 @@ impl TaskStore {
         Self { pool }
     }
 
-    #[cfg(test)]
     pub(crate) fn pool(&self) -> &SqlitePool {
         &self.pool
     }
@@ -524,6 +556,7 @@ impl TaskStore {
         let metadata_json = input.metadata.to_string();
         let required_skills_json = serde_json::to_string(&input.required_skills)
             .context("failed to serialize required skills")?;
+        input.context.validate()?;
 
         for attempt in 0..Self::MAX_CREATE_RETRIES {
             let mut tx = self
@@ -589,6 +622,20 @@ impl TaskStore {
                     let task = task_from_row(task)?;
 
                     Self::replace_dependencies_in_tx(&mut tx, &task, edges).await?;
+
+                    // Revision 1 and the task row commit together: a task can
+                    // never exist without the snapshot it started from.
+                    let dependencies = Self::dependency_pairs_in_tx(&mut tx, &task.id).await?;
+                    let snapshot = TaskRevisionSnapshot::capture(&task, &dependencies);
+                    Self::insert_revision_in_tx(
+                        &mut tx,
+                        &task.id,
+                        0,
+                        &snapshot,
+                        &input.context,
+                        None,
+                    )
+                    .await?;
 
                     tx.commit()
                         .await
@@ -876,6 +923,26 @@ impl TaskStore {
         edges: Option<&[(i64, TaskDependencyKind)]>,
         status_policy: StatusTransitionPolicy,
     ) -> Result<Option<TaskUpdateResult>> {
+        self.apply_update(task_number, input, edges, status_policy, None)
+            .await
+    }
+
+    /// The one transactional task mutation. Every caller — REST, CLI, portal,
+    /// tools, automation, restore — reaches storage through here, so the task
+    /// row, its revision, and its dependency edges can never disagree.
+    ///
+    /// `restored_from` marks the revision a restore replayed; ordinary edits
+    /// pass `None`.
+    async fn apply_update(
+        &self,
+        task_number: i64,
+        input: UpdateTaskInput,
+        edges: Option<&[(i64, TaskDependencyKind)]>,
+        status_policy: StatusTransitionPolicy,
+        restored_from: Option<i64>,
+    ) -> Result<Option<TaskUpdateResult>> {
+        input.context.validate()?;
+
         let mut tx = self
             .pool
             .begin_with("BEGIN IMMEDIATE")
@@ -899,12 +966,41 @@ impl TaskStore {
 
         let current = task_from_row(row)?;
         let previous_status = current.status;
+        let context = input.context.clone();
+        check_expected_revision(task_number, &current, &context)?;
+
+        let before_dependencies = Self::dependency_pairs_in_tx(&mut tx, &current.id).await?;
+        let before = TaskRevisionSnapshot::capture(&current, &before_dependencies);
+        let task_id = current.id.clone();
+        let current_revision = current.revision;
+
         let mut task =
             Self::update_current_in_tx(&mut tx, task_number, current, input, status_policy).await?;
 
         if let Some(edges) = edges {
             Self::replace_dependencies_in_tx(&mut tx, &task, edges).await?;
         }
+
+        let after_dependencies = Self::dependency_pairs_in_tx(&mut tx, &task_id).await?;
+        let after = TaskRevisionSnapshot::capture(&task, &after_dependencies);
+
+        // An update that changes nothing material leaves no trace in history
+        // and emits no edit event.
+        let new_revision = if after == before {
+            None
+        } else {
+            let revision = Self::insert_revision_in_tx(
+                &mut tx,
+                &task_id,
+                current_revision,
+                &after,
+                &context,
+                restored_from,
+            )
+            .await?;
+            task.revision = revision;
+            Some(revision)
+        };
 
         tx.commit()
             .await
@@ -920,7 +1016,60 @@ impl TaskStore {
         Ok(Some(TaskUpdateResult {
             previous_status,
             task,
+            new_revision,
         }))
+    }
+
+    /// Restore a historical revision by appending a new one whose material
+    /// state matches it.
+    ///
+    /// Revision `revision` is never touched and nothing after it is erased. The
+    /// restore is an ordinary update underneath, so status transitions,
+    /// dependency validation, and optimistic concurrency all still apply.
+    pub async fn restore_revision(
+        &self,
+        task_number: i64,
+        revision: i64,
+        context: TaskMutationContext,
+    ) -> Result<TaskUpdateResult> {
+        let target =
+            self.get_revision(task_number, revision)
+                .await?
+                .ok_or(TaskError::RevisionNotFound {
+                    task_number,
+                    revision,
+                })?;
+        let snapshot = target.snapshot;
+        let edges = snapshot.dependency_edges();
+
+        let input = UpdateTaskInput {
+            title: Some(snapshot.title),
+            description: Some(snapshot.description),
+            status: Some(snapshot.status),
+            priority: Some(snapshot.priority),
+            subtasks: Some(snapshot.subtasks),
+            metadata: Some(snapshot.metadata),
+            replace_metadata: true,
+            assigned_agent_id: Some(snapshot.assigned_agent_id),
+            worker_type: Some(snapshot.worker_type),
+            project_id: Some(snapshot.project_id),
+            repo_id: Some(snapshot.repo_id),
+            worktree_mode: Some(snapshot.worktree_mode),
+            worktree_id: Some(snapshot.worktree_id),
+            required_skills: Some(snapshot.required_skills),
+            context,
+            ..Default::default()
+        };
+
+        self.apply_update(
+            task_number,
+            input,
+            Some(&edges),
+            StatusTransitionPolicy::Enforce,
+            Some(revision),
+        )
+        .await?
+        .ok_or_else(|| TaskError::NotFound { task_number }.into())
     }
 
     async fn replace_dependencies_in_tx(
@@ -1008,6 +1157,8 @@ impl TaskStore {
         task_number: i64,
         input: UpdateTaskInput,
     ) -> Result<WorkerTaskUpdateResult> {
+        input.context.validate()?;
+
         let mut tx = self
             .pool
             .begin_with("BEGIN IMMEDIATE")
@@ -1045,7 +1196,15 @@ impl TaskStore {
 
         let current = task_from_row(row)?;
         let previous_status = current.status;
-        let task = Self::update_current_in_tx(
+        let context = input.context.clone();
+        check_expected_revision(task_number, &current, &context)?;
+
+        let dependencies = Self::dependency_pairs_in_tx(&mut tx, &current.id).await?;
+        let before = TaskRevisionSnapshot::capture(&current, &dependencies);
+        let task_id = current.id.clone();
+        let current_revision = current.revision;
+
+        let mut task = Self::update_current_in_tx(
             &mut tx,
             task_number,
             current,
@@ -1053,6 +1212,24 @@ impl TaskStore {
             StatusTransitionPolicy::Enforce,
         )
         .await?;
+
+        // Workers cannot touch dependency edges, so the edge set is unchanged.
+        let after = TaskRevisionSnapshot::capture(&task, &dependencies);
+        let new_revision = if after == before {
+            None
+        } else {
+            let revision = Self::insert_revision_in_tx(
+                &mut tx,
+                &task_id,
+                current_revision,
+                &after,
+                &context,
+                None,
+            )
+            .await?;
+            task.revision = revision;
+            Some(revision)
+        };
 
         tx.commit()
             .await
@@ -1062,6 +1239,7 @@ impl TaskStore {
             TaskUpdateResult {
                 previous_status,
                 task,
+                new_revision,
             },
         )))
     }
@@ -1077,11 +1255,11 @@ impl TaskStore {
             && status_policy == StatusTransitionPolicy::Enforce
             && !can_transition(current.status, next_status)
         {
-            return Err(crate::error::Error::Other(anyhow::anyhow!(
-                "invalid task status transition: {} -> {}",
-                current.status,
-                next_status
-            )));
+            return Err(TaskError::InvalidTransition {
+                from: current.status.to_string(),
+                to: next_status.to_string(),
+            }
+            .into());
         }
 
         let mut subtasks = input.subtasks.unwrap_or(current.subtasks);
@@ -1093,11 +1271,12 @@ impl TaskStore {
 
         let next_status = input.status.unwrap_or(current.status);
         let next_priority = input.priority.unwrap_or(current.priority);
-        let next_metadata = merge_json_object(current.metadata, input.metadata);
-        let next_assigned = match input.assigned_agent_id {
-            Some(agent_id) => Some(agent_id),
-            None => current.assigned_agent_id.clone(),
+        let next_metadata = if input.replace_metadata {
+            input.metadata.unwrap_or(current.metadata)
+        } else {
+            merge_json_object(current.metadata, input.metadata)
         };
+        let next_assigned = patch(input.assigned_agent_id, current.assigned_agent_id.clone());
         let reassigned = next_assigned != current.assigned_agent_id;
 
         // If the task is being reassigned to a different agent, clear the worker
@@ -1126,11 +1305,11 @@ impl TaskStore {
             None
         };
 
-        let next_worker_type = input.worker_type.or(current.worker_type);
-        let next_project_id = input.project_id.or(current.project_id);
-        let next_repo_id = input.repo_id.or(current.repo_id);
-        let next_worktree_mode = input.worktree_mode.or(current.worktree_mode);
-        let next_worktree_id = input.worktree_id.or(current.worktree_id);
+        let next_worker_type = patch(input.worker_type, current.worker_type);
+        let next_project_id = patch(input.project_id, current.project_id);
+        let next_repo_id = patch(input.repo_id, current.repo_id);
+        let next_worktree_mode = patch(input.worktree_mode, current.worktree_mode);
+        let next_worktree_id = patch(input.worktree_id, current.worktree_id);
         let next_required_skills = input.required_skills.unwrap_or(current.required_skills);
         let required_skills_json = serde_json::to_string(&next_required_skills)
             .context("failed to serialize required skills")?;
@@ -1168,7 +1347,7 @@ impl TaskStore {
 
         let mut sql = sqlx::query(&query)
             .bind(input.title.unwrap_or(current.title))
-            .bind(input.description.or(current.description))
+            .bind(patch(input.description, current.description))
             .bind(next_status.as_str())
             .bind(next_priority.as_str())
             .bind(&next_assigned)
@@ -1202,14 +1381,55 @@ impl TaskStore {
         task_from_row(updated)
     }
 
+    /// Delete a task with its comments and revisions.
+    ///
+    /// The child rows are removed explicitly rather than through the foreign
+    /// key, which only cascades when `PRAGMA foreign_keys` is on.
     pub async fn delete(&self, task_number: i64) -> Result<bool> {
-        let result = sqlx::query("DELETE FROM tasks WHERE task_number = ?")
-            .bind(task_number)
-            .execute(&self.pool)
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .context("failed to open task delete transaction")?;
+
+        let task_id: Option<String> =
+            sqlx::query_scalar("SELECT id FROM tasks WHERE task_number = ?")
+                .bind(task_number)
+                .fetch_optional(&mut *tx)
+                .await
+                .context("failed to resolve task for deletion")?;
+
+        let Some(task_id) = task_id else {
+            tx.rollback()
+                .await
+                .context("failed to roll back empty task delete transaction")?;
+            return Ok(false);
+        };
+
+        for table in ["task_comments", "task_revisions", "task_dependencies"] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE task_id = ?"))
+                .bind(&task_id)
+                .execute(&mut *tx)
+                .await
+                .with_context(|| format!("failed to delete {table} for task"))?;
+        }
+        sqlx::query("DELETE FROM task_dependencies WHERE depends_on_task_id = ?")
+            .bind(&task_id)
+            .execute(&mut *tx)
+            .await
+            .context("failed to delete inbound task dependencies")?;
+
+        sqlx::query("DELETE FROM tasks WHERE id = ?")
+            .bind(&task_id)
+            .execute(&mut *tx)
             .await
             .context("failed to delete task")?;
 
-        Ok(result.rows_affected() > 0)
+        tx.commit()
+            .await
+            .context("failed to commit task delete transaction")?;
+
+        Ok(true)
     }
 
     pub async fn get_by_worker_id(&self, worker_id: &str) -> Result<Option<Task>> {
@@ -1231,10 +1451,29 @@ enum StatusTransitionPolicy {
     Override,
 }
 
+/// Fail a mutation whose caller read an older version of the task. The error
+/// carries the current revision so the caller can refresh and retry without a
+/// second round trip.
+fn check_expected_revision(
+    task_number: i64,
+    current: &Task,
+    context: &TaskMutationContext,
+) -> Result<()> {
+    match context.expected_revision {
+        Some(expected) if expected != current.revision => Err(TaskError::RevisionConflict {
+            task_number,
+            expected,
+            current: current.revision,
+        }
+        .into()),
+        _ => Ok(()),
+    }
+}
+
 /// Column list used by all SELECT queries. Kept in sync with `task_from_row`.
-const SELECT_COLUMNS: &str = "SELECT id, task_number, title, description, status, priority, \
+pub(crate) const SELECT_COLUMNS: &str = "SELECT id, task_number, title, description, status, priority, \
      owner_agent_id, assigned_agent_id, subtasks, metadata, goal_id, source_memory_id, worker_id, \
-     worker_type, project_id, repo_id, worktree_mode, worktree_id, required_skills, \
+     worker_type, project_id, repo_id, worktree_mode, worktree_id, required_skills, revision, \
      created_by, approved_at, approved_by, created_at, updated_at, completed_at";
 
 pub fn can_transition(current: TaskStatus, next: TaskStatus) -> bool {
@@ -1305,7 +1544,7 @@ fn parse_metadata(value: &str) -> Value {
     serde_json::from_str(value).unwrap_or_else(|_| Value::Object(serde_json::Map::new()))
 }
 
-fn task_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Task> {
+pub(crate) fn task_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Task> {
     let status_value: String = row
         .try_get("status")
         .context("failed to read task status")?;
@@ -1378,6 +1617,7 @@ fn task_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Task> {
             .and_then(|value| serde_json::from_str(&value).ok())
             .unwrap_or_default(),
         depends_on: Vec::new(),
+        revision: row.try_get("revision").unwrap_or(0),
         created_by: row
             .try_get("created_by")
             .context("failed to read task created_by")?,
@@ -1444,6 +1684,7 @@ pub(crate) async fn setup_test_store() -> TaskStore {
             worktree_mode TEXT,
             worktree_id TEXT,
             required_skills TEXT NOT NULL DEFAULT '[]',
+            revision INTEGER NOT NULL DEFAULT 0,
             created_by TEXT NOT NULL,
             approved_at TEXT,
             approved_by TEXT,
@@ -1479,6 +1720,42 @@ pub(crate) async fn setup_test_store() -> TaskStore {
     .execute(&pool)
     .await
     .expect("task_dependencies should be created");
+
+    sqlx::query(
+        "CREATE TABLE task_comments (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            id TEXT NOT NULL UNIQUE,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            author_type TEXT NOT NULL,
+            author_id TEXT,
+            body TEXT NOT NULL,
+            worker_id TEXT,
+            metadata TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )",
+    )
+    .execute(&pool)
+    .await
+    .expect("task_comments should be created");
+
+    sqlx::query(
+        "CREATE TABLE task_revisions (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            revision INTEGER NOT NULL,
+            snapshot TEXT NOT NULL,
+            author_type TEXT NOT NULL,
+            author_id TEXT,
+            source TEXT NOT NULL,
+            edit_summary TEXT,
+            restored_from INTEGER,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            UNIQUE (task_id, revision)
+        )",
+    )
+    .execute(&pool)
+    .await
+    .expect("task_revisions should be created");
 
     sqlx::query("INSERT INTO task_number_seq (id, next_number) VALUES (1, 1)")
         .execute(&pool)
@@ -1743,7 +2020,7 @@ mod tests {
             .update(
                 created.task_number,
                 UpdateTaskInput {
-                    worktree_id: Some("wt-1".to_string()),
+                    worktree_id: Some(Some("wt-1".to_string())),
                     ..Default::default()
                 },
             )
@@ -1778,6 +2055,7 @@ mod tests {
             worktree_id: None,
             required_skills: vec!["Task-Skill".to_string(), "shared".to_string()],
             depends_on: Vec::new(),
+            revision: 1,
             created_by: "branch".to_string(),
             approved_at: None,
             approved_by: None,
@@ -2176,7 +2454,7 @@ mod tests {
             .update(
                 created.task_number,
                 UpdateTaskInput {
-                    assigned_agent_id: Some("agent-other".to_string()),
+                    assigned_agent_id: Some(Some("agent-other".to_string())),
                     ..Default::default()
                 },
             )

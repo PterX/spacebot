@@ -23,6 +23,8 @@ import {
 	taskListTitle,
 	TaskMetadataBadges,
 } from "@/components/TaskUtils";
+import {TaskComments} from "@/components/TaskComments";
+import {TaskHistory} from "@/components/TaskHistory";
 
 const TASK_LIMIT = 200;
 
@@ -221,14 +223,14 @@ export function AgentTasks({agentId}: {agentId: string}) {
 			{/* Detail panel */}
 			{activeTask && (
 				<div className="w-[400px] shrink-0 overflow-y-auto border-l border-app-line">
-					{/* Sits above TaskDetail until @spacedrive/ai ships the
-					    beforeSubtasks slot, which places it in-card. */}
-					<ExecutionPlanSection task={activeTask} />
-					<div className="border-b border-app-line/40 px-4 py-2">
-						<TaskMetadataBadges task={activeTask} enrichment={enrichments.get(activeTask.task_number)} />
-					</div>
+					{enrichments.has(activeTask.task_number) && (
+						<div className="border-b border-app-line/40 px-4 py-2">
+							<TaskMetadataBadges enrichment={enrichments.get(activeTask.task_number)} />
+						</div>
+					)}
 					<TaskDetail
 						task={activeTask as unknown as Task}
+						beforeSubtasks={<ExecutionPlanSection task={activeTask} />}
 						onStatusChange={handleStatusChange}
 						onSubtaskToggle={handleSubtaskToggle}
 						onDelete={handleDelete}
@@ -237,6 +239,14 @@ export function AgentTasks({agentId}: {agentId: string}) {
 					{/* GitHub metadata (not part of the shared TaskDetail) */}
 					<GithubSection
 						metadata={(activeTask as unknown as TaskItem).metadata}
+					/>
+					<TaskComments
+						taskNumber={activeTask.task_number}
+						agentId={agentId}
+					/>
+					<TaskHistory
+						taskNumber={activeTask.task_number}
+						currentRevision={activeTask.revision}
 					/>
 				</div>
 			)}

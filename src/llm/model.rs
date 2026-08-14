@@ -151,6 +151,48 @@ impl SpacebotModel {
         }
     }
 
+    /// Drop tool results this request cannot pair before it reaches a provider.
+    ///
+    /// A stranded result is rejected at the API boundary, so the model never
+    /// runs and a retry of the same history fails the same way. Repairing here
+    /// covers every caller regardless of which trim produced the history, and
+    /// the warning names what went so a cut that keeps stranding results is
+    /// still visible rather than silently absorbed.
+    ///
+    /// A history that repairs to nothing has no request left to send: the
+    /// provider requires at least one message, so this reports the empty
+    /// history rather than spending a call that is certain to be rejected.
+    fn repair_request_history(
+        &self,
+        request: &mut CompletionRequest,
+    ) -> Result<(), CompletionError> {
+        let Some((repaired, dropped)) =
+            crate::llm::history_repair::repair_orphaned_tool_results(&request.chat_history)
+        else {
+            return Ok(());
+        };
+
+        let Ok(chat_history) = OneOrMany::many(repaired) else {
+            tracing::error!(
+                model = %self.full_model_name,
+                dropped,
+                "request history is entirely unpaired tool results"
+            );
+            return Err(CompletionError::RequestError(
+                format!("request history is {dropped} unpaired tool results and nothing else")
+                    .into(),
+            ));
+        };
+
+        tracing::warn!(
+            model = %self.full_model_name,
+            dropped,
+            "dropped tool results with no matching call from request history"
+        );
+        request.chat_history = chat_history;
+        Ok(())
+    }
+
     /// Direct call to the provider (no fallback logic).
     async fn attempt_completion(
         &self,
@@ -381,10 +423,12 @@ impl CompletionModel for SpacebotModel {
 
     async fn completion(
         &self,
-        request: CompletionRequest,
+        mut request: CompletionRequest,
     ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
         #[cfg(feature = "metrics")]
         let start = std::time::Instant::now();
+
+        self.repair_request_history(&mut request)?;
 
         let result = async move {
             let Some(routing) = &self.routing else {
@@ -650,8 +694,10 @@ impl CompletionModel for SpacebotModel {
 
     async fn stream(
         &self,
-        request: CompletionRequest,
+        mut request: CompletionRequest,
     ) -> Result<StreamingCompletionResponse<RawStreamingResponse>, CompletionError> {
+        self.repair_request_history(&mut request)?;
+
         let provider_config = self.provider_config_for_current_model().await?;
 
         match provider_config.api_type {

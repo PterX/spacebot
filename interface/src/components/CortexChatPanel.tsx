@@ -1,4 +1,4 @@
-import {useCallback, useEffect, useRef, useState} from "react";
+import {useCallback, useEffect, useMemo, useRef, useState} from "react";
 import {useCortexChat, type ToolActivity} from "@/hooks/useCortexChat";
 import {Markdown} from "@/components/Markdown";
 import {ToolCall, type ToolCallPair} from "@/components/ToolCall";
@@ -14,6 +14,7 @@ import {
 	PopoverContent,
 	PopoverTrigger,
 } from "@spacedrive/primitives";
+import {ChatMessageList} from "@spacedrive/ai";
 import {Plus, X, Clock, Trash} from "@phosphor-icons/react";
 
 interface CortexChatPanelProps {
@@ -382,7 +383,6 @@ export function CortexChatPanel({
 	} = useCortexChat(agentId, channelId, {freshThread: !!initialPrompt});
 	const [input, setInput] = useState("");
 	const [threadListOpen, setThreadListOpen] = useState(false);
-	const messagesEndRef = useRef<HTMLDivElement>(null);
 	const initialPromptSentRef = useRef(false);
 
 	// Auto-send initial prompt once the fresh thread is ready
@@ -399,9 +399,21 @@ export function CortexChatPanel({
 		}
 	}, [initialPrompt, threadId, isStreaming, messages.length, sendMessage]);
 
-	useEffect(() => {
-		messagesEndRef.current?.scrollIntoView({behavior: "smooth"});
-	}, [messages.length, isStreaming, toolActivity.length]);
+	type ChatRow =
+		| {kind: "message"; id: string; message: (typeof messages)[number]}
+		| {kind: "streaming"}
+		| {kind: "error"; message: string};
+
+	const rows: ChatRow[] = useMemo(() => {
+		const list: ChatRow[] = messages.map((m) => ({
+			kind: "message",
+			id: m.id,
+			message: m,
+		}));
+		if (isStreaming) list.push({kind: "streaming"});
+		if (error) list.push({kind: "error", message: error});
+		return list;
+	}, [messages, isStreaming, error]);
 
 	const handleSubmit = () => {
 		const trimmed = input.trim();
@@ -469,52 +481,67 @@ export function CortexChatPanel({
 			)}
 
 			{/* Messages */}
-			<div className="min-h-0 flex-1 overflow-y-auto">
-				<div className="flex flex-col gap-5 p-3 pb-4">
-					{messages.map((message) => (
-						<div key={message.id}>
-							{message.role === "user" ? (
-								<div className="flex justify-end">
-									<div className="max-w-[85%] rounded-2xl rounded-br-md bg-app-hover/30 px-3 py-2">
-										<p className="text-sm text-ink">{message.content}</p>
+			<div className="min-h-0 flex-1">
+				<ChatMessageList<ChatRow>
+					messages={rows}
+					getMessageKey={(index) => {
+						const row = rows[index]!;
+						if (row.kind === "message") return row.id;
+						return `__${row.kind}__`;
+					}}
+					estimateMessageSize={() => 80}
+					renderMessage={(row) => {
+						if (row.kind === "streaming") {
+							return (
+								<div className="px-3 pb-5">
+									<ToolActivityIndicator activity={toolActivity} />
+									{!toolActivity.some((t) => t.status === "running") && (
+										<ThinkingIndicator />
+									)}
+								</div>
+							);
+						}
+						if (row.kind === "error") {
+							return (
+								<div className="px-3 pb-5">
+									<div className="rounded-lg border border-red-500/20 bg-red-500/5 px-3 py-2.5 text-sm text-red-400">
+										{row.message}
 									</div>
 								</div>
-							) : (
-								<div className="flex flex-col gap-2">
-									{message.tool_calls && message.tool_calls.length > 0 && (
-										<div className="flex flex-col gap-1.5">
-											{message.tool_calls.map((call) => (
-												<ToolCall key={call.id} pair={toToolCallPair(call)} />
-											))}
+							);
+						}
+						const message = row.message;
+						return (
+							<div className="px-3 pb-5">
+								{message.role === "user" ? (
+									<div className="flex justify-end">
+										<div className="max-w-[85%] rounded-2xl rounded-br-md bg-app-hover/30 px-3 py-2">
+											<p className="text-sm text-ink">{message.content}</p>
 										</div>
-									)}
-									{message.content && (
-										<div className="text-sm text-ink-dull">
-											<Markdown>{message.content}</Markdown>
-										</div>
-									)}
-								</div>
-							)}
-						</div>
-					))}
-
-					{/* Streaming state */}
-					{isStreaming && (
-						<div>
-							<ToolActivityIndicator activity={toolActivity} />
-							{!toolActivity.some((t) => t.status === "running") && (
-								<ThinkingIndicator />
-							)}
-						</div>
-					)}
-
-					{error && (
-						<div className="rounded-lg border border-red-500/20 bg-red-500/5 px-3 py-2.5 text-sm text-red-400">
-							{error}
-						</div>
-					)}
-					<div ref={messagesEndRef} />
-				</div>
+									</div>
+								) : (
+									<div className="flex flex-col gap-2">
+										{message.tool_calls && message.tool_calls.length > 0 && (
+											<div className="flex flex-col gap-1.5">
+												{message.tool_calls.map((call) => (
+													<ToolCall
+														key={call.id}
+														pair={toToolCallPair(call)}
+													/>
+												))}
+											</div>
+										)}
+										{message.content && (
+											<div className="text-sm text-ink-dull">
+												<Markdown>{message.content}</Markdown>
+											</div>
+										)}
+									</div>
+								)}
+							</div>
+						);
+					}}
+				/>
 			</div>
 
 			{messages.length === 0 && !isStreaming && (

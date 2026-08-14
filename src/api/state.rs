@@ -500,6 +500,25 @@ pub enum ApiEvent {
         /// "created", "updated", or "deleted".
         action: String,
     },
+    /// A material task edit committed and appended a revision. Never emitted
+    /// for a no-op update or a rolled-back transaction.
+    TaskRevised {
+        agent_id: String,
+        task_number: i64,
+        /// The revision this edit produced.
+        revision: i64,
+        /// The revision that was restored, when this edit was a restore.
+        restored_from: Option<i64>,
+    },
+    /// A comment was appended to a task.
+    TaskCommented {
+        agent_id: String,
+        task_number: i64,
+        comment_id: String,
+        /// Stable ordering cursor for the comment thread.
+        seq: i64,
+        author_type: String,
+    },
     /// A finalized content part from an OpenCode worker session.
     OpenCodePartUpdated {
         agent_id: String,

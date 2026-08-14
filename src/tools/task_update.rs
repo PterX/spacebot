@@ -19,8 +19,6 @@ pub enum TaskUpdateScope {
 #[derive(Debug, Clone)]
 pub struct TaskUpdateTool {
     task_store: Arc<TaskStore>,
-    // Retained for future authorization checks on global task updates.
-    #[allow(dead_code)]
     agent_id: AgentId,
     scope: TaskUpdateScope,
     working_memory: Option<Arc<crate::memory::WorkingMemoryStore>>,
@@ -76,6 +74,11 @@ pub struct TaskUpdateArgs {
     /// Full replacement of the task's dependency edges; omit to leave
     /// unchanged.
     pub depends_on: Option<Vec<crate::tools::task_create::TaskDependencyArg>>,
+    /// One line on why this edit was made, recorded on the revision.
+    pub edit_summary: Option<String>,
+    /// The revision this edit was written against. When it no longer matches,
+    /// the update fails instead of overwriting a change made in between.
+    pub expected_revision: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,6 +86,9 @@ pub struct TaskUpdateOutput {
     pub success: bool,
     pub task_number: i64,
     pub status: String,
+    /// The task's revision after this call. Unchanged when the update was a
+    /// no-op, and the token to pass as `expected_revision` on the next edit.
+    pub revision: i64,
     pub message: String,
 }
 
@@ -115,7 +121,8 @@ impl Tool for TaskUpdateTool {
                         }
                     },
                     "metadata": { "type": "object", "description": "Metadata object deep-merged with current metadata" },
-                    "complete_subtask": { "type": "integer", "description": "Subtask index to mark complete" }
+                    "complete_subtask": { "type": "integer", "description": "Subtask index to mark complete" },
+                    "edit_summary": { "type": "string", "description": "One line on why this edit was made, recorded on the task's revision history" }
                 },
                 "required": ["task_number"]
             })
@@ -185,7 +192,9 @@ impl Tool for TaskUpdateTool {
                             "required": ["task"]
                         },
                         "description": "Full replacement of this task's dependency edges"
-                    }
+                    },
+                    "edit_summary": { "type": "string", "description": "One line on why this edit was made, recorded on the task's revision history" },
+                    "expected_revision": { "type": "integer", "description": "The task's revision as you last read it. Supply it when rewriting a description so a concurrent edit fails loudly instead of being overwritten" }
                 },
                 "required": ["task_number"]
             })
@@ -257,24 +266,41 @@ impl Tool for TaskUpdateTool {
             ),
         };
 
+        let (author_type, author_id, source) = match &self.scope {
+            TaskUpdateScope::Branch => (
+                crate::tasks::TaskAuthorKind::Agent,
+                self.agent_id.to_string(),
+                crate::tasks::TaskMutationSource::Tool,
+            ),
+            TaskUpdateScope::Worker(worker_id) => (
+                crate::tasks::TaskAuthorKind::Worker,
+                worker_id.to_string(),
+                crate::tasks::TaskMutationSource::Worker,
+            ),
+        };
+
         let input = UpdateTaskInput {
             title: args.title,
-            description: args.description,
+            description: args.description.map(Some),
             status,
             priority,
             subtasks: args.subtasks,
             metadata: args.metadata,
+            replace_metadata: false,
             worker_id: args.worker_id,
             clear_worker_id: false,
             approved_by: args.approved_by,
             complete_subtask,
             assigned_agent_id: None,
-            worker_type,
-            project_id: args.project_id,
-            repo_id: args.repo_id,
-            worktree_mode,
-            worktree_id: args.worktree_id,
+            worker_type: worker_type.map(Some),
+            project_id: args.project_id.map(Some),
+            repo_id: args.repo_id.map(Some),
+            worktree_mode: worktree_mode.map(Some),
+            worktree_id: args.worktree_id.map(Some),
             required_skills: args.required_skills,
+            context: crate::tasks::TaskMutationContext::new(author_type, Some(author_id), source)
+                .with_summary(args.edit_summary)
+                .expecting(args.expected_revision),
         };
 
         let edges = args
@@ -318,6 +344,7 @@ impl Tool for TaskUpdateTool {
             },
         };
         let previous_status = update_result.previous_status;
+        let new_revision = update_result.new_revision;
         let updated = update_result.task;
 
         if let Some(working_memory) = &self.working_memory {
@@ -345,11 +372,23 @@ impl Tool for TaskUpdateTool {
                 .record();
         }
 
+        let message = match new_revision {
+            Some(revision) => format!(
+                "Updated task #{} (revision {revision})",
+                updated.task_number
+            ),
+            None => format!(
+                "Task #{} already matched the requested values; nothing changed",
+                updated.task_number
+            ),
+        };
+
         Ok(TaskUpdateOutput {
             success: true,
             task_number: updated.task_number,
             status: updated.status.to_string(),
-            message: format!("Updated task #{}", updated.task_number),
+            revision: updated.revision,
+            message,
         })
     }
 }
@@ -439,6 +478,8 @@ mod tests {
                 worktree_id: None,
                 required_skills: None,
                 depends_on: None,
+                edit_summary: None,
+                expected_revision: None,
             })
             .await
             .expect("task update should succeed");
@@ -497,6 +538,8 @@ mod tests {
                 worktree_id: None,
                 required_skills: None,
                 depends_on: None,
+                edit_summary: None,
+                expected_revision: None,
             })
             .await
             .expect("task update should succeed");
@@ -579,6 +622,8 @@ mod tests {
                 worktree_id: None,
                 required_skills: None,
                 depends_on: None,
+                edit_summary: None,
+                expected_revision: None,
             })
             .await
             .expect_err("foreign task should be rejected");
@@ -601,6 +646,8 @@ mod tests {
                 worktree_id: None,
                 required_skills: None,
                 depends_on: None,
+                edit_summary: None,
+                expected_revision: None,
             })
             .await
             .expect_err("missing task should be rejected the same way");

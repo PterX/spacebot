@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link } from "@tanstack/react-router";
+import {useEffect, useMemo, useRef, useState} from "react";
+import {Link} from "@tanstack/react-router";
 import {
   api,
   type ChannelInfo,
@@ -14,19 +14,20 @@ import {
   type ActiveWorker,
   type ActiveBranch,
 } from "@/hooks/useChannelLiveState";
-import { useLiveContext } from "@/hooks/useLiveContext";
-import { Markdown } from "@/components/Markdown";
-import { PromptInspectModal } from "@/components/PromptInspectModal";
+import {useLiveContext} from "@/hooks/useLiveContext";
+import {Markdown} from "@/components/Markdown";
+import {PromptInspectModal} from "@/components/PromptInspectModal";
 import {
-  ProcessCard,
-  ProcessDetail,
-  branchRunStatus,
-  type ProcessRunDisplay,
-  type ProcessSelection,
+	ProcessCard,
+	ProcessDetail,
+	branchRunStatus,
+	type ProcessRunDisplay,
+	type ProcessSelection,
 } from "@/components/processes/ProcessRunView";
-import { formatTimestamp, platformIcon, platformColor } from "@/lib/format";
-import { Button } from "@spacedrive/primitives";
-import { Code } from "@phosphor-icons/react";
+import {formatTimestamp, platformIcon, platformColor} from "@/lib/format";
+import {Button} from "@spacedrive/primitives";
+import {ChatMessageList, type ChatMessageListHandle} from "@spacedrive/ai";
+import {Code} from "@phosphor-icons/react";
 
 interface ChannelDetailProps {
   agentId: string;
@@ -282,6 +283,28 @@ function TimelineEntry({
   }
 }
 
+/**
+ * Estimated row height, used to place a row before measurement lands. A
+ * constant estimate leaves freshly scrolled rows overlapping until they
+ * settle, so track the shape of each row: process cards render at a fixed
+ * height, and message height scales with content length.
+ */
+function estimateTimelineItemHeight(item: TimelineItem): number {
+	if (item.type === "branch_run" || item.type === "worker_run") return 117;
+	if (item.type === "checkpoint") return 80;
+	if (item.type !== "message") return 71;
+
+	// Wrapped prose and hard-wrapped blocks (code, lists) grow at different
+	// rates, so take whichever model predicts the taller row.
+	const content = item.content;
+	const wrapped = 32 + content.length * 0.31;
+	const lines = content
+		.split("\n")
+		.reduce((count, line) => count + Math.max(1, Math.ceil(line.length / 110)), 0);
+	const stacked = 48 + lines * 22;
+	return Math.min(2000, Math.max(71, Math.round(Math.max(wrapped, stacked))));
+}
+
 function processFallback(
   selection: ProcessSelection,
   timeline: TimelineItem[],
@@ -367,39 +390,53 @@ export function ChannelDetail({
     [selection, timeline, workers, branches, channel?.display_name],
   );
 
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const sentinelRef = useRef<HTMLDivElement>(null);
-  const lastLoadMoreAtRef = useRef(0);
+	type ChannelRow =
+		| {kind: "beginning"}
+		| {kind: "item"; item: TimelineItem}
+		| {kind: "thinking"}
+		| {kind: "typing"};
 
-  // Trigger load when the sentinel at the top of the timeline becomes visible
-  const handleIntersection = useCallback(
-    (entries: IntersectionObserverEntry[]) => {
-      const entry = entries[0];
-      if (!entry?.isIntersecting) {
-        return;
-      }
-      const now = Date.now();
-      if (now - lastLoadMoreAtRef.current < 800) {
-        return;
-      }
-      if (hasMore && !loadingMore) {
-        lastLoadMoreAtRef.current = now;
-        onLoadMore();
-      }
-    },
-    [hasMore, loadingMore, onLoadMore],
-  );
+	const rows: ChannelRow[] = useMemo(() => {
+		const list: ChannelRow[] = [];
+		if (!hasMore && timeline.length > 0) list.push({kind: "beginning"});
+		for (const item of timeline) list.push({kind: "item", item});
+		if (thinking) list.push({kind: "thinking"});
+		if (isTyping) list.push({kind: "typing"});
+		return list;
+	}, [timeline, hasMore, isTyping, thinking]);
 
-  useEffect(() => {
-    const sentinel = sentinelRef.current;
-    if (!sentinel) return;
-    const observer = new IntersectionObserver(handleIntersection, {
-      root: scrollRef.current,
-      rootMargin: "200px",
-    });
-    observer.observe(sentinel);
-    return () => observer.disconnect();
-  }, [handleIntersection]);
+	const rowCount = rows.length;
+	const chatRef = useRef<ChatMessageListHandle>(null);
+	const openedChannelRef = useRef<string | null>(null);
+
+	useEffect(() => {
+		openedChannelRef.current = null;
+	}, [channelId]);
+
+	// Open a channel at its newest message and keep following the end while
+	// history streams in. Rows are placed from estimates and re-measured after
+	// paint, and the timeline keeps growing after the first render, so hold the
+	// bottom across a few frames each time. Once the reader scrolls up, their
+	// position is left alone.
+	useEffect(() => {
+		if (rowCount === 0) return;
+		const opening = openedChannelRef.current !== channelId;
+		if (!opening && (chatRef.current?.getDistanceFromEnd() ?? 0) > 200) return;
+
+		let frame = 0;
+		let attempts = 0;
+		const pinToEnd = () => {
+			chatRef.current?.scrollToEnd({behavior: "auto"});
+			attempts += 1;
+			if (attempts < 12) {
+				frame = requestAnimationFrame(pinToEnd);
+			} else {
+				openedChannelRef.current = channelId;
+			}
+		};
+		frame = requestAnimationFrame(pinToEnd);
+		return () => cancelAnimationFrame(frame);
+	}, [channelId, rowCount]);
 
   return (
     <div className="relative flex h-full min-w-0">
@@ -485,76 +522,92 @@ export function ChannelDetail({
           </div>
         </div>
 
-        {/* Timeline — flex-col-reverse keeps scroll pinned to bottom */}
-        <div
-          ref={scrollRef}
-          className="flex flex-1 flex-col-reverse overflow-y-auto"
-        >
-          <div className="flex flex-col gap-1 p-6">
-            {/* Sentinel for infinite scroll — sits above the oldest item */}
-            <div ref={sentinelRef} className="h-px" />
-            {loadingMore && (
-              <div className="flex justify-center py-3">
-                <span className="text-tiny text-ink-faint">
-                  Loading older messages...
-                </span>
-              </div>
-            )}
-            {!hasMore && timeline.length > 0 && (
-              <div className="flex justify-center py-3">
-                <span className="text-tiny text-ink-faint/50">
-                  Beginning of conversation
-                </span>
-              </div>
-            )}
-            {timeline.length === 0 ? (
-              <p className="text-sm text-ink-faint">No messages yet</p>
-            ) : (
-              timeline.map((item) => (
-                <TimelineEntry
-                  key={item.id}
-                  item={item}
-                  liveWorkers={workers}
-                  liveBranches={branches}
-                  channelId={channelId}
-                  selection={selection}
-                  onSelect={setSelection}
-                />
-              ))
-            )}
-            {thinking && (
-              <div className="flex gap-3 px-3 py-2">
-                <span className="flex-shrink-0 pt-0.5 text-tiny text-ink-faint">
-                  {formatTimestamp(Date.now())}
-                </span>
-                <div className="min-w-0 flex-1 rounded-md bg-app-dark-box/40 px-3 py-2">
-                  <span className="text-tiny font-medium uppercase tracking-wide text-ink-faint">
-                    thinking
-                  </span>
-                  <div className="mt-0.5 whitespace-pre-wrap break-words text-xs italic leading-relaxed text-ink-dull">
-                    {thinking}
-                  </div>
-                </div>
-              </div>
-            )}
-            {isTyping && (
-              <div className="flex gap-3 px-3 py-2">
-                <span className="flex-shrink-0 pt-0.5 text-tiny text-ink-faint">
-                  {formatTimestamp(Date.now())}
-                </span>
-                <div className="flex items-center gap-1.5">
-                  <span className="text-sm font-medium text-status-success">
-                    bot
-                  </span>
-                  <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-ink-faint" />
-                  <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-ink-faint [animation-delay:0.2s]" />
-                  <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-ink-faint [animation-delay:0.4s]" />
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
+				{/* Timeline — min-h-0 lets the virtualized list bound its own
+				    scroll height instead of growing to the full spacer size */}
+				<div className="flex min-h-0 flex-1">
+					{timeline.length === 0 ? (
+						<p className="p-6 text-sm text-ink-faint">No messages yet</p>
+					) : (
+						<ChatMessageList<ChannelRow>
+							className="flex-1"
+							handleRef={chatRef}
+							messages={rows}
+							hasMoreHistory={hasMore}
+							isLoadingOlder={loadingMore}
+							onLoadOlder={onLoadMore}
+							getMessageKey={(index) => {
+								const row = rows[index]!;
+								if (row.kind === "item") return row.item.id;
+								return `__${row.kind}__`;
+							}}
+							estimateMessageSize={(index) => {
+								const row = rows[index]!;
+								if (row.kind === "beginning") return 43;
+								if (row.kind === "thinking") return 80;
+								if (row.kind === "typing") return 40;
+								return estimateTimelineItemHeight(row.item);
+							}}
+							renderMessage={(row) => {
+								if (row.kind === "beginning") {
+									return (
+										<div className="flex justify-center px-6 py-3">
+											<span className="text-tiny text-ink-faint/50">
+												Beginning of conversation
+											</span>
+										</div>
+									);
+								}
+								if (row.kind === "thinking") {
+									return (
+										<div className="flex gap-3 px-9 py-2">
+											<span className="flex-shrink-0 pt-0.5 text-tiny text-ink-faint">
+												{formatTimestamp(Date.now())}
+											</span>
+											<div className="min-w-0 flex-1 rounded-md bg-app-dark-box/40 px-3 py-2">
+												<span className="text-tiny font-medium uppercase tracking-wide text-ink-faint">
+													thinking
+												</span>
+												<div className="mt-0.5 whitespace-pre-wrap break-words text-xs italic leading-relaxed text-ink-dull">
+													{thinking}
+												</div>
+											</div>
+										</div>
+									);
+								}
+								if (row.kind === "typing") {
+									return (
+										<div className="flex gap-3 px-9 py-2">
+											<span className="flex-shrink-0 pt-0.5 text-tiny text-ink-faint">
+												{formatTimestamp(Date.now())}
+											</span>
+											<div className="flex items-center gap-1.5">
+												<span className="text-sm font-medium text-status-success">
+													bot
+												</span>
+												<span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-ink-faint" />
+												<span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-ink-faint [animation-delay:0.2s]" />
+												<span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-ink-faint [animation-delay:0.4s]" />
+											</div>
+										</div>
+									);
+								}
+								return (
+									<div className="px-6 pt-1">
+										<TimelineEntry
+											item={row.item}
+											liveWorkers={workers}
+											liveBranches={branches}
+											channelId={channelId}
+											selection={selection}
+											onSelect={setSelection}
+										/>
+									</div>
+								);
+							}}
+						/>
+					)}
+				</div>
+			</div>
 
       {selection && selectedFallback && (
         <aside className="absolute inset-0 z-30 border-l border-app-line/50 md:static md:z-auto md:w-[min(46%,560px)] md:flex-shrink-0">

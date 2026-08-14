@@ -3,6 +3,10 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 default:
     @just --list
 
+# Run the daemon from source. Extra args pass through, e.g. `just dev --foreground`.
+dev *args:
+    cargo run -- start {{args}}
+
 preflight:
     ./scripts/preflight.sh
 

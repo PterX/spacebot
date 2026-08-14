@@ -1,6 +1,6 @@
 //! Worker: Independent task execution process.
 
-use crate::agent::compactor::estimate_history_tokens;
+use crate::agent::compactor::{aligned_fractional_cut, estimate_history_tokens};
 use crate::config::BrowserConfig;
 use crate::conversation::history::{ProcessRunLogger, WorkerLifecycle};
 use crate::conversation::settings::WorkerMemoryMode;
@@ -165,10 +165,13 @@ pub enum WorkerOutcome {
     /// Worker was cancelled (LLM `PromptCancelled`, manual cancel, etc.).
     Cancelled { reason: String },
     /// Worker exceeded the wall-clock timeout. `segments_run` reflects how
-    /// many segments completed before the timeout fired.
+    /// many segments completed before the timeout fired. `result` carries
+    /// whatever the run had already produced, and is empty when the timeout
+    /// landed before anything was recoverable.
     Timeout {
         elapsed_secs: u64,
         segments_run: usize,
+        result: String,
     },
     /// Browser (or other tool) detected an external defense — captcha,
     /// login wall, rate limit, WAF block. The worker exits cleanly so the
@@ -199,8 +202,17 @@ impl WorkerOutcome {
             Self::Timeout {
                 elapsed_secs,
                 segments_run,
-            } => format!(
+                result,
+            } if result.is_empty() => format!(
                 "Worker exceeded {elapsed_secs}s wall-clock timeout after {segments_run} segments."
+            ),
+            Self::Timeout {
+                elapsed_secs,
+                segments_run,
+                result,
+            } => format!(
+                "{result}\n\n(exceeded {elapsed_secs}s wall-clock timeout after \
+                 {segments_run} segments — partial result)"
             ),
             Self::Blocked { reason, url, .. } => match url {
                 Some(url) => format!("Worker blocked: {} at {url}", reason.describe()),
@@ -532,6 +544,11 @@ impl Worker {
     pub async fn run(self) -> Result<WorkerOutcome> {
         let timeout_secs = self.worker_wall_clock_timeout_secs;
         let segments_tracker = self.segments_run.clone();
+        // The timeout drops `run_inner`, taking its history with it. These
+        // handles are the only routes to what the run produced, so they are
+        // taken before `self` moves.
+        let transcript_tracker = self.transcript_snapshot.clone();
+        let hook = self.hook.clone();
         let worker_id = self.id;
         let agent_id = self.deps.agent_id.clone();
 
@@ -542,16 +559,19 @@ impl Worker {
             outcome = &mut inner_fut => outcome,
             _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
                 let segments = segments_tracker.load(std::sync::atomic::Ordering::Relaxed);
+                let result = recover_timed_out_result(&hook, &transcript_tracker);
                 tracing::warn!(
                     %worker_id,
                     %agent_id,
                     timeout_secs,
                     segments_run = segments,
+                    recovered_bytes = result.len(),
                     "worker exceeded wall-clock timeout"
                 );
                 Ok(WorkerOutcome::Timeout {
                     elapsed_secs: timeout_secs,
                     segments_run: segments,
+                    result,
                 })
             }
         }
@@ -588,7 +608,6 @@ impl Worker {
 
         // Create per-worker ToolServer with task tools
         let interactive = self.input_rx.is_some();
-        self.hook = self.hook.clone().with_terminate_on_outcome(!interactive);
         let worker_tool_server = crate::tools::create_worker_tool_server(
             self.deps.agent_id.clone(),
             self.id,
@@ -761,24 +780,6 @@ impl Worker {
                         );
                     }
                     Err(rig::completion::PromptError::PromptCancelled { reason, .. }) => {
-                        if reason == SpacebotHook::WORKER_OUTCOME_RECORDED_REASON {
-                            tracing::info!(
-                                worker_id = %self.id,
-                                "one-shot worker stopped after recording terminal outcome"
-                            );
-                            self.persist_transcript(&compacted_history, &history).await;
-                            // The signaled outcome text is the worker's actual
-                            // result; the fallbacks cover a signal that carried
-                            // no text.
-                            let result = self
-                                .hook
-                                .take_outcome_text()
-                                .or_else(|| crate::agent::extract_last_assistant_text(&history))
-                                .unwrap_or_else(|| {
-                                    "Worker reported a terminal outcome.".to_string()
-                                });
-                            return Ok(WorkerOutcome::Success { result });
-                        }
                         self.state = WorkerState::Failed;
                         self.hook.send_status("cancelled");
                         self.write_failure_log(&history, &format!("cancelled: {reason}"));
@@ -1208,9 +1209,13 @@ impl Worker {
         let estimated = estimate_history_tokens(history);
         let usage = estimated as f32 / context_window as f32;
 
-        let remove_count = ((total as f32 * fraction) as usize)
-            .max(1)
-            .min(total.saturating_sub(2));
+        // A worker accumulates its own tool traffic for the length of the run,
+        // so this cut lands among call/result pairs far more often than the
+        // one-shot cuts do.
+        let remove_count = aligned_fractional_cut(history, fraction, 2);
+        if remove_count == 0 {
+            return;
+        }
         let removed: Vec<rig::message::Message> = history.drain(..remove_count).collect();
         compacted_history.extend(removed.iter().cloned());
 
@@ -1595,6 +1600,43 @@ fn dedup_tool_results(history: &mut [rig::message::Message]) {
     if replaced > 0 {
         tracing::debug!(replaced, "deduped stale tool results in history");
     }
+}
+
+/// Recover the best available account of a run that hit its wall clock.
+///
+/// A timed-out worker is cancelled where it stands, so its history is gone and
+/// only durable side effects remain. An outcome the worker signalled through
+/// `set_status` is preferred because it is the worker's own summary; otherwise
+/// the last checkpointed transcript is recapped.
+///
+/// Checkpoints land at segment boundaries, so a run that times out inside its
+/// first segment has nothing to recover and returns empty — the caller reports
+/// the timeout plainly rather than presenting silence as a finding.
+fn recover_timed_out_result(hook: &SpacebotHook, snapshot: &WorkerTranscriptSnapshot) -> String {
+    if let Some(outcome) = hook.take_outcome_text() {
+        return outcome;
+    }
+
+    let Ok(guard) = snapshot.read() else {
+        return String::new();
+    };
+    let Some(payload) = guard.as_ref() else {
+        return String::new();
+    };
+
+    let steps = match crate::conversation::worker_transcript::deserialize_transcript(
+        &payload.transcript,
+    ) {
+        Ok(steps) => steps,
+        Err(error) => {
+            tracing::warn!(%error, "failed to read checkpointed transcript for timed-out worker");
+            return String::new();
+        }
+    };
+
+    let history = crate::conversation::worker_transcript::transcript_to_history(&steps);
+    crate::agent::extract_last_assistant_text(&history)
+        .unwrap_or_else(|| build_worker_recap(&history))
 }
 
 /// Build a recap of removed worker history for the compaction marker.

@@ -56,9 +56,6 @@ pub struct SpacebotHook {
     /// Carried into `WorkerOutcome` so the durable result holds the worker's
     /// findings rather than a placeholder.
     outcome_text: std::sync::Arc<std::sync::Mutex<Option<String>>>,
-    /// One-shot workers terminate immediately after recording an outcome.
-    /// Interactive workers keep their session open for follow-up input.
-    terminate_on_outcome: bool,
     /// Counts consecutive text-only nudge attempts. Reset to zero whenever a
     /// tool call completes successfully, so the budget tracks *consecutive*
     /// text-only responses rather than total across the worker's lifetime.
@@ -103,9 +100,6 @@ impl SpacebotHook {
     /// PromptCancelled reason used once a memory-persistence run has recorded
     /// its terminal outcome and the loop should stop.
     pub const MEMORY_PERSISTENCE_COMPLETE_REASON: &str = "spacebot_memory_persistence_complete";
-    /// PromptCancelled reason used once a one-shot worker has claimed its
-    /// terminal outcome through `set_status`.
-    pub const WORKER_OUTCOME_RECORDED_REASON: &str = "spacebot_worker_outcome_recorded";
     /// Maximum nudge retries per prompt request.
     pub const TOOL_NUDGE_MAX_RETRIES: usize = 2;
     /// Maximum completion-contract retries per prompt request.
@@ -140,7 +134,6 @@ impl SpacebotHook {
             ),
             outcome_signaled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             outcome_text: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            terminate_on_outcome: false,
             nudge_attempts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             loop_guard: std::sync::Arc::new(std::sync::Mutex::new(LoopGuard::new(
                 loop_guard_config,
@@ -159,12 +152,6 @@ impl SpacebotHook {
     /// Override the default process-scoped nudge policy.
     pub fn with_tool_nudge_policy(mut self, policy: ToolNudgePolicy) -> Self {
         self.tool_nudge_policy = policy;
-        self
-    }
-
-    /// End the current prompt loop after a successful worker outcome.
-    pub fn with_terminate_on_outcome(mut self, terminate_on_outcome: bool) -> Self {
-        self.terminate_on_outcome = terminate_on_outcome;
         self
     }
 
@@ -1513,11 +1500,6 @@ where
             }
             self.outcome_signaled
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            if self.terminate_on_outcome {
-                return HookAction::Terminate {
-                    reason: Self::WORKER_OUTCOME_RECORDED_REASON.into(),
-                };
-            }
         }
 
         // Channel turns should end immediately after a successful reply or skip
@@ -1769,10 +1751,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_shot_worker_outcome_terminates_the_prompt_loop() {
-        let hook = make_hook()
-            .with_tool_nudge_policy(ToolNudgePolicy::Enabled)
-            .with_terminate_on_outcome(true);
+    async fn outcome_signal_lets_the_worker_write_its_final_text() {
+        let hook = make_hook().with_tool_nudge_policy(ToolNudgePolicy::Enabled);
         let action = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
             &hook,
             "set_status",
@@ -1783,19 +1763,16 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(
-            action,
-            HookAction::Terminate { ref reason }
-                if reason == SpacebotHook::WORKER_OUTCOME_RECORDED_REASON
-        ));
+        assert!(
+            matches!(action, HookAction::Continue),
+            "the outcome signal must not end the loop: the worker's next turn is its deliverable"
+        );
         assert!(hook.outcome_signaled());
     }
 
     #[tokio::test]
     async fn outcome_signal_retains_full_outcome_text() {
-        let hook = make_hook()
-            .with_tool_nudge_policy(ToolNudgePolicy::Enabled)
-            .with_terminate_on_outcome(true);
+        let hook = make_hook().with_tool_nudge_policy(ToolNudgePolicy::Enabled);
         let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
             &hook,
             "set_status",
@@ -1816,9 +1793,7 @@ mod tests {
 
     #[tokio::test]
     async fn reset_clears_retained_outcome_text() {
-        let hook = make_hook()
-            .with_tool_nudge_policy(ToolNudgePolicy::Enabled)
-            .with_terminate_on_outcome(false);
+        let hook = make_hook().with_tool_nudge_policy(ToolNudgePolicy::Enabled);
         let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
             &hook,
             "set_status",
