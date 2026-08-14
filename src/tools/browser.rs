@@ -136,6 +136,37 @@ fn is_v4_mapped_blocked(ip: std::net::Ipv6Addr) -> bool {
 
 // Page readiness helper
 
+/// Cap on a single navigation completing.
+const NAVIGATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a graceful browser shutdown is given before it is killed.
+const BROWSER_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a killed browser is given to actually exit.
+const BROWSER_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Bound a navigation so a page that never finishes cannot stall its caller.
+///
+/// A renderer can accept a navigation and then never commit a frame: the
+/// browser process records the URL and title while the underlying future stays
+/// pending, with no error and no further progress. Nothing downstream has
+/// another cue that anything is wrong, so this cap is what turns a wedged page
+/// into an error the model can read and route around.
+async fn bounded_navigation<F: std::future::Future>(
+    url: &str,
+    navigation: F,
+) -> Result<F::Output, BrowserError> {
+    tokio::time::timeout(NAVIGATION_TIMEOUT, navigation)
+        .await
+        .map_err(|_| {
+            BrowserError::new(format!(
+                "navigation to {url} did not complete within {}s — the page never finished \
+                 loading. Try a different URL, or fetch the page with the shell instead.",
+                NAVIGATION_TIMEOUT.as_secs()
+            ))
+        })
+}
+
 /// Wait for the page to be "ready enough" for DOM extraction.
 ///
 /// Many sites are SPAs that load a shell document and then hydrate with JS.
@@ -682,10 +713,33 @@ async fn close_browser_resources(
 ) {
     // Close gracefully before aborting the handler so chromiumoxide does not
     // fall back to force-killing the child.
-    match tokio::time::timeout(std::time::Duration::from_secs(5), browser.close()).await {
-        Ok(Ok(_)) => tracing::debug!("browser closed gracefully"),
-        Ok(Err(error)) => tracing::debug!(%error, "failed to close browser"),
-        Err(_) => tracing::debug!("browser close timed out after 5s"),
+    let closed = match tokio::time::timeout(BROWSER_CLOSE_TIMEOUT, browser.close()).await {
+        Ok(Ok(_)) => {
+            tracing::debug!("browser closed gracefully");
+            true
+        }
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "failed to close browser");
+            false
+        }
+        Err(_) => {
+            tracing::debug!("browser close timed out");
+            false
+        }
+    };
+
+    // A graceful close asks the browser to shut itself down, which a wedged
+    // process cannot honour. Killing the child is what makes teardown final:
+    // without it the process outlives its worker, holding its profile
+    // directory open and its memory resident.
+    if !closed && let Some(Err(error)) = browser.kill().await {
+        tracing::warn!(%error, "failed to kill unresponsive browser process");
+    }
+
+    // Reap the child so its profile directory is no longer in use before the
+    // removal below.
+    if let Err(_elapsed) = tokio::time::timeout(BROWSER_EXIT_TIMEOUT, browser.wait()).await {
+        tracing::warn!("browser process did not exit; its profile directory may be left behind");
     }
 
     if let Some(task) = handler_task {
@@ -1459,8 +1513,8 @@ impl Tool for BrowserNavigateTool {
         // Get or create the active page
         let page = get_or_create_page(&self.context, &mut state, Some(&args.url)).await?;
 
-        page.goto(&args.url)
-            .await
+        bounded_navigation(&args.url, page.goto(&args.url))
+            .await?
             .map_err(|error| BrowserError::new(format!("navigation failed: {error}")))?;
 
         // Wait briefly for SPA content to render. Many sites load a shell via
@@ -2013,9 +2067,8 @@ impl Tool for BrowserTabOpenTool {
             .as_ref()
             .ok_or_else(|| BrowserError::new("browser not launched — call browser_launch first"))?;
 
-        let page = browser
-            .new_page(target_url)
-            .await
+        let page = bounded_navigation(target_url, browser.new_page(target_url))
+            .await?
             .map_err(|error| BrowserError::new(format!("failed to open tab: {error}")))?;
 
         let target_id = page_target_id(&page);
@@ -2373,9 +2426,8 @@ async fn get_or_create_page<'a>(
         .ok_or_else(|| BrowserError::new("browser not launched — call browser_launch first"))?;
 
     let target_url = url.unwrap_or("about:blank");
-    let page = browser
-        .new_page(target_url)
-        .await
+    let page = bounded_navigation(target_url, browser.new_page(target_url))
+        .await?
         .map_err(|error| BrowserError::new(format!("failed to create page: {error}")))?;
 
     let target_id = page_target_id(&page);
