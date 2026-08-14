@@ -1223,6 +1223,38 @@ export interface TaskCommentListResponse {
 	next_cursor?: number | null;
 }
 
+/** Mirrors TaskAttemptOutcome on the server. */
+export type TaskAttemptOutcome =
+	| "succeeded"
+	| "partial"
+	| "blocked"
+	| "failed"
+	| "cancelled"
+	| "timed_out"
+	| "interrupted";
+
+/** One worker run attempted against a task. */
+export interface TaskAttempt {
+	id: string;
+	task_id: string;
+	worker_id: string;
+	attempt: number;
+	author_type: TaskAuthorKind;
+	author_id?: string | null;
+	agent_id?: string | null;
+	channel_id?: string | null;
+	started_at: string;
+	/** Absent while the run is still live. */
+	outcome?: TaskAttemptOutcome | null;
+	outcome_summary?: string | null;
+	ended_at?: string | null;
+}
+
+export interface TaskAttemptListResponse {
+	attempts: TaskAttempt[];
+	summary?: string | null;
+}
+
 export interface TaskCommentResponse {
 	comment: TaskComment;
 }
@@ -2871,6 +2903,8 @@ export const api = {
 			query ? `/tasks/${taskNumber}/comments?${query}` : `/tasks/${taskNumber}/comments`,
 		);
 	},
+	listTaskAttempts: (taskNumber: number): Promise<TaskAttemptListResponse> =>
+		taskRequest<TaskAttemptListResponse>(`/tasks/${taskNumber}/attempts`),
 	createTaskComment: (
 		taskNumber: number,
 		request: CreateTaskCommentRequest,
