@@ -35,6 +35,9 @@ pub enum TaskAttemptOutcome {
     Failed,
     Cancelled,
     TimedOut,
+    /// The process died before the run reached a terminal state. Distinct from
+    /// a failure: nothing was decided about the work itself.
+    Interrupted,
 }
 
 impl TaskAttemptOutcome {
@@ -46,6 +49,7 @@ impl TaskAttemptOutcome {
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
             Self::TimedOut => "timed_out",
+            Self::Interrupted => "interrupted",
         }
     }
 
@@ -57,6 +61,7 @@ impl TaskAttemptOutcome {
             "failed" => Some(Self::Failed),
             "cancelled" => Some(Self::Cancelled),
             "timed_out" => Some(Self::TimedOut),
+            "interrupted" => Some(Self::Interrupted),
             _ => None,
         }
     }
@@ -275,6 +280,33 @@ impl TaskStore {
         .context("failed to list task attempts")?;
 
         rows.iter().map(attempt_from_row).collect()
+    }
+
+    /// Close attempts left live by a process that died.
+    ///
+    /// Workers run in-process, so every attempt still open at startup belongs
+    /// to a run that no longer exists. Without this the spawn guard would see a
+    /// live attempt forever and the task could never be worked again — a crash
+    /// mid-run would permanently take that task off the board.
+    ///
+    /// Recorded as interrupted rather than failed: the process died, which says
+    /// nothing about whether the work was going to succeed.
+    pub async fn reconcile_interrupted_attempts(&self) -> Result<usize> {
+        let affected = sqlx::query(
+            "UPDATE task_worker_runs \
+             SET outcome_kind = ?, \
+                 outcome_summary = COALESCE(outcome_summary, ?), \
+                 ended_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') \
+             WHERE ended_at IS NULL",
+        )
+        .bind(TaskAttemptOutcome::Interrupted.as_str())
+        .bind("The process running this attempt exited before it finished.")
+        .execute(self.pool())
+        .await
+        .context("failed to reconcile interrupted task attempts")?
+        .rows_affected();
+
+        Ok(affected as usize)
     }
 
     /// Prior-attempt lines for a set of tasks, keyed by task number.
@@ -606,6 +638,54 @@ mod tests {
             .expect("history should load");
         assert_eq!(attempts[0].outcome, Some(TaskAttemptOutcome::Succeeded));
         assert_eq!(attempts[0].outcome_summary.as_deref(), Some("done"));
+    }
+
+    /// A crash mid-run must not take the task off the board for good.
+    #[tokio::test]
+    async fn a_restart_closes_a_live_attempt_and_unblocks_the_task() {
+        let (store, number) = store_with_task().await;
+        store
+            .start_task_attempt(number, start("worker-1"))
+            .await
+            .expect("start should succeed")
+            .expect("task exists");
+        assert!(
+            store
+                .live_task_attempt(number)
+                .await
+                .expect("lookup should succeed")
+                .is_some()
+        );
+
+        let closed = store
+            .reconcile_interrupted_attempts()
+            .await
+            .expect("reconcile should succeed");
+
+        assert_eq!(closed, 1);
+        assert!(
+            store
+                .live_task_attempt(number)
+                .await
+                .expect("lookup should succeed")
+                .is_none(),
+            "the task must be spawnable again after a restart"
+        );
+
+        let attempts = store
+            .list_task_attempts(number, 10)
+            .await
+            .expect("history should load");
+        assert_eq!(attempts[0].outcome, Some(TaskAttemptOutcome::Interrupted));
+
+        // A run that already ended keeps the outcome it recorded.
+        assert_eq!(
+            store
+                .reconcile_interrupted_attempts()
+                .await
+                .expect("second reconcile"),
+            0
+        );
     }
 
     #[tokio::test]

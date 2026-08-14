@@ -952,6 +952,23 @@ async fn run(
         .await
         .context("failed to migrate legacy projects to instance database")?;
 
+    // Workers run in-process, so any attempt still open belongs to a run that
+    // died with the previous process. Close them, or the task-scoped spawn
+    // guard would see a live run forever and that task could never be worked
+    // again.
+    match global_task_store.reconcile_interrupted_attempts().await {
+        Ok(closed) if closed > 0 => {
+            tracing::info!(
+                attempts = closed,
+                "closed task attempts interrupted by an exit"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%error, "failed to reconcile interrupted task attempts");
+        }
+    }
+
     // Tasks executed before the worktree binding was recorded have a
     // `task-<number>` worktree on disk that nothing points at. Reconnect them
     // by name so a retry reuses the worktree instead of rediscovering it.
