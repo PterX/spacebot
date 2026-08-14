@@ -1,23 +1,18 @@
-import { useEffect, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { InlineBranchCard, MessageBubble } from "@spacedrive/ai";
-import { File as FileIcon } from "@phosphor-icons/react";
+import {useEffect, useMemo, useRef, useState} from "react";
+import {useQuery} from "@tanstack/react-query";
+import {ChatMessageList, InlineBranchCard, MessageBubble, type ChatMessageListHandle} from "@spacedrive/ai";
+import {File as FileIcon} from "@phosphor-icons/react";
 import {
-  api,
-  type AttachmentMeta,
-  type TimelineBranchRun,
-  type TimelineCheckpoint,
-  type TimelineItem,
-  type WorkerListItem,
+	api,
+	type AttachmentMeta,
+	type TimelineBranchRun,
+	type TimelineCheckpoint,
+	type TimelineItem,
+	type WorkerListItem,
 } from "@/api/client";
-import { Markdown } from "@/components/Markdown";
-import {
-  ToolCall,
-  type ToolCallPair,
-  tryParseJson,
-  isErrorResult,
-} from "@/components/ToolCall";
-import { PortalWorkerCard } from "./PortalWorkerCard";
+import {Markdown} from "@/components/Markdown";
+import {ToolCall, type ToolCallPair, tryParseJson, isErrorResult} from "@/components/ToolCall";
+import {PortalWorkerCard} from "./PortalWorkerCard";
 import clsx from "clsx";
 
 /**
@@ -290,6 +285,12 @@ function synthesizeWorker(
   };
 }
 
+
+type TimelineRow =
+	| {kind: "item"; item: TimelineItem}
+	| {kind: "typing"}
+	| {kind: "spacer"};
+
 export function PortalTimeline({
   agentId,
   conversationId,
@@ -297,143 +298,169 @@ export function PortalTimeline({
   isTyping,
   sendCount,
 }: PortalTimelineProps) {
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const previousLengthRef = useRef(0);
+	const chatRef = useRef<ChatMessageListHandle>(null);
 
-  // Fetch workers for this channel to resolve worker_run items.
-  const workersQuery = useQuery({
-    queryKey: ["portal-workers", agentId, conversationId],
-    queryFn: () => api.workersList(agentId, { limit: 20 }),
-    enabled: Boolean(conversationId),
-    refetchInterval: 2000,
-  });
+	const workersQuery = useQuery({
+		queryKey: ["portal-workers", agentId, conversationId],
+		queryFn: () => api.workersList(agentId, {limit: 20}),
+		enabled: Boolean(conversationId),
+		refetchInterval: 2000,
+	});
 
-  // Resolve complete worker records when polling has caught up. Timeline rows
-  // still render immediately through `synthesizeWorker`.
-  const conversationWorkers = (workersQuery.data?.workers ?? []).filter(
-    (w) => w.channel_id === conversationId,
-  );
+	const conversationWorkers = (workersQuery.data?.workers ?? []).filter(
+		(w) => w.channel_id === conversationId,
+	);
+	const workerIds = new Set(conversationWorkers.map((w) => w.id));
 
-  // Smart auto-scroll: only when near bottom
-  useEffect(() => {
-    const element = scrollRef.current;
-    if (!element) return;
+	const visibleItems = timeline.filter((item) => {
+		if (item.type !== "worker_run") return true;
+		return workerIds.has(item.id);
+	});
 
-    const previousLength = previousLengthRef.current;
-    const currentLength = timeline.length;
-    const distanceFromBottom =
-      element.scrollHeight - element.scrollTop - element.clientHeight;
-    const isNearBottom = distanceFromBottom < 160;
-    const shouldAutoScroll =
-      (currentLength > previousLength || isTyping) &&
-      (previousLength === 0 || isNearBottom);
+	const rows: TimelineRow[] = useMemo(() => {
+		const list: TimelineRow[] = visibleItems.map((item) => ({
+			kind: "item",
+			item,
+		}));
+		if (isTyping) list.push({kind: "typing"});
+		list.push({kind: "spacer"});
+		return list;
+	}, [visibleItems, isTyping]);
 
-    if (shouldAutoScroll) {
-      requestAnimationFrame(() => {
-        element.scrollTo({ top: element.scrollHeight, behavior: "auto" });
-      });
-    }
+	useEffect(() => {
+		if (sendCount === 0) return;
+		chatRef.current?.scrollToEnd({behavior: "smooth"});
+	}, [sendCount]);
 
-    previousLengthRef.current = currentLength;
-  }, [timeline.length, isTyping]);
+	const copyMessage = async (content: string) => {
+		await navigator.clipboard.writeText(content);
+	};
 
-  // Always scroll to bottom when the user sends a message.
-  useEffect(() => {
-    if (sendCount === 0) return;
-    const element = scrollRef.current;
-    if (!element) return;
-    requestAnimationFrame(() => {
-      element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
-    });
-  }, [sendCount]);
+	return (
+		<ChatMessageList<TimelineRow>
+			className="flex-1"
+			handleRef={chatRef}
+			messages={rows}
+			getMessageKey={(index) => {
+				const row = rows[index]!;
+				if (row.kind === "item") return row.item.id;
+				return `__${row.kind}__`;
+			}}
+			estimateMessageSize={(index) => {
+				const row = rows[index]!;
+				if (row.kind === "spacer") return 180;
+				if (row.kind === "typing") return 32;
+				return 80;
+			}}
+			renderMessage={(row) => {
+				if (row.kind === "spacer") return <div className="h-[180px]" />;
+				if (row.kind === "typing") {
+					return (
+						<div className="mx-auto max-w-3xl px-4 pb-2">
+							<ThinkingIndicator />
+						</div>
+					);
+				}
+				const item = row.item;
+				return (
+					<div className="mx-auto max-w-3xl px-4 pb-2">
+						{renderTimelineItem(item, {
+							agentId,
+							conversationId,
+							conversationWorkers,
+							onCopy: copyMessage,
+						})}
+					</div>
+				);
+			}}
+		/>
+	);
+}
 
-  const copyMessage = async (content: string) => {
-    await navigator.clipboard.writeText(content);
-  };
-
-  return (
-    <div ref={scrollRef} className="flex-1 overflow-x-hidden overflow-y-auto">
-      <div className="mx-auto flex max-w-3xl flex-col gap-2 px-4 py-6 pb-[180px]">
-        {timeline.map((item) => {
-          if (item.type === "message") {
-            const attachments = item.attachments ?? [];
-            if (item.role === "user" && attachments.length > 0) {
-              return (
-                <UserMessageWithAttachments
-                  key={item.id}
-                  content={item.content}
-                  attachments={attachments}
-                  agentId={agentId}
-                />
-              );
-            }
-            return (
-              <div key={item.id}>
-                <MessageBubble
-                  content={item.content}
-                  isUser={item.role === "user"}
-                  onCopy={(content) => void copyMessage(content)}
-                />
-                {attachments.length > 0 && (
-                  <AssistantAttachments
-                    agentId={agentId}
-                    attachments={attachments}
-                  />
-                )}
-              </div>
-            );
-          }
-          if (item.type === "branch_run") {
-            return (
-              <div key={item.id} className="py-1">
-                <InlineBranchCard
-                  description={(item as TimelineBranchRun).description}
-                  completedAt={(item as TimelineBranchRun).completed_at ?? null}
-                  conclusion={(item as TimelineBranchRun).conclusion}
-                />
-              </div>
-            );
-          }
-          if (item.type === "worker_run") {
-            const worker =
-              conversationWorkers.find((w) => w.id === item.id) ??
-              synthesizeWorker(item, conversationId);
-            return (
-              <div key={item.id} className="py-2">
-                <PortalWorkerCard agentId={agentId} worker={worker} />
-              </div>
-            );
-          }
-          if (item.type === "tool_call_run") {
-            const parsedArgs = tryParseJson(item.args);
-            const parsedResult = item.result ? tryParseJson(item.result) : null;
-            const pair: ToolCallPair = {
-              id: item.id,
-              name: item.tool_name,
-              argsRaw: item.args,
-              args: parsedArgs,
-              resultRaw: item.result ?? null,
-              result: parsedResult,
-              status:
-                item.status === "running"
-                  ? "running"
-                  : item.result && isErrorResult(item.result, parsedResult)
-                    ? "error"
-                    : "completed",
-            };
-            return (
-              <div key={item.id} className="py-1">
-                <ToolCall pair={pair} />
-              </div>
-            );
-          }
-          if (item.type === "checkpoint") {
-            return <InlineCheckpointCard key={item.id} item={item} />;
-          }
-          return null;
-        })}
-        {isTyping && <ThinkingIndicator />}
-      </div>
-    </div>
-  );
+function renderTimelineItem(
+	item: TimelineItem,
+	{
+		agentId,
+		conversationId,
+		conversationWorkers,
+		onCopy,
+	}: {
+		agentId: string;
+		conversationId: string;
+		conversationWorkers: WorkerListItem[];
+		onCopy: (content: string) => Promise<void>;
+	},
+) {
+	if (item.type === "message") {
+		const attachments = item.attachments ?? [];
+		if (item.role === "user" && attachments.length > 0) {
+			return (
+				<UserMessageWithAttachments
+					content={item.content}
+					attachments={attachments}
+					agentId={agentId}
+				/>
+			);
+		}
+		return (
+			<div>
+				<MessageBubble
+					content={item.content}
+					isUser={item.role === "user"}
+					onCopy={(content) => void onCopy(content)}
+				/>
+				{attachments.length > 0 && (
+					<AssistantAttachments agentId={agentId} attachments={attachments} />
+				)}
+			</div>
+		);
+	}
+	if (item.type === "branch_run") {
+		return (
+			<div className="py-1">
+				<InlineBranchCard
+					description={(item as TimelineBranchRun).description}
+					completedAt={(item as TimelineBranchRun).completed_at ?? null}
+					conclusion={(item as TimelineBranchRun).conclusion}
+				/>
+			</div>
+		);
+	}
+	if (item.type === "worker_run") {
+		const worker =
+			conversationWorkers.find((w) => w.id === item.id) ??
+			synthesizeWorker(item, conversationId);
+		return (
+			<div className="py-2">
+				<PortalWorkerCard agentId={agentId} worker={worker} />
+			</div>
+		);
+	}
+	if (item.type === "tool_call_run") {
+		const parsedArgs = tryParseJson(item.args);
+		const parsedResult = item.result ? tryParseJson(item.result) : null;
+		const pair: ToolCallPair = {
+			id: item.id,
+			name: item.tool_name,
+			argsRaw: item.args,
+			args: parsedArgs,
+			resultRaw: item.result ?? null,
+			result: parsedResult,
+			status:
+				item.status === "running"
+					? "running"
+					: item.result && isErrorResult(item.result, parsedResult)
+						? "error"
+						: "completed",
+		};
+		return (
+			<div className="py-1">
+				<ToolCall pair={pair} />
+			</div>
+		);
+	}
+	if (item.type === "checkpoint") {
+		return <InlineCheckpointCard item={item} />;
+	}
+	return null;
 }

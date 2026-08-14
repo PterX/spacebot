@@ -466,7 +466,13 @@ impl Chronicler {
                 );
                 return Ok(false);
             }
-            let remove_count = (total / 2).min(total - MIN_RETAINED_MESSAGES);
+            let remove_count = advance_past_stranded_tool_results(
+                &history,
+                (total / 2).min(total - MIN_RETAINED_MESSAGES),
+            );
+            if remove_count == 0 {
+                return Ok(false);
+            }
             history.drain(..remove_count);
             self.fence.note_head_mutation();
             self.fence.rebase_turns(remove_count);
@@ -919,6 +925,31 @@ impl RollupContext {
 /// valid and the next trim catches up.
 ///
 /// Free-standing so it can be driven directly, exactly as production runs it.
+/// Whether dropping the prefix before `message` would strand it: a tool result
+/// whose originating call sits in the dropped span.
+fn opens_with_tool_result(message: &Message) -> bool {
+    matches!(message, Message::User { content }
+        if content
+            .iter()
+            .any(|item| matches!(item, rig::message::UserContent::ToolResult(_))))
+}
+
+/// Move a prefix cut forward until the retained history no longer starts with
+/// an orphaned tool result.
+///
+/// Providers reject a tool result that has no matching call, and the rejection
+/// lands before the turn can mutate anything, so a channel trimmed mid-turn
+/// replays the same invalid history and fails on every subsequent message until
+/// it is rebuilt. Dropping the stranded results with the rest of their turn
+/// costs a little context and keeps the channel usable.
+fn advance_past_stranded_tool_results(history: &[Message], remove: usize) -> usize {
+    let mut aligned = remove;
+    while aligned < history.len() && opens_with_tool_result(&history[aligned]) {
+        aligned += 1;
+    }
+    aligned
+}
+
 pub(crate) async fn trim_live_history_to_boundary(
     channel_id: &ChannelId,
     fence: &Arc<HistoryFence>,
@@ -941,8 +972,10 @@ pub(crate) async fn trim_live_history_to_boundary(
         return 0;
     }
 
+    // The retention floor is a raw message count, so clamping to it can land
+    // inside the turn that `droppable` was chosen to preserve.
     let floor = history.len().saturating_sub(MIN_RETAINED_MESSAGES);
-    let remove = droppable.min(floor);
+    let remove = advance_past_stranded_tool_results(&history, droppable.min(floor));
     if remove == 0 {
         return 0;
     }
@@ -1306,6 +1339,87 @@ fn render_entries(entries: &[&ChronicleCheckpoint], collapsed_upto: usize) -> St
 mod tests {
     use super::*;
 
+    fn user_text(text: &str) -> Message {
+        Message::User {
+            content: rig::OneOrMany::one(rig::message::UserContent::text(text)),
+        }
+    }
+
+    fn assistant_tool_call(id: &str) -> Message {
+        Message::Assistant {
+            id: None,
+            content: rig::OneOrMany::one(rig::message::AssistantContent::tool_call(
+                id,
+                "shell",
+                serde_json::json!({"command": "ls"}),
+            )),
+        }
+    }
+
+    fn tool_result(id: &str) -> Message {
+        Message::User {
+            content: rig::OneOrMany::one(rig::message::UserContent::ToolResult(
+                rig::message::ToolResult {
+                    id: id.to_string(),
+                    call_id: None,
+                    content: rig::OneOrMany::one(rig::message::ToolResultContent::text("ok")),
+                },
+            )),
+        }
+    }
+
+    /// A cut that lands between a tool call and its result would leave the
+    /// retained history opening on a result whose call is gone — the shape
+    /// providers reject outright.
+    #[test]
+    fn a_cut_between_a_call_and_its_result_moves_past_the_result() {
+        let history = vec![
+            user_text("older"),
+            assistant_tool_call("call_1"),
+            tool_result("call_1"),
+            user_text("newer"),
+        ];
+
+        let aligned = advance_past_stranded_tool_results(&history, 2);
+
+        assert_eq!(
+            aligned, 3,
+            "the stranded result must be dropped with its call"
+        );
+        assert!(!opens_with_tool_result(&history[aligned]));
+    }
+
+    #[test]
+    fn consecutive_stranded_results_are_all_dropped() {
+        let history = vec![
+            assistant_tool_call("call_1"),
+            tool_result("call_1"),
+            tool_result("call_2"),
+            user_text("newer"),
+        ];
+
+        assert_eq!(advance_past_stranded_tool_results(&history, 1), 3);
+    }
+
+    #[test]
+    fn a_cut_on_a_turn_boundary_is_left_alone() {
+        let history = vec![
+            assistant_tool_call("call_1"),
+            tool_result("call_1"),
+            user_text("newer"),
+        ];
+
+        assert_eq!(advance_past_stranded_tool_results(&history, 2), 2);
+        assert_eq!(advance_past_stranded_tool_results(&history, 0), 0);
+    }
+
+    #[test]
+    fn a_history_of_only_results_is_fully_dropped_rather_than_left_invalid() {
+        let history = vec![tool_result("call_1"), tool_result("call_2")];
+
+        assert_eq!(advance_past_stranded_tool_results(&history, 1), 2);
+    }
+
     fn checkpoint(seq: i64, title: &str, summary: &str) -> ChronicleCheckpoint {
         let at = DateTime::parse_from_rfc3339("2026-08-01T00:00:00Z")
             .unwrap()
@@ -1643,6 +1757,46 @@ mod tests {
         assert_eq!(
             remaining, 4,
             "the whole covered prefix goes, down to the retention floor"
+        );
+    }
+
+    /// The retention floor is a raw count, so it can clamp the cut inside the
+    /// turn that `droppable` was chosen to keep whole. Landing there strands a
+    /// tool result, which every later turn replays until the provider rejects
+    /// the channel outright.
+    #[tokio::test]
+    async fn a_floor_clamped_cut_does_not_strand_a_tool_result() {
+        let store = store_with_two_checkpoints().await;
+        let fence = Arc::new(HistoryFence::new());
+
+        // The retention floor lands the cut at index 6, between the call at 5
+        // and its result at 6.
+        let mut entries = (0..10)
+            .map(|index| Message::from(format!("entry {index}")))
+            .collect::<Vec<_>>();
+        entries[5] = assistant_tool_call("call_1");
+        entries[6] = tool_result("call_1");
+        let history = Arc::new(RwLock::new(entries));
+        fence.record_turn(3, 3);
+        fence.record_turn(10, 6);
+
+        let checkpoint = store
+            .latest("ch", 0)
+            .await
+            .expect("latest")
+            .expect("a checkpoint exists");
+
+        let entry = fence.snapshot();
+        trim_live_history_to_boundary(&Arc::from("ch"), &fence, &history, entry, &checkpoint).await;
+
+        let remaining = history.read().await;
+        assert!(
+            !remaining.is_empty(),
+            "the trim must not consume the whole history"
+        );
+        assert!(
+            !opens_with_tool_result(&remaining[0]),
+            "retained history opened on a tool result whose call was dropped"
         );
     }
 
