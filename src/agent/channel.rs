@@ -189,18 +189,23 @@ async fn enrich_ask_interaction(
                 return format!("[interaction: {action_id}] (expired — no matching options)");
             }
 
-            // Resolve the question so duplicate clicks get the expired path.
-            // Failure is non-fatal — the answer still rendered correctly.
-            if let Err(error) = store.resolve(question_id, &answer_labels).await {
-                tracing::warn!(
-                    question_id,
-                    %error,
-                    "failed to resolve pending question; duplicate clicks may re-fire"
-                );
+            // The conditional update makes only one concurrent interaction the
+            // answer; later clicks must not reach the model as another answer.
+            match store.resolve(question_id, &answer_labels).await {
+                Ok(true) => {
+                    let labels_str = answer_labels.join(", ");
+                    format!("{sender_name} answered \"{}\": {labels_str}", q.question)
+                }
+                Ok(false) => format!("[interaction: {action_id}] (expired)"),
+                Err(error) => {
+                    tracing::warn!(
+                        question_id,
+                        %error,
+                        "failed to resolve pending question"
+                    );
+                    format!("[interaction: {action_id}] (expired)")
+                }
             }
-
-            let labels_str = answer_labels.join(", ");
-            format!("{sender_name} answered \"{}\": {labels_str}", q.question)
         }
         Ok(Some(_)) => {
             // Already resolved
