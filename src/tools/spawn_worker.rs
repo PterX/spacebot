@@ -174,13 +174,30 @@ impl SpawnWorkerTool {
                 let worktree_name = format!("task-{number}");
 
                 // Reuse the worktree from an earlier spawn attempt instead of
-                // failing on the existing path.
-                let existing = deps
-                    .project_store
-                    .list_worktrees(&project.id)
-                    .await
-                    .ok()
-                    .and_then(|worktrees| worktrees.into_iter().find(|w| w.name == worktree_name));
+                // failing on the existing path. The binding the task carries is
+                // authoritative; the `task-<number>` name is the compatibility
+                // key for tasks provisioned before that binding was recorded.
+                let bound = match plan.worktree_id.as_deref() {
+                    Some(worktree_id) => deps
+                        .project_store
+                        .get_worktree(worktree_id)
+                        .await
+                        .ok()
+                        .flatten(),
+                    None => None,
+                };
+
+                let existing = match bound {
+                    Some(worktree) => Some(worktree),
+                    None => deps
+                        .project_store
+                        .list_worktrees(&project.id)
+                        .await
+                        .ok()
+                        .and_then(|worktrees| {
+                            worktrees.into_iter().find(|w| w.name == worktree_name)
+                        }),
+                };
 
                 match existing {
                     Some(worktree) => {
@@ -656,6 +673,10 @@ impl SpawnWorkerTool {
                     crate::tasks::UpdateTaskInput {
                         worker_id: Some(worker_id.to_string()),
                         status: status_change,
+                        // Record the worktree this run resolved to, so a retry
+                        // reuses it instead of rediscovering it by name and a
+                        // task's working directory is visible on the board.
+                        worktree_id: plan.worktree_id.clone().map(Some),
                         ..Default::default()
                     },
                 )

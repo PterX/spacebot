@@ -952,6 +952,47 @@ async fn run(
         .await
         .context("failed to migrate legacy projects to instance database")?;
 
+    // Tasks executed before the worktree binding was recorded have a
+    // `task-<number>` worktree on disk that nothing points at. Reconnect them
+    // by name so a retry reuses the worktree instead of rediscovering it.
+    {
+        let mut candidates = Vec::new();
+        match global_project_store.list_projects(None).await {
+            Ok(projects) => {
+                for project in projects {
+                    match global_project_store.list_worktrees(&project.id).await {
+                        Ok(worktrees) => {
+                            candidates.extend(worktrees.into_iter().map(|w| (w.name, w.id)))
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                project_id = %project.id,
+                                %error,
+                                "failed to list worktrees for task binding backfill"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to list projects for task binding backfill");
+            }
+        }
+
+        match global_task_store
+            .backfill_worktree_bindings(&candidates)
+            .await
+        {
+            Ok(bound) if bound > 0 => {
+                tracing::info!(tasks = bound, "bound tasks to their existing worktrees");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "failed to backfill task worktree bindings");
+            }
+        }
+    }
+
     // Start HTTP API server if enabled
     let mut api_state = spacebot::api::ApiState::new_with_provider_sender(
         provider_tx,

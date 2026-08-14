@@ -847,6 +847,69 @@ impl TaskStore {
         Ok(Some(task))
     }
 
+    /// Bind tasks to the worktree already carrying their conventional name.
+    ///
+    /// A task provisioned before the binding was recorded has a `task-<number>`
+    /// worktree on disk and no `worktree_id`, so nothing connects the two and a
+    /// retry rediscovers the worktree by name every time. `candidates` is
+    /// `(worktree_name, worktree_id)`; the caller supplies them so this does
+    /// not reach into the project tables.
+    ///
+    /// The binding is inferred from the naming convention rather than observed
+    /// when the worktree was provisioned, and the revision it writes says so —
+    /// that is what keeps an inferred binding distinguishable from a real one.
+    /// Idempotent: a task that already has a binding is never revisited.
+    pub async fn backfill_worktree_bindings(
+        &self,
+        candidates: &[(String, String)],
+    ) -> Result<usize> {
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        let unbound: Vec<i64> = sqlx::query_scalar(
+            "SELECT task_number FROM tasks WHERE worktree_id IS NULL ORDER BY task_number",
+        )
+        .fetch_all(self.pool())
+        .await
+        .context("failed to list tasks without a worktree binding")?;
+
+        let mut bound = 0usize;
+        for task_number in unbound {
+            let name = format!("task-{task_number}");
+            let Some((_, worktree_id)) = candidates.iter().find(|(known, _)| *known == name) else {
+                continue;
+            };
+
+            let context = TaskMutationContext::new(
+                crate::tasks::TaskAuthorKind::System,
+                Some("migration".to_string()),
+                crate::tasks::TaskMutationSource::Migration,
+            )
+            .with_summary(Some(format!(
+                "Bound to the existing {name} worktree by name; inferred from the naming \
+                 convention, not observed when the worktree was provisioned"
+            )));
+
+            let updated = self
+                .update(
+                    task_number,
+                    UpdateTaskInput {
+                        worktree_id: Some(Some(worktree_id.clone())),
+                        context,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+
+            if updated.is_some() {
+                bound += 1;
+            }
+        }
+
+        Ok(bound)
+    }
+
     pub async fn update(&self, task_number: i64, input: UpdateTaskInput) -> Result<Option<Task>> {
         Ok(self
             .update_with_status_transition(task_number, input)
