@@ -52,6 +52,10 @@ pub struct SpacebotHook {
     /// Once signaled, the nudge system allows text-only responses to pass
     /// through as legitimate completions.
     outcome_signaled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Full text of the last successful `set_status(kind: "outcome")` call.
+    /// Carried into `WorkerOutcome` so the durable result holds the worker's
+    /// findings rather than a placeholder.
+    outcome_text: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// One-shot workers terminate immediately after recording an outcome.
     /// Interactive workers keep their session open for follow-up input.
     terminate_on_outcome: bool,
@@ -135,6 +139,7 @@ impl SpacebotHook {
                 std::sync::atomic::AtomicBool::new(false),
             ),
             outcome_signaled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            outcome_text: std::sync::Arc::new(std::sync::Mutex::new(None)),
             terminate_on_outcome: false,
             nudge_attempts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             loop_guard: std::sync::Arc::new(std::sync::Mutex::new(LoopGuard::new(
@@ -202,12 +207,19 @@ impl SpacebotHook {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Take the outcome text recorded by the last successful
+    /// `set_status(kind: "outcome")` call, if any.
+    pub fn take_outcome_text(&self) -> Option<String> {
+        self.outcome_text.lock().expect("outcome text lock").take()
+    }
+
     /// Reset per-prompt state (tool nudging, outcome tracking, and loop guard).
     pub fn reset_tool_nudge_state(&self) {
         self.completion_calls
             .store(0, std::sync::atomic::Ordering::Relaxed);
         self.outcome_signaled
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.outcome_text.lock().expect("outcome text lock").take();
         self.nudge_attempts
             .store(0, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut guard) = self.loop_guard.lock() {
@@ -1492,6 +1504,13 @@ where
             && parsed.get("success").and_then(|v| v.as_bool()) == Some(true)
             && parsed.get("kind").and_then(|v| v.as_str()) == Some("outcome")
         {
+            if let Some(text) = parsed
+                .get("outcome")
+                .and_then(|v| v.as_str())
+                .filter(|text| !text.trim().is_empty())
+            {
+                *self.outcome_text.lock().expect("outcome text lock") = Some(text.to_string());
+            }
             self.outcome_signaled
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             if self.terminate_on_outcome {
@@ -1770,6 +1789,48 @@ mod tests {
                 if reason == SpacebotHook::WORKER_OUTCOME_RECORDED_REASON
         ));
         assert!(hook.outcome_signaled());
+    }
+
+    #[tokio::test]
+    async fn outcome_signal_retains_full_outcome_text() {
+        let hook = make_hook()
+            .with_tool_nudge_policy(ToolNudgePolicy::Enabled)
+            .with_terminate_on_outcome(true);
+        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
+            &hook,
+            "set_status",
+            None,
+            "internal_1",
+            "{\"status\":\"Console verified\",\"kind\":\"outcome\"}",
+            "{\"success\":true,\"worker_id\":1,\"status\":\"Console verified...\",\"outcome\":\"Console verified at http://127.0.0.1:4100 with PID 19671\",\"kind\":\"outcome\"}",
+        )
+        .await;
+
+        assert_eq!(
+            hook.take_outcome_text().as_deref(),
+            Some("Console verified at http://127.0.0.1:4100 with PID 19671"),
+        );
+        // Taking the text consumes it.
+        assert!(hook.take_outcome_text().is_none());
+    }
+
+    #[tokio::test]
+    async fn reset_clears_retained_outcome_text() {
+        let hook = make_hook()
+            .with_tool_nudge_policy(ToolNudgePolicy::Enabled)
+            .with_terminate_on_outcome(false);
+        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
+            &hook,
+            "set_status",
+            None,
+            "internal_1",
+            "{\"status\":\"done\",\"kind\":\"outcome\"}",
+            "{\"success\":true,\"worker_id\":1,\"status\":\"done\",\"outcome\":\"done\",\"kind\":\"outcome\"}",
+        )
+        .await;
+
+        hook.reset_tool_nudge_state();
+        assert!(hook.take_outcome_text().is_none());
     }
 
     #[tokio::test]
