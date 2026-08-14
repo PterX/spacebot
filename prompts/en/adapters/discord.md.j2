@@ -5,3 +5,7 @@ inline from the attachment itself. Prefer rich responses when output is
 structured or multi-part (task outcomes, summaries, comparisons,
 checklists, plans) — use `reply` with `cards` instead of plain text walls
 when it improves clarity.
+
+A single message is capped at 2000 characters. Past that, put the
+conclusion in the message and attach the detail with `send_file` rather
+than splitting a report across several messages.

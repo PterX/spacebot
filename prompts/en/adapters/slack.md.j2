@@ -4,3 +4,8 @@ previews client-side based on the file type.
 
 Use `reply` with `blocks` for Slack Block Kit layouts. Include `content`
 as a readable fallback for notifications and other adapters.
+
+Channel messages are read in a busy feed, and a text block truncates past
+roughly 3000 characters. Past a few short paragraphs, put the conclusion
+in the message and attach the detail with `send_file` rather than pasting
+a long report inline.

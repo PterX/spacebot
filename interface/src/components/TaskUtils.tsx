@@ -44,38 +44,22 @@ function formatRelativeTime(iso: string) {
 }
 
 export function TaskMetadataBadges({
-  task,
   enrichment,
 }: {
-  task: TaskItem;
   enrichment?: TaskEnrichment;
 }) {
+  if (!enrichment) return null;
+
   return (
     <div className="flex min-w-0 flex-wrap items-center gap-1">
-      {enrichment && (
-        <Badge
-          variant="info"
-          size="sm"
-          title={`Researched ${formatRelativeTime(enrichment.at)}: ${enrichment.detail}`}
-        >
-          <FontAwesomeIcon icon={faClock} className="text-[9px]" />
-          <span>Researched {formatRelativeTime(enrichment.at)}</span>
-        </Badge>
-      )}
-      {task.depends_on.map((edge) => (
-        <Badge
-          key={`${edge.kind}-${edge.depends_on_task_number}`}
-          variant={edge.satisfied ? "success" : "warning"}
-          size="sm"
-          title={`${edge.depends_on_title} - ${edge.depends_on_status}`}
-        >
-          <FontAwesomeIcon
-            icon={edge.kind === "stack" ? faLayerGroup : edge.satisfied ? faLockOpen : faLock}
-            className="text-[9px]"
-          />
-          <span>{edge.kind === "stack" ? "Stacks on" : "Blocked by"} SPC-{edge.depends_on_task_number}</span>
-        </Badge>
-      ))}
+      <Badge
+        variant="info"
+        size="sm"
+        title={`Researched ${formatRelativeTime(enrichment.at)}: ${enrichment.detail}`}
+      >
+        <FontAwesomeIcon icon={faClock} className="text-[9px]" />
+        <span>Researched {formatRelativeTime(enrichment.at)}</span>
+      </Badge>
     </div>
   );
 }
@@ -285,8 +269,8 @@ export function ExecutionPlanSection({ task }: { task: TaskItem }) {
   })();
 
   return (
-    <div className="border-b border-app-line/40 px-4 py-3">
-      <h3 className="mb-2 text-xs font-medium uppercase tracking-wide text-ink-dull">
+    <div className="rounded-lg border border-dashed border-app-line/60 bg-app-box/30 p-3">
+      <h3 className="mb-2 text-[10px] font-medium uppercase tracking-[0.12em] text-ink-faint">
         Execution Plan
       </h3>
       <div className="flex flex-wrap items-center gap-1.5">

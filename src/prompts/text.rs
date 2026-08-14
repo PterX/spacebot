@@ -82,6 +82,7 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         ("en", "adapters/signal") => include_str!("../../prompts/en/adapters/signal.md.j2"),
         ("en", "adapters/discord") => include_str!("../../prompts/en/adapters/discord.md.j2"),
         ("en", "adapters/slack") => include_str!("../../prompts/en/adapters/slack.md.j2"),
+        ("en", "adapters/telegram") => include_str!("../../prompts/en/adapters/telegram.md.j2"),
         ("en", "adapters/mattermost") => include_str!("../../prompts/en/adapters/mattermost.md.j2"),
         ("en", "adapters/portal") => include_str!("../../prompts/en/adapters/portal.md.j2"),
         ("en", "adapters/twitch") => include_str!("../../prompts/en/adapters/twitch.md.j2"),
