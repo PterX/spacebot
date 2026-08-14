@@ -1,4 +1,4 @@
-//! LanceDB table management and embedding storage with HNSW vector index and FTS.
+//! LanceDB table management and embedding storage with cosine vector index and FTS.
 
 use crate::error::{DbError, Result};
 use arrow_array::cast::AsArray;
@@ -158,6 +158,7 @@ impl EmbeddingTable {
             .query()
             .nearest_to(query_embedding)
             .map_err(|e| DbError::LanceDb(e.to_string()))?
+            .distance_type(lancedb::DistanceType::Cosine)
             .limit(limit)
             .execute()
             .await
@@ -295,15 +296,10 @@ impl EmbeddingTable {
         Ok(matches)
     }
 
-    /// Create HNSW vector index and FTS index for better performance.
+    /// Create cosine vector and FTS indexes for better performance.
     /// Should be called after enough data accumulates.
     pub async fn create_indexes(&self) -> Result<()> {
-        // Create HNSW vector index on embedding column
-        self.table
-            .create_index(&["embedding"], lancedb::index::Index::Auto)
-            .execute()
-            .await
-            .map_err(|e| DbError::LanceDb(format!("Failed to create vector index: {}", e)))?;
+        Self::ensure_cosine_vector_index(&self.table).await?;
 
         self.ensure_fts_index().await?;
 
@@ -367,6 +363,133 @@ impl EmbeddingTable {
             );
         }
         Ok(())
+    }
+
+    async fn ensure_cosine_vector_index(table: &lancedb::Table) -> Result<()> {
+        use lancedb::index::IndexType;
+
+        let indexes = table
+            .list_indices()
+            .await
+            .map_err(|e| DbError::LanceDb(e.to_string()))?;
+        let mut has_cosine_index = false;
+        for index in indexes.into_iter().filter(|index| {
+            index.columns.len() == 1
+                && index.columns[0] == "embedding"
+                && matches!(
+                    index.index_type,
+                    IndexType::IvfFlat
+                        | IndexType::IvfSq
+                        | IndexType::IvfPq
+                        | IndexType::IvfRq
+                        | IndexType::IvfHnswPq
+                        | IndexType::IvfHnswSq
+                )
+        }) {
+            let statistics = table
+                .index_stats(&index.name)
+                .await
+                .map_err(|e| DbError::LanceDb(e.to_string()))?;
+            if statistics.and_then(|statistics| statistics.distance_type)
+                == Some(lancedb::DistanceType::Cosine)
+            {
+                has_cosine_index = true;
+                continue;
+            }
+
+            table
+                .drop_index(&index.name)
+                .await
+                .map_err(|e| DbError::LanceDb(e.to_string()))?;
+        }
+
+        if has_cosine_index {
+            return Ok(());
+        }
+
+        table
+            .create_index(
+                &["embedding"],
+                lancedb::index::Index::IvfFlat(
+                    lancedb::index::vector::IvfFlatIndexBuilder::default()
+                        .distance_type(lancedb::DistanceType::Cosine),
+                ),
+            )
+            .execute()
+            .await
+            .map_err(|e| DbError::LanceDb(format!("Failed to create cosine vector index: {}", e)))
+            .map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChronicleEmbeddingTable, EmbeddingTable};
+
+    fn embedding(first: f32, second: f32) -> Vec<f32> {
+        let mut embedding = vec![0.0; 384];
+        embedding[0] = first;
+        embedding[1] = second;
+        embedding
+    }
+
+    #[tokio::test]
+    async fn vector_searches_use_cosine_distance() {
+        let directory = tempfile::tempdir().unwrap();
+        let connection = lancedb::connect(directory.path().to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+        let memory_table = EmbeddingTable::open_or_create(&connection).await.unwrap();
+        let chronicle_table = ChronicleEmbeddingTable::open_or_create(&connection)
+            .await
+            .unwrap();
+        let query = embedding(1.0, 0.0);
+
+        memory_table
+            .store(
+                "00000000-0000-0000-0000-000000000001",
+                "nearly parallel",
+                &embedding(10.0, 1.0),
+            )
+            .await
+            .unwrap();
+        memory_table
+            .store(
+                "00000000-0000-0000-0000-000000000002",
+                "closer by L2",
+                &embedding(1.0, 1.0),
+            )
+            .await
+            .unwrap();
+        chronicle_table
+            .store(
+                "checkpoint-1",
+                "nearly parallel",
+                "channel",
+                1,
+                "nearly parallel",
+                &embedding(10.0, 1.0),
+            )
+            .await
+            .unwrap();
+        chronicle_table
+            .store(
+                "checkpoint-2",
+                "closer by L2",
+                "channel",
+                2,
+                "closer by L2",
+                &embedding(1.0, 1.0),
+            )
+            .await
+            .unwrap();
+
+        let memory_results = memory_table.vector_search(&query, 2).await.unwrap();
+        let chronicle_results = chronicle_table.vector_search(&query, 2).await.unwrap();
+
+        assert_eq!(memory_results[0].0, "00000000-0000-0000-0000-000000000001");
+        assert_eq!(chronicle_results[0].checkpoint_id, "checkpoint-1");
     }
 }
 
@@ -563,6 +686,7 @@ impl ChronicleEmbeddingTable {
             .query()
             .nearest_to(query_embedding)
             .map_err(|e| DbError::LanceDb(e.to_string()))?
+            .distance_type(lancedb::DistanceType::Cosine)
             .limit(limit)
             .execute()
             .await
@@ -653,16 +777,10 @@ impl ChronicleEmbeddingTable {
         Ok(matches)
     }
 
-    /// Create HNSW vector index and FTS index for better performance.
+    /// Create cosine vector and FTS indexes for better performance.
     /// Should be called after enough data accumulates.
     pub async fn create_indexes(&self) -> Result<()> {
-        self.table
-            .create_index(&["embedding"], lancedb::index::Index::Auto)
-            .execute()
-            .await
-            .map_err(|e| {
-                DbError::LanceDb(format!("Failed to create chronicle vector index: {}", e))
-            })?;
+        EmbeddingTable::ensure_cosine_vector_index(&self.table).await?;
 
         self.ensure_fts_index().await?;
 
