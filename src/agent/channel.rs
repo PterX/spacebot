@@ -191,10 +191,10 @@ async fn enrich_ask_interaction(
 
             // Resolve the question so duplicate clicks get the expired path.
             // Failure is non-fatal — the answer still rendered correctly.
-            if let Err(e) = store.resolve(question_id, &answer_labels).await {
+            if let Err(error) = store.resolve(question_id, &answer_labels).await {
                 tracing::warn!(
                     question_id,
-                    error = %e,
+                    %error,
                     "failed to resolve pending question; duplicate clicks may re-fire"
                 );
             }
@@ -563,7 +563,6 @@ impl ChannelState {
             format!("Worker cancelled: {reason}")
         };
 
-        let mut control = self.worker_handles.write().await.remove(&worker_id);
         let Some(lifecycle) = self
             .process_run_logger
             .read_worker_lifecycle(worker_id)
@@ -574,6 +573,7 @@ impl ChannelState {
         };
 
         if lifecycle.is_terminal() {
+            self.worker_handles.write().await.remove(&worker_id);
             self.cleanup_worker_routing(worker_id).await;
             return Ok(());
         }
@@ -600,10 +600,16 @@ impl ChannelState {
         };
 
         if lifecycle == crate::conversation::WorkerLifecycle::Completing {
-            if let Some(control) = &control {
+            let terminal_notify = self
+                .worker_handles
+                .read()
+                .await
+                .get(&worker_id)
+                .map(|control| control.terminal_notify.clone());
+            if let Some(terminal_notify) = terminal_notify {
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_secs(2),
-                    control.terminal_notify.notified(),
+                    terminal_notify.notified(),
                 )
                 .await;
             }
@@ -614,10 +620,12 @@ impl ChannelState {
                 .map_err(|error| error.to_string())?
                 .is_some()
             {
+                self.worker_handles.write().await.remove(&worker_id);
                 self.cleanup_worker_routing(worker_id).await;
                 return Ok(());
             }
         }
+        let mut control = self.worker_handles.write().await.remove(&worker_id);
         if let Some(control) = &mut control {
             if let Some(opencode_cancellation) = &control.opencode_cancellation
                 && let Some(session) = opencode_cancellation.lock().await.clone()
@@ -642,13 +650,18 @@ impl ChannelState {
                     tracing::warn!(%error, %worker_id, "cancelled worker task failed while joining");
                 }
             }
-            if self
+            let terminal = self
                 .process_run_logger
                 .read_worker_terminal(worker_id)
-                .await
-                .map_err(|error| error.to_string())?
-                .is_some()
-            {
+                .await;
+            let terminal = match terminal {
+                Ok(terminal) => terminal,
+                Err(error) => {
+                    self.worker_handles.write().await.insert(worker_id, control);
+                    return Err(error.to_string());
+                }
+            };
+            if terminal.is_some() {
                 self.cleanup_worker_routing(worker_id).await;
                 return Ok(());
             }
@@ -679,8 +692,16 @@ impl ChannelState {
             transcript.as_ref(),
             crate::conversation::WorkerTerminalOwner::Cancel,
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await;
+        let terminal = match terminal {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                if let Some(control) = control {
+                    self.worker_handles.write().await.insert(worker_id, control);
+                }
+                return Err(error.to_string());
+            }
+        };
         if let Some((terminal, true)) = terminal {
             self.deps
                 .event_tx
