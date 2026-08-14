@@ -224,7 +224,10 @@ impl Compactor {
             return Ok(());
         }
 
-        let remove_count = total / 2;
+        let remove_count = advance_past_stranded_tool_results(&history, total / 2);
+        if remove_count == 0 {
+            return Ok(());
+        }
 
         let removed: Vec<Message> = history.drain(..remove_count).collect();
         drop(removed);
@@ -278,6 +281,7 @@ async fn run_compaction(
         let remove_count = ((total as f32 * fraction) as usize)
             .max(1)
             .min(total.saturating_sub(2));
+        let remove_count = advance_past_stranded_tool_results(&hist, remove_count);
         if remove_count == 0 {
             return Ok(0);
         }
@@ -401,6 +405,31 @@ fn forked_compaction_marker_tokens(removed_total: usize) -> usize {
 /// when they alone exceed the budget — a single oversized tool result can
 /// outweigh the whole window, and dropping it would strip the fork of the
 /// context it was forked for.
+/// Whether dropping the prefix before `message` would strand it: a tool result
+/// whose originating call sits in the dropped span.
+pub(crate) fn opens_with_tool_result(message: &Message) -> bool {
+    matches!(message, Message::User { content }
+        if content
+            .iter()
+            .any(|item| matches!(item, rig::message::UserContent::ToolResult(_))))
+}
+
+/// Move a prefix cut forward until the retained history no longer starts with
+/// an orphaned tool result.
+///
+/// Providers reject a tool result that has no matching call, and the rejection
+/// lands before the turn can mutate anything, so a channel trimmed mid-turn
+/// replays the same invalid history and fails on every subsequent message until
+/// it is rebuilt. Dropping the stranded results with the rest of their turn
+/// costs a little context and keeps the channel usable.
+pub(crate) fn advance_past_stranded_tool_results(history: &[Message], remove: usize) -> usize {
+    let mut aligned = remove;
+    while aligned < history.len() && opens_with_tool_result(&history[aligned]) {
+        aligned += 1;
+    }
+    aligned
+}
+
 pub fn precompact_forked_history(
     history: &mut Vec<Message>,
     context_window: usize,
@@ -422,6 +451,10 @@ pub fn precompact_forked_history(
         let remove_count = ((total as f32 * fraction) as usize)
             .max(1)
             .min(total - FORK_MIN_RETAINED_MESSAGES);
+        let remove_count = advance_past_stranded_tool_results(history, remove_count);
+        if remove_count == 0 {
+            break;
+        }
         history.drain(..remove_count);
         removed_total += remove_count;
     }
@@ -616,6 +649,59 @@ mod tests {
 
     fn text_message(size: usize) -> Message {
         Message::from("x".repeat(size))
+    }
+
+    fn assistant_tool_call(id: &str) -> Message {
+        Message::Assistant {
+            id: None,
+            content: rig::OneOrMany::one(AssistantContent::tool_call(
+                id,
+                "shell",
+                serde_json::json!({"command": "ls"}),
+            )),
+        }
+    }
+
+    fn tool_result(id: &str, size: usize) -> Message {
+        Message::User {
+            content: rig::OneOrMany::one(UserContent::ToolResult(rig::message::ToolResult {
+                id: id.to_string(),
+                call_id: None,
+                content: rig::OneOrMany::one(rig::message::ToolResultContent::text(
+                    "x".repeat(size),
+                )),
+            })),
+        }
+    }
+
+    /// A fork carries the parent's tool traffic verbatim, so a fractional cut
+    /// can land between a call and its result. The provider rejects the
+    /// stranded result outright, and the fork dies on its first call.
+    ///
+    /// Laid out so the 50% cut lands exactly on a result: one leading message
+    /// then call/result pairs puts results on even indices.
+    #[test]
+    fn precompact_never_strands_a_tool_result_at_the_front() {
+        let mut history: Vec<Message> = vec![text_message(4000)];
+        for index in 0..10 {
+            history.push(assistant_tool_call(&format!("call_{index}")));
+            history.push(tool_result(&format!("call_{index}"), 4000));
+        }
+        assert!(
+            opens_with_tool_result(&history[10]),
+            "cut index must be a result"
+        );
+
+        let removed = precompact_forked_history(&mut history, 12_000, 0.50, 0);
+
+        assert!(
+            removed > 0,
+            "history was over budget and should have been cut"
+        );
+        assert!(
+            !opens_with_tool_result(&history[1]),
+            "fork opened on a tool result whose call was dropped"
+        );
     }
 
     #[test]

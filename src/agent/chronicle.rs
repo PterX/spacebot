@@ -9,7 +9,9 @@
 //!
 //! See `docs/design-docs/session-chronicles.md`.
 
-use crate::agent::compactor::{estimate_history_tokens, estimate_text_tokens};
+use crate::agent::compactor::{
+    advance_past_stranded_tool_results, estimate_history_tokens, estimate_text_tokens,
+};
 use crate::config::ChronicleConfig;
 use crate::conversation::chronicle::{
     CheckpointKind, ChronicleBoundary, ChronicleCheckpoint, ChronicleStats, ChronicleStore,
@@ -925,31 +927,6 @@ impl RollupContext {
 /// valid and the next trim catches up.
 ///
 /// Free-standing so it can be driven directly, exactly as production runs it.
-/// Whether dropping the prefix before `message` would strand it: a tool result
-/// whose originating call sits in the dropped span.
-fn opens_with_tool_result(message: &Message) -> bool {
-    matches!(message, Message::User { content }
-        if content
-            .iter()
-            .any(|item| matches!(item, rig::message::UserContent::ToolResult(_))))
-}
-
-/// Move a prefix cut forward until the retained history no longer starts with
-/// an orphaned tool result.
-///
-/// Providers reject a tool result that has no matching call, and the rejection
-/// lands before the turn can mutate anything, so a channel trimmed mid-turn
-/// replays the same invalid history and fails on every subsequent message until
-/// it is rebuilt. Dropping the stranded results with the rest of their turn
-/// costs a little context and keeps the channel usable.
-fn advance_past_stranded_tool_results(history: &[Message], remove: usize) -> usize {
-    let mut aligned = remove;
-    while aligned < history.len() && opens_with_tool_result(&history[aligned]) {
-        aligned += 1;
-    }
-    aligned
-}
-
 pub(crate) async fn trim_live_history_to_boundary(
     channel_id: &ChannelId,
     fence: &Arc<HistoryFence>,
@@ -1338,6 +1315,7 @@ fn render_entries(entries: &[&ChronicleCheckpoint], collapsed_upto: usize) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::compactor::opens_with_tool_result;
 
     fn user_text(text: &str) -> Message {
         Message::User {
