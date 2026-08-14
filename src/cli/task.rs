@@ -3,7 +3,37 @@
 use super::client::{self, ApiClient};
 use super::output;
 use clap::Subcommand;
-use spacebot::api::tasks::{TaskActionResponse, TaskListResponse, TaskResponse};
+use spacebot::api::tasks::{
+    TaskActionResponse, TaskCommentListResponse, TaskCommentResponse, TaskHistoryResponse,
+    TaskListResponse, TaskResponse, TaskRevisionResponse,
+};
+use spacebot::tasks::TaskRevisionDiff;
+
+/// Marks every write from this binary so revision history records where a
+/// change came from.
+const CLI_SOURCE: &str = "cli";
+
+/// Render a snapshot field value as one line, or as an indented block when it
+/// spans several.
+fn render_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "-".to_string(),
+        serde_json::Value::String(text) => text.clone(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
+fn print_block(label: &str, value: &serde_json::Value) {
+    let rendered = render_value(value);
+    if rendered.contains('\n') {
+        println!("{label}:");
+        for line in rendered.lines() {
+            println!("    {line}");
+        }
+    } else {
+        println!("{label}: {rendered}");
+    }
+}
 
 #[derive(Subcommand)]
 pub enum TaskCommand {
@@ -81,6 +111,70 @@ pub enum TaskCommand {
         /// Mark the subtask at this index complete (0-based)
         #[arg(long)]
         complete_subtask: Option<usize>,
+        /// Why this edit was made, recorded on the revision
+        #[arg(long)]
+        summary: Option<String>,
+        /// Fail if the task has moved past this revision
+        #[arg(long)]
+        expect: Option<i64>,
+    },
+    /// Add a comment to a task's discussion
+    Comment {
+        /// Task number
+        number: i64,
+        /// Comment body
+        body: String,
+        /// Author recorded on the comment
+        #[arg(long)]
+        author: Option<String>,
+    },
+    /// List a task's comments
+    Comments {
+        /// Task number
+        number: i64,
+        /// Maximum number of comments to return
+        #[arg(short, long, default_value_t = 50)]
+        limit: i64,
+        /// Resume after this comment sequence number
+        #[arg(long)]
+        after: Option<i64>,
+    },
+    /// List a task's revision history
+    History {
+        /// Task number
+        number: i64,
+        /// Maximum number of revisions to return
+        #[arg(short, long, default_value_t = 50)]
+        limit: i64,
+    },
+    /// Show one historical revision of a task
+    Revision {
+        /// Task number
+        number: i64,
+        /// Revision number
+        revision: i64,
+    },
+    /// Show what changed between two revisions
+    Diff {
+        /// Task number
+        number: i64,
+        /// Revision to diff from
+        from: i64,
+        /// Revision to diff to (defaults to current)
+        to: Option<i64>,
+    },
+    /// Restore a task to a historical revision
+    Restore {
+        /// Task number
+        number: i64,
+        /// Revision to restore
+        revision: i64,
+        /// Why the restore is being made
+        #[arg(long)]
+        summary: Option<String>,
+        /// Revision the restore is written against (defaults to current)
+        #[arg(long)]
+        expect: Option<i64>,
     },
     /// Approve a task (move to ready)
     Approve {
@@ -198,6 +292,7 @@ pub async fn run(ctx: &super::Context, task_cmd: TaskCommand) -> anyhow::Result<
                 task.assigned_agent_id.as_deref().unwrap_or("-")
             );
             println!("Created by:  {}", task.created_by);
+            println!("Revision:    {}", task.revision);
             println!("Created:     {}", output::short_timestamp(&task.created_at));
             println!("Updated:     {}", output::short_timestamp(&task.updated_at));
             if let Some(worker_id) = &task.worker_id {
@@ -237,6 +332,7 @@ pub async fn run(ctx: &super::Context, task_cmd: TaskCommand) -> anyhow::Result<
             let mut body = serde_json::json!({
                 "owner_agent_id": owner,
                 "title": title,
+                "source": CLI_SOURCE,
             });
             if let Some(assigned) = &assigned {
                 body["assigned_agent_id"] = serde_json::json!(assigned);
@@ -279,8 +375,10 @@ pub async fn run(ctx: &super::Context, task_cmd: TaskCommand) -> anyhow::Result<
             priority,
             assigned,
             complete_subtask,
+            summary,
+            expect,
         } => {
-            let mut body = serde_json::json!({});
+            let mut body = serde_json::json!({ "source": CLI_SOURCE });
             if let Some(title) = &title {
                 body["title"] = serde_json::json!(title);
             }
@@ -299,8 +397,20 @@ pub async fn run(ctx: &super::Context, task_cmd: TaskCommand) -> anyhow::Result<
             if let Some(index) = complete_subtask {
                 body["complete_subtask"] = serde_json::json!(index);
             }
-            if body.as_object().is_none_or(|fields| fields.is_empty()) {
+            if title.is_none()
+                && description.is_none()
+                && status.is_none()
+                && priority.is_none()
+                && assigned.is_none()
+                && complete_subtask.is_none()
+            {
                 anyhow::bail!("nothing to update — pass at least one field flag");
+            }
+            if let Some(summary) = &summary {
+                body["edit_summary"] = serde_json::json!(summary);
+            }
+            if let Some(expect) = expect {
+                body["expected_revision"] = serde_json::json!(expect);
             }
 
             let value = client.put(&format!("tasks/{number}"), &body).await?;
@@ -310,9 +420,242 @@ pub async fn run(ctx: &super::Context, task_cmd: TaskCommand) -> anyhow::Result<
             }
             let response: TaskResponse = client::parse(value)?;
             eprintln!(
-                "Task #{} updated ({}).",
+                "Task #{} updated ({}, revision {}).",
                 response.task.task_number,
-                output::enum_label(&response.task.status)
+                output::enum_label(&response.task.status),
+                response.task.revision
+            );
+            Ok(())
+        }
+        TaskCommand::Comment {
+            number,
+            body,
+            author,
+        } => {
+            let mut request = serde_json::json!({ "body": body });
+            if let Some(author) = &author {
+                request["author_id"] = serde_json::json!(author);
+            }
+
+            let value = client
+                .post(&format!("tasks/{number}/comments"), &request)
+                .await?;
+            if ctx.json {
+                output::json(&value);
+                return Ok(());
+            }
+            let response: TaskCommentResponse = client::parse(value)?;
+            eprintln!("Commented on task #{number} (#{}).", response.comment.seq);
+            Ok(())
+        }
+        TaskCommand::Comments {
+            number,
+            limit,
+            after,
+        } => {
+            let mut query = vec![format!("limit={limit}")];
+            if let Some(after) = after {
+                query.push(format!("after={after}"));
+            }
+
+            let value = client
+                .get(&format!("tasks/{number}/comments?{}", query.join("&")))
+                .await?;
+            if ctx.json {
+                output::json(&value);
+                return Ok(());
+            }
+            let response: TaskCommentListResponse = client::parse(value)?;
+            if response.comments.is_empty() {
+                eprintln!("No comments on task #{number}.");
+                return Ok(());
+            }
+            for comment in &response.comments {
+                println!(
+                    "#{} {} {} · {}",
+                    comment.seq,
+                    comment.author_type,
+                    comment.author_id.as_deref().unwrap_or("-"),
+                    output::short_timestamp(&comment.created_at)
+                );
+                for line in comment.body.lines() {
+                    println!("    {line}");
+                }
+                println!();
+            }
+            eprintln!(
+                "{} of {} comment(s) shown.",
+                response.comments.len(),
+                response.total
+            );
+            Ok(())
+        }
+        TaskCommand::History { number, limit } => {
+            let value = client
+                .get(&format!("tasks/{number}/revisions?limit={limit}"))
+                .await?;
+            if ctx.json {
+                output::json(&value);
+                return Ok(());
+            }
+            let response: TaskHistoryResponse = client::parse(value)?;
+            if response.revisions.is_empty() {
+                eprintln!("Task #{number} has no revision history.");
+                return Ok(());
+            }
+            let rows: Vec<Vec<String>> = response
+                .revisions
+                .iter()
+                .map(|revision| {
+                    vec![
+                        revision.revision.to_string(),
+                        revision.author_type.to_string(),
+                        revision
+                            .author_id
+                            .clone()
+                            .unwrap_or_else(|| "-".to_string()),
+                        revision.source.to_string(),
+                        match revision.restored_from {
+                            Some(from) => format!("restore of {from}"),
+                            None => revision
+                                .edit_summary
+                                .clone()
+                                .unwrap_or_else(|| "-".to_string()),
+                        },
+                        output::short_timestamp(&revision.created_at),
+                    ]
+                })
+                .collect();
+            output::table(&["REV", "AUTHOR", "ID", "SOURCE", "SUMMARY", "WHEN"], &rows);
+            eprintln!("Task #{number} is at revision {}.", response.current);
+            Ok(())
+        }
+        TaskCommand::Revision { number, revision } => {
+            let value = client
+                .get(&format!("tasks/{number}/revisions/{revision}"))
+                .await?;
+            if ctx.json {
+                output::json(&value);
+                return Ok(());
+            }
+            let response: TaskRevisionResponse = client::parse(value)?;
+            let summary = &response.revision.summary;
+            let snapshot = &response.revision.snapshot;
+            println!("Revision:    {}", summary.revision);
+            println!(
+                "Author:      {} {}",
+                summary.author_type,
+                summary.author_id.as_deref().unwrap_or("-")
+            );
+            println!("Source:      {}", summary.source);
+            if let Some(from) = summary.restored_from {
+                println!("Restored:    revision {from}");
+            }
+            if let Some(edit_summary) = &summary.edit_summary {
+                println!("Summary:     {edit_summary}");
+            }
+            println!(
+                "When:        {}",
+                output::short_timestamp(&summary.created_at)
+            );
+            println!();
+            println!("Title:       {}", snapshot.title);
+            println!("Status:      {}", output::enum_label(&snapshot.status));
+            println!("Priority:    {}", output::enum_label(&snapshot.priority));
+            println!(
+                "Assigned:    {}",
+                snapshot.assigned_agent_id.as_deref().unwrap_or("-")
+            );
+            if let Some(description) = &snapshot.description {
+                println!("Description: {description}");
+            }
+            if !snapshot.subtasks.is_empty() {
+                println!("Subtasks:");
+                for subtask in &snapshot.subtasks {
+                    let marker = if subtask.completed { "x" } else { " " };
+                    println!("  [{marker}] {}", subtask.title);
+                }
+            }
+            if !snapshot.depends_on.is_empty() {
+                let edges: Vec<String> = snapshot
+                    .depends_on
+                    .iter()
+                    .map(|edge| format!("#{} ({})", edge.task, edge.kind))
+                    .collect();
+                println!("Depends on:  {}", edges.join(", "));
+            }
+            Ok(())
+        }
+        TaskCommand::Diff { number, from, to } => {
+            let mut query = vec![format!("from={from}")];
+            if let Some(to) = to {
+                query.push(format!("to={to}"));
+            }
+
+            let value = client
+                .get(&format!(
+                    "tasks/{number}/revisions/diff?{}",
+                    query.join("&")
+                ))
+                .await?;
+            if ctx.json {
+                output::json(&value);
+                return Ok(());
+            }
+            let diff: TaskRevisionDiff = client::parse(value)?;
+            if diff.changes.is_empty() {
+                eprintln!(
+                    "Revisions {} and {} of task #{number} are materially identical.",
+                    diff.from, diff.to
+                );
+                return Ok(());
+            }
+            eprintln!("Task #{number}: revision {} → {}", diff.from, diff.to);
+            for change in &diff.changes {
+                println!();
+                println!("{}", change.field);
+                print_block("  before", &change.before);
+                print_block("  after", &change.after);
+            }
+            Ok(())
+        }
+        TaskCommand::Restore {
+            number,
+            revision,
+            summary,
+            expect,
+        } => {
+            let expected = match expect {
+                Some(expected) => expected,
+                None => {
+                    let value = client.get(&format!("tasks/{number}")).await?;
+                    let response: TaskResponse = client::parse(value)?;
+                    response.task.revision
+                }
+            };
+
+            let mut request = serde_json::json!({
+                "expected_revision": expected,
+                "source": CLI_SOURCE,
+            });
+            if let Some(summary) = &summary {
+                request["edit_summary"] = serde_json::json!(summary);
+            }
+
+            let value = client
+                .post(
+                    &format!("tasks/{number}/revisions/{revision}/restore"),
+                    &request,
+                )
+                .await?;
+            if ctx.json {
+                output::json(&value);
+                return Ok(());
+            }
+            let response: TaskResponse = client::parse(value)?;
+            eprintln!(
+                "Task #{number} restored to revision {revision}, now at revision {}.",
+                response.task.revision
             );
             Ok(())
         }
@@ -320,7 +663,7 @@ pub async fn run(ctx: &super::Context, task_cmd: TaskCommand) -> anyhow::Result<
             number,
             approved_by,
         } => {
-            let mut body = serde_json::json!({});
+            let mut body = serde_json::json!({ "source": CLI_SOURCE });
             if let Some(approved_by) = &approved_by {
                 body["approved_by"] = serde_json::json!(approved_by);
             }
@@ -344,7 +687,7 @@ pub async fn run(ctx: &super::Context, task_cmd: TaskCommand) -> anyhow::Result<
             number,
             approved_by,
         } => {
-            let mut body = serde_json::json!({});
+            let mut body = serde_json::json!({ "source": CLI_SOURCE });
             if let Some(approved_by) = &approved_by {
                 body["approved_by"] = serde_json::json!(approved_by);
             }
@@ -365,7 +708,10 @@ pub async fn run(ctx: &super::Context, task_cmd: TaskCommand) -> anyhow::Result<
             Ok(())
         }
         TaskCommand::Assign { number, agent } => {
-            let body = serde_json::json!({ "assigned_agent_id": agent });
+            let body = serde_json::json!({
+                "assigned_agent_id": agent,
+                "source": CLI_SOURCE,
+            });
             let value = client
                 .post(&format!("tasks/{number}/assign"), &body)
                 .await?;

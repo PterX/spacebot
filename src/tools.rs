@@ -15,13 +15,13 @@
 //! - `memory_save` + `memory_recall` + `memory_delete` + `memory_consolidate`
 //!   + `channel_recall`
 //! - `spacebot_docs` for embedded self-documentation lookup
-//! - `task_create` + `task_list` + `task_update`
+//! - `task_create` + `task_list` + `task_update` + `task_history` + `add_task_comment`
 //! - `spawn_worker` is included for channel-originated branches only
 //! - `restart` when the daemon lifecycle handle is available
 //!
 //! **Worker ToolServer** (one per worker, created at spawn time):
 //! - `shell`, `file_read`/`file_write`/`file_edit`/`file_list` — stateless, registered at creation
-//! - `task_update` — scoped to the worker's assigned task
+//! - `task_update` + `add_task_comment` — scoped to the worker's assigned task
 //! - `set_status` — per-worker instance, registered at creation
 //! - `restart` when the daemon lifecycle handle is available
 //!
@@ -29,6 +29,7 @@
 //! - branch + worker tool superset plus `spacebot_docs`, `config_inspect`, `spawn_worker`,
 //!   and `restart`
 
+pub mod add_task_comment;
 pub mod ask;
 pub mod attachment_recall;
 pub mod autonomy_complete;
@@ -73,6 +74,7 @@ pub mod skip;
 pub mod spacebot_docs;
 pub mod spawn_worker;
 pub mod task_create;
+pub mod task_history;
 pub mod task_list;
 pub mod task_update;
 pub mod web_search;
@@ -91,6 +93,9 @@ pub mod factory_search_context;
 pub mod factory_update_config;
 pub mod factory_update_identity;
 
+pub use add_task_comment::{
+    AddTaskCommentArgs, AddTaskCommentError, AddTaskCommentOutput, AddTaskCommentTool,
+};
 pub use ask::{AskArgs, AskError, AskOptionArg, AskOutput, AskTool};
 pub use attachment_recall::{
     AttachmentRecallArgs, AttachmentRecallError, AttachmentRecallOutput, AttachmentRecallTool,
@@ -187,6 +192,7 @@ pub use spawn_worker::{
     SpawnWorkerOutput, SpawnWorkerTool,
 };
 pub use task_create::{TaskCreateArgs, TaskCreateError, TaskCreateOutput, TaskCreateTool};
+pub use task_history::{TaskHistoryArgs, TaskHistoryError, TaskHistoryOutput, TaskHistoryTool};
 pub use task_list::{TaskListArgs, TaskListError, TaskListOutput, TaskListTool};
 pub use task_update::{TaskUpdateArgs, TaskUpdateError, TaskUpdateOutput, TaskUpdateTool};
 pub use web_search::{SearchResult, WebSearchArgs, WebSearchError, WebSearchOutput, WebSearchTool};
@@ -1030,8 +1036,12 @@ pub fn create_branch_tool_server(
 
     let mut task_create = TaskCreateTool::new(task_store.clone(), agent_id.to_string(), "branch")
         .with_execution_context(project_store, runtime_config.clone());
+    let mut task_history = TaskHistoryTool::new(task_store.clone(), agent_id.clone());
+    let mut add_task_comment = AddTaskCommentTool::for_branch(task_store.clone(), agent_id.clone());
     if let Some(ref api) = api_state {
         task_create = task_create.with_api_state(api.clone());
+        task_history = task_history.with_api_state(api.clone());
+        add_task_comment = add_task_comment.with_api_state(api.clone());
     }
 
     // Reflection passes read transcripts for error text and recovery steps,
@@ -1057,7 +1067,12 @@ pub fn create_branch_tool_server(
         .tool(EmailSearchTool::new(runtime_config.clone()))
         .tool(task_create)
         .tool(TaskListTool::new(task_store.clone(), agent_id.to_string()))
-        .tool(TaskUpdateTool::for_branch(task_store, agent_id.clone()))
+        .tool(TaskUpdateTool::for_branch(
+            task_store.clone(),
+            agent_id.clone(),
+        ))
+        .tool(task_history)
+        .tool(add_task_comment)
         .tool(GoalListTool::new(goal_store.clone()))
         .tool(FileReadTool::new(
             runtime_config.workspace_dir.clone(),
@@ -1229,6 +1244,11 @@ pub fn create_worker_tool_server(
             ),
         )
         .tool(TaskUpdateTool::for_worker(
+            task_store.clone(),
+            agent_id.clone(),
+            worker_id,
+        ))
+        .tool(AddTaskCommentTool::for_worker(
             task_store,
             agent_id.clone(),
             worker_id,
@@ -1392,7 +1412,18 @@ pub fn create_cortex_chat_tool_server(
                 .with_api_state(api_state.clone()),
         )
         .tool(TaskListTool::new(task_store.clone(), agent_id.to_string()))
-        .tool(TaskUpdateTool::for_branch(task_store, agent_id.clone()))
+        .tool(TaskUpdateTool::for_branch(
+            task_store.clone(),
+            agent_id.clone(),
+        ))
+        .tool(
+            TaskHistoryTool::new(task_store.clone(), agent_id.clone())
+                .with_api_state(api_state.clone()),
+        )
+        .tool(
+            AddTaskCommentTool::for_branch(task_store, agent_id.clone())
+                .with_api_state(api_state.clone()),
+        )
         .tool(GoalCreateTool::new(goal_store.clone()).with_api_state(api_state.clone()))
         .tool(GoalListTool::new(goal_store.clone()))
         .tool(GoalUpdateTool::new(goal_store).with_api_state(api_state))

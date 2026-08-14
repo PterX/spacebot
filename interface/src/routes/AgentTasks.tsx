@@ -23,6 +23,8 @@ import {
 	taskListTitle,
 	TaskMetadataBadges,
 } from "@/components/TaskUtils";
+import {TaskComments} from "@/components/TaskComments";
+import {TaskHistory} from "@/components/TaskHistory";
 
 const TASK_LIMIT = 200;
 
@@ -237,6 +239,14 @@ export function AgentTasks({agentId}: {agentId: string}) {
 					{/* GitHub metadata (not part of the shared TaskDetail) */}
 					<GithubSection
 						metadata={(activeTask as unknown as TaskItem).metadata}
+					/>
+					<TaskComments
+						taskNumber={activeTask.task_number}
+						agentId={agentId}
+					/>
+					<TaskHistory
+						taskNumber={activeTask.task_number}
+						currentRevision={activeTask.revision}
 					/>
 				</div>
 			)}

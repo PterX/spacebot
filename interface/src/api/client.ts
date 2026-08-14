@@ -1149,12 +1149,177 @@ export interface TaskItem {
 	worktree_id?: string | null;
 	required_skills: string[];
 	depends_on: TaskDependencyEdge[];
+	/** Latest revision number, and the token to send back as expected_revision. */
+	revision: number;
 	created_by: string;
 	approved_at?: string;
 	approved_by?: string;
 	created_at: string;
 	updated_at: string;
 	completed_at?: string;
+}
+
+export type TaskAuthorKind = "user" | "agent" | "worker" | "system";
+
+export type TaskMutationSource =
+	| "api"
+	| "cli"
+	| "portal"
+	| "tool"
+	| "worker"
+	| "restore"
+	| "migration"
+	| "system";
+
+export interface TaskComment {
+	seq: number;
+	id: string;
+	task_id: string;
+	author_type: TaskAuthorKind;
+	author_id?: string;
+	body: string;
+	worker_id?: string;
+	metadata: Record<string, unknown>;
+	created_at: string;
+}
+
+export interface TaskCommentListResponse {
+	comments: TaskComment[];
+	total: number;
+	next_cursor?: number | null;
+}
+
+export interface TaskCommentResponse {
+	comment: TaskComment;
+}
+
+export interface CreateTaskCommentRequest {
+	author_type?: TaskAuthorKind;
+	author_id?: string;
+	body: string;
+	worker_id?: string;
+	metadata?: Record<string, unknown>;
+}
+
+export interface TaskRevisionDependency {
+	task: number;
+	kind: TaskDependencyKind;
+}
+
+export interface TaskRevisionSnapshot {
+	title: string;
+	description?: string | null;
+	status: TaskStatus;
+	priority: TaskPriority;
+	assigned_agent_id?: string | null;
+	subtasks: TaskSubtask[];
+	metadata: Record<string, unknown>;
+	goal_id?: string | null;
+	worker_type?: TaskWorkerType | null;
+	project_id?: string | null;
+	repo_id?: string | null;
+	worktree_mode?: TaskWorktreeMode | null;
+	worktree_id?: string | null;
+	required_skills: string[];
+	depends_on: TaskRevisionDependency[];
+}
+
+export interface TaskRevisionSummary {
+	id: string;
+	task_id: string;
+	revision: number;
+	author_type: TaskAuthorKind;
+	author_id?: string | null;
+	source: TaskMutationSource;
+	edit_summary?: string | null;
+	restored_from?: number | null;
+	created_at: string;
+}
+
+export type TaskRevision = TaskRevisionSummary & {
+	snapshot: TaskRevisionSnapshot;
+};
+
+export interface TaskHistoryResponse {
+	revisions: TaskRevisionSummary[];
+	current: number;
+}
+
+export interface TaskRevisionResponse {
+	revision: TaskRevision;
+}
+
+export interface TaskFieldChange {
+	field: string;
+	before: unknown;
+	after: unknown;
+}
+
+export interface TaskRevisionDiff {
+	task_number: number;
+	from: number;
+	to: number;
+	changes: TaskFieldChange[];
+}
+
+/**
+ * A task write that the server rejected.
+ *
+ * A 409 carries the revision the caller sent alongside the one actually
+ * stored, so the UI can say what happened rather than only that it failed.
+ */
+export class TaskRequestError extends Error {
+	readonly status: number;
+	readonly expectedRevision?: number;
+	readonly currentRevision?: number;
+
+	constructor(
+		status: number,
+		message: string,
+		expectedRevision?: number,
+		currentRevision?: number,
+	) {
+		super(message);
+		this.name = "TaskRequestError";
+		this.status = status;
+		this.expectedRevision = expectedRevision;
+		this.currentRevision = currentRevision;
+	}
+
+	/** True when the task moved on between the read and the write. */
+	get isConflict(): boolean {
+		return this.status === 409;
+	}
+}
+
+async function taskRequest<T>(
+	path: string,
+	init?: Omit<RequestInit, "body"> & { body?: unknown },
+): Promise<T> {
+	const { body, ...rest } = init ?? {};
+	const response = await fetch(`${getApiBase()}${path}`, {
+		...rest,
+		headers:
+			body === undefined
+				? rest.headers
+				: { "Content-Type": "application/json", ...rest.headers },
+		body: body === undefined ? undefined : JSON.stringify(body),
+	});
+
+	if (!response.ok) {
+		const detail = (await response.json().catch(() => null)) as {
+			error?: string;
+			expected_revision?: number;
+			current_revision?: number;
+		} | null;
+		throw new TaskRequestError(
+			response.status,
+			detail?.error ?? `API error: ${response.status}`,
+			detail?.expected_revision,
+			detail?.current_revision,
+		);
+	}
+	return response.json() as Promise<T>;
 }
 
 export interface TaskListResponse {
@@ -1185,15 +1350,21 @@ export interface CreateTaskRequest {
 
 export interface UpdateTaskRequest {
 	title?: string;
-	description?: string;
+	/** null clears the description; omit to leave it unchanged. */
+	description?: string | null;
 	status?: TaskStatus;
 	priority?: TaskPriority;
-	assigned_agent_id?: string;
+	/** null unassigns; omit to leave the assignment unchanged. */
+	assigned_agent_id?: string | null;
 	subtasks?: TaskSubtask[];
 	metadata?: Record<string, unknown>;
 	complete_subtask?: number;
 	worker_id?: string;
 	approved_by?: string;
+	/** Revision this edit was written against; a stale value gets a 409. */
+	expected_revision?: number;
+	edit_summary?: string;
+	source?: TaskMutationSource;
 }
 
 // -- Goal Types --
@@ -2647,24 +2818,57 @@ export const api = {
 	},
 	getTask: (taskNumber: number) =>
 		fetchJson<TaskResponse>(`/tasks/${taskNumber}`),
-	createTask: async (request: CreateTaskRequest): Promise<TaskResponse> => {
-		const response = await fetch(`${getApiBase()}/tasks`, {
+	createTask: (request: CreateTaskRequest): Promise<TaskResponse> =>
+		taskRequest<TaskResponse>("/tasks", {
 			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify(request),
-		});
-		if (!response.ok) throw new Error(`API error: ${response.status}`);
-		return response.json() as Promise<TaskResponse>;
-	},
-	updateTask: async (taskNumber: number, request: UpdateTaskRequest): Promise<TaskResponse> => {
-		const response = await fetch(`${getApiBase()}/tasks/${taskNumber}`, {
+			body: { source: "portal", ...request },
+		}),
+	updateTask: (taskNumber: number, request: UpdateTaskRequest): Promise<TaskResponse> =>
+		taskRequest<TaskResponse>(`/tasks/${taskNumber}`, {
 			method: "PUT",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify(request),
-		});
-		if (!response.ok) throw new Error(`API error: ${response.status}`);
-		return response.json() as Promise<TaskResponse>;
+			body: { source: "portal", ...request },
+		}),
+	listTaskComments: (taskNumber: number, params?: { after?: number; limit?: number }) => {
+		const search = new URLSearchParams();
+		if (params?.after !== undefined) search.set("after", String(params.after));
+		if (params?.limit) search.set("limit", String(params.limit));
+		const query = search.toString();
+		return taskRequest<TaskCommentListResponse>(
+			query ? `/tasks/${taskNumber}/comments?${query}` : `/tasks/${taskNumber}/comments`,
+		);
 	},
+	createTaskComment: (
+		taskNumber: number,
+		request: CreateTaskCommentRequest,
+	): Promise<TaskCommentResponse> =>
+		taskRequest<TaskCommentResponse>(`/tasks/${taskNumber}/comments`, {
+			method: "POST",
+			body: request,
+		}),
+	listTaskRevisions: (taskNumber: number, limit = 50): Promise<TaskHistoryResponse> =>
+		taskRequest<TaskHistoryResponse>(`/tasks/${taskNumber}/revisions?limit=${limit}`),
+	getTaskRevision: (taskNumber: number, revision: number): Promise<TaskRevisionResponse> =>
+		taskRequest<TaskRevisionResponse>(`/tasks/${taskNumber}/revisions/${revision}`),
+	diffTaskRevisions: (
+		taskNumber: number,
+		from: number,
+		to?: number,
+	): Promise<TaskRevisionDiff> => {
+		const search = new URLSearchParams({ from: String(from) });
+		if (to !== undefined) search.set("to", String(to));
+		return taskRequest<TaskRevisionDiff>(
+			`/tasks/${taskNumber}/revisions/diff?${search.toString()}`,
+		);
+	},
+	restoreTaskRevision: (
+		taskNumber: number,
+		revision: number,
+		request: { expected_revision: number; edit_summary?: string },
+	): Promise<TaskResponse> =>
+		taskRequest<TaskResponse>(`/tasks/${taskNumber}/revisions/${revision}/restore`, {
+			method: "POST",
+			body: { source: "portal", ...request },
+		}),
 	deleteTask: async (taskNumber: number): Promise<TaskActionResponse> => {
 		const response = await fetch(`${getApiBase()}/tasks/${taskNumber}`, {
 			method: "DELETE",
@@ -2672,33 +2876,21 @@ export const api = {
 		if (!response.ok) throw new Error(`API error: ${response.status}`);
 		return response.json() as Promise<TaskActionResponse>;
 	},
-	approveTask: async (taskNumber: number, approvedBy?: string): Promise<TaskResponse> => {
-		const response = await fetch(`${getApiBase()}/tasks/${taskNumber}/approve`, {
+	approveTask: (taskNumber: number, approvedBy?: string): Promise<TaskResponse> =>
+		taskRequest<TaskResponse>(`/tasks/${taskNumber}/approve`, {
 			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ approved_by: approvedBy }),
-		});
-		if (!response.ok) throw new Error(`API error: ${response.status}`);
-		return response.json() as Promise<TaskResponse>;
-	},
-	executeTask: async (taskNumber: number): Promise<TaskResponse> => {
-		const response = await fetch(`${getApiBase()}/tasks/${taskNumber}/execute`, {
+			body: { approved_by: approvedBy, source: "portal" },
+		}),
+	executeTask: (taskNumber: number): Promise<TaskResponse> =>
+		taskRequest<TaskResponse>(`/tasks/${taskNumber}/execute`, {
 			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({}),
-		});
-		if (!response.ok) throw new Error(`API error: ${response.status}`);
-		return response.json() as Promise<TaskResponse>;
-	},
-	assignTask: async (taskNumber: number, assignedAgentId: string): Promise<TaskResponse> => {
-		const response = await fetch(`${getApiBase()}/tasks/${taskNumber}/assign`, {
+			body: { source: "portal" },
+		}),
+	assignTask: (taskNumber: number, assignedAgentId: string): Promise<TaskResponse> =>
+		taskRequest<TaskResponse>(`/tasks/${taskNumber}/assign`, {
 			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ assigned_agent_id: assignedAgentId }),
-		});
-		if (!response.ok) throw new Error(`API error: ${response.status}`);
-		return response.json() as Promise<TaskResponse>;
-	},
+			body: { assigned_agent_id: assignedAgentId, source: "portal" },
+		}),
 
 	// Goals API
 	listGoals: (params?: { status?: GoalStatus; limit?: number }) => {

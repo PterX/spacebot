@@ -168,6 +168,8 @@ pub(super) async fn events_sse(
                             ApiEvent::AgentMessageSent { .. } => "agent_message_sent",
                             ApiEvent::AgentMessageReceived { .. } => "agent_message_received",
                             ApiEvent::TaskUpdated { .. } => "task_updated",
+                            ApiEvent::TaskRevised { .. } => "task_revised",
+                            ApiEvent::TaskCommented { .. } => "task_commented",
                             ApiEvent::OpenCodePartUpdated { .. } => "opencode_part_updated",
                             ApiEvent::ProcessText { .. } => "process_text",
                             ApiEvent::CortexChatMessage { .. } => "cortex_chat_message",

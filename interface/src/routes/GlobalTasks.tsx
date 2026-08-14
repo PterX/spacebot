@@ -29,6 +29,8 @@ import {
 	taskListTitle,
 	TaskMetadataBadges,
 } from "@/components/TaskUtils";
+import {TaskComments} from "@/components/TaskComments";
+import {TaskHistory} from "@/components/TaskHistory";
 
 const TASK_LIMIT = 200;
 
@@ -325,6 +327,18 @@ export function GlobalTasks() {
 					/>
 					<GithubSection
 						metadata={(activeTask as unknown as TaskItem).metadata}
+					/>
+					<TaskComments
+						taskNumber={activeTask.task_number}
+						agentId={
+							activeTask.assigned_agent_id ?? activeTask.owner_agent_id
+						}
+						resolveAgentName={resolveAgentName}
+					/>
+					<TaskHistory
+						taskNumber={activeTask.task_number}
+						currentRevision={activeTask.revision}
+						resolveAgentName={resolveAgentName}
 					/>
 				</div>
 			)}

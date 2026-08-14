@@ -54,10 +54,37 @@ function InlineCheckpointCard({ item }: { item: TimelineCheckpoint }) {
   );
 }
 
+function ConversationStartMarker({ createdAt }: { createdAt: string }) {
+	const timestamp = new Date(createdAt).toLocaleString(undefined, {
+		month: "short",
+		day: "numeric",
+		year: "numeric",
+		hour: "numeric",
+		minute: "2-digit",
+	});
+
+	return (
+		<div className="flex items-center gap-3 py-5">
+			<span className="h-px flex-1 border-t border-dashed border-app-line/60" />
+			<span className="shrink-0 text-[10px] uppercase tracking-[0.12em] text-ink-faint">
+				Beginning of conversation · {timestamp}
+			</span>
+			<span className="h-px flex-1 border-t border-dashed border-app-line/60" />
+		</div>
+	);
+}
+
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatMessageTime(createdAt: string): string {
+	return new Date(createdAt).toLocaleTimeString(undefined, {
+		hour: "numeric",
+		minute: "2-digit",
+	});
 }
 
 function InlineMedia({
@@ -84,10 +111,12 @@ function UserMessageWithAttachments({
   content,
   attachments,
   agentId,
+	createdAt,
 }: {
   content: string;
   attachments: AttachmentMeta[];
   agentId: string;
+	createdAt: string;
 }) {
   const images = attachments.filter((a) => a.mime_type.startsWith("image/"));
   const media = attachments.filter(
@@ -162,6 +191,7 @@ function UserMessageWithAttachments({
           </div>
         )}
       </div>
+			<span className="mt-1 text-[10px] text-ink-faint">{formatMessageTime(createdAt)}</span>
     </div>
   );
 }
@@ -245,6 +275,7 @@ function AssistantAttachments({
 interface PortalTimelineProps {
   agentId: string;
   conversationId: string;
+	conversationCreatedAt?: string;
   timeline: TimelineItem[];
   isTyping: boolean;
   sendCount: number;
@@ -287,6 +318,7 @@ function synthesizeWorker(
 
 
 type TimelineRow =
+	| {kind: "conversation_start"; createdAt: string}
 	| {kind: "item"; item: TimelineItem}
 	| {kind: "typing"}
 	| {kind: "spacer"};
@@ -294,6 +326,7 @@ type TimelineRow =
 export function PortalTimeline({
   agentId,
   conversationId,
+	conversationCreatedAt,
   timeline,
   isTyping,
   sendCount,
@@ -322,10 +355,13 @@ export function PortalTimeline({
 			kind: "item",
 			item,
 		}));
+		if (conversationCreatedAt && visibleItems.length > 0) {
+			list.unshift({kind: "conversation_start", createdAt: conversationCreatedAt});
+		}
 		if (isTyping) list.push({kind: "typing"});
 		list.push({kind: "spacer"});
 		return list;
-	}, [visibleItems, isTyping]);
+	}, [conversationCreatedAt, visibleItems, isTyping]);
 
 	useEffect(() => {
 		if (sendCount === 0) return;
@@ -344,16 +380,25 @@ export function PortalTimeline({
 			getMessageKey={(index) => {
 				const row = rows[index]!;
 				if (row.kind === "item") return row.item.id;
+				if (row.kind === "conversation_start") return "__conversation_start__";
 				return `__${row.kind}__`;
 			}}
 			estimateMessageSize={(index) => {
 				const row = rows[index]!;
-				if (row.kind === "spacer") return 180;
+				if (row.kind === "spacer") return 260;
 				if (row.kind === "typing") return 32;
+				if (row.kind === "conversation_start") return 42;
 				return 80;
 			}}
 			renderMessage={(row) => {
-				if (row.kind === "spacer") return <div className="h-[180px]" />;
+				if (row.kind === "spacer") return <div className="h-[260px]" />;
+				if (row.kind === "conversation_start") {
+					return (
+						<div className="mx-auto max-w-3xl px-4">
+							<ConversationStartMarker createdAt={row.createdAt} />
+						</div>
+					);
+				}
 				if (row.kind === "typing") {
 					return (
 						<div className="mx-auto max-w-3xl px-4 pb-2">
@@ -399,6 +444,7 @@ function renderTimelineItem(
 					content={item.content}
 					attachments={attachments}
 					agentId={agentId}
+					createdAt={item.created_at}
 				/>
 			);
 		}
@@ -409,6 +455,14 @@ function renderTimelineItem(
 					isUser={item.role === "user"}
 					onCopy={(content) => void onCopy(content)}
 				/>
+				<div
+					className={clsx(
+						"mt-[-0.25rem] text-[10px] text-ink-faint",
+						item.role === "user" ? "text-right" : "text-left",
+					)}
+				>
+					{formatMessageTime(item.created_at)}
+				</div>
 				{attachments.length > 0 && (
 					<AssistantAttachments agentId={agentId} attachments={attachments} />
 				)}

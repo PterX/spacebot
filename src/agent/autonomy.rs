@@ -919,6 +919,7 @@ mod tests {
             worktree_id: None,
             required_skills: Vec::new(),
             depends_on: Vec::new(),
+            revision: 1,
             created_by: "user".to_string(),
             approved_at: None,
             approved_by: None,

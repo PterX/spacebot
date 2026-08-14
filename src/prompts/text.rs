@@ -299,6 +299,12 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         ("en", "tools/task_update") => {
             include_str!("../../prompts/en/tools/task_update_description.md.j2")
         }
+        ("en", "tools/task_history") => {
+            include_str!("../../prompts/en/tools/task_history_description.md.j2")
+        }
+        ("en", "tools/add_task_comment") => {
+            include_str!("../../prompts/en/tools/add_task_comment_description.md.j2")
+        }
         ("en", "tools/goal_create") => {
             include_str!("../../prompts/en/tools/goal_create_description.md.j2")
         }

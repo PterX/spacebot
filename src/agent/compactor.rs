@@ -277,11 +277,7 @@ async fn run_compaction(
     let (removed_messages, remove_count) = {
         let _guard = fence.lock_mutation().await;
         let mut hist = history.write().await;
-        let total = hist.len();
-        let remove_count = ((total as f32 * fraction) as usize)
-            .max(1)
-            .min(total.saturating_sub(2));
-        let remove_count = advance_past_stranded_tool_results(&hist, remove_count);
+        let remove_count = aligned_fractional_cut(&hist, fraction, 2);
         if remove_count == 0 {
             return Ok(0);
         }
@@ -430,6 +426,24 @@ pub(crate) fn advance_past_stranded_tool_results(history: &[Message], remove: us
     aligned
 }
 
+/// How many leading messages a fractional cut should remove.
+///
+/// `retain_floor` is the count of most recent messages the caller keeps
+/// regardless of the fraction. The cut is then advanced past any stranded tool
+/// results, so the retained history opens on a message a provider accepts.
+/// Returns 0 when no prefix can be dropped without splitting a pair.
+pub(crate) fn aligned_fractional_cut(
+    history: &[Message],
+    fraction: f32,
+    retain_floor: usize,
+) -> usize {
+    let total = history.len();
+    let remove_count = ((total as f32 * fraction) as usize)
+        .max(1)
+        .min(total.saturating_sub(retain_floor));
+    advance_past_stranded_tool_results(history, remove_count)
+}
+
 pub fn precompact_forked_history(
     history: &mut Vec<Message>,
     context_window: usize,
@@ -448,10 +462,7 @@ pub fn precompact_forked_history(
             break;
         }
 
-        let remove_count = ((total as f32 * fraction) as usize)
-            .max(1)
-            .min(total - FORK_MIN_RETAINED_MESSAGES);
-        let remove_count = advance_past_stranded_tool_results(history, remove_count);
+        let remove_count = aligned_fractional_cut(history, fraction, FORK_MIN_RETAINED_MESSAGES);
         if remove_count == 0 {
             break;
         }
@@ -701,6 +712,43 @@ mod tests {
         assert!(
             !opens_with_tool_result(&history[1]),
             "fork opened on a tool result whose call was dropped"
+        );
+    }
+
+    /// The rule every fractional cut shares: land the requested fraction, then
+    /// move forward off any result whose call the cut would drop. A worker's
+    /// mid-run compaction reaches this through the same helper, where its cut
+    /// falls among tool traffic it produced itself.
+    #[test]
+    fn aligned_fractional_cut_never_lands_on_a_tool_result() {
+        let mut history: Vec<Message> = vec![text_message(10)];
+        for index in 0..10 {
+            history.push(assistant_tool_call(&format!("call_{index}")));
+            history.push(tool_result(&format!("call_{index}"), 10));
+        }
+
+        let cut = aligned_fractional_cut(&history, 0.50, 2);
+
+        assert_eq!(cut, 11, "cut should advance off the result at index 10");
+        assert!(!opens_with_tool_result(&history[cut]));
+    }
+
+    /// The floor wins over the fraction, and a floor that leaves only a
+    /// stranded result yields no cut at all rather than an invalid one.
+    #[test]
+    fn aligned_fractional_cut_respects_the_retain_floor() {
+        let history: Vec<Message> = vec![
+            assistant_tool_call("call_0"),
+            tool_result("call_0", 10),
+            assistant_tool_call("call_1"),
+            tool_result("call_1", 10),
+        ];
+
+        assert_eq!(aligned_fractional_cut(&history, 0.50, 2), 2);
+        assert_eq!(
+            aligned_fractional_cut(&history, 0.75, 1),
+            4,
+            "advancing off a trailing result consumes the rest of the history"
         );
     }
 

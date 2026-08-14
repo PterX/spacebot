@@ -42,6 +42,9 @@ export function PortalPanel({ agentId }: PortalPanelProps) {
   });
 
   const conversations = conversationsData?.conversations ?? [];
+	const activeConversation = conversations.find(
+		(conversation) => conversation.id === activeConversationId,
+	);
 
   // Auto-select the newest conversation on first load
   useEffect(() => {
@@ -293,6 +296,7 @@ export function PortalPanel({ agentId }: PortalPanelProps) {
             <PortalTimeline
               agentId={agentId}
               conversationId={activeConversationId}
+				conversationCreatedAt={activeConversation?.created_at}
               timeline={timeline}
               isTyping={isTyping}
               sendCount={sendCount}

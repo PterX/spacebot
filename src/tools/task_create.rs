@@ -367,6 +367,12 @@ impl Tool for TaskCreateTool {
                     worktree_mode,
                     worktree_id: args.worktree_id,
                     required_skills: args.required_skills,
+                    context: crate::tasks::TaskMutationContext::new(
+                        crate::tasks::TaskAuthorKind::Agent,
+                        Some(self.agent_id.to_string()),
+                        crate::tasks::TaskMutationSource::Tool,
+                    )
+                    .with_summary(Some("Task created".to_string())),
                 },
                 &depends_on,
             )

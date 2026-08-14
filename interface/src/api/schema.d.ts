@@ -431,6 +431,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/agents/processes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List branch and worker runs for an agent. */
+        get: operations["list_processes"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/processes/detail": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get one branch or worker run with its transcript. */
+        get: operations["process_detail"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/agents/profile": {
         parameters: {
             query?: never;
@@ -1195,6 +1229,22 @@ export interface paths {
         };
         get: operations["get_channel_settings"];
         put: operations["update_channel_settings"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/chronicle": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_chronicle_history"];
+        put?: never;
         post?: never;
         delete?: never;
         options?: never;
@@ -2509,6 +2559,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/tasks/{number}/comments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /tasks/{number}/comments` — list a task's comments, oldest first. */
+        get: operations["list_task_comments"];
+        put?: never;
+        /** `POST /tasks/{number}/comments` — append a comment to a task. */
+        post: operations["create_task_comment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/tasks/{number}/execute": {
         parameters: {
             query?: never;
@@ -2523,6 +2591,82 @@ export interface paths {
          *     Tasks already in `ready` or `in_progress` are returned as-is.
          */
         post: operations["execute_task"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/tasks/{number}/revisions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /tasks/{number}/revisions` — list revision summaries, newest first. */
+        get: operations["list_task_revisions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/tasks/{number}/revisions/diff": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /tasks/{number}/revisions/diff` — compare two points in a task's
+         *     history. `to` defaults to the current revision.
+         */
+        get: operations["diff_task_revisions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/tasks/{number}/revisions/{revision}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /tasks/{number}/revisions/{revision}` — read one historical revision. */
+        get: operations["get_task_revision"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/tasks/{number}/revisions/{revision}/restore": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /tasks/{number}/revisions/{revision}/restore` — put a task back to a
+         *     historical revision by appending a new one.
+         * @description Nothing is rewound: revision `revision` and everything after it stay exactly
+         *     as they were, and the restore lands as the new latest version.
+         */
+        post: operations["restore_task_revision"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2838,6 +2982,15 @@ export interface components {
             tuning?: null | components["schemas"]["TuningUpdate"];
             warmup?: null | components["schemas"]["WarmupUpdate"];
         };
+        AgentDailyBrief: {
+            agent_id: string;
+            /** Format: date-time */
+            created_at: string;
+            day: string;
+            /** Format: int64 */
+            event_count: number;
+            summary: string;
+        };
         /** @description Summary of an agent's configuration, exposed via the API. */
         AgentInfo: {
             context_window: number;
@@ -2893,10 +3046,10 @@ export interface components {
         AgentsResponse: {
             agents: components["schemas"]["AgentInfo"][];
         };
-        ApproveRequest: {
+        ApproveRequest: components["schemas"]["MutationAttribution"] & {
             approved_by?: string | null;
         };
-        AssignRequest: {
+        AssignRequest: components["schemas"]["MutationAttribution"] & {
             assigned_agent_id: string;
         };
         /** @description Association between memories. */
@@ -3142,6 +3295,25 @@ export interface components {
             seq: number;
             title: string;
         };
+        ChronicleHistoryItem: {
+            agent_id: string;
+            channel_id: string;
+            /** Format: date-time */
+            covers_from: string;
+            /** Format: date-time */
+            covers_to: string;
+            /** Format: date-time */
+            created_at: string;
+            id: string;
+            /** Format: int64 */
+            message_count: number;
+            summary: string;
+            title: string;
+        };
+        ChronicleHistoryResponse: {
+            checkpoints: components["schemas"]["ChronicleHistoryItem"][];
+            daily_briefs: components["schemas"]["AgentDailyBrief"][];
+        };
         /** @description Session chronicle tuning. Only consulted when `mode` is "chronicle". */
         ChronicleSection: {
             context_token_budget: number;
@@ -3156,6 +3328,8 @@ export interface components {
             max_recent: number;
             /** Format: int64 */
             recent_window_hours: number;
+            rollup_batch: number;
+            rollup_threshold: number;
         };
         ChronicleUpdate: {
             context_token_budget?: number | null;
@@ -3170,6 +3344,8 @@ export interface components {
             max_recent?: number | null;
             /** Format: int64 */
             recent_window_hours?: number | null;
+            rollup_batch?: number | null;
+            rollup_threshold?: number | null;
         };
         /**
          * @description What happens when a worker explicitly calls "close" on the browser.
@@ -3316,12 +3492,8 @@ export interface components {
             total: number;
         };
         CortexSection: {
-            /** Format: int64 */
-            branch_timeout_secs: number;
             /** Format: int32 */
             circuit_breaker_threshold: number;
-            /** Format: int32 */
-            detached_worker_timeout_retry_limit: number;
             /** Format: float */
             maintenance_decay_rate: number;
             /** Format: int64 */
@@ -3332,19 +3504,14 @@ export interface components {
             maintenance_min_age_days: number;
             /** Format: float */
             maintenance_prune_threshold: number;
-            supervisor_kill_budget_per_tick: number;
             /** Format: int64 */
             tick_interval_secs: number;
             /** Format: int64 */
-            worker_timeout_secs: number;
+            worker_wall_clock_timeout_secs: number;
         };
         CortexUpdate: {
-            /** Format: int64 */
-            branch_timeout_secs?: number | null;
             /** Format: int32 */
             circuit_breaker_threshold?: number | null;
-            /** Format: int32 */
-            detached_worker_timeout_retry_limit?: number | null;
             /** Format: float */
             maintenance_decay_rate?: number | null;
             /** Format: int64 */
@@ -3355,11 +3522,10 @@ export interface components {
             maintenance_min_age_days?: number | null;
             /** Format: float */
             maintenance_prune_threshold?: number | null;
-            supervisor_kill_budget_per_tick?: number | null;
             /** Format: int64 */
             tick_interval_secs?: number | null;
             /** Format: int64 */
-            worker_timeout_secs?: number | null;
+            worker_wall_clock_timeout_secs?: number | null;
         };
         CreateAgentRequest: {
             agent_id: string;
@@ -3490,7 +3656,16 @@ export interface components {
             path: string;
             remote_url?: string | null;
         };
-        CreateTaskRequest: {
+        CreateTaskCommentRequest: {
+            author_id?: string | null;
+            /** @description Defaults to `user` — the interface is the human's comment surface. */
+            author_type?: string | null;
+            body: string;
+            metadata?: unknown;
+            /** @description Worker run this comment reports on, when applicable. */
+            worker_id?: string | null;
+        };
+        CreateTaskRequest: components["schemas"]["MutationAttribution"] & {
             /** @description Agent assigned to execute. Defaults to `owner_agent_id`. */
             assigned_agent_id?: string | null;
             created_by?: string | null;
@@ -4026,6 +4201,19 @@ export interface components {
         ModelsResponse: {
             models: components["schemas"]["ModelInfo"][];
         };
+        /**
+         * @description Who is performing a mutation and why, carried by every write endpoint and
+         *     recorded on the revision it produces.
+         */
+        MutationAttribution: {
+            author_id?: string | null;
+            /** @description `user` (default), `agent`, `worker`, or `system`. */
+            author_type?: string | null;
+            /** @description One line on why the edit was made. */
+            edit_summary?: string | null;
+            /** @description Which surface this call came from: `api` (default), `cli`, `portal`. */
+            source?: string | null;
+        };
         MutationResponse: {
             message: string;
             success: boolean;
@@ -4211,6 +4399,37 @@ export interface components {
             id: string;
             name: string;
             tags?: string[];
+        };
+        ProcessListResponse: {
+            processes: components["schemas"]["ProcessResponse"][];
+            /** Format: int64 */
+            total: number;
+        };
+        ProcessResponse: {
+            channel_id?: string | null;
+            channel_name?: string | null;
+            completed_at?: string | null;
+            directory?: string | null;
+            has_transcript: boolean;
+            id: string;
+            input: string;
+            interactive: boolean;
+            kind: string;
+            /** Format: int64 */
+            max_turns?: number | null;
+            model?: string | null;
+            /** Format: int32 */
+            opencode_port?: number | null;
+            opencode_session_id?: string | null;
+            output?: string | null;
+            process_type: string;
+            profile?: string | null;
+            project_id?: string | null;
+            started_at: string;
+            status: string;
+            /** Format: int64 */
+            tool_calls: number;
+            transcript?: components["schemas"]["TranscriptStep"][] | null;
         };
         ProcessTokens: {
             /** Format: int64 */
@@ -4452,6 +4671,14 @@ export interface components {
         RestartResponse: {
             status: string;
         };
+        RestoreRevisionRequest: components["schemas"]["MutationAttribution"] & {
+            /**
+             * Format: int64
+             * @description The task's revision as the caller last read it. Required so a restore
+             *     never silently discards an edit made while the user was deciding.
+             */
+            expected_revision: number;
+        };
         RestoreVersionRequest: {
             author_id?: string;
             author_type?: string;
@@ -4646,6 +4873,12 @@ export interface components {
              *     unconditionally — a contract, unlike advisory `suggested_skills`.
              */
             required_skills: string[];
+            /**
+             * Format: int64
+             * @description Number of the task's latest revision, and the token a caller passes back
+             *     as `expected_revision` to prove it is editing the version it read.
+             */
+            revision: number;
             source_memory_id?: string | null;
             status: components["schemas"]["TaskStatus"];
             subtasks: components["schemas"]["TaskSubtask"][];
@@ -4662,6 +4895,43 @@ export interface components {
         TaskActionResponse: {
             message: string;
             success: boolean;
+        };
+        /**
+         * @description Who performed a task mutation or wrote a comment.
+         * @enum {string}
+         */
+        TaskAuthorKind: "user" | "agent" | "worker" | "system";
+        TaskComment: {
+            author_id?: string | null;
+            author_type: components["schemas"]["TaskAuthorKind"];
+            body: string;
+            created_at: string;
+            id: string;
+            metadata: unknown;
+            /**
+             * Format: int64
+             * @description Monotonic sequence number. Stable pagination cursor.
+             */
+            seq: number;
+            task_id: string;
+            /** @description Worker run this comment reports on, when it reports on one. */
+            worker_id?: string | null;
+        };
+        TaskCommentListResponse: {
+            comments: components["schemas"]["TaskComment"][];
+            /**
+             * Format: int64
+             * @description Cursor for the next page, absent when this page is the last one.
+             */
+            next_cursor?: number | null;
+            /**
+             * Format: int64
+             * @description Total comments on the task, independent of this page.
+             */
+            total: number;
+        };
+        TaskCommentResponse: {
+            comment: components["schemas"]["TaskComment"];
         };
         /**
          * @description A dependency edge as seen from the dependent task, with enough context to
@@ -4686,13 +4956,116 @@ export interface components {
             /** Format: int64 */
             task: number;
         };
+        /**
+         * @description A task handler failure rendered as JSON.
+         *
+         *     A stale write needs more than a status code: the response carries the
+         *     revision the caller expected alongside the one actually stored, so a client
+         *     can refresh and retry without a second round trip.
+         */
+        TaskErrorBody: {
+            /** Format: int64 */
+            current_revision?: number | null;
+            error: string;
+            /** Format: int64 */
+            expected_revision?: number | null;
+        };
+        /** @description One field that differs between two snapshots. */
+        TaskFieldChange: {
+            after: unknown;
+            before: unknown;
+            field: string;
+        };
+        TaskHistoryResponse: {
+            /**
+             * Format: int64
+             * @description The task's current revision number.
+             */
+            current: number;
+            revisions: components["schemas"]["TaskRevisionSummary"][];
+        };
         TaskListResponse: {
             tasks: components["schemas"]["Task"][];
         };
+        /**
+         * @description Which surface a task mutation arrived through. Recorded per revision so
+         *     history reads as a sequence of decisions with their origin intact.
+         * @enum {string}
+         */
+        TaskMutationSource: "api" | "cli" | "portal" | "tool" | "worker" | "restore" | "migration" | "system";
         /** @enum {string} */
         TaskPriority: "critical" | "high" | "medium" | "low";
         TaskResponse: {
             task: components["schemas"]["Task"];
+        };
+        /** @description A revision with the full material snapshot it recorded. */
+        TaskRevision: components["schemas"]["TaskRevisionSummary"] & {
+            snapshot: components["schemas"]["TaskRevisionSnapshot"];
+        };
+        /**
+         * @description A dependency edge as stored in a snapshot: the referenced task number, not
+         *     its internal id, so a snapshot stays readable after the store is rebuilt.
+         */
+        TaskRevisionDependency: {
+            kind: components["schemas"]["TaskDependencyKind"];
+            /** Format: int64 */
+            task: number;
+        };
+        /** @description A diff between two points in a task's history. */
+        TaskRevisionDiff: {
+            changes: components["schemas"]["TaskFieldChange"][];
+            /** Format: int64 */
+            from: number;
+            /** Format: int64 */
+            task_number: number;
+            /** Format: int64 */
+            to: number;
+        };
+        TaskRevisionResponse: {
+            revision: components["schemas"]["TaskRevision"];
+        };
+        /**
+         * @description Every field whose change needs historical reconstruction.
+         *
+         *     Deliberately excluded, because they describe a run rather than the spec:
+         *     `worker_id` (the currently bound worker), `approved_at`/`completed_at`
+         *     (derived from status transitions), `updated_at`, and the identity fields
+         *     that never change — `id`, `task_number`, `owner_agent_id`, `created_by`,
+         *     `source_memory_id`.
+         */
+        TaskRevisionSnapshot: {
+            assigned_agent_id?: string | null;
+            depends_on: components["schemas"]["TaskRevisionDependency"][];
+            description?: string | null;
+            goal_id?: string | null;
+            metadata: unknown;
+            priority: components["schemas"]["TaskPriority"];
+            project_id?: string | null;
+            repo_id?: string | null;
+            required_skills: string[];
+            status: components["schemas"]["TaskStatus"];
+            subtasks: components["schemas"]["TaskSubtask"][];
+            title: string;
+            worker_type?: null | components["schemas"]["TaskWorkerType"];
+            worktree_id?: string | null;
+            worktree_mode?: null | components["schemas"]["TaskWorktreeMode"];
+        };
+        /** @description A revision without its snapshot — what a history list renders. */
+        TaskRevisionSummary: {
+            author_id?: string | null;
+            author_type: components["schemas"]["TaskAuthorKind"];
+            created_at: string;
+            edit_summary?: string | null;
+            id: string;
+            /**
+             * Format: int64
+             * @description Set when this revision was produced by restoring an earlier one.
+             */
+            restored_from?: number | null;
+            /** Format: int64 */
+            revision: number;
+            source: components["schemas"]["TaskMutationSource"];
+            task_id: string;
         };
         /** @enum {string} */
         TaskStatus: "pending_approval" | "backlog" | "ready" | "in_progress" | "done" | "failed";
@@ -4986,13 +5359,21 @@ export interface components {
             release_url?: string | null;
             update_available: boolean;
         };
-        UpdateTaskRequest: {
+        UpdateTaskRequest: components["schemas"]["MutationAttribution"] & {
             approved_by?: string | null;
+            /** @description Send `null` to unassign. Omit to leave unchanged. */
             assigned_agent_id?: string | null;
             complete_subtask?: number | null;
             /** @description Full replacement of dependency edges; omit to leave unchanged. */
             depends_on?: components["schemas"]["TaskDependencyRequest"][] | null;
+            /** @description Send `null` to clear. Omit to leave unchanged. */
             description?: string | null;
+            /**
+             * Format: int64
+             * @description The task's revision as the caller last read it. When supplied and stale,
+             *     the update fails with 409 instead of overwriting the newer version.
+             */
+            expected_revision?: number | null;
             metadata?: unknown;
             priority?: string | null;
             project_id?: string | null;
@@ -6527,6 +6908,82 @@ export interface operations {
                 };
             };
             /** @description Agent not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_processes: {
+        parameters: {
+            query: {
+                agent_id: string;
+                limit?: number;
+                offset?: number;
+                status?: string | null;
+                kind?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProcessListResponse"];
+                };
+            };
+            /** @description Agent not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    process_detail: {
+        parameters: {
+            query: {
+                agent_id: string;
+                kind: string;
+                process_id: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProcessResponse"];
+                };
+            };
+            /** @description Agent or process not found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -8353,6 +8810,35 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ChannelSettingsResponse"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_chronicle_history: {
+        parameters: {
+            query?: {
+                /** @description Maximum number of chronicle checkpoints to return. */
+                limit?: number | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChronicleHistoryResponse"];
                 };
             };
             /** @description Internal server error */
@@ -11399,6 +11885,103 @@ export interface operations {
             };
         };
     };
+    list_task_comments: {
+        parameters: {
+            query?: {
+                /** @description Resume after this comment `seq`. Comments are returned oldest-first. */
+                after?: number | null;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description Task number */
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskCommentListResponse"];
+                };
+            };
+            /** @description Task not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskErrorBody"];
+                };
+            };
+            /** @description Task store not initialized */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskErrorBody"];
+                };
+            };
+        };
+    };
+    create_task_comment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Task number */
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateTaskCommentRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskCommentResponse"];
+                };
+            };
+            /** @description Invalid comment */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskErrorBody"];
+                };
+            };
+            /** @description Task not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskErrorBody"];
+                };
+            };
+            /** @description Task store not initialized */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskErrorBody"];
+                };
+            };
+        };
+    };
     execute_task: {
         parameters: {
             query?: never;
@@ -11443,6 +12026,199 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    list_task_revisions: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description Task number */
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskHistoryResponse"];
+                };
+            };
+            /** @description Task not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskErrorBody"];
+                };
+            };
+            /** @description Task store not initialized */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskErrorBody"];
+                };
+            };
+        };
+    };
+    diff_task_revisions: {
+        parameters: {
+            query: {
+                /** @description Revision to diff from. */
+                from: number;
+                /** @description Revision to diff to. Defaults to the task's current revision. */
+                to?: number | null;
+            };
+            header?: never;
+            path: {
+                /** @description Task number */
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskRevisionDiff"];
+                };
+            };
+            /** @description Task or revision not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskErrorBody"];
+                };
+            };
+            /** @description Task store not initialized */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskErrorBody"];
+                };
+            };
+        };
+    };
+    get_task_revision: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Task number */
+                number: number;
+                /** @description Revision number */
+                revision: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskRevisionResponse"];
+                };
+            };
+            /** @description Task or revision not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskErrorBody"];
+                };
+            };
+            /** @description Task store not initialized */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskErrorBody"];
+                };
+            };
+        };
+    };
+    restore_task_revision: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Task number */
+                number: number;
+                /** @description Revision to restore */
+                revision: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RestoreRevisionRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskResponse"];
+                };
+            };
+            /** @description Restore rejected by task rules */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskErrorBody"];
+                };
+            };
+            /** @description Task or revision not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskErrorBody"];
+                };
+            };
+            /** @description Task changed since the caller read it */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskErrorBody"];
+                };
+            };
+            /** @description Task store not initialized */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskErrorBody"];
+                };
             };
         };
     };

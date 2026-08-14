@@ -31,6 +31,10 @@ interface LiveContextValue {
 	workerEventVersion: number;
 	/** Monotonically increasing counter, bumped on every task lifecycle SSE event. */
 	taskEventVersion: number;
+	/** Bumped when a comment is appended to any task. */
+	taskCommentVersion: number;
+	/** Bumped when a material task edit commits a revision. */
+	taskRevisionVersion: number;
 	/** Live transcript steps for running branches and workers, keyed by process ID. */
 	liveTranscripts: Record<string, TranscriptStep[]>;
 	/** Live OpenCode parts for running workers, keyed by worker_id. Parts are insertion-ordered Maps keyed by part ID. */
@@ -48,6 +52,8 @@ const LiveContext = createContext<LiveContextValue>({
 	activeBranches: {},
 	workerEventVersion: 0,
 	taskEventVersion: 0,
+	taskCommentVersion: 0,
+	taskRevisionVersion: 0,
 	liveTranscripts: {},
 	liveOpenCodeParts: {},
 });
@@ -95,6 +101,16 @@ export function LiveContextProvider({ children, onBootstrapped }: { children: Re
 
 	const [taskEventVersion, setTaskEventVersion] = useState(0);
 	const bumpTaskVersion = useCallback(() => setTaskEventVersion((v) => v + 1), []);
+
+	const [taskCommentVersion, setTaskCommentVersion] = useState(0);
+	const bumpTaskCommentVersion = useCallback(() => setTaskCommentVersion((v) => v + 1), []);
+
+	// A revision means the task itself changed, so the board refreshes too.
+	const [taskRevisionVersion, setTaskRevisionVersion] = useState(0);
+	const bumpTaskRevisionVersion = useCallback(() => {
+		setTaskRevisionVersion((v) => v + 1);
+		setTaskEventVersion((v) => v + 1);
+	}, []);
 
 	// Live transcript accumulator for branch and worker process events.
 	const [liveTranscripts, setLiveTranscripts] = useState<Record<string, TranscriptStep[]>>({});
@@ -385,11 +401,13 @@ export function LiveContextProvider({ children, onBootstrapped }: { children: Re
 			agent_message_sent: handleAgentMessage,
 			agent_message_received: handleAgentMessage,
 			task_updated: bumpTaskVersion,
+			task_commented: bumpTaskCommentVersion,
+			task_revised: bumpTaskRevisionVersion,
 			cortex_chat_message: handleCortexChatMessage,
 			notification_created: handleNotificationCreated,
 			notification_updated: handleNotificationUpdated,
 		}),
-		[channelHandlers, wrappedBranchStarted, wrappedWorkerStarted, wrappedWorkerStatus, wrappedWorkerIdle, wrappedWorkerCompleted, wrappedToolStarted, wrappedToolCompleted, handleToolOutput, handleOpenCodePartUpdated, handleProcessText, handleAgentMessage, bumpTaskVersion, handleCortexChatMessage, handleNotificationCreated, handleNotificationUpdated],
+		[channelHandlers, wrappedBranchStarted, wrappedWorkerStarted, wrappedWorkerStatus, wrappedWorkerIdle, wrappedWorkerCompleted, wrappedToolStarted, wrappedToolCompleted, handleToolOutput, handleOpenCodePartUpdated, handleProcessText, handleAgentMessage, bumpTaskVersion, bumpTaskCommentVersion, bumpTaskRevisionVersion, handleCortexChatMessage, handleNotificationCreated, handleNotificationUpdated],
 	);
 
 	const onReconnect = useCallback(() => {
@@ -428,7 +446,7 @@ export function LiveContextProvider({ children, onBootstrapped }: { children: Re
 	}, [hasData, onBootstrapped]);
 
 	return (
-		<LiveContext.Provider value={{ liveStates, channels, connectionState, hasData, loadOlderMessages, activeLinks, activeWorkers, activeBranches, workerEventVersion, taskEventVersion, liveTranscripts, liveOpenCodeParts }}>
+		<LiveContext.Provider value={{ liveStates, channels, connectionState, hasData, loadOlderMessages, activeLinks, activeWorkers, activeBranches, workerEventVersion, taskEventVersion, taskCommentVersion, taskRevisionVersion, liveTranscripts, liveOpenCodeParts }}>
 			{children}
 		</LiveContext.Provider>
 	);

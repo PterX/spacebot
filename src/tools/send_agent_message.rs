@@ -247,6 +247,12 @@ impl Tool for SendAgentMessageTool {
                 metadata,
                 source_memory_id: None,
                 created_by: format!("agent:{}", sending_agent_id),
+                context: crate::tasks::TaskMutationContext::new(
+                    crate::tasks::TaskAuthorKind::Agent,
+                    Some(sending_agent_id.to_string()),
+                    crate::tasks::TaskMutationSource::Tool,
+                )
+                .with_summary(Some(format!("Delegated to {target_display}"))),
                 ..Default::default()
             })
             .await

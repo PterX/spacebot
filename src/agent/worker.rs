@@ -1,6 +1,6 @@
 //! Worker: Independent task execution process.
 
-use crate::agent::compactor::estimate_history_tokens;
+use crate::agent::compactor::{aligned_fractional_cut, estimate_history_tokens};
 use crate::config::BrowserConfig;
 use crate::conversation::history::{ProcessRunLogger, WorkerLifecycle};
 use crate::conversation::settings::WorkerMemoryMode;
@@ -1189,9 +1189,13 @@ impl Worker {
         let estimated = estimate_history_tokens(history);
         let usage = estimated as f32 / context_window as f32;
 
-        let remove_count = ((total as f32 * fraction) as usize)
-            .max(1)
-            .min(total.saturating_sub(2));
+        // A worker accumulates its own tool traffic for the length of the run,
+        // so this cut lands among call/result pairs far more often than the
+        // one-shot cuts do.
+        let remove_count = aligned_fractional_cut(history, fraction, 2);
+        if remove_count == 0 {
+            return;
+        }
         let removed: Vec<rig::message::Message> = history.drain(..remove_count).collect();
         compacted_history.extend(removed.iter().cloned());
 

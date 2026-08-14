@@ -920,6 +920,18 @@ async fn run(
 
     let global_task_store = Arc::new(spacebot::tasks::TaskStore::new(instance_pool.clone()));
 
+    // Tasks that predate revision history get a baseline snapshot of exactly
+    // how they stand now. Idempotent, so a retry after a partial run is a
+    // no-op; it does not reconstruct descriptions that were overwritten before
+    // history existed.
+    let baselines = global_task_store
+        .backfill_baseline_revisions()
+        .await
+        .context("failed to write baseline task revisions")?;
+    if baselines > 0 {
+        tracing::info!(tasks = baselines, "wrote baseline task revisions");
+    }
+
     // Instance-level goal store. Goals are instance-scoped like tasks.
     let global_goal_store = Arc::new(spacebot::goals::GoalStore::new(instance_pool.clone()));
 

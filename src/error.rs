@@ -32,6 +32,9 @@ pub enum Error {
     #[error(transparent)]
     Wiki(Box<WikiError>),
 
+    #[error(transparent)]
+    Task(Box<TaskError>),
+
     #[error("database error: {0}")]
     Sqlx(#[from] sqlx::Error),
 
@@ -80,6 +83,11 @@ impl From<SettingsError> for Error {
 impl From<WikiError> for Error {
     fn from(e: WikiError) -> Self {
         Error::Wiki(Box::new(e))
+    }
+}
+impl From<TaskError> for Error {
+    fn from(e: TaskError) -> Self {
+        Error::Task(Box::new(e))
     }
 }
 
@@ -268,6 +276,34 @@ pub enum WikiError {
 
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
+
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+/// Task store errors that callers act on differently — the API maps each to a
+/// distinct status, and a conflict carries enough state for a caller to refresh
+/// and retry without a second round trip.
+#[derive(Debug, thiserror::Error)]
+pub enum TaskError {
+    #[error("task #{task_number} not found")]
+    NotFound { task_number: i64 },
+
+    #[error("revision {revision} not found for task #{task_number}")]
+    RevisionNotFound { task_number: i64, revision: i64 },
+
+    #[error("task #{task_number} has moved on: expected revision {expected}, current is {current}")]
+    RevisionConflict {
+        task_number: i64,
+        expected: i64,
+        current: i64,
+    },
+
+    #[error("invalid task status transition: {from} -> {to}")]
+    InvalidTransition { from: String, to: String },
+
+    #[error("{0}")]
+    Invalid(String),
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),
