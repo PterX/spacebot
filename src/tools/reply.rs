@@ -483,17 +483,17 @@ impl Tool for ReplyTool {
             ));
         }
 
-        if let Some(blocks) = &args.blocks {
-            if let Some(leak) = scan_blocks_for_leaks(blocks)? {
-                tracing::error!(
-                    conversation_id = %self.conversation_id,
-                    leak_prefix = %&leak[..leak.len().min(8)],
-                    "reply tool blocked Slack blocks matching secret pattern"
-                );
-                return Err(ReplyError(
-                    "blocked reply blocks: potential secret detected".into(),
-                ));
-            }
+        if let Some(blocks) = &args.blocks
+            && let Some(leak) = scan_blocks_for_leaks(blocks)?
+        {
+            tracing::error!(
+                conversation_id = %self.conversation_id,
+                leak_prefix = %&leak[..leak.len().min(8)],
+                "reply tool blocked Slack blocks matching secret pattern"
+            );
+            return Err(ReplyError(
+                "blocked reply blocks: potential secret detected".into(),
+            ));
         }
 
         let response = if let Some(name) = thread_name {
