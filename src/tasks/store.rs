@@ -488,6 +488,7 @@ pub struct UpdateTaskInput {
     pub repo_id: Patch<String>,
     pub worktree_mode: Patch<TaskWorktreeMode>,
     pub worktree_id: Patch<String>,
+    pub goal_id: Patch<String>,
     pub required_skills: Option<Vec<String>>,
     /// Attribution and optimistic-concurrency expectations for this mutation.
     pub context: TaskMutationContext,
@@ -1056,6 +1057,7 @@ impl TaskStore {
             repo_id: Some(snapshot.repo_id),
             worktree_mode: Some(snapshot.worktree_mode),
             worktree_id: Some(snapshot.worktree_id),
+            goal_id: Some(snapshot.goal_id),
             required_skills: Some(snapshot.required_skills),
             context,
             ..Default::default()
@@ -1310,6 +1312,7 @@ impl TaskStore {
         let next_repo_id = patch(input.repo_id, current.repo_id);
         let next_worktree_mode = patch(input.worktree_mode, current.worktree_mode);
         let next_worktree_id = patch(input.worktree_id, current.worktree_id);
+        let next_goal_id = patch(input.goal_id, current.goal_id);
         let next_required_skills = input.required_skills.unwrap_or(current.required_skills);
         let required_skills_json = serde_json::to_string(&next_required_skills)
             .context("failed to serialize required skills")?;
@@ -1318,7 +1321,7 @@ impl TaskStore {
             "UPDATE tasks SET title = ?, description = ?, status = ?, priority = ?, \
              assigned_agent_id = ?, subtasks = ?, metadata = ?, \
              worker_type = ?, project_id = ?, repo_id = ?, worktree_mode = ?, \
-             worktree_id = ?, required_skills = ?, ",
+             worktree_id = ?, goal_id = ?, required_skills = ?, ",
         );
 
         if clear_worker {
@@ -1358,6 +1361,7 @@ impl TaskStore {
             .bind(&next_repo_id)
             .bind(next_worktree_mode.map(TaskWorktreeMode::as_str))
             .bind(&next_worktree_id)
+            .bind(&next_goal_id)
             .bind(&required_skills_json);
 
         if !clear_worker {

@@ -752,6 +752,7 @@ pub(super) async fn update_task(
                 repo_id: request.repo_id,
                 worktree_mode: request.worktree_mode,
                 worktree_id: request.worktree_id,
+                goal_id: None,
                 required_skills: request.required_skills,
                 context,
             },

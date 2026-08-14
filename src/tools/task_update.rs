@@ -297,6 +297,7 @@ impl Tool for TaskUpdateTool {
             repo_id: args.repo_id.map(Some),
             worktree_mode: worktree_mode.map(Some),
             worktree_id: args.worktree_id.map(Some),
+            goal_id: None,
             required_skills: args.required_skills,
             context: crate::tasks::TaskMutationContext::new(author_type, Some(author_id), source)
                 .with_summary(args.edit_summary)

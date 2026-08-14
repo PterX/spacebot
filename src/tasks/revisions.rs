@@ -949,6 +949,84 @@ mod tests {
         assert_eq!(restored.task.metadata, serde_json::json!({}));
     }
 
+    /// `goal_id` is in the snapshot and `changes` diffs it, so a restore that
+    /// left the current goal in place would report success while producing a
+    /// task that does not match the revision it claims to have restored.
+    #[tokio::test]
+    async fn restore_reinstates_the_goal_it_recorded() {
+        let (store, number) = store_with_task().await;
+
+        store
+            .update_with_status_transition(
+                number,
+                UpdateTaskInput {
+                    goal_id: Some(Some("goal-original".to_string())),
+                    context: user_context("Attach the original goal"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update should succeed");
+
+        let moved = store
+            .update_with_status_transition(
+                number,
+                UpdateTaskInput {
+                    goal_id: Some(Some("goal-moved".to_string())),
+                    context: user_context("Move to another goal"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update should succeed")
+            .expect("task should exist");
+        assert_eq!(moved.task.goal_id.as_deref(), Some("goal-moved"));
+
+        let restored = store
+            .restore_revision(number, 2, user_context("Back to the original goal"))
+            .await
+            .expect("restore should succeed");
+
+        assert_eq!(restored.task.goal_id.as_deref(), Some("goal-original"));
+
+        // The revision the restore appended must match what it restored, or a
+        // diff against it still reports a goal change.
+        let diff = store
+            .diff_revisions(number, 2, None)
+            .await
+            .expect("diff should compute");
+        assert!(
+            !diff.changes.iter().any(|change| change.field == "goal_id"),
+            "the restored revision should agree with revision 2 on goal_id"
+        );
+    }
+
+    /// A restore back to a revision that predates any goal must clear it,
+    /// matching how the other patch fields behave.
+    #[tokio::test]
+    async fn restore_clears_a_goal_the_target_revision_did_not_have() {
+        let (store, number) = store_with_task().await;
+
+        store
+            .update_with_status_transition(
+                number,
+                UpdateTaskInput {
+                    goal_id: Some(Some("goal-1".to_string())),
+                    context: user_context("Attach a goal"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update should succeed");
+
+        let restored = store
+            .restore_revision(number, 1, user_context("Back to the start"))
+            .await
+            .expect("restore should succeed");
+
+        assert_eq!(restored.task.goal_id, None);
+    }
+
     #[tokio::test]
     async fn diff_reports_only_the_fields_that_changed() {
         let (store, number) = store_with_task().await;
