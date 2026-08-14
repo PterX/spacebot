@@ -655,21 +655,24 @@ impl ChannelState {
                     tracing::warn!(%error, %worker_id, "cancelled worker task failed while joining");
                 }
             }
-            let terminal = self
-                .process_run_logger
-                .read_worker_terminal(worker_id)
-                .await;
-            let terminal = match terminal {
-                Ok(terminal) => terminal,
-                Err(error) => {
+        }
+
+        let terminal = self
+            .process_run_logger
+            .read_worker_terminal(worker_id)
+            .await;
+        let terminal = match terminal {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                if let Some(control) = control {
                     self.worker_handles.write().await.insert(worker_id, control);
-                    return Err(error.to_string());
                 }
-            };
-            if terminal.is_some() {
-                self.cleanup_worker_routing(worker_id).await;
-                return Ok(());
+                return Err(error.to_string());
             }
+        };
+        if terminal.is_some() {
+            self.cleanup_worker_routing(worker_id).await;
+            return Ok(());
         }
 
         let transcript = self
