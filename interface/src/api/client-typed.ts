@@ -1,4 +1,5 @@
 import createClient from "openapi-fetch";
+import { getAuthHeaders } from "./client";
 import type { paths } from "./schema";
 
 let baseUrl = "";
@@ -12,11 +13,6 @@ function getClient() {
         baseUrl: baseUrl ? `${baseUrl}/api` : "/api",
         headers: getAuthHeaders(),
     });
-}
-
-function getAuthHeaders(): Record<string, string> {
-    const token = localStorage.getItem("spacebot_auth_token");
-    return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
 // Re-export the typed client for direct use
