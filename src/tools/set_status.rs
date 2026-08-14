@@ -97,6 +97,11 @@ pub struct SetStatusOutput {
     pub worker_id: WorkerId,
     /// The status that was set.
     pub status: String,
+    /// Full outcome text when `kind` is `outcome`, uncapped so the worker's
+    /// terminal result survives into the durable completion record. Absent
+    /// for progress updates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
     /// The kind of status that was set.
     pub kind: StatusKind,
 }
@@ -132,21 +137,29 @@ impl Tool for SetStatusTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        // Cap status length to prevent context bloat in the status block.
-        // Status is rendered into every channel turn so it should stay short.
-        let status = if args.status.len() > 256 {
-            let end = args.status.floor_char_boundary(256);
-            let boundary = args.status[..end].rfind(char::is_whitespace).unwrap_or(end);
-            format!("{}...", &args.status[..boundary])
-        } else {
-            args.status
-        };
-
-        // Scrub tool secret values before the status reaches the channel.
+        // Scrub tool secret values before the status leaves the worker.
         // Layer 1: exact-match redaction of known secrets from the store.
         // Layer 2: regex-based redaction of unknown secret patterns.
-        let status = crate::secrets::scrub::scrub_secrets(&status, &self.tool_secret_pairs);
-        let status = crate::secrets::scrub::scrub_leaks(&status);
+        // Scrubbing runs on the full text so the display cap below can't
+        // truncate a secret out of exact-match range.
+        let scrubbed = crate::secrets::scrub::scrub_secrets(&args.status, &self.tool_secret_pairs);
+        let scrubbed = crate::secrets::scrub::scrub_leaks(&scrubbed);
+
+        // Cap status length to prevent context bloat in the status block.
+        // Status is rendered into every channel turn so it should stay short.
+        let status = if scrubbed.len() > 256 {
+            let end = scrubbed.floor_char_boundary(256);
+            let boundary = scrubbed[..end].rfind(char::is_whitespace).unwrap_or(end);
+            format!("{}...", &scrubbed[..boundary])
+        } else {
+            scrubbed.clone()
+        };
+
+        // An outcome status is the worker's terminal result, not just a
+        // progress line: the full text rides in the tool output so the
+        // completion path can deliver it, while the capped form feeds the
+        // live status stream.
+        let outcome = (args.kind == StatusKind::Outcome).then_some(scrubbed);
 
         if args.kind == StatusKind::Outcome && !self.interactive {
             match self
@@ -184,6 +197,7 @@ impl Tool for SetStatusTool {
             success: true,
             worker_id: self.worker_id,
             status,
+            outcome,
             kind: args.kind,
         })
     }
@@ -252,6 +266,35 @@ mod tests {
             logger,
             worker_id,
         )
+    }
+
+    #[tokio::test]
+    async fn outcome_output_carries_full_text_while_status_stays_capped() {
+        let (tool, _logger, _worker_id) = setup(false).await;
+        let long = format!("Verified the deployment. {}", "detail ".repeat(60));
+        let output = tool
+            .call(SetStatusArgs {
+                status: long.clone(),
+                kind: StatusKind::Outcome,
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.outcome.as_deref(), Some(long.as_str()));
+        assert!(output.status.len() <= 260);
+        assert!(output.status.ends_with("..."));
+    }
+
+    #[tokio::test]
+    async fn progress_output_has_no_outcome_text() {
+        let (tool, _logger, _worker_id) = setup(false).await;
+        let output = tool
+            .call(SetStatusArgs {
+                status: "working on it".to_string(),
+                kind: StatusKind::Progress,
+            })
+            .await
+            .unwrap();
+        assert!(output.outcome.is_none());
     }
 
     #[tokio::test]

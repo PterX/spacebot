@@ -767,9 +767,17 @@ impl Worker {
                                 "one-shot worker stopped after recording terminal outcome"
                             );
                             self.persist_transcript(&compacted_history, &history).await;
-                            return Ok(WorkerOutcome::Success {
-                                result: "Worker reported a terminal outcome.".to_string(),
-                            });
+                            // The signaled outcome text is the worker's actual
+                            // result; the fallbacks cover a signal that carried
+                            // no text.
+                            let result = self
+                                .hook
+                                .take_outcome_text()
+                                .or_else(|| crate::agent::extract_last_assistant_text(&history))
+                                .unwrap_or_else(|| {
+                                    "Worker reported a terminal outcome.".to_string()
+                                });
+                            return Ok(WorkerOutcome::Success { result });
                         }
                         self.state = WorkerState::Failed;
                         self.hook.send_status("cancelled");
@@ -869,10 +877,12 @@ impl Worker {
                     worker_id = %self.id,
                     "worker produced empty text but outcome was signaled, treating as success"
                 );
-                // Use a synthetic result — the channel already received the
-                // outcome status via the event stream, so this is just for the
-                // worker result record.
-                result = "Task completed (outcome signaled via set_status).".to_string();
+                // Prefer the signaled outcome text so the worker result record
+                // carries the actual findings; the synthetic fallback covers a
+                // signal that carried no text.
+                result = self.hook.take_outcome_text().unwrap_or_else(|| {
+                    "Task completed (outcome signaled via set_status).".to_string()
+                });
             } else {
                 self.state = WorkerState::Failed;
                 self.hook.send_status("failed (empty result)");
