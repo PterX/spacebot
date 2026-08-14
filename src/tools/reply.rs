@@ -93,6 +93,12 @@ impl ReplyTool {
 #[error("Reply failed: {0}")]
 pub struct ReplyError(String);
 
+fn scan_blocks_for_leaks(blocks: &[serde_json::Value]) -> Result<Option<String>, ReplyError> {
+    let serialized_blocks = serde_json::to_string(blocks)
+        .map_err(|error| ReplyError(format!("failed to serialize Slack blocks: {error}")))?;
+    Ok(crate::secrets::scrub::scan_for_leaks(&serialized_blocks))
+}
+
 /// Arguments for reply tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReplyArgs {
@@ -477,6 +483,19 @@ impl Tool for ReplyTool {
             ));
         }
 
+        if let Some(blocks) = &args.blocks {
+            if let Some(leak) = scan_blocks_for_leaks(blocks)? {
+                tracing::error!(
+                    conversation_id = %self.conversation_id,
+                    leak_prefix = %&leak[..leak.len().min(8)],
+                    "reply tool blocked Slack blocks matching secret pattern"
+                );
+                return Err(ReplyError(
+                    "blocked reply blocks: potential secret detected".into(),
+                ));
+            }
+        }
+
         let response = if let Some(name) = thread_name {
             // Cap thread names at 100 characters (Discord limit)
             let thread_name = if name.len() > 100 {
@@ -549,6 +568,7 @@ impl Tool for ReplyTool {
 mod tests {
     use super::{
         normalize_discord_mention_tokens, normalize_poll_payload, sanitize_discord_user_id,
+        scan_blocks_for_leaks,
     };
 
     #[test]
@@ -560,6 +580,37 @@ mod tests {
         .expect("reply args accepts Slack blocks");
         assert_eq!(args.blocks.unwrap().len(), 1);
     }
+
+    #[test]
+    fn detects_secret_in_serialized_slack_blocks() {
+        let blocks = vec![serde_json::json!({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "Token: sk-ant-abcdefghijklmnopqrstuvwxyz"
+            }
+        })];
+
+        let leak = scan_blocks_for_leaks(&blocks).expect("blocks scan");
+
+        assert!(leak.is_some());
+    }
+
+    #[test]
+    fn allows_slack_blocks_without_secrets() {
+        let blocks = vec![serde_json::json!({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "Deploy completed successfully."
+            }
+        })];
+
+        let leak = scan_blocks_for_leaks(&blocks).expect("blocks scan");
+
+        assert!(leak.is_none());
+    }
+
     use crate::Poll;
 
     #[test]
