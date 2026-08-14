@@ -129,6 +129,23 @@ fn classify_worker_completion(
     }
 }
 
+/// How a run ended, as a task's attempt history records it.
+///
+/// Mirrors the worker's own outcome rather than collapsing to success/failure,
+/// so a task can tell a run that delivered partial work from one that was
+/// cancelled or timed out.
+fn attempt_outcome(kind: WorkerCompletionKind) -> crate::tasks::TaskAttemptOutcome {
+    use crate::tasks::TaskAttemptOutcome as Outcome;
+    match kind {
+        WorkerCompletionKind::Success => Outcome::Succeeded,
+        WorkerCompletionKind::Partial => Outcome::Partial,
+        WorkerCompletionKind::Blocked => Outcome::Blocked,
+        WorkerCompletionKind::Cancelled => Outcome::Cancelled,
+        WorkerCompletionKind::Timeout => Outcome::TimedOut,
+        WorkerCompletionKind::Failed => Outcome::Failed,
+    }
+}
+
 fn completion_flags(kind: WorkerCompletionKind) -> (bool, bool) {
     let notify = true;
     let success = matches!(
@@ -988,6 +1005,7 @@ async fn spawn_worker_inner(
         None,
         None,
         secrets_store,
+        Some(state.deps.task_store.clone()),
         "builtin",
         worker.run().instrument(worker_span),
     );
@@ -1222,6 +1240,7 @@ async fn spawn_opencode_worker_inner(
         Some(opencode_cancellation),
         Some(directory_claim),
         oc_secrets_store,
+        Some(state.deps.task_store.clone()),
         "opencode",
         async move {
             let result = worker.run().await.map_err(SpacebotError::from);
@@ -1294,6 +1313,8 @@ pub(crate) fn spawn_worker_task<F>(
     >,
     opencode_directory_claim: Option<crate::opencode::server::OpenCodeDirectoryClaim>,
     secrets_store: Option<Arc<crate::secrets::store::SecretsStore>>,
+    // Present when the run should be recorded against a task's history.
+    task_store: Option<Arc<crate::tasks::TaskStore>>,
     #[cfg_attr(not(feature = "metrics"), allow(unused_variables))] worker_type: &'static str,
     future: F,
 ) -> WorkerTaskControl
@@ -1381,6 +1402,22 @@ where
         };
         let (notify, _success) = completion_flags(kind);
         let outcome_kind = outcome_kind(kind);
+
+        // Close this run in the task's attempt history. Keyed by worker id, so
+        // a run that was never bound to a task simply matches nothing.
+        if let Some(task_store) = &task_store {
+            let summary: String = result_text.chars().take(280).collect();
+            if let Err(error) = task_store
+                .finish_task_attempt(
+                    &worker_id.to_string(),
+                    attempt_outcome(kind),
+                    (!summary.is_empty()).then_some(summary.as_str()),
+                )
+                .await
+            {
+                tracing::warn!(%error, %worker_id, "failed to record the task attempt outcome");
+            }
+        }
         #[cfg(feature = "metrics")]
         {
             let metrics = crate::telemetry::Metrics::global();
@@ -1746,6 +1783,7 @@ pub async fn resume_idle_worker_into_state(
                 Some(opencode_cancellation),
                 Some(directory_claim),
                 oc_secrets_store,
+                Some(state.deps.task_store.clone()),
                 "opencode",
                 async move {
                     let result = worker.run().await.map_err(SpacebotError::from)?;
@@ -1876,6 +1914,7 @@ pub async fn resume_idle_worker_into_state(
                 None,
                 None,
                 secrets_store,
+                Some(state.deps.task_store.clone()),
                 "builtin",
                 worker.run().instrument(worker_span),
             );
@@ -2048,6 +2087,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             "builtin",
             async {
                 Err::<WorkerOutcome, crate::Error>(
@@ -2102,6 +2142,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             "builtin",
             async move {
                 started_tx.send(()).expect("test receiver remains active");
@@ -2144,6 +2185,7 @@ mod tests {
             Some(channel_id.clone()),
             run_logger,
             crate::agent::worker::new_worker_transcript_snapshot(),
+            None,
             None,
             None,
             None,
@@ -2191,6 +2233,7 @@ mod tests {
             Some(Arc::<str>::from("durable-channel")),
             run_logger,
             crate::agent::worker::new_worker_transcript_snapshot(),
+            None,
             None,
             None,
             None,

@@ -76,6 +76,13 @@ impl std::fmt::Display for TaskAuthorKind {
     }
 }
 
+impl Default for TaskAuthorKind {
+    /// Unattributed writes are Spacebot's own.
+    fn default() -> Self {
+        Self::System
+    }
+}
+
 /// Which surface a task mutation arrived through. Recorded per revision so
 /// history reads as a sequence of decisions with their origin intact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]

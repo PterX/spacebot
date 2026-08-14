@@ -1,0 +1,741 @@
+//! Every worker run attempted against a task.
+//!
+//! `tasks.worker_id` names the run executing right now and is overwritten by
+//! the next spawn, so a task retried three times remembers only the last one.
+//! That is enough to route a reply and not enough to decide anything: an
+//! autonomous loop picking work off the board has to know what has already been
+//! tried and how it ended before it spawns again, or it repeats failed work
+//! forever.
+//!
+//! The reference to the worker is a bare id. Tasks live in the instance
+//! database and `worker_runs` lives in the per-agent database, so the link
+//! crosses a database boundary and no foreign key can enforce it. A run whose
+//! worker row has been pruned still records that the attempt happened.
+
+use crate::error::Result;
+use crate::tasks::revisions::TaskAuthorKind;
+use crate::tasks::store::TaskStore;
+
+use anyhow::Context as _;
+use serde::{Deserialize, Serialize};
+use sqlx::{Row as _, sqlite::SqliteRow};
+
+/// Hard ceiling on rows returned by a single attempt-history call.
+pub const MAX_ATTEMPT_PAGE: i64 = 100;
+
+/// How a worker run ended, from the task's point of view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskAttemptOutcome {
+    Succeeded,
+    /// Reached its budget with real work delivered but the task unfinished.
+    Partial,
+    /// Stopped waiting on something outside its control.
+    Blocked,
+    Failed,
+    Cancelled,
+    TimedOut,
+}
+
+impl TaskAttemptOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Partial => "partial",
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "succeeded" => Some(Self::Succeeded),
+            "partial" => Some(Self::Partial),
+            "blocked" => Some(Self::Blocked),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            "timed_out" => Some(Self::TimedOut),
+            _ => None,
+        }
+    }
+
+    /// Whether this outcome means the work was actually delivered.
+    pub fn is_success(self) -> bool {
+        matches!(self, Self::Succeeded)
+    }
+}
+
+impl std::fmt::Display for TaskAttemptOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// One worker run recorded against a task.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct TaskAttempt {
+    pub id: String,
+    pub task_id: String,
+    pub worker_id: String,
+    /// 1 for the first run on this task.
+    pub attempt: i64,
+    pub author_type: TaskAuthorKind,
+    pub author_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub channel_id: Option<String>,
+    pub started_at: String,
+    /// `None` while the run is still live.
+    pub outcome: Option<TaskAttemptOutcome>,
+    pub outcome_summary: Option<String>,
+    pub ended_at: Option<String>,
+}
+
+impl TaskAttempt {
+    /// Whether this run has not reached a terminal state.
+    pub fn is_live(&self) -> bool {
+        self.ended_at.is_none()
+    }
+}
+
+/// What to record when a run starts.
+#[derive(Debug, Clone, Default)]
+pub struct StartTaskAttempt {
+    pub worker_id: String,
+    pub author_type: TaskAuthorKind,
+    pub author_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub channel_id: Option<String>,
+}
+
+const ATTEMPT_COLUMNS: &str = "SELECT id, task_id, worker_id, attempt, author_type, author_id, \
+     agent_id, channel_id, started_at, outcome_kind, outcome_summary, ended_at \
+     FROM task_worker_runs";
+
+fn attempt_from_row(row: &SqliteRow) -> Result<TaskAttempt> {
+    let author_type: String = row.try_get("author_type").unwrap_or_default();
+    let outcome_kind: Option<String> = row.try_get("outcome_kind").ok().flatten();
+
+    Ok(TaskAttempt {
+        id: row.try_get("id").context("attempt row missing id")?,
+        task_id: row
+            .try_get("task_id")
+            .context("attempt row missing task_id")?,
+        worker_id: row
+            .try_get("worker_id")
+            .context("attempt row missing worker_id")?,
+        attempt: row
+            .try_get("attempt")
+            .context("attempt row missing attempt")?,
+        author_type: TaskAuthorKind::parse(&author_type).unwrap_or(TaskAuthorKind::System),
+        author_id: row.try_get("author_id").ok().flatten(),
+        agent_id: row.try_get("agent_id").ok().flatten(),
+        channel_id: row.try_get("channel_id").ok().flatten(),
+        started_at: row
+            .try_get("started_at")
+            .context("attempt row missing started_at")?,
+        outcome: outcome_kind.as_deref().and_then(TaskAttemptOutcome::parse),
+        outcome_summary: row.try_get("outcome_summary").ok().flatten(),
+        ended_at: row.try_get("ended_at").ok().flatten(),
+    })
+}
+
+impl TaskStore {
+    /// Record that a worker run has started against a task.
+    ///
+    /// The attempt number is allocated inside the transaction, so two spawns
+    /// racing on the same task cannot both claim the same ordinal. Re-recording
+    /// the same worker returns the existing row rather than a second attempt,
+    /// which makes a retried bind idempotent.
+    pub async fn start_task_attempt(
+        &self,
+        task_number: i64,
+        input: StartTaskAttempt,
+    ) -> Result<Option<TaskAttempt>> {
+        let mut tx = self
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .context("failed to open task attempt transaction")?;
+
+        let task_id: Option<String> =
+            sqlx::query_scalar("SELECT id FROM tasks WHERE task_number = ?")
+                .bind(task_number)
+                .fetch_optional(&mut *tx)
+                .await
+                .context("failed to resolve task for attempt")?;
+
+        let Some(task_id) = task_id else {
+            tx.rollback()
+                .await
+                .context("failed to roll back task attempt transaction")?;
+            return Ok(None);
+        };
+
+        let existing = sqlx::query(&format!(
+            "{ATTEMPT_COLUMNS} WHERE task_id = ? AND worker_id = ?"
+        ))
+        .bind(&task_id)
+        .bind(&input.worker_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("failed to check for an existing attempt")?;
+
+        if let Some(row) = existing {
+            let attempt = attempt_from_row(&row)?;
+            tx.commit()
+                .await
+                .context("failed to commit task attempt transaction")?;
+            return Ok(Some(attempt));
+        }
+
+        let next_attempt: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(attempt), 0) + 1 FROM task_worker_runs WHERE task_id = ?",
+        )
+        .bind(&task_id)
+        .fetch_one(&mut *tx)
+        .await
+        .context("failed to allocate an attempt number")?;
+
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO task_worker_runs \
+             (id, task_id, worker_id, attempt, author_type, author_id, agent_id, channel_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(&task_id)
+        .bind(&input.worker_id)
+        .bind(next_attempt)
+        .bind(input.author_type.as_str())
+        .bind(&input.author_id)
+        .bind(&input.agent_id)
+        .bind(&input.channel_id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to record task attempt")?;
+
+        let row = sqlx::query(&format!("{ATTEMPT_COLUMNS} WHERE id = ?"))
+            .bind(&id)
+            .fetch_one(&mut *tx)
+            .await
+            .context("failed to reload the recorded attempt")?;
+        let attempt = attempt_from_row(&row)?;
+
+        tx.commit()
+            .await
+            .context("failed to commit task attempt transaction")?;
+        Ok(Some(attempt))
+    }
+
+    /// Record how a run ended.
+    ///
+    /// Terminal state is written once: a second call for the same worker leaves
+    /// the first outcome in place, so a duplicated completion cannot rewrite
+    /// history. Returns whether this call was the one that closed the run.
+    pub async fn finish_task_attempt(
+        &self,
+        worker_id: &str,
+        outcome: TaskAttemptOutcome,
+        summary: Option<&str>,
+    ) -> Result<bool> {
+        let affected = sqlx::query(
+            "UPDATE task_worker_runs \
+             SET outcome_kind = ?, outcome_summary = ?, \
+                 ended_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') \
+             WHERE worker_id = ? AND ended_at IS NULL",
+        )
+        .bind(outcome.as_str())
+        .bind(summary)
+        .bind(worker_id)
+        .execute(self.pool())
+        .await
+        .context("failed to record task attempt outcome")?
+        .rows_affected();
+
+        Ok(affected > 0)
+    }
+
+    /// The runs attempted against a task, newest first.
+    pub async fn list_task_attempts(
+        &self,
+        task_number: i64,
+        limit: i64,
+    ) -> Result<Vec<TaskAttempt>> {
+        let limit = limit.clamp(1, MAX_ATTEMPT_PAGE);
+        let rows = sqlx::query(&format!(
+            "{ATTEMPT_COLUMNS} WHERE task_id = (SELECT id FROM tasks WHERE task_number = ?) \
+             ORDER BY attempt DESC LIMIT ?"
+        ))
+        .bind(task_number)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await
+        .context("failed to list task attempts")?;
+
+        rows.iter().map(attempt_from_row).collect()
+    }
+
+    /// Prior-attempt lines for a set of tasks, keyed by task number.
+    ///
+    /// One query for the whole board. Rendering prompt context must not issue a
+    /// query per task, and a task that has never been attempted is simply
+    /// absent from the map rather than carrying an empty entry.
+    pub async fn prior_attempt_summaries(
+        &self,
+        task_numbers: &[i64],
+    ) -> Result<std::collections::HashMap<i64, String>> {
+        if task_numbers.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let placeholders = std::iter::repeat_n("?", task_numbers.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT t.task_number AS task_number, r.id, r.task_id, r.worker_id, r.attempt, \
+             r.author_type, r.author_id, r.agent_id, r.channel_id, r.started_at, \
+             r.outcome_kind, r.outcome_summary, r.ended_at \
+             FROM task_worker_runs r JOIN tasks t ON t.id = r.task_id \
+             WHERE t.task_number IN ({placeholders}) ORDER BY r.attempt DESC"
+        );
+
+        let mut query = sqlx::query(&sql);
+        for number in task_numbers {
+            query = query.bind(number);
+        }
+        let rows = query
+            .fetch_all(self.pool())
+            .await
+            .context("failed to load attempt history for the board")?;
+
+        let mut grouped: std::collections::HashMap<i64, Vec<TaskAttempt>> =
+            std::collections::HashMap::new();
+        for row in &rows {
+            let number: i64 = row
+                .try_get("task_number")
+                .context("attempt row missing task_number")?;
+            grouped
+                .entry(number)
+                .or_default()
+                .push(attempt_from_row(row)?);
+        }
+
+        Ok(grouped
+            .into_iter()
+            .filter_map(|(number, attempts)| {
+                render_prior_attempts(&attempts).map(|line| (number, line))
+            })
+            .collect())
+    }
+
+    /// The task a worker was spawned for, if it was spawned for one.
+    pub async fn task_number_for_worker(&self, worker_id: &str) -> Result<Option<i64>> {
+        let number: Option<i64> = sqlx::query_scalar(
+            "SELECT t.task_number FROM task_worker_runs r \
+             JOIN tasks t ON t.id = r.task_id \
+             WHERE r.worker_id = ?",
+        )
+        .bind(worker_id)
+        .fetch_optional(self.pool())
+        .await
+        .context("failed to resolve the task for a worker")?;
+
+        Ok(number)
+    }
+
+    /// The run currently executing against a task, if any.
+    ///
+    /// This is what makes a spawn guard task-scoped rather than channel-scoped:
+    /// it sees a live run no matter which channel started it.
+    pub async fn live_task_attempt(&self, task_number: i64) -> Result<Option<TaskAttempt>> {
+        let row = sqlx::query(&format!(
+            "{ATTEMPT_COLUMNS} WHERE task_id = (SELECT id FROM tasks WHERE task_number = ?) \
+             AND ended_at IS NULL ORDER BY attempt DESC LIMIT 1"
+        ))
+        .bind(task_number)
+        .fetch_optional(self.pool())
+        .await
+        .context("failed to look for a live task attempt")?;
+
+        row.as_ref().map(attempt_from_row).transpose()
+    }
+}
+
+/// One line summarising what has already been tried on a task.
+///
+/// Rendered into prompt context so a spawn decision is made knowing the
+/// history. Bounded on purpose: a heavily retried task must not crowd out the
+/// rest of the board.
+pub fn render_prior_attempts(attempts: &[TaskAttempt]) -> Option<String> {
+    let finished: Vec<&TaskAttempt> = attempts.iter().filter(|a| !a.is_live()).collect();
+    let live = attempts.iter().find(|a| a.is_live());
+
+    if finished.is_empty() && live.is_none() {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+
+    if !finished.is_empty() {
+        let outcomes: Vec<String> = finished
+            .iter()
+            .take(3)
+            .map(|attempt| {
+                let outcome = attempt
+                    .outcome
+                    .map(|o| o.to_string())
+                    .unwrap_or_else(|| "ended without an outcome".to_string());
+                format!("#{} {}", attempt.attempt, outcome)
+            })
+            .collect();
+
+        let plural = if finished.len() == 1 {
+            "attempt"
+        } else {
+            "attempts"
+        };
+        parts.push(format!(
+            "{} prior {plural} ({})",
+            finished.len(),
+            outcomes.join(", ")
+        ));
+    }
+
+    if let Some(live) = live {
+        parts.push(format!("attempt #{} is running now", live.attempt));
+    }
+
+    Some(parts.join("; "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tasks::store::{CreateTaskInput, setup_test_store};
+
+    fn task_input(title: &str) -> CreateTaskInput {
+        CreateTaskInput {
+            owner_agent_id: "main".to_string(),
+            title: title.to_string(),
+            ..Default::default()
+        }
+    }
+
+    async fn store_with_task() -> (TaskStore, i64) {
+        let store = setup_test_store().await;
+        let task = store
+            .create(task_input("linkage"))
+            .await
+            .expect("task should be created");
+        (store, task.task_number)
+    }
+
+    fn start(worker_id: &str) -> StartTaskAttempt {
+        StartTaskAttempt {
+            worker_id: worker_id.to_string(),
+            author_type: TaskAuthorKind::Agent,
+            author_id: Some("main".to_string()),
+            agent_id: Some("main".to_string()),
+            channel_id: Some("telegram:1".to_string()),
+        }
+    }
+
+    /// The record this whole module exists for: a task run three times keeps
+    /// all three, where `tasks.worker_id` would remember only the last.
+    #[tokio::test]
+    async fn every_attempt_is_kept_with_its_outcome() {
+        let (store, number) = store_with_task().await;
+
+        for (worker, outcome) in [
+            ("worker-a", TaskAttemptOutcome::Failed),
+            ("worker-b", TaskAttemptOutcome::TimedOut),
+            ("worker-c", TaskAttemptOutcome::Succeeded),
+        ] {
+            store
+                .start_task_attempt(number, start(worker))
+                .await
+                .expect("start should succeed")
+                .expect("task exists");
+            store
+                .finish_task_attempt(worker, outcome, Some("summary"))
+                .await
+                .expect("finish should succeed");
+        }
+
+        let attempts = store
+            .list_task_attempts(number, 10)
+            .await
+            .expect("history should load");
+
+        assert_eq!(attempts.len(), 3);
+        // Newest first.
+        assert_eq!(attempts[0].attempt, 3);
+        assert_eq!(attempts[0].worker_id, "worker-c");
+        assert_eq!(attempts[0].outcome, Some(TaskAttemptOutcome::Succeeded));
+        assert_eq!(attempts[2].attempt, 1);
+        assert_eq!(attempts[2].outcome, Some(TaskAttemptOutcome::Failed));
+        assert!(attempts.iter().all(|a| !a.is_live()));
+    }
+
+    /// The reverse lookup the API had no way to answer.
+    #[tokio::test]
+    async fn a_worker_resolves_back_to_its_task() {
+        let (store, number) = store_with_task().await;
+        store
+            .start_task_attempt(number, start("worker-1"))
+            .await
+            .expect("start should succeed")
+            .expect("task exists");
+
+        assert_eq!(
+            store
+                .task_number_for_worker("worker-1")
+                .await
+                .expect("lookup should succeed"),
+            Some(number)
+        );
+        assert_eq!(
+            store
+                .task_number_for_worker("worker-unknown")
+                .await
+                .expect("lookup should succeed"),
+            None
+        );
+    }
+
+    /// A live run is visible regardless of which channel started it, which is
+    /// what lets a spawn guard be task-scoped rather than channel-scoped.
+    #[tokio::test]
+    async fn a_live_attempt_is_visible_until_it_ends() {
+        let (store, number) = store_with_task().await;
+        assert!(
+            store
+                .live_task_attempt(number)
+                .await
+                .expect("lookup should succeed")
+                .is_none()
+        );
+
+        let mut other_channel = start("worker-1");
+        other_channel.channel_id = Some("discord:99".to_string());
+        store
+            .start_task_attempt(number, other_channel)
+            .await
+            .expect("start should succeed")
+            .expect("task exists");
+
+        let live = store
+            .live_task_attempt(number)
+            .await
+            .expect("lookup should succeed")
+            .expect("a run is live");
+        assert_eq!(live.worker_id, "worker-1");
+        assert_eq!(live.channel_id.as_deref(), Some("discord:99"));
+
+        store
+            .finish_task_attempt("worker-1", TaskAttemptOutcome::Succeeded, None)
+            .await
+            .expect("finish should succeed");
+        assert!(
+            store
+                .live_task_attempt(number)
+                .await
+                .expect("lookup should succeed")
+                .is_none()
+        );
+    }
+
+    /// Re-binding the same worker must not invent a second attempt, so a
+    /// retried bind after a transient failure stays idempotent.
+    #[tokio::test]
+    async fn re_recording_the_same_worker_reuses_its_attempt() {
+        let (store, number) = store_with_task().await;
+
+        let first = store
+            .start_task_attempt(number, start("worker-1"))
+            .await
+            .expect("start should succeed")
+            .expect("task exists");
+        let again = store
+            .start_task_attempt(number, start("worker-1"))
+            .await
+            .expect("start should succeed")
+            .expect("task exists");
+
+        assert_eq!(first.id, again.id);
+        assert_eq!(again.attempt, 1);
+        assert_eq!(
+            store
+                .list_task_attempts(number, 10)
+                .await
+                .expect("history should load")
+                .len(),
+            1
+        );
+    }
+
+    /// A duplicated completion must not rewrite how the run ended.
+    #[tokio::test]
+    async fn terminal_state_is_written_once() {
+        let (store, number) = store_with_task().await;
+        store
+            .start_task_attempt(number, start("worker-1"))
+            .await
+            .expect("start should succeed")
+            .expect("task exists");
+
+        assert!(
+            store
+                .finish_task_attempt("worker-1", TaskAttemptOutcome::Succeeded, Some("done"))
+                .await
+                .expect("finish should succeed")
+        );
+        assert!(
+            !store
+                .finish_task_attempt("worker-1", TaskAttemptOutcome::Failed, Some("nope"))
+                .await
+                .expect("finish should succeed"),
+            "a second completion must not close the run again"
+        );
+
+        let attempts = store
+            .list_task_attempts(number, 10)
+            .await
+            .expect("history should load");
+        assert_eq!(attempts[0].outcome, Some(TaskAttemptOutcome::Succeeded));
+        assert_eq!(attempts[0].outcome_summary.as_deref(), Some("done"));
+    }
+
+    #[tokio::test]
+    async fn an_attempt_on_a_missing_task_is_not_recorded() {
+        let store = setup_test_store().await;
+        assert!(
+            store
+                .start_task_attempt(4242, start("worker-1"))
+                .await
+                .expect("start should succeed")
+                .is_none()
+        );
+    }
+
+    /// The board renders in one query, and a task never attempted is absent
+    /// rather than carrying an empty line.
+    #[tokio::test]
+    async fn board_summaries_cover_only_attempted_tasks() {
+        let store = setup_test_store().await;
+        let attempted = store
+            .create(task_input("attempted"))
+            .await
+            .expect("task should be created")
+            .task_number;
+        let untouched = store
+            .create(task_input("untouched"))
+            .await
+            .expect("task should be created")
+            .task_number;
+
+        store
+            .start_task_attempt(attempted, start("worker-1"))
+            .await
+            .expect("start should succeed")
+            .expect("task exists");
+        store
+            .finish_task_attempt("worker-1", TaskAttemptOutcome::Failed, None)
+            .await
+            .expect("finish should succeed");
+        store
+            .start_task_attempt(attempted, start("worker-2"))
+            .await
+            .expect("start should succeed")
+            .expect("task exists");
+
+        let summaries = store
+            .prior_attempt_summaries(&[attempted, untouched])
+            .await
+            .expect("summaries should load");
+
+        assert_eq!(summaries.len(), 1);
+        let line = summaries
+            .get(&attempted)
+            .expect("attempted task summarised");
+        assert!(line.contains("1 prior attempt"), "{line}");
+        assert!(line.contains("#1 failed"), "{line}");
+        assert!(line.contains("attempt #2 is running now"), "{line}");
+        assert!(!summaries.contains_key(&untouched));
+    }
+
+    #[tokio::test]
+    async fn board_summaries_are_empty_without_tasks() {
+        let store = setup_test_store().await;
+        assert!(
+            store
+                .prior_attempt_summaries(&[])
+                .await
+                .expect("summaries should load")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn prior_attempts_render_nothing_for_a_fresh_task() {
+        assert_eq!(render_prior_attempts(&[]), None);
+    }
+
+    #[test]
+    fn prior_attempts_name_the_outcomes_and_the_live_run() {
+        let attempt = |n: i64, outcome: Option<TaskAttemptOutcome>, ended: bool| TaskAttempt {
+            id: format!("id-{n}"),
+            task_id: "task-1".to_string(),
+            worker_id: format!("worker-{n}"),
+            attempt: n,
+            author_type: TaskAuthorKind::Agent,
+            author_id: None,
+            agent_id: None,
+            channel_id: None,
+            started_at: "2026-08-14T00:00:00Z".to_string(),
+            outcome,
+            outcome_summary: None,
+            ended_at: ended.then(|| "2026-08-14T01:00:00Z".to_string()),
+        };
+
+        let rendered = render_prior_attempts(&[
+            attempt(3, None, false),
+            attempt(2, Some(TaskAttemptOutcome::TimedOut), true),
+            attempt(1, Some(TaskAttemptOutcome::Failed), true),
+        ])
+        .expect("a task with history renders");
+
+        assert!(rendered.contains("2 prior attempts"));
+        assert!(rendered.contains("#2 timed_out"));
+        assert!(rendered.contains("#1 failed"));
+        assert!(rendered.contains("attempt #3 is running now"));
+    }
+
+    /// A heavily retried task must not crowd the board out of the prompt.
+    #[test]
+    fn prior_attempts_are_bounded() {
+        let attempts: Vec<TaskAttempt> = (1..=20)
+            .rev()
+            .map(|n| TaskAttempt {
+                id: format!("id-{n}"),
+                task_id: "task-1".to_string(),
+                worker_id: format!("worker-{n}"),
+                attempt: n,
+                author_type: TaskAuthorKind::Agent,
+                author_id: None,
+                agent_id: None,
+                channel_id: None,
+                started_at: "2026-08-14T00:00:00Z".to_string(),
+                outcome: Some(TaskAttemptOutcome::Failed),
+                outcome_summary: None,
+                ended_at: Some("2026-08-14T01:00:00Z".to_string()),
+            })
+            .collect();
+
+        let rendered = render_prior_attempts(&attempts).expect("renders");
+        assert!(rendered.contains("20 prior attempts"));
+        assert_eq!(rendered.matches('#').count(), 3, "only three are named");
+    }
+}

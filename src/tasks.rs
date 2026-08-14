@@ -4,6 +4,7 @@ pub mod comments;
 pub mod migration;
 pub mod revisions;
 pub mod store;
+pub mod worker_runs;
 
 pub use comments::{
     CreateTaskCommentInput, MAX_COMMENT_BODY_BYTES, MAX_COMMENT_PAGE, MIN_COMMENT_BODY_CHARS,
@@ -14,6 +15,10 @@ pub use revisions::{
     TaskMutationContext, TaskMutationSource, TaskRevision, TaskRevisionDependency,
     TaskRevisionDiff, TaskRevisionSnapshot, TaskRevisionSummary,
 };
+pub use worker_runs::{
+    MAX_ATTEMPT_PAGE, StartTaskAttempt, TaskAttempt, TaskAttemptOutcome, render_prior_attempts,
+};
+
 pub use store::{
     CreateTaskInput, ExecutionDefaults, ExecutionPlan, Patch, Task, TaskDependencyEdge,
     TaskDependencyKind, TaskListFilter, TaskPriority, TaskStatus, TaskStore, TaskSubtask,

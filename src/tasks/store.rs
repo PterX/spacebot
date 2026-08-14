@@ -1824,6 +1824,28 @@ pub(crate) async fn setup_test_store() -> TaskStore {
     .await
     .expect("task_revisions should be created");
 
+    sqlx::query(
+        "CREATE TABLE task_worker_runs (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            worker_id TEXT NOT NULL,
+            attempt INTEGER NOT NULL,
+            author_type TEXT NOT NULL DEFAULT 'system',
+            author_id TEXT,
+            agent_id TEXT,
+            channel_id TEXT,
+            started_at TIMESTAMP NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            outcome_kind TEXT,
+            outcome_summary TEXT,
+            ended_at TIMESTAMP,
+            UNIQUE (task_id, worker_id),
+            UNIQUE (task_id, attempt)
+        )",
+    )
+    .execute(&pool)
+    .await
+    .expect("task_worker_runs should be created");
+
     sqlx::query("INSERT INTO task_number_seq (id, next_number) VALUES (1, 1)")
         .execute(&pool)
         .await

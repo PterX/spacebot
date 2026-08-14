@@ -100,6 +100,17 @@ impl SpawnWorkerTool {
             }
         }
 
+        // Refuse a second run on a task something is already working. The
+        // delegation check elsewhere is per-channel, so without this two
+        // channels can spawn on the same task without either noticing.
+        if let Ok(Some(live)) = deps.task_store.live_task_attempt(number).await {
+            return Err(SpawnWorkerError(format!(
+                "task #{number} is already being worked by worker {} (attempt #{}, started {}). \
+                 Wait for it, or cancel it before spawning again.",
+                live.worker_id, live.attempt, live.started_at
+            )));
+        }
+
         let project = match &task.project_id {
             Some(project_id) => Some(
                 deps.project_store
@@ -689,6 +700,32 @@ impl SpawnWorkerTool {
                     "failed to bind spawned worker to task"
                 );
             }
+
+            // The pointer above names only the run executing now. This is the
+            // history: what has been tried on this task and how it ended.
+            if let Err(error) = self
+                .state
+                .deps
+                .task_store
+                .start_task_attempt(
+                    plan.task_number,
+                    crate::tasks::StartTaskAttempt {
+                        worker_id: worker_id.to_string(),
+                        author_type: crate::tasks::TaskAuthorKind::Agent,
+                        author_id: Some(self.state.deps.agent_id.to_string()),
+                        agent_id: Some(self.state.deps.agent_id.to_string()),
+                        channel_id: Some(self.state.channel_id.to_string()),
+                    },
+                )
+                .await
+            {
+                tracing::warn!(
+                    %error,
+                    task_number = plan.task_number,
+                    %worker_id,
+                    "failed to record the task attempt"
+                );
+            }
         }
 
         // Link the worker to project/worktree if specified (fire-and-forget update).
@@ -1046,6 +1083,7 @@ impl Tool for DetachedSpawnWorkerTool {
             None,
             None,
             secrets_store,
+            Some(self.deps.task_store.clone()),
             "builtin",
             worker.run().instrument(worker_span),
         );

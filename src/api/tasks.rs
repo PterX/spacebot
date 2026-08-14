@@ -352,6 +352,14 @@ pub struct TaskCommentResponse {
 }
 
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct TaskAttemptListResponse {
+    /// Worker runs attempted against this task, newest first.
+    pub attempts: Vec<crate::tasks::TaskAttempt>,
+    /// One line summarising what has been tried, as prompt context renders it.
+    pub summary: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TaskHistoryResponse {
     pub revisions: Vec<crate::tasks::TaskRevisionSummary>,
     /// The task's current revision number.
@@ -1049,6 +1057,41 @@ pub(super) async fn list_task_comments(
         total,
         next_cursor,
     }))
+}
+
+/// `GET /tasks/{number}/attempts` — the worker runs attempted against a task.
+///
+/// `tasks.worker_id` names only the run executing right now; this is the
+/// history that says what has already been tried and how it ended.
+#[utoipa::path(
+    get,
+    path = "/tasks/{number}/attempts",
+    params(("number" = i64, Path, description = "Task number")),
+    responses(
+        (status = 200, body = TaskAttemptListResponse),
+        (status = 404, description = "Task not found", body = TaskErrorBody),
+        (status = 503, description = "Task store not initialized", body = TaskErrorBody),
+    ),
+    tag = "tasks",
+)]
+pub(super) async fn list_task_attempts(
+    State(state): State<Arc<ApiState>>,
+    Path(number): Path<i64>,
+) -> Result<Json<TaskAttemptListResponse>, TaskApiError> {
+    let store = task_store(&state)?;
+
+    // Distinguish "never attempted" from "no such task".
+    store
+        .get_by_number(number)
+        .await?
+        .ok_or_else(|| TaskApiError::not_found(number))?;
+
+    let attempts = store
+        .list_task_attempts(number, crate::tasks::MAX_ATTEMPT_PAGE)
+        .await?;
+    let summary = crate::tasks::render_prior_attempts(&attempts);
+
+    Ok(Json(TaskAttemptListResponse { attempts, summary }))
 }
 
 /// `POST /tasks/{number}/comments` — append a comment to a task.
