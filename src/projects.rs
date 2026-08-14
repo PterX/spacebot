@@ -103,7 +103,7 @@ pub async fn provision_worktree(
         .await
         .context("git worktree add failed")?;
 
-    let worktree = store
+    let worktree = match store
         .create_worktree(CreateWorktreeInput {
             project_id: project.id.clone(),
             repo_id: repo.id.clone(),
@@ -113,7 +113,21 @@ pub async fn provision_worktree(
             created_by: created_by.to_string(),
         })
         .await
-        .context("failed to register worktree in database")?;
+    {
+        Ok(worktree) => worktree,
+        Err(error) => {
+            if let Err(cleanup_error) =
+                git::remove_worktree(&repo_abs_path, &worktree_abs_path).await
+            {
+                tracing::warn!(
+                    %cleanup_error,
+                    worktree_path = %worktree_abs_path.display(),
+                    "failed to remove worktree after database registration failed"
+                );
+            }
+            return Err(error).context("failed to register worktree in database");
+        }
+    };
 
     Ok(ProvisionedWorktree {
         worktree,
