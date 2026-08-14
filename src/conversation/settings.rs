@@ -96,6 +96,16 @@ pub enum WorkerMemoryMode {
 }
 
 impl WorkerMemoryMode {
+    /// The serde string form, used to select capability prose in templates.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WorkerMemoryMode::None => "none",
+            WorkerMemoryMode::Ambient => "ambient",
+            WorkerMemoryMode::Tools => "tools",
+            WorkerMemoryMode::Full => "full",
+        }
+    }
+
     /// Returns true if the worker should receive ambient memory context.
     pub fn ambient_enabled(&self) -> bool {
         matches!(

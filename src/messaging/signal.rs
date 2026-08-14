@@ -23,8 +23,7 @@
 //!
 //! - **Threading:** Signal has no native thread concept. `ThreadReply` responses are
 //!   sent as regular messages without thread context.
-//! - **Rich formatting:** Signal has no rich formatting (bold, italic, etc.).
-//!   `RichMessage` is sent as plain text.
+//! - **Rich formatting:** Markdown is converted to Signal `textStyle` ranges.
 //! - **Reactions:** Signal reactions are supported via JSON-RPC but require complex
 //!   target identification (author UUID + timestamp). Not currently implemented.
 //! - **Ephemeral messages:** Not supported; sent as regular messages.
@@ -87,6 +86,16 @@ const SSE_INITIAL_BACKOFF: Duration = Duration::from_secs(2);
 /// Maximum SSE reconnection delay.
 const SSE_MAX_BACKOFF: Duration = Duration::from_secs(60);
 
+/// Markdown spans supported by Signal's native text style ranges.
+const MARKDOWN_STYLES: &[(&str, &str)] = &[
+    ("**", "BOLD"),
+    ("__", "BOLD"),
+    ("~~", "STRIKETHROUGH"),
+    ("`", "MONOSPACE"),
+    ("*", "ITALIC"),
+    ("_", "ITALIC"),
+];
+
 // ── PII redaction helpers ───────────────────────────────────────
 
 /// Redact a Signal identifier (phone number or UUID) for logging.
@@ -125,6 +134,92 @@ fn redact_url(url: &str) -> String {
     } else {
         format!("{}://{}", scheme, host)
     }
+}
+
+/// Convert common markdown syntax into Signal's text and UTF-16 style ranges.
+fn markdown_to_signal(markdown: &str) -> (String, Vec<String>) {
+    let markdown = markdown.trim();
+    let mut text = String::new();
+    let mut styles = Vec::new();
+    let mut lines = markdown.lines().peekable();
+
+    while let Some(line) = lines.next() {
+        if let Some(language) = line.strip_prefix("```") {
+            let mut code = String::new();
+            if !language.trim().is_empty() {
+                // Language identifiers do not belong in the rendered content.
+            }
+            for code_line in lines.by_ref() {
+                if code_line == "```" {
+                    break;
+                }
+                if !code.is_empty() {
+                    text.push('\n');
+                }
+                code.push_str(code_line);
+            }
+            let start = utf16_length(&text);
+            text.push_str(&code);
+            let length = utf16_length(&code);
+            if length > 0 {
+                styles.push(format!("{start}:{length}:MONOSPACE"));
+            }
+        } else {
+            let heading = line
+                .strip_prefix("###### ")
+                .or_else(|| line.strip_prefix("##### "))
+                .or_else(|| line.strip_prefix("#### "))
+                .or_else(|| line.strip_prefix("### "))
+                .or_else(|| line.strip_prefix("## "))
+                .or_else(|| line.strip_prefix("# "));
+            let start = utf16_length(&text);
+            let rendered = render_signal_inline(heading.unwrap_or(line), &mut text, &mut styles);
+            if heading.is_some() && rendered > 0 {
+                styles.push(format!("{start}:{rendered}:BOLD"));
+            }
+        }
+        if lines.peek().is_some() {
+            text.push('\n');
+        }
+    }
+
+    (text, styles)
+}
+
+/// Render inline markdown into `text`, adding native Signal ranges as it goes.
+fn render_signal_inline(source: &str, text: &mut String, styles: &mut Vec<String>) -> usize {
+    let mut remaining = source;
+    let start = utf16_length(text);
+    while !remaining.is_empty() {
+        let Some((delimiter, style)) = MARKDOWN_STYLES
+            .iter()
+            .find(|(delimiter, _)| remaining.starts_with(*delimiter))
+        else {
+            let character = remaining.chars().next().expect("non-empty source");
+            text.push(character);
+            remaining = &remaining[character.len_utf8()..];
+            continue;
+        };
+        let after_open = &remaining[delimiter.len()..];
+        let Some(end) = after_open.find(delimiter) else {
+            text.push_str(delimiter);
+            remaining = after_open;
+            continue;
+        };
+        let content = &after_open[..end];
+        let span_start = utf16_length(text);
+        text.push_str(content);
+        let length = utf16_length(content);
+        if length > 0 {
+            styles.push(format!("{span_start}:{length}:{style}"));
+        }
+        remaining = &after_open[end + delimiter.len()..];
+    }
+    utf16_length(text) - start
+}
+
+fn utf16_length(text: &str) -> usize {
+    text.encode_utf16().count()
 }
 
 // ── signal-cli SSE event JSON shapes ────────────────────────────
@@ -389,6 +484,21 @@ impl SignalAdapter {
         params
     }
 
+    fn build_styled_rpc_params(
+        &self,
+        target: &RecipientTarget,
+        message: &str,
+    ) -> serde_json::Value {
+        let (text, styles) = markdown_to_signal(message);
+        let mut params = self.build_rpc_params(target, Some(&text), None);
+        if styles.len() == 1 {
+            params["textStyle"] = serde_json::Value::String(styles[0].clone());
+        } else if !styles.is_empty() {
+            params["textStyles"] = serde_json::json!(styles);
+        }
+        params
+    }
+
     // ── outbound helpers ────────────────────────────────────────
 
     /// Resolve the outbound target for a conversation from message metadata.
@@ -406,7 +516,7 @@ impl SignalAdapter {
 
     /// Send a text message to the resolved target.
     async fn send_text(&self, target: &RecipientTarget, text: &str) -> anyhow::Result<()> {
-        let params = self.build_rpc_params(target, Some(text), None);
+        let params = self.build_styled_rpc_params(target, text);
         self.rpc_request("send", params).await?;
         Ok(())
     }
@@ -781,7 +891,6 @@ impl Messaging for SignalAdapter {
                 self.send_text(&target, &text).await?;
             }
             OutboundResponse::RichMessage { text, .. } => {
-                // Signal has no rich formatting — send plain text.
                 self.stop_typing(&message.conversation_id).await;
                 self.send_text(&target, &text).await?;
             }
@@ -1603,6 +1712,33 @@ mod tests {
 
         assert!(params.get("message").is_none());
         assert!(params.get("attachments").is_none());
+    }
+
+    #[test]
+    fn markdown_conversion_uses_utf16_style_ranges() {
+        let (text, styles) = markdown_to_signal("# Hello\n**bold** and `code` \u{1f680}");
+
+        assert_eq!(text, "Hello\nbold and code \u{1f680}");
+        assert_eq!(styles, vec!["0:5:BOLD", "6:4:BOLD", "15:4:MONOSPACE"]);
+    }
+
+    #[test]
+    fn styled_rpc_params_use_single_and_multiple_style_keys() {
+        let adapter = test_adapter();
+        let target = RecipientTarget::Direct("+5555555555".to_string());
+
+        let single = adapter.build_styled_rpc_params(&target, "**bold**");
+        assert_eq!(single["message"], "bold");
+        assert_eq!(single["textStyle"], "0:4:BOLD");
+        assert!(single.get("textStyles").is_none());
+
+        let multiple = adapter.build_styled_rpc_params(&target, "**bold** and `code`");
+        assert_eq!(multiple["message"], "bold and code");
+        assert_eq!(
+            multiple["textStyles"],
+            serde_json::json!(["0:4:BOLD", "9:4:MONOSPACE"])
+        );
+        assert!(multiple.get("textStyle").is_none());
     }
 
     #[test]

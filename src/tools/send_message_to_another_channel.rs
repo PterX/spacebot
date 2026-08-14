@@ -30,6 +30,7 @@ pub struct SendMessageTool {
     conversation_logger: ConversationLogger,
     agent_display_name: String,
     current_adapter: Option<String>,
+    process_control_registry: Arc<crate::agent::process_control::ProcessControlRegistry>,
 }
 
 impl std::fmt::Debug for SendMessageTool {
@@ -45,6 +46,7 @@ impl SendMessageTool {
         conversation_logger: ConversationLogger,
         agent_display_name: String,
         current_adapter: Option<String>,
+        process_control_registry: Arc<crate::agent::process_control::ProcessControlRegistry>,
     ) -> Self {
         Self {
             messaging_manager,
@@ -52,6 +54,7 @@ impl SendMessageTool {
             conversation_logger,
             agent_display_name,
             current_adapter,
+            process_control_registry,
         }
     }
 }
@@ -358,6 +361,17 @@ impl Tool for SendMessageTool {
             &args.message,
             Some(&self.agent_display_name),
         );
+
+        // A resident destination keeps its own in-memory history, which the
+        // durable write above does not reach. Without this the receiving
+        // channel's next turn cannot see what was just said in its name.
+        if let Some(handle) = self
+            .process_control_registry
+            .channel_handle(&destination_channel_id)
+            .await
+        {
+            handle.state().inject_agent_message(&args.message).await;
+        }
 
         tracing::info!(
             adapter = %broadcast_target.adapter,

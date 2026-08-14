@@ -1,0 +1,24 @@
+---
+title: Questions
+description: Durable operator questions and answer correlation.
+---
+
+# Questions
+
+The `ask` tool lets an agent pause for a decision without losing the work that led to it. Spacebot stores the question, answer options, source channel, delivery reference, and eventual answer in the pending-question store.
+
+Questions survive restarts and can be answered later. The answer is correlated to the original request even when the user responds from a different supported interaction surface.
+
+## Behavior
+
+An agent supplies a question, a set of labeled options, and whether multiple selections are allowed. Spacebot delivers the question through the current messaging surface when it supports interactions and records the resulting answer once.
+
+Pending and resolved questions expire after seven days. Resolution is atomic: a duplicate click or late retry cannot replace an answer that was already recorded.
+
+Use `ask` when work requires operator intent. Do not use it for routine progress updates, which belong in task state, worker status, or an autonomy run summary.
+
+## Related Documentation
+
+- [Autonomy](/docs/autonomy)
+- [Tasks](/docs/tasks)
+- [Messaging](/docs/messaging)

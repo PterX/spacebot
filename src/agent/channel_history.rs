@@ -42,6 +42,7 @@ pub(crate) fn apply_history_after_turn(
     history_len_before: usize,
     channel_id: &str,
     is_retrigger: bool,
+    persisted_user_text: Option<(&str, &str)>,
 ) -> AppliedHistory {
     match result {
         Ok(_) => {
@@ -51,7 +52,9 @@ pub(crate) fn apply_history_after_turn(
             // concurrent writes from background tasks (e.g. the compaction
             // worker) that landed in guard between the clone and the write-back
             // are not erased.
-            let new_messages = history.into_iter().skip(history_len_before);
+            let mut new_messages: Vec<rig::message::Message> =
+                history.into_iter().skip(history_len_before).collect();
+            strip_turn_envelope(&mut new_messages, persisted_user_text);
             guard.extend(new_messages);
             AppliedHistory::default()
         }
@@ -61,7 +64,9 @@ pub(crate) fn apply_history_after_turn(
             // every message built before the turn cap was hit, in a consistent
             // state (no dangling tool calls; the error fires at loop-iteration
             // start, after the previous iteration's tool results were pushed).
-            let new_messages = chat_history[history_len_before..].iter().cloned();
+            let mut new_messages: Vec<rig::message::Message> =
+                chat_history[history_len_before..].to_vec();
+            strip_turn_envelope(&mut new_messages, persisted_user_text);
             guard.extend(new_messages);
             AppliedHistory::default()
         }
@@ -118,9 +123,11 @@ pub(crate) fn apply_history_after_turn(
             // messages, and internal correction prompts.
             let mut preserved = 0usize;
 
-            // Preserve the user text message
+            // Preserve the user text message, minus the live turn envelope.
             if let Some(message) = new_messages.iter().find(|m| is_user_text_message(m)) {
-                guard.push(message.clone());
+                let mut message = message.clone();
+                strip_turn_envelope(std::slice::from_mut(&mut message), persisted_user_text);
+                guard.push(message);
                 preserved += 1;
             }
 
@@ -179,6 +186,31 @@ pub(crate) fn apply_history_after_turn(
 pub(crate) struct AppliedHistory {
     pub retrigger_reply_preserved: bool,
     pub reply_text: Option<String>,
+}
+
+/// Replace the live turn envelope with the plain user text before history
+/// persists. The envelope (wall-clock line, coalesce hint) is addressed to
+/// the current turn only — persisted copies would stack stale clock lines
+/// and repeat harness policy as user speech on every later turn.
+fn strip_turn_envelope(
+    messages: &mut [rig::message::Message],
+    persisted_user_text: Option<(&str, &str)>,
+) {
+    let Some((live_text, plain_text)) = persisted_user_text else {
+        return;
+    };
+    for message in messages {
+        let rig::message::Message::User { content } = message else {
+            continue;
+        };
+        let matches_live = content
+            .iter()
+            .any(|c| matches!(c, rig::message::UserContent::Text(t) if t.text == live_text));
+        if matches_live {
+            *content = rig::OneOrMany::one(rig::message::UserContent::text(plain_text));
+            return;
+        }
+    }
 }
 
 /// Count assistant messages carrying tool calls in a history slice.
@@ -414,6 +446,17 @@ pub(crate) fn format_batched_user_message(
     format!("[{display_name}] ({absolute_timestamp}; {relative_text}): {text_content}")
 }
 
+/// Wrap a live user message with the current wall-clock line.
+///
+/// The clock leaves the system prompt — a guaranteed per-turn cache miss —
+/// and rides on the current user message envelope instead, where per-turn
+/// change costs nothing. History messages already bake absolute timestamps
+/// at insert time (`format_user_message`), so the model keeps temporal
+/// grounding without the system prompt ever observing `Utc::now()`.
+pub(crate) fn with_time_envelope(current_time_line: &str, body: &str) -> String {
+    format!("Current date/time: {current_time_line}\n\n{body}")
+}
+
 pub(crate) fn extract_message_id(message: &InboundMessage) -> Option<String> {
     message
         .metadata
@@ -476,6 +519,14 @@ pub(crate) fn event_is_for_channel(event: &ProcessEvent, channel_id: &ChannelId)
             channel_id: event_channel,
             ..
         }
+        | ProcessEvent::CompactionStarted {
+            channel_id: event_channel,
+            ..
+        }
+        | ProcessEvent::CompactionCompleted {
+            channel_id: event_channel,
+            ..
+        }
         | ProcessEvent::ChronicleCheckpoint {
             channel_id: event_channel,
             ..
@@ -489,6 +540,10 @@ pub(crate) fn event_is_for_channel(event: &ProcessEvent, channel_id: &ChannelId)
             ..
         } => event_channel == channel_id,
         ProcessEvent::TextDelta {
+            channel_id: event_channel,
+            ..
+        }
+        | ProcessEvent::ReasoningDelta {
             channel_id: event_channel,
             ..
         } => event_channel.as_ref() == Some(channel_id),
@@ -508,10 +563,12 @@ pub(crate) fn event_is_for_channel(event: &ProcessEvent, channel_id: &ChannelId)
             channel_id: event_channel,
             ..
         } => event_channel == channel_id,
-        ProcessEvent::OpenCodePartUpdated { .. }
+        ProcessEvent::ChannelSystemMessage { .. }
+        | ProcessEvent::ChannelAssistantMessage { .. }
+        | ProcessEvent::OpenCodePartUpdated { .. }
         | ProcessEvent::StatusUpdate { .. }
         | ProcessEvent::TaskUpdated { .. }
-        | ProcessEvent::WorkerText { .. }
+        | ProcessEvent::ProcessText { .. }
         | ProcessEvent::CortexChatUpdate { .. }
         | ProcessEvent::ToolOutput { .. } => false,
     }
@@ -530,6 +587,38 @@ mod tests {
         Message::User {
             content: rig::OneOrMany::one(rig::message::UserContent::text(text)),
         }
+    }
+
+    #[test]
+    fn history_persists_plain_text_not_the_turn_envelope() {
+        let plain = "[user] (2026-08-11 09:00:00): hello";
+        let live = super::with_time_envelope("2026-08-11 09:00:12 UTC", plain);
+
+        let mut guard: Vec<Message> = Vec::new();
+        let history = vec![user_msg(&live), assistant_msg("hi")];
+        apply_history_after_turn(
+            &Ok("hi".to_string()),
+            &mut guard,
+            history,
+            0,
+            "test",
+            false,
+            Some((&live, plain)),
+        );
+
+        assert_eq!(guard.len(), 2);
+        let Message::User { content } = &guard[0] else {
+            panic!("first persisted message should be the user turn");
+        };
+        let text = content
+            .iter()
+            .find_map(|c| match c {
+                rig::message::UserContent::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .expect("user text");
+        assert_eq!(text, plain);
+        assert!(!text.contains("Current date/time"));
     }
 
     fn assistant_msg(text: &str) -> Message {
@@ -566,6 +655,7 @@ mod tests {
             len_before,
             "test",
             false,
+            None,
         );
 
         assert_eq!(guard, history);
@@ -584,7 +674,15 @@ mod tests {
             prompt: Box::new(user_msg("prompt")),
         });
 
-        apply_history_after_turn(&err, &mut guard, history.clone(), len_before, "test", false);
+        apply_history_after_turn(
+            &err,
+            &mut guard,
+            history.clone(),
+            len_before,
+            "test",
+            false,
+            None,
+        );
 
         assert_eq!(guard, history);
     }
@@ -613,7 +711,7 @@ mod tests {
             reason: "reply delivered".to_string(),
         });
 
-        apply_history_after_turn(&err, &mut guard, history, len_before, "test", false);
+        apply_history_after_turn(&err, &mut guard, history, len_before, "test", false, None);
 
         // User prompt and reply content should be preserved, tool-call structure discarded
         let mut expected = initial;
@@ -659,7 +757,7 @@ mod tests {
             reason: "reply delivered".to_string(),
         });
 
-        apply_history_after_turn(&err, &mut guard, history, len_before, "test", false);
+        apply_history_after_turn(&err, &mut guard, history, len_before, "test", false, None);
 
         let mut expected = initial;
         expected.push(user_msg("new user prompt"));
@@ -695,7 +793,7 @@ mod tests {
             reason: "reply delivered".to_string(),
         });
 
-        apply_history_after_turn(&err, &mut guard, history, len_before, "test", false);
+        apply_history_after_turn(&err, &mut guard, history, len_before, "test", false, None);
 
         let mut expected = initial;
         expected.push(user_msg("real user prompt"));
@@ -734,7 +832,7 @@ mod tests {
         });
 
         let preserved =
-            apply_history_after_turn(&err, &mut guard, history, len_before, "test", true);
+            apply_history_after_turn(&err, &mut guard, history, len_before, "test", true, None);
 
         let mut expected = initial;
         expected.push(assistant_msg("Relayed branch result to user."));
@@ -769,7 +867,7 @@ mod tests {
         });
 
         let preserved =
-            apply_history_after_turn(&err, &mut guard, history, len_before, "test", true);
+            apply_history_after_turn(&err, &mut guard, history, len_before, "test", true, None);
 
         assert!(
             !preserved.retrigger_reply_preserved,
@@ -794,7 +892,7 @@ mod tests {
             CompletionError::ResponseError("API error".to_string()),
         ));
 
-        apply_history_after_turn(&err, &mut guard, history, len_before, "test", false);
+        apply_history_after_turn(&err, &mut guard, history, len_before, "test", false, None);
 
         assert_eq!(
             guard, initial,
@@ -815,7 +913,7 @@ mod tests {
             "nonexistent_tool".to_string(),
         )));
 
-        apply_history_after_turn(&err, &mut guard, history, len_before, "test", false);
+        apply_history_after_turn(&err, &mut guard, history, len_before, "test", false, None);
 
         assert_eq!(
             guard, initial,
@@ -859,7 +957,7 @@ mod tests {
             reason: "reply delivered".to_string(),
         });
 
-        apply_history_after_turn(&err, &mut guard, history, len_before, "test", false);
+        apply_history_after_turn(&err, &mut guard, history, len_before, "test", false, None);
 
         assert!(
             guard.is_empty(),
@@ -881,7 +979,7 @@ mod tests {
             reason: "skip delivered".to_string(),
         });
 
-        apply_history_after_turn(&err, &mut guard, history, len_before, "test", false);
+        apply_history_after_turn(&err, &mut guard, history, len_before, "test", false, None);
 
         assert_eq!(
             guard, initial,
@@ -919,6 +1017,7 @@ mod tests {
             len_before,
             "test",
             false,
+            None,
         );
 
         // User prompt and reply content preserved, tool-call structure discarded
@@ -949,6 +1048,7 @@ mod tests {
             len_before2,
             "test",
             false,
+            None,
         );
 
         assert_eq!(
@@ -1042,6 +1142,24 @@ mod tests {
         assert!(
             !formatted_normal.contains("[attachment or empty message]"),
             "normal messages should not use placeholder"
+        );
+    }
+
+    #[test]
+    fn with_time_envelope_prepends_clock_line() {
+        use super::with_time_envelope;
+
+        let enveloped = with_time_envelope("2026-08-11 12:00:00 UTC", "hello");
+        assert_eq!(
+            enveloped,
+            "Current date/time: 2026-08-11 12:00:00 UTC\n\nhello"
+        );
+
+        // Multi-line body keeps its own shape below the envelope.
+        let enveloped = with_time_envelope("2026-08-11 12:00:00 UTC", "line 1\nline 2");
+        assert_eq!(
+            enveloped,
+            "Current date/time: 2026-08-11 12:00:00 UTC\n\nline 1\nline 2"
         );
     }
 

@@ -63,7 +63,7 @@ export const SECTIONS: AgentConfigSection[] = [
 		group: "config",
 		description: "System observer settings",
 		detail:
-			"The cortex monitors active processes and generates memory bulletins. Tick interval controls observation frequency. Timeouts determine when stuck workers or branches get cancelled. The circuit breaker auto-disables after consecutive failures.",
+			"The cortex monitors active processes and writes to the memory store. Tick interval controls observation frequency. Timeouts determine when stuck workers or branches get cancelled. The circuit breaker auto-disables after consecutive failures.",
 	},
 	{
 		id: "coalesce",

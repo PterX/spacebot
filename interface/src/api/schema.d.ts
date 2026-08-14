@@ -2859,8 +2859,6 @@ export interface components {
             activity_heatmap: components["schemas"]["HeatmapCell"][];
             channel_count: number;
             cron_jobs: components["schemas"]["CronJobInfo"][];
-            last_bulletin_at?: string | null;
-            latest_bulletin?: string | null;
             memory_counts: {
                 [key: string]: number;
             };
@@ -2888,7 +2886,6 @@ export interface components {
             cron_job_count: number;
             id: string;
             last_activity_at?: string | null;
-            last_bulletin_at?: string | null;
             /** Format: int64 */
             memory_total: number;
             profile?: null | components["schemas"]["AgentProfile"];
@@ -3136,6 +3133,15 @@ export interface components {
         ChannelsResponse: {
             channels: components["schemas"]["ChannelResponse"][];
         };
+        /**
+         * @description Chronicle checkpoint reference surfaced on search results: which
+         *     checkpoint's span produced this memory (range join, 1.7).
+         */
+        CheckpointRef: {
+            /** Format: int64 */
+            seq: number;
+            title: string;
+        };
         /** @description Session chronicle tuning. Only consulted when `mode` is "chronicle". */
         ChronicleSection: {
             context_token_budget: number;
@@ -3312,10 +3318,6 @@ export interface components {
         CortexSection: {
             /** Format: int64 */
             branch_timeout_secs: number;
-            /** Format: int64 */
-            bulletin_interval_secs: number;
-            bulletin_max_turns: number;
-            bulletin_max_words: number;
             /** Format: int32 */
             circuit_breaker_threshold: number;
             /** Format: int32 */
@@ -3339,10 +3341,6 @@ export interface components {
         CortexUpdate: {
             /** Format: int64 */
             branch_timeout_secs?: number | null;
-            /** Format: int64 */
-            bulletin_interval_secs?: number | null;
-            bulletin_max_turns?: number | null;
-            bulletin_max_words?: number | null;
             /** Format: int32 */
             circuit_breaker_threshold?: number | null;
             /** Format: int32 */
@@ -3496,14 +3494,21 @@ export interface components {
             /** @description Agent assigned to execute. Defaults to `owner_agent_id`. */
             assigned_agent_id?: string | null;
             created_by?: string | null;
+            depends_on?: components["schemas"]["TaskDependencyRequest"][];
             description?: string | null;
             metadata?: unknown;
             /** @description Agent that owns (created) this task. */
             owner_agent_id: string;
             priority?: string | null;
+            project_id?: string | null;
+            repo_id?: string | null;
+            required_skills?: string[];
             source_memory_id?: string | null;
             subtasks?: components["schemas"]["TaskSubtask"][];
             title: string;
+            worker_type?: null | components["schemas"]["TaskWorkerType"];
+            worktree_id?: string | null;
+            worktree_mode?: null | components["schemas"]["TaskWorktreeMode"];
         };
         CreateWorktreeRequest: {
             branch: string;
@@ -3876,6 +3881,11 @@ export interface components {
         };
         MemoriesSearchResponse: {
             results: components["schemas"]["MemorySearchResult"][];
+            /**
+             * @description Chronicle checkpoint hits from the unified search surface, labeled so
+             *     the frontend can render sessions apart from memories.
+             */
+            sessions: components["schemas"]["SessionSearchHit"][];
         };
         /** @description Memory structure. */
         Memory: {
@@ -3897,6 +3907,11 @@ export interface components {
             last_accessed_at: string;
             memory_type: components["schemas"]["MemoryType"];
             source?: string | null;
+            /**
+             * @description Chronicle checkpoint whose span this memory superseded (set by write-
+             *     time consolidation). Provenance for supersede-with-provenance (1.7).
+             */
+            supersedes_checkpoint_id?: string | null;
             /** Format: date-time */
             updated_at: string;
         };
@@ -3924,6 +3939,7 @@ export interface components {
         };
         /** @description Search result combining memory with relevance score. */
         MemorySearchResult: {
+            checkpoint?: null | components["schemas"]["CheckpointRef"];
             memory: components["schemas"]["Memory"];
             rank: number;
             /** Format: float */
@@ -3933,7 +3949,7 @@ export interface components {
          * @description Memory types.
          * @enum {string}
          */
-        MemoryType: "fact" | "preference" | "decision" | "identity" | "event" | "observation" | "goal" | "todo";
+        MemoryType: "fact" | "preference" | "decision" | "identity" | "event" | "observation" | "goal" | "todo" | "human";
         MessagesResponse: {
             has_more: boolean;
             items: components["schemas"]["TimelineItem"][];
@@ -4533,6 +4549,16 @@ export interface components {
             /** @enum {string} */
             kind: "agent";
         };
+        /** @description A chronicle checkpoint hit returned alongside memory results. */
+        SessionSearchHit: {
+            channel_id: string;
+            checkpoint_id: string;
+            /** Format: int64 */
+            seq: number;
+            /** Format: float */
+            similarity: number;
+            title: string;
+        };
         SetChannelArchiveRequest: {
             agent_id: string;
             archived: boolean;
@@ -4549,6 +4575,7 @@ export interface components {
         };
         SkillInfo: {
             base_dir: string;
+            category: string;
             description: string;
             file_path: string;
             name: string;
@@ -4595,6 +4622,11 @@ export interface components {
             completed_at?: string | null;
             created_at: string;
             created_by: string;
+            /**
+             * @description Dependency edges, hydrated by the store's read paths (not stored on
+             *     the tasks row).
+             */
+            depends_on?: components["schemas"]["TaskDependencyEdge"][];
             description?: string | null;
             /** @description Goal this task contributes to, when linked. */
             goal_id?: string | null;
@@ -4602,6 +4634,18 @@ export interface components {
             metadata: unknown;
             owner_agent_id: string;
             priority: components["schemas"]["TaskPriority"];
+            /** @description Execution plan: project this task's work belongs to. */
+            project_id?: string | null;
+            /**
+             * @description Execution plan: repo within the project, needed when `worktree_mode`
+             *     is `create` on a multi-repo project.
+             */
+            repo_id?: string | null;
+            /**
+             * @description Skills whose content is injected into the executing worker's context
+             *     unconditionally — a contract, unlike advisory `suggested_skills`.
+             */
+            required_skills: string[];
             source_memory_id?: string | null;
             status: components["schemas"]["TaskStatus"];
             subtasks: components["schemas"]["TaskSubtask"][];
@@ -4610,10 +4654,37 @@ export interface components {
             title: string;
             updated_at: string;
             worker_id?: string | null;
+            worker_type?: null | components["schemas"]["TaskWorkerType"];
+            /** @description Execution plan: existing worktree to run in (`worktree_mode: existing`). */
+            worktree_id?: string | null;
+            worktree_mode?: null | components["schemas"]["TaskWorktreeMode"];
         };
         TaskActionResponse: {
             message: string;
             success: boolean;
+        };
+        /**
+         * @description A dependency edge as seen from the dependent task, with enough context to
+         *     render and to compute blockedness without another query.
+         */
+        TaskDependencyEdge: {
+            depends_on_status: components["schemas"]["TaskStatus"];
+            /** Format: int64 */
+            depends_on_task_number: number;
+            depends_on_title: string;
+            kind: components["schemas"]["TaskDependencyKind"];
+            /** @description Whether this edge currently permits the dependent to run. */
+            satisfied: boolean;
+        };
+        /**
+         * @description How a dependency edge blocks its dependent.
+         * @enum {string}
+         */
+        TaskDependencyKind: "gate" | "stack";
+        TaskDependencyRequest: {
+            kind?: null | components["schemas"]["TaskDependencyKind"];
+            /** Format: int64 */
+            task: number;
         };
         TaskListResponse: {
             tasks: components["schemas"]["Task"][];
@@ -4629,6 +4700,16 @@ export interface components {
             completed: boolean;
             title: string;
         };
+        /**
+         * @description Which kind of worker executes a task.
+         * @enum {string}
+         */
+        TaskWorkerType: "builtin" | "opencode";
+        /**
+         * @description Where a task's worker runs relative to its project checkout.
+         * @enum {string}
+         */
+        TaskWorktreeMode: "root" | "existing" | "create";
         /** @description A unified timeline item combining messages, branch runs, and worker runs. */
         TimelineItem: {
             attachments?: components["schemas"]["SavedAttachmentMeta"][];
@@ -4909,13 +4990,21 @@ export interface components {
             approved_by?: string | null;
             assigned_agent_id?: string | null;
             complete_subtask?: number | null;
+            /** @description Full replacement of dependency edges; omit to leave unchanged. */
+            depends_on?: components["schemas"]["TaskDependencyRequest"][] | null;
             description?: string | null;
             metadata?: unknown;
             priority?: string | null;
+            project_id?: string | null;
+            repo_id?: string | null;
+            required_skills?: string[] | null;
             status?: string | null;
             subtasks?: components["schemas"]["TaskSubtask"][] | null;
             title?: string | null;
             worker_id?: string | null;
+            worker_type?: null | components["schemas"]["TaskWorkerType"];
+            worktree_id?: string | null;
+            worktree_mode?: null | components["schemas"]["TaskWorktreeMode"];
         };
         UploadSkillResponse: {
             installed: string[];
@@ -5043,12 +5132,12 @@ export interface components {
         WarmupState: "cold" | "warming" | "warm" | "degraded";
         /** @description Warmup runtime status snapshot for API and observability. */
         WarmupStatus: {
-            /** Format: int64 */
-            bulletin_age_secs?: number | null;
             embedding_ready: boolean;
             last_error?: string | null;
             /** Format: int64 */
             last_refresh_unix_ms?: number | null;
+            /** Format: int64 */
+            refresh_age_secs?: number | null;
             state: components["schemas"]["WarmupState"];
         };
         WarmupStatusEntry: {

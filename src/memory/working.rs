@@ -612,14 +612,45 @@ pub async fn render_working_memory(
         };
 
         // Boost events from the current channel: always include them.
-        for event in &tail_events {
-            let line = format_event_line(event, channel_id);
-            let line_tokens = estimate_tokens(&line);
+        // Collapse consecutive identical events ("Agent started ×7").
+        let collapsed: Vec<(String, usize)> = {
+            let mut out: Vec<(String, usize)> = Vec::new();
+            for event in &tail_events {
+                let line = format_event_line(event, channel_id);
+                if let Some((last_line, count)) = out.last_mut()
+                    && *last_line == line
+                {
+                    *count += 1;
+                    continue;
+                }
+                out.push((line, 1));
+            }
+            out
+        };
+        let mut events_shown = 0usize;
+        for (line, count) in &collapsed {
+            let rendered = if *count > 1 {
+                format!("{line} ×{count}")
+            } else {
+                line.clone()
+            };
+            let line_tokens = estimate_tokens(&rendered);
             if tokens_used + line_tokens > today_budget {
                 break;
             }
-            writeln!(output, "- {line}").ok();
+            writeln!(output, "- {rendered}").ok();
             tokens_used += line_tokens;
+            events_shown += count;
+        }
+        // A view discloses its depth: when selection dropped events, say
+        // how many exist so recall knows there is more than the render.
+        if events_shown < unsynthesized.len() {
+            writeln!(
+                output,
+                "({events_shown} of {} events shown)",
+                unsynthesized.len()
+            )
+            .ok();
         }
     }
 
@@ -702,7 +733,8 @@ pub async fn render_channel_activity_map(
             c.display_name, \
             c.platform, \
             m.sender_name AS last_sender_name, \
-            m.created_at AS last_message_at \
+            m.created_at AS last_message_at, \
+            (SELECT COUNT(*) FROM conversation_messages cm WHERE cm.channel_id = c.id) AS message_count \
          FROM channels c \
          LEFT JOIN conversation_messages m ON m.id = ( \
             SELECT id FROM conversation_messages \
@@ -737,14 +769,15 @@ pub async fn render_channel_activity_map(
 
     let now = Utc::now();
     let mut output = String::with_capacity(512);
-    writeln!(output, "## Other Channels\n").ok();
+    writeln!(output, "## Channel Activity\n").ok();
 
     for row in &rows {
         let channel_id: String = row.get("id");
         let display_name: Option<String> = row.get("display_name");
-        let _platform: String = row.get("platform");
+        let platform: String = row.get("platform");
         let last_sender: Option<String> = row.get("last_sender_name");
         let last_message_at: Option<DateTime<Utc>> = row.get("last_message_at");
+        let message_count: i64 = row.get("message_count");
 
         let name = display_name.as_deref().unwrap_or(&channel_id);
 
@@ -756,7 +789,10 @@ pub async fn render_channel_activity_map(
         let sender = last_sender.as_deref().unwrap_or("unknown");
         let topic = topic_hints.get(&channel_id);
 
-        let mut line = format!("{name} -- {time_ago}, {sender}");
+        let mut line = format!(
+            "- {name} ({platform}) — {time_ago} · {} messages · last: {sender}",
+            group_thousands(message_count)
+        );
         if let Some(topic_summary) = topic {
             // Truncate topic to keep the map compact.
             let truncated = if topic_summary.len() > 80 {
@@ -780,6 +816,8 @@ pub async fn render_participant_context(
     participants: &[crate::conversation::ActiveParticipant],
     channel_id: &str,
     config: &crate::config::ParticipantContextConfig,
+    memory_store: &crate::memory::MemoryStore,
+    anchor_cache: &tokio::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
 ) -> Result<String> {
     use std::fmt::Write;
 
@@ -789,9 +827,10 @@ pub async fn render_participant_context(
 
     let now = Utc::now();
     let mut output = String::new();
-    writeln!(output, "## Participants\n").ok();
+    let mut shown = 0usize;
 
     for participant in participants {
+        shown += 1;
         write!(output, "**{}**", participant.display_name).ok();
         if let Some(role) = participant.role.as_deref() {
             write!(output, " -- {role}").ok();
@@ -811,12 +850,32 @@ pub async fn render_participant_context(
         )
         .await?;
         writeln!(output, "  Recent: {recent_line}.").ok();
+
+        // Human anchor (3.1a): the curated anchor memory for this person,
+        // resolved exactly by participant key and cached per session. Only
+        // the first line is shown inline — the anchor is a summary, not a
+        // dump.
+        if let Some(anchor) =
+            resolve_human_anchor(memory_store, anchor_cache, &participant.participant_key).await?
+        {
+            let first_line = anchor.lines().next().unwrap_or("").trim();
+            if !first_line.is_empty() {
+                writeln!(output, "  Anchor: {first_line}").ok();
+            }
+        }
         writeln!(output).ok();
 
         if estimate_tokens(&output) >= config.token_budget {
             break;
         }
     }
+
+    let header = if shown < participants.len() {
+        format!("## Participants — {shown} of {}\n\n", participants.len())
+    } else {
+        "## Participants\n\n".to_string()
+    };
+    let output = format!("{header}{output}");
 
     if estimate_tokens(&output) > config.token_budget {
         let mut trimmed = String::new();
@@ -834,6 +893,48 @@ pub async fn render_participant_context(
     }
 
     Ok(output.trim_end().to_string())
+}
+
+/// In-turn human anchor resolution with a per-session cache. Exact match on
+/// the participant key; misses are cached too, so each human costs at most
+/// one query per session (3.1a). The cache is shared and mutated in place —
+/// the lock is held only around map access, never across the store query —
+/// so concurrent prompt builds accumulate entries instead of clobbering
+/// each other.
+async fn resolve_human_anchor(
+    store: &crate::memory::MemoryStore,
+    cache: &tokio::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
+    human_id: &str,
+) -> Result<Option<String>> {
+    if let Some(cached) = cache.lock().await.get(human_id) {
+        return Ok(cached.clone());
+    }
+    let resolved = store
+        .get_human_anchor(human_id)
+        .await?
+        .map(|memory| memory.content);
+    cache
+        .lock()
+        .await
+        .insert(human_id.to_string(), resolved.clone());
+    Ok(resolved)
+}
+
+/// Format an integer with `,` thousands separators for display.
+fn group_thousands(value: i64) -> String {
+    let digits = value.abs().to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+    if value < 0 {
+        format!("-{grouped}")
+    } else {
+        grouped
+    }
 }
 
 /// Format a single event as a one-line summary for the raw tail.
@@ -1742,9 +1843,16 @@ mod tests {
             last_message_at: Utc::now(),
         }];
 
-        let rendered = render_participant_context(&store, &participants, "discord:chan-1", &config)
-            .await
-            .unwrap();
+        let rendered = render_participant_context(
+            &store,
+            &participants,
+            "discord:chan-1",
+            &config,
+            &*crate::memory::MemoryStore::connect_in_memory().await,
+            &tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        )
+        .await
+        .unwrap();
 
         assert!(rendered.contains("## Participants"));
         assert!(rendered.contains("**Victor** -- Maintainer"));

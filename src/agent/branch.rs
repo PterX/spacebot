@@ -4,13 +4,14 @@ use crate::error::Result;
 use crate::hooks::SpacebotHook;
 use crate::llm::SpacebotModel;
 use crate::llm::routing::is_context_overflow_error;
-use crate::tools::{MemoryPersistenceContractState, MemoryPersistenceTerminalOutcome};
+use crate::tools::{
+    BranchDelegationState, MemoryPersistenceContractState, MemoryPersistenceTerminalOutcome,
+};
 use crate::{AgentDeps, BranchId, ChannelId, ProcessEvent, ProcessId, ProcessType};
 use rig::agent::AgentBuilder;
 use rig::completion::CompletionModel;
 use rig::tool::server::ToolServerHandle;
 use std::sync::Arc;
-use uuid::Uuid;
 
 /// Max consecutive context overflow recoveries before giving up.
 const MAX_OVERFLOW_RETRIES: usize = 2;
@@ -34,6 +35,7 @@ pub struct Branch {
     pub max_turns: usize,
     /// Optional completion contract state used only by silent memory-persistence branches.
     pub memory_persistence_contract: Option<Arc<MemoryPersistenceContractState>>,
+    pub branch_delegation: Option<Arc<BranchDelegationState>>,
     /// Model override from conversation settings (per-process or blanket).
     pub model_override: Option<String>,
 }
@@ -42,12 +44,14 @@ pub struct Branch {
 pub struct BranchExecutionConfig {
     pub max_turns: usize,
     pub memory_persistence_contract: Option<Arc<MemoryPersistenceContractState>>,
+    pub branch_delegation: Option<Arc<BranchDelegationState>>,
 }
 
 impl Branch {
     /// Create a new branch from a channel.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        id: BranchId,
         channel_id: ChannelId,
         description: impl Into<String>,
         deps: AgentDeps,
@@ -57,7 +61,6 @@ impl Branch {
         execution_config: BranchExecutionConfig,
         model_override: Option<String>,
     ) -> Self {
-        let id = Uuid::new_v4();
         let process_id = ProcessId::Branch(id);
         let mut hook = SpacebotHook::new(
             deps.agent_id.clone(),
@@ -68,6 +71,9 @@ impl Branch {
         );
         if let Some(contract_state) = &execution_config.memory_persistence_contract {
             hook = hook.with_memory_persistence_contract(contract_state.clone());
+        }
+        if let Some(delegation) = &execution_config.branch_delegation {
+            hook = hook.with_branch_delegation(delegation.clone());
         }
 
         Self {
@@ -81,6 +87,7 @@ impl Branch {
             tool_server,
             max_turns: execution_config.max_turns,
             memory_persistence_contract: execution_config.memory_persistence_contract,
+            branch_delegation: execution_config.branch_delegation,
             model_override,
         }
     }
@@ -129,6 +136,7 @@ impl Branch {
             .build();
 
         let mut current_prompt = prompt;
+        let mut transcript_history = Vec::new();
         let mut overflow_retries = 0;
         let mut memory_contract_retries = 0;
         let enforce_memory_contract = self.memory_persistence_contract.is_some();
@@ -137,11 +145,17 @@ impl Branch {
             if enforce_memory_contract {
                 self.hook.set_completion_contract_request_active(true);
             }
-            match self
+            let history_len_before_attempt = self.history.len();
+            let result = self
                 .hook
                 .prompt_once(&agent, &mut self.history, &current_prompt)
-                .await
-            {
+                .await;
+            transcript_history.extend_from_slice(
+                self.history
+                    .get(history_len_before_attempt..)
+                    .unwrap_or_default(),
+            );
+            match result {
                 Ok(response) => break response,
                 Err(rig::completion::PromptError::MaxTurnsError { .. }) => {
                     self.hook.set_completion_contract_request_active(false);
@@ -169,6 +183,15 @@ impl Branch {
                         "memory persistence branch reached terminal outcome"
                     );
                     break self.memory_persistence_conclusion();
+                }
+                Err(rig::completion::PromptError::PromptCancelled { reason, .. })
+                    if SpacebotHook::is_branch_delegated_reason(&reason) =>
+                {
+                    let delegation = self
+                        .branch_delegation_conclusion()
+                        .await
+                        .expect("branch delegation termination requires a delegation");
+                    break delegation;
                 }
                 Err(rig::completion::PromptError::PromptCancelled { reason, .. })
                     if enforce_memory_contract
@@ -242,7 +265,7 @@ impl Branch {
                         self.hook.set_completion_contract_request_active(false);
                     }
                     tracing::error!(branch_id = %self.id, %error, "branch LLM call failed");
-                    return Err(crate::error::AgentError::Other(error.into()).into());
+                    break format!("Branch failed: {error}");
                 }
             }
         };
@@ -262,12 +285,31 @@ impl Branch {
         };
         let conclusion = crate::secrets::scrub::scrub_leaks(&conclusion);
 
+        let transcript_steps =
+            crate::conversation::worker_transcript::transcript_steps(&transcript_history);
+        let tool_calls = transcript_steps
+            .iter()
+            .map(|step| match step {
+                crate::conversation::worker_transcript::TranscriptStep::Action { content } => content
+                    .iter()
+                    .filter(|content| matches!(content, crate::conversation::worker_transcript::ActionContent::ToolCall { .. }))
+                    .count() as i64,
+                _ => 0,
+            })
+            .sum();
+        let transcript = (!transcript_steps.is_empty())
+            .then(|| crate::conversation::worker_transcript::serialize_steps(&transcript_steps));
+        let status = classify_branch_status(&conclusion).to_string();
+
         // Send conclusion back to the channel
         let _ = self.deps.event_tx.send(ProcessEvent::BranchResult {
             agent_id: self.deps.agent_id.clone(),
             branch_id: self.id,
             channel_id: self.channel_id.clone(),
             conclusion: conclusion.clone(),
+            status,
+            transcript,
+            tool_calls,
         });
 
         // Flush accumulated token usage.
@@ -309,6 +351,14 @@ impl Branch {
             }
             None => "Memory persistence complete.".to_string(),
         }
+    }
+
+    async fn branch_delegation_conclusion(&self) -> Option<String> {
+        let delegation = self.branch_delegation.as_ref()?.delegation().await?;
+        Some(format_branch_delegation_conclusion(
+            delegation.worker_id,
+            &delegation.task,
+        ))
     }
 
     /// Compact history down to what the context window has left once this
@@ -361,5 +411,52 @@ impl Branch {
              Continue with the information available.]"
         );
         self.history.insert(0, rig::message::Message::from(marker));
+    }
+}
+
+fn format_branch_delegation_conclusion(worker_id: crate::WorkerId, task: &str) -> String {
+    format!("Delegated task to worker {worker_id}: {task}")
+}
+
+pub(crate) fn classify_branch_status(conclusion: &str) -> &'static str {
+    if conclusion.starts_with("Branch cancelled:")
+        || conclusion.starts_with("Branch was cancelled:")
+    {
+        "cancelled"
+    } else if conclusion.starts_with("Branch failed:") {
+        "failed"
+    } else {
+        "done"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_branch_status, format_branch_delegation_conclusion};
+
+    #[test]
+    fn branch_terminal_status_matches_legacy_conclusion_prefixes() {
+        assert_eq!(classify_branch_status("Finished the investigation"), "done");
+        assert_eq!(
+            classify_branch_status("Branch failed: provider error"),
+            "failed"
+        );
+        assert_eq!(
+            classify_branch_status("Branch cancelled: user requested"),
+            "cancelled"
+        );
+        assert_eq!(
+            classify_branch_status("Branch was cancelled: timeout"),
+            "cancelled"
+        );
+    }
+
+    #[test]
+    fn delegated_branch_conclusion_is_deterministic() {
+        let worker_id = uuid::Uuid::nil();
+        assert_eq!(
+            format_branch_delegation_conclusion(worker_id, "inspect the repository"),
+            "Delegated task to worker 00000000-0000-0000-0000-000000000000: inspect the repository"
+        );
     }
 }

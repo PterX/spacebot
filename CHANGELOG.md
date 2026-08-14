@@ -2,6 +2,34 @@
 
 Seeded from GitHub releases; maintained by the release bump workflow.
 
+## v0.6.0 - The Chronicles Update
+
+### Release Story
+
+v0.6.0 is The Chronicles Update. Spacebot can now preserve the history of long-running conversations as a durable, navigable record instead of repeatedly rewriting one rolling summary. Chronicle compaction cuts append-only checkpoints over contiguous transcript ranges, keeps a bounded view in the live prompt, and lets the agent list checkpoints, open one, or expand a range through a branch. Checkpoints survive restarts, retain their provenance through rollups, and appear inline in the Portal timeline.
+
+The release also gives autonomous work a durable operating model. Every agent can have a home channel, goals, a configurable autonomy level, a run history, and typed wake sources for schedules, webhooks, task approvals, comments, and system events. The autonomy channel wakes with its identity, task state, goals, recent activity, and its own prior work. It enriches proposed tasks, executes approved work, records findings as it goes, and only reaches out when it needs a decision or finds something time-sensitive. The idle cortex working-memory loop is gone, so an agent does not spend tokens synthesizing context when there is no work to do.
+
+Tasks now carry the context needed to run real work. Execution plans define the worker type, project, worktree mode, and required skills. Dependency edges model gates and stacked work so blocked tasks do not run early. The task UI renders plans and dependencies, and task status can be reconciled directly by an operator when work completes outside Spacebot.
+
+Spacebot now learns from the work you do with it. Built-in skills give workers established procedures from the first run, while reflection can distill successful multi-step work into new skills or improve existing ones. Skills are organized into categories and ranked by access frequency, giving the model a compact index that routes it toward the procedures most relevant to the work at hand.
+
+Workers now begin as full forks of the channel that delegated to them, carrying the relevant conversation context instead of starting cold. Chronicles keep that context bounded as sessions age, so workers can act with more of the intent behind a task without inheriting an unmanageably large transcript. That makes Spacebot better suited to orchestration, where successful delegation depends on preserving context while keeping independent work focused.
+
+Highlights:
+- Session chronicles with append-only checkpoints, restart-safe coverage, timeline entries, and transcript expansion
+- Autonomy channels with goals, home-channel delivery, level controls, durable run history, and a live operations panel
+- Removed the idle cortex working-memory loop to stop background token spend without active work
+- Typed wake definitions and event queues for schedules, webhooks, approvals, comments, idle conditions, and internal events
+- Task execution plans and dependency graphs with readiness gating
+- Unified typed slash commands, including `/whoami` and `/pause`, with explicit authority and atomic settings updates
+- Full CLI coverage for instance resources through a shared API client
+- Skill lifecycle management: typed frontmatter, categories, usage tracking, reflection, and origin-scoped write controls
+- Full-context worker forks, with chronicle-bounded history for focused delegation
+- `ask` tool with durable pending questions and answer correlation
+- Memory-first knowledge context with deterministic rendering, write-time consolidation, human identity anchors, and reflection notices
+- Portal live compaction status, streaming reasoning, branch observability, and converged worker lifecycle state
+
 ## v0.5.0
 
 ### Release Story

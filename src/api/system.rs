@@ -93,7 +93,7 @@ pub(super) async fn status(State(state): State<Arc<ApiState>>) -> Json<StatusRes
     let uptime = state.started_at.elapsed();
     Json(StatusResponse {
         status: "running",
-        version: env!("CARGO_PKG_VERSION"),
+        version: env!("SPACEBOT_VERSION"),
         pid: std::process::id(),
         uptime_seconds: uptime.as_secs(),
     })
@@ -152,6 +152,7 @@ pub(super) async fn events_sse(
                             ApiEvent::InboundMessage { .. } => "inbound_message",
                             ApiEvent::OutboundMessage { .. } => "outbound_message",
                             ApiEvent::OutboundMessageDelta { .. } => "outbound_message_delta",
+                            ApiEvent::ReasoningDelta { .. } => "reasoning_delta",
                             ApiEvent::TypingState { .. } => "typing_state",
                             ApiEvent::WorkerStarted { .. } => "worker_started",
                             ApiEvent::WorkerStatusUpdate { .. } => "worker_status",
@@ -159,6 +160,8 @@ pub(super) async fn events_sse(
                             ApiEvent::WorkerCompleted { .. } => "worker_completed",
                             ApiEvent::BranchStarted { .. } => "branch_started",
                             ApiEvent::BranchCompleted { .. } => "branch_completed",
+                            ApiEvent::CompactionStarted { .. } => "compaction_started",
+                            ApiEvent::CompactionCompleted { .. } => "compaction_completed",
                             ApiEvent::ToolStarted { .. } => "tool_started",
                             ApiEvent::ToolCompleted { .. } => "tool_completed",
                             ApiEvent::ConfigReloaded => "config_reloaded",
@@ -166,7 +169,7 @@ pub(super) async fn events_sse(
                             ApiEvent::AgentMessageReceived { .. } => "agent_message_received",
                             ApiEvent::TaskUpdated { .. } => "task_updated",
                             ApiEvent::OpenCodePartUpdated { .. } => "opencode_part_updated",
-                            ApiEvent::WorkerText { .. } => "worker_text",
+                            ApiEvent::ProcessText { .. } => "process_text",
                             ApiEvent::CortexChatMessage { .. } => "cortex_chat_message",
                             ApiEvent::NotificationCreated { .. } => "notification_created",
                             ApiEvent::NotificationUpdated { .. } => "notification_updated",

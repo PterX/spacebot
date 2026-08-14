@@ -31,9 +31,12 @@ use std::path::{Path, PathBuf};
 pub const SUPPORT_SUBDIRS: &[&str] = &["references", "templates", "scripts", "assets"];
 
 /// Character budget for skill descriptions in prompt indexes. Enforced on
-/// create/edit paths; pre-existing skills render truncated instead of
-/// failing to load.
-pub const DESCRIPTION_BUDGET: usize = 80;
+/// create/edit paths; pre-existing and imported skills render truncated
+/// instead of failing to load.
+pub const DESCRIPTION_BUDGET: usize = 160;
+
+/// Maximum size of a SKILL.md file in bytes.
+pub const MAX_SKILL_BYTES: usize = 100 * 1024;
 
 /// Typed SKILL.md frontmatter. Unknown fields are ignored so skills from
 /// other ecosystems (carrying `version`, `author`, `license`, ...) load fine.
@@ -306,6 +309,35 @@ impl SkillSet {
         prompt_engine.render_skills_worker(skill_infos, &self.category_descriptions)
     }
 
+    /// Render the full content of required skills for direct injection into
+    /// a worker's system prompt.
+    ///
+    /// Unlike the index rendered by [`Self::render_worker_skills`], this
+    /// carries entire skill bodies — required skills are a contract the
+    /// worker must receive, not a listing it may consult. Names that don't
+    /// resolve are skipped with a warning; validation belongs to the caller.
+    pub fn render_required_skills(&self, names: &[&str]) -> Option<String> {
+        let mut sections = Vec::new();
+        for name in names {
+            match self.get(name) {
+                Some(skill) => {
+                    sections.push(format!("### {}\n\n{}", skill.name, skill.content.trim()));
+                }
+                None => {
+                    tracing::warn!(skill = %name, "required skill not found, skipping injection");
+                }
+            }
+        }
+        if sections.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "## Required Skills\n\nThe following skills are part of this task's contract. \
+             Follow them — they are not suggestions.\n\n{}",
+            sections.join("\n\n")
+        ))
+    }
+
     /// Remove a skill by name.
     ///
     /// Only workspace-level skills can be removed via this method. Built-in
@@ -393,7 +425,44 @@ fn index_description(description: &str) -> String {
         .chars()
         .take(DESCRIPTION_BUDGET.saturating_sub(3))
         .collect();
-    format!("{truncated}...")
+    // Cut back to the last word boundary so the index never ends mid-word;
+    // descriptions with no whitespace fall back to the raw character cut.
+    let cut = match truncated.rfind(char::is_whitespace) {
+        Some(index) => truncated[..index].trim_end(),
+        None => truncated.as_str(),
+    };
+    format!("{cut}...")
+}
+
+/// Structural validation shared by the create/edit and import paths: the
+/// file is within the size cap, frontmatter parses, a description exists,
+/// and the body is non-empty. The description budget is a create/edit
+/// policy enforced in `skill_manage`, not here — imported skills render
+/// truncated instead of failing to install.
+pub fn validate_skill_structure(content: &str) -> Result<(), String> {
+    if content.len() > MAX_SKILL_BYTES {
+        return Err(format!(
+            "SKILL.md is {} bytes; the cap is {MAX_SKILL_BYTES}",
+            content.len()
+        ));
+    }
+
+    let (frontmatter, body) =
+        parse_skill_markdown(content).map_err(|error| format!("invalid frontmatter: {error}"))?;
+
+    if frontmatter
+        .description
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        return Err("frontmatter must include a description".to_string());
+    }
+    if body.trim().is_empty() {
+        return Err("skill body is empty".to_string());
+    }
+
+    Ok(())
 }
 
 /// Public skill information for API responses.
@@ -483,23 +552,25 @@ fn latest_archived_copy(dir: &Path, name: &str) -> Option<PathBuf> {
 pub async fn restore_skill_dir(workspace_skills_dir: &Path, name: &str) -> anyhow::Result<PathBuf> {
     let archive_root = workspace_skills_dir.join(ARCHIVE_DIR);
 
-    // Look in the archive root, then one category level deep — mirroring
-    // discovery's two levels.
-    let mut found: Option<(PathBuf, PathBuf)> = latest_archived_copy(&archive_root, name)
-        .map(|source| (source, workspace_skills_dir.join(name)));
-
-    if found.is_none()
-        && let Ok(mut entries) = tokio::fs::read_dir(&archive_root).await
-    {
+    // Walk the archive tree breadth-first, mirroring discovery's recursive
+    // category nesting, so the shallowest copy wins. Directories that are
+    // themselves archived skills (they contain a SKILL.md) are not
+    // descended into.
+    let mut found: Option<(PathBuf, PathBuf)> = None;
+    let mut pending = std::collections::VecDeque::from([archive_root.clone()]);
+    while let Some(dir) = pending.pop_front() {
+        if let Some(source) = latest_archived_copy(&dir, name) {
+            let relative = dir.strip_prefix(&archive_root).unwrap_or(Path::new(""));
+            found = Some((source, workspace_skills_dir.join(relative).join(name)));
+            break;
+        }
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
         while let Ok(Some(entry)) = entries.next_entry().await {
-            let category_dir = entry.path();
-            if !category_dir.is_dir() {
-                continue;
-            }
-            if let Some(source) = latest_archived_copy(&category_dir, name) {
-                let category = entry.file_name();
-                found = Some((source, workspace_skills_dir.join(category).join(name)));
-                break;
+            let path = entry.path();
+            if path.is_dir() && !path.join("SKILL.md").exists() {
+                pending.push_back(path);
             }
         }
     }
@@ -539,14 +610,15 @@ pub async fn restore_skill_dir(workspace_skills_dir: &Path, name: &str) -> anyho
 
 /// Load all skills from a directory.
 ///
-/// Each subdirectory containing a `SKILL.md` file is treated as a skill. A
-/// subdirectory without one is treated as a category and scanned one level
-/// deeper, so both `skills/{name}/SKILL.md` and
-/// `skills/{category}/{name}/SKILL.md` load. Hidden directories (`.archive`,
-/// `.snapshots`, `.git`, ...) are excluded from discovery.
+/// Each subdirectory containing a `SKILL.md` file is treated as a skill; a
+/// subdirectory without one is treated as a category and scanned
+/// recursively, so `skills/{name}`, `skills/{category}/{name}`, and deeper
+/// nestings like `skills/{category}/{subcategory}/{name}` all load. Nested
+/// category names join with `/` (`mlops/inference`). Hidden directories
+/// (`.archive`, `.snapshots`, `.git`, ...) are excluded from discovery.
 ///
 /// Returns the loaded skills and any category descriptions found in
-/// `index.md` files within category directories.
+/// `DESCRIPTION.md` or `index.md` files within category directories.
 async fn load_skills_from_dir(
     dir: &Path,
     source: SkillSource,
@@ -554,57 +626,89 @@ async fn load_skills_from_dir(
     let mut skills = Vec::new();
     let mut category_descriptions = HashMap::new();
 
-    let mut entries = tokio::fs::read_dir(dir)
-        .await
-        .with_context(|| format!("failed to read skills directory: {}", dir.display()))?;
+    let mut pending: Vec<(PathBuf, String)> = vec![(dir.to_path_buf(), String::new())];
 
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-
-        if entry.file_name().to_string_lossy().starts_with('.') {
-            continue;
-        }
-
-        if path.join("SKILL.md").exists() {
-            load_skill_into(&mut skills, &path, "general", source.clone()).await;
-            continue;
-        }
-
-        // Category directory: scan its direct subdirectories for skills.
-        let category_name = entry.file_name().to_string_lossy().to_string();
-
-        // Load category description from index.md, if present.
-        if let Ok(Some(desc)) = load_category_description(&path).await {
-            category_descriptions.insert(category_name.clone(), desc);
-        }
-
-        let Ok(mut category_entries) = tokio::fs::read_dir(&path).await else {
-            continue;
-        };
-        while let Ok(Some(category_entry)) = category_entries.next_entry().await {
-            let skill_dir = category_entry.path();
-            if !skill_dir.is_dir()
-                || category_entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with('.')
-                || !skill_dir.join("SKILL.md").exists()
-            {
+    while let Some((current, category)) = pending.pop() {
+        let mut entries = match tokio::fs::read_dir(&current).await {
+            Ok(entries) => entries,
+            Err(error) if category.is_empty() => {
+                return Err(anyhow::Error::from(error).context(format!(
+                    "failed to read skills directory: {}",
+                    current.display()
+                )));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %current.display(),
+                    "failed to read category directory, skipping"
+                );
                 continue;
             }
-            load_skill_into(&mut skills, &skill_dir, &category_name, source.clone()).await;
+        };
+
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+
+            if path.join("SKILL.md").exists() {
+                let skill_category = if category.is_empty() {
+                    "general"
+                } else {
+                    category.as_str()
+                };
+                load_skill_into(&mut skills, &path, skill_category, source.clone()).await;
+                continue;
+            }
+
+            // Category directory: record its description and recurse.
+            let name = entry.file_name().to_string_lossy().to_string();
+            let child_category = if category.is_empty() {
+                name
+            } else {
+                format!("{category}/{name}")
+            };
+
+            if let Ok(Some(desc)) = load_category_description(&path).await {
+                category_descriptions.insert(child_category.clone(), desc);
+            }
+
+            pending.push((path, child_category));
         }
     }
 
     Ok((skills, category_descriptions))
 }
 
-/// Load a category description from an `index.md` file inside a category
-/// directory. Returns `None` when the file is absent or has no description.
+/// Load a category description from a `DESCRIPTION.md` or `index.md` file
+/// inside a category directory. `DESCRIPTION.md` is the portable skill-tree
+/// convention and wins when both exist; its description may live in
+/// frontmatter or as the plain markdown body. `index.md` carries its
+/// description in frontmatter only. Returns `None` when neither file
+/// yields a description.
 async fn load_category_description(category_dir: &Path) -> anyhow::Result<Option<String>> {
+    let description_path = category_dir.join("DESCRIPTION.md");
+    match tokio::fs::read_to_string(&description_path).await {
+        Ok(raw) => {
+            let (frontmatter, body) = parse_skill_markdown(&raw)?;
+            if let Some(description) = frontmatter.description {
+                return Ok(Some(description));
+            }
+            let body = body.trim();
+            if !body.is_empty() {
+                return Ok(Some(body.to_string()));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
     let index_path = category_dir.join("index.md");
     let raw = match tokio::fs::read_to_string(&index_path).await {
         Ok(raw) => raw,
@@ -905,6 +1009,18 @@ mod tests {
     }
 
     #[test]
+    fn test_index_description_cuts_at_word_boundary() {
+        let word = "reticulating ";
+        let long = word.repeat(DESCRIPTION_BUDGET / word.len() + 2);
+        let rendered = index_description(&long);
+        assert!(rendered.chars().count() <= DESCRIPTION_BUDGET);
+        // The cut never lands mid-word: stripping the ellipsis leaves a
+        // whole number of words.
+        let body = rendered.strip_suffix("...").unwrap();
+        assert!(body.split_whitespace().all(|w| w == word.trim()));
+    }
+
+    #[test]
     fn test_index_description_budget_is_chars_not_bytes() {
         // 79 two-byte chars: 158 bytes, but within the 80-char budget.
         let multibyte = "é".repeat(DESCRIPTION_BUDGET - 1);
@@ -967,6 +1083,90 @@ mod tests {
         assert_eq!(content, "round 1");
     }
 
+    #[tokio::test]
+    async fn nested_categories_load_recursively() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let write_skill = |path: PathBuf, name: &str| {
+            let content = format!("---\nname: {name}\ndescription: {name} skill\n---\nBody.");
+            async move {
+                tokio::fs::create_dir_all(&path).await.unwrap();
+                tokio::fs::write(path.join("SKILL.md"), content)
+                    .await
+                    .unwrap();
+            }
+        };
+
+        write_skill(root.join("top"), "top").await;
+        write_skill(root.join("mlops").join("training"), "training").await;
+        write_skill(
+            root.join("mlops").join("inference").join("llama-cpp"),
+            "llama-cpp",
+        )
+        .await;
+
+        let (skills, _) = load_skills_from_dir(root, SkillSource::Workspace)
+            .await
+            .unwrap();
+
+        let category_of = |name: &str| {
+            skills
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| s.category.clone())
+        };
+        assert_eq!(category_of("top").as_deref(), Some("general"));
+        assert_eq!(category_of("training").as_deref(), Some("mlops"));
+        assert_eq!(category_of("llama-cpp").as_deref(), Some("mlops/inference"));
+    }
+
+    #[tokio::test]
+    async fn description_md_preferred_over_index_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let category = root.join("ops");
+        let skill = category.join("deploy");
+        tokio::fs::create_dir_all(&skill).await.unwrap();
+        tokio::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: deploy\ndescription: d\n---\nBody.",
+        )
+        .await
+        .unwrap();
+
+        // Plain-body DESCRIPTION.md wins over index.md frontmatter.
+        tokio::fs::write(category.join("DESCRIPTION.md"), "Operations procedures.\n")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            category.join("index.md"),
+            "---\ndescription: From index.\n---\n",
+        )
+        .await
+        .unwrap();
+
+        let (_, descriptions) = load_skills_from_dir(root, SkillSource::Workspace)
+            .await
+            .unwrap();
+        assert_eq!(
+            descriptions.get("ops").map(String::as_str),
+            Some("Operations procedures.")
+        );
+
+        // Without DESCRIPTION.md, index.md frontmatter still loads.
+        tokio::fs::remove_file(category.join("DESCRIPTION.md"))
+            .await
+            .unwrap();
+        let (_, descriptions) = load_skills_from_dir(root, SkillSource::Workspace)
+            .await
+            .unwrap();
+        assert_eq!(
+            descriptions.get("ops").map(String::as_str),
+            Some("From index.")
+        );
+    }
+
     #[test]
     fn test_platform_other_never_matches_host() {
         assert!(!Platform::list_matches_host(&[Platform::Other]));
@@ -1008,8 +1208,8 @@ mod tests {
         let engine = crate::prompts::PromptEngine::new("en").unwrap();
         let prompt = set.render_channel_prompt(&engine).unwrap();
         assert!(prompt.contains("<available_skills>"));
-        assert!(prompt.contains("<name>weather</name>"));
-        assert!(prompt.contains("<description>Get weather forecasts</description>"));
+        assert!(prompt.contains("**general**"));
+        assert!(prompt.contains("- weather: Get weather forecasts"));
     }
 
     #[test]
@@ -1037,13 +1237,12 @@ mod tests {
         // Without suggestions
         let prompt = set.render_worker_skills(&[], &engine).unwrap();
         assert!(prompt.contains("<available_skills>"));
-        assert!(prompt.contains("<name>weather</name>"));
-        assert!(prompt.contains("<description>Get weather forecasts</description>"));
-        assert!(!prompt.contains("suggested=\"true\""));
+        assert!(prompt.contains("- weather: Get weather forecasts"));
+        assert!(!prompt.contains("- weather (suggested)"));
 
         // With suggestion
         let prompt = set.render_worker_skills(&["weather"], &engine).unwrap();
-        assert!(prompt.contains("suggested=\"true\""));
+        assert!(prompt.contains("- weather (suggested): Get weather forecasts"));
 
         // Empty set returns empty string
         let empty_set = SkillSet::default();

@@ -106,6 +106,36 @@ export type WorkerRunInfo = Types.WorkerListItem;
 export type AssociationItem = Types.Association;
 
 export type ProcessType = "channel" | "branch" | "worker";
+export type ProcessKind = "branch" | "worker";
+
+export interface ProcessRun {
+	kind: ProcessKind;
+	id: string;
+	input: string;
+	output: string | null;
+	status: string;
+	process_type: string;
+	profile: string | null;
+	channel_id: string | null;
+	channel_name: string | null;
+	started_at: string;
+	completed_at: string | null;
+	has_transcript: boolean;
+	transcript: Types.TranscriptStep[] | null;
+	tool_calls: number;
+	model: string | null;
+	max_turns: number | null;
+	opencode_session_id: string | null;
+	opencode_port: number | null;
+	directory: string | null;
+	interactive: boolean;
+	project_id: string | null;
+}
+
+export interface ProcessListResponse {
+	processes: ProcessRun[];
+	total: number;
+}
 
 export interface InboundMessageEvent {
 	type: "inbound_message";
@@ -114,6 +144,7 @@ export interface InboundMessageEvent {
 	sender_name?: string | null;
 	sender_id: string;
 	text: string;
+	system: boolean;
 	attachments?: AttachmentMeta[];
 }
 
@@ -130,6 +161,14 @@ export interface OutboundMessageDeltaEvent {
 	channel_id: string;
 	text_delta: string;
 	aggregated_text: string;
+}
+
+export interface ReasoningDeltaEvent {
+	type: "reasoning_delta";
+	agent_id: string;
+	channel_id: string;
+	reasoning_delta: string;
+	aggregated_reasoning: string;
 }
 
 export interface TypingStateEvent {
@@ -205,6 +244,20 @@ export interface BranchCompletedEvent {
 	conclusion: string;
 }
 
+export interface CompactionStartedEvent {
+	type: "compaction_started";
+	agent_id: string;
+	channel_id: string;
+	kind: "rolling" | "chronicle";
+}
+
+export interface CompactionCompletedEvent {
+	type: "compaction_completed";
+	agent_id: string;
+	channel_id: string;
+	success: boolean;
+}
+
 export interface ToolStartedEvent {
 	type: "tool_started";
 	agent_id: string;
@@ -270,10 +323,12 @@ export interface OpenCodePartUpdatedEvent {
 	part: OpenCodePart;
 }
 
-export interface WorkerTextEvent {
-	type: "worker_text";
+export interface ProcessTextEvent {
+	type: "process_text";
 	agent_id: string;
-	worker_id: string;
+	process_type: ProcessType;
+	process_id: string;
+	channel_id: string | null;
 	text: string;
 }
 
@@ -289,6 +344,7 @@ export type ApiEvent =
 	| InboundMessageEvent
 	| OutboundMessageEvent
 	| OutboundMessageDeltaEvent
+	| ReasoningDeltaEvent
 	| TypingStateEvent
 	| WorkerStartedEvent
 	| WorkerStatusEvent
@@ -301,7 +357,7 @@ export type ApiEvent =
 	| ToolCompletedEvent
 	| ToolOutputEvent
 	| OpenCodePartUpdatedEvent
-	| WorkerTextEvent
+	| ProcessTextEvent
 	| CortexChatMessageEvent;
 
 // -- Timeline types (discriminated union parts) --
@@ -317,7 +373,7 @@ export interface AttachmentMeta {
 export interface TimelineMessage {
 	type: "message";
 	id: string;
-	role: "user" | "assistant";
+	role: "user" | "assistant" | "system";
 	sender_name: string | null;
 	sender_id: string | null;
 	content: string;
@@ -396,9 +452,16 @@ export interface CompletedItemInfo {
 	result_summary: string;
 }
 
+export interface CompactionStatusInfo {
+	/** Matches the compaction modes the backend emits. */
+	kind: "rolling" | "chronicle";
+	started_at: string;
+}
+
 export interface StatusBlockSnapshot {
 	active_workers: WorkerStatusInfo[];
 	active_branches: BranchStatusInfo[];
+	active_compaction: CompactionStatusInfo | null;
 	completed_items: CompletedItemInfo[];
 }
 
@@ -485,7 +548,8 @@ export type MemoryType =
 	| "event"
 	| "observation"
 	| "goal"
-	| "todo";
+	| "todo"
+	| "human";
 
 export const MEMORY_TYPES: MemoryType[] = [
 	"fact", "preference", "decision", "identity",
@@ -658,9 +722,6 @@ export interface CortexSection {
 	worker_timeout_secs: number;
 	branch_timeout_secs: number;
 	circuit_breaker_threshold: number;
-	bulletin_interval_secs: number;
-	bulletin_max_words: number;
-	bulletin_max_turns: number;
 }
 
 export interface CoalesceSection {
@@ -770,9 +831,6 @@ export interface CortexUpdate {
 	worker_timeout_secs?: number;
 	branch_timeout_secs?: number;
 	circuit_breaker_threshold?: number;
-	bulletin_interval_secs?: number;
-	bulletin_max_words?: number;
-	bulletin_max_turns?: number;
 }
 
 export interface AutonomyUpdate {
@@ -1053,6 +1111,17 @@ export interface UploadSkillResponse {
 
 export type TaskStatus = "pending_approval" | "backlog" | "ready" | "in_progress" | "done" | "failed";
 export type TaskPriority = "critical" | "high" | "medium" | "low";
+export type TaskWorkerType = "builtin" | "opencode";
+export type TaskWorktreeMode = "root" | "existing" | "create";
+export type TaskDependencyKind = "gate" | "stack";
+
+export interface TaskDependencyEdge {
+	depends_on_task_number: number;
+	depends_on_title: string;
+	depends_on_status: TaskStatus;
+	kind: TaskDependencyKind;
+	satisfied: boolean;
+}
 
 export interface TaskSubtask {
 	title: string;
@@ -1073,6 +1142,13 @@ export interface TaskItem {
 	goal_id?: string;
 	source_memory_id?: string;
 	worker_id?: string;
+	worker_type?: TaskWorkerType | null;
+	project_id?: string | null;
+	repo_id?: string | null;
+	worktree_mode?: TaskWorktreeMode | null;
+	worktree_id?: string | null;
+	required_skills: string[];
+	depends_on: TaskDependencyEdge[];
 	created_by: string;
 	approved_at?: string;
 	approved_by?: string;
@@ -1658,6 +1734,25 @@ export const api = {
 	},
 	workerDetail: (agentId: string, workerId: string) =>
 		fetchJson<Types.WorkerDetailResponse>(`/agents/workers/detail?agent_id=${encodeURIComponent(agentId)}&worker_id=${encodeURIComponent(workerId)}`),
+	processesList: (
+		agentId: string,
+		params: {limit?: number; offset?: number; status?: string; kind?: ProcessKind} = {},
+	) => {
+		const search = new URLSearchParams({agent_id: agentId});
+		if (params.limit) search.set("limit", String(params.limit));
+		if (params.offset) search.set("offset", String(params.offset));
+		if (params.status) search.set("status", params.status);
+		if (params.kind) search.set("kind", params.kind);
+		return fetchJson<ProcessListResponse>(`/agents/processes?${search}`);
+	},
+	processDetail: (agentId: string, kind: ProcessKind, processId: string) => {
+		const search = new URLSearchParams({
+			agent_id: agentId,
+			kind,
+			process_id: processId,
+		});
+		return fetchJson<ProcessRun>(`/agents/processes/detail?${search}`);
+	},
 	agentMemories: (agentId: string, params: MemoryGraphParams = {}) => {
 		const search = new URLSearchParams({ agent_id: agentId });
 		if (params.limit) search.set("limit", String(params.limit));
@@ -2929,6 +3024,9 @@ export const api = {
 		const query = qs.toString();
 		return fetchJson<ActivityResponse>(`/activity${query ? `?${query}` : ""}`);
 	},
+
+	chronicleHistory: (limit = 20) =>
+		fetchJson<ChronicleHistoryResponse>(`/chronicle?limit=${limit}`),
 }
 
 export interface UsageTotals {
@@ -3002,6 +3100,31 @@ export interface ActivityTotals {
 export interface ActivityResponse {
 	daily: ActivityDay[];
 	totals: ActivityTotals;
+}
+
+export interface AgentDailyBrief {
+	agent_id: string;
+	day: string;
+	summary: string;
+	event_count: number;
+	created_at: string;
+}
+
+export interface ChronicleHistoryItem {
+	id: string;
+	agent_id: string;
+	channel_id: string;
+	title: string;
+	summary: string;
+	message_count: number;
+	covers_from: string;
+	covers_to: string;
+	created_at: string;
+}
+
+export interface ChronicleHistoryResponse {
+	daily_briefs: AgentDailyBrief[];
+	checkpoints: ChronicleHistoryItem[];
 }
 
 // Wiki types

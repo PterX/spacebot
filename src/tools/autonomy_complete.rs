@@ -5,7 +5,7 @@
 //! primary continuity mechanism. Modeled on `memory_persistence_complete`:
 //! the channel enforces the call before exit and retries when it is missing.
 
-use crate::agent::autonomy::AutonomyRunHandle;
+use crate::agent::autonomy::{AutonomyFinishRequest, AutonomyRunHandle};
 use crate::wakes::AutonomyAction;
 
 use rig::completion::ToolDefinition;
@@ -131,21 +131,10 @@ impl Tool for AutonomyCompleteTool {
             });
         }
 
-        let recorded = self
-            .handle
-            .store
-            .complete_run(&self.handle.run_id, summary, &actions)
-            .await
-            .map_err(|error| AutonomyCompleteError(error.to_string()))?;
-        if !recorded {
-            // The driver already finished this run (timeout wrap-up racing
-            // the tool call). The summary is lost but the contract is met.
-            tracing::warn!(
-                run_id = %self.handle.run_id,
-                "autonomy_complete called after the run was already finished"
-            );
-        }
-        self.handle.mark_completed();
+        self.handle.request_finish(AutonomyFinishRequest {
+            summary: summary.to_string(),
+            actions: actions.clone(),
+        });
 
         Ok(AutonomyCompleteOutput {
             success: true,
@@ -194,11 +183,11 @@ mod tests {
 
         assert!(output.success);
         assert_eq!(output.recorded_actions, 1);
-        assert!(handle.completed());
+        assert!(handle.finish_requested());
 
         let recent = store.recent(1).await.expect("recent");
-        assert_eq!(recent[0].status, AutonomyRunStatus::Completed);
-        assert_eq!(recent[0].actions[0].task_number, Some(7));
+        assert_eq!(recent[0].status, AutonomyRunStatus::Running);
+        assert!(recent[0].actions.is_empty());
     }
 
     #[tokio::test]

@@ -178,6 +178,22 @@ kind = "hierarchical"
 
 Humans don't have workspaces, databases, or messaging tools. They exist to model the org structure and will later map to dashboard auth and permissions.
 
+### HUMAN.md
+
+Each human can have a long-form profile at `humans/{id}/HUMAN.md`. It renders verbatim into the org context of every agent linked to that human, on every turn — so its contents are a per-turn token cost, and the right size is small.
+
+The profile is capped by `human_profile_cap` (default 4,000 chars). Past the cap it still renders in full but with a loud over-budget utilization header; past 2x it truncates at a section boundary. The utilization header is the pressure signal: when it climbs, move content out rather than raising the cap.
+
+What belongs in HUMAN.md is the **authored core** — things that stay true for years:
+
+- Identity: name, handles, the few facts that define who this person is.
+- How to work with them: tone, format, escalation preferences, what they consider a good answer.
+- Standing rules and sensitivities: privacy boundaries, topics that never appear in casual output, rules for handling their data.
+
+What doesn't belong is anything **dated or volatile**: current projects and their metrics, health or financial snapshots, travel plans, relationship state, goals for this quarter. Those go to the memory store — via [ingestion](/docs/ingestion) or `memory_save` — where dating and supersession are native: a changed fact gets a new dated memory that supersedes the old one, instead of an edit that erases history.
+
+The litmus test: if a line needs an "as of" date to stay honest, it's a memory, not profile.
+
 ## Groups
 
 Groups are visual containers in the topology graph. They don't affect agent behavior — they're for organizing the layout.

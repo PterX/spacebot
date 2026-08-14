@@ -41,7 +41,6 @@ pub struct SystemInfo {
     /// Whether embeddings are loaded and ready.
     pub embedding_ready: bool,
     /// Age of the memory bulletin in minutes, if known.
-    pub bulletin_age_minutes: Option<u64>,
     /// Number of registered cron jobs, if known.
     pub cron_job_count: Option<usize>,
 }
@@ -86,8 +85,6 @@ impl SystemInfo {
         }
         .to_string();
 
-        let bulletin_age_minutes = warmup_status.bulletin_age_secs.map(|secs| secs / 60);
-
         Self {
             version: crate::update::CURRENT_VERSION.to_string(),
             deployment: match crate::update::Deployment::detect() {
@@ -109,7 +106,6 @@ impl SystemInfo {
             sandbox_active: sandbox.containment_active(),
             warmup_state,
             embedding_ready: warmup_status.embedding_ready,
-            bulletin_age_minutes,
             cron_job_count: None,
         }
     }
@@ -134,10 +130,19 @@ pub struct StatusBlock {
     pub active_branches: Vec<BranchStatus>,
     /// Currently running workers.
     pub active_workers: Vec<WorkerStatus>,
+    /// The currently running context compaction, if any.
+    pub active_compaction: Option<CompactionStatus>,
     /// Recently completed work.
     pub completed_items: Vec<CompletedItem>,
     /// Active link conversations with other agents.
     pub active_link_conversations: Vec<LinkConversationStatus>,
+}
+
+/// Status of an active rolling compaction or chronicle checkpoint.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CompactionStatus {
+    pub kind: String,
+    pub started_at: DateTime<Utc>,
 }
 
 /// Status of an active branch.
@@ -199,6 +204,15 @@ impl StatusBlock {
     /// Update from a process event.
     pub fn update(&mut self, event: &ProcessEvent) {
         match event {
+            ProcessEvent::CompactionStarted { kind, .. } => {
+                self.active_compaction = Some(CompactionStatus {
+                    kind: kind.clone(),
+                    started_at: Utc::now(),
+                });
+            }
+            ProcessEvent::CompactionCompleted { .. } => {
+                self.active_compaction = None;
+            }
             ProcessEvent::WorkerStatus {
                 worker_id, status, ..
             } => {
@@ -596,11 +610,6 @@ fn render_system_info(info: &SystemInfo, current_time_line: Option<&str>) -> Str
         "embeddings loading".to_string()
     };
     warmup_parts.push(&embedding_label);
-    let bulletin_label;
-    if let Some(age) = info.bulletin_age_minutes {
-        bulletin_label = format!("bulletin {}m ago", age);
-        warmup_parts.push(&bulletin_label);
-    }
     output.push_str(&format!("Warmup: {}\n", warmup_parts.join(", ")));
 
     // Cron jobs
@@ -621,7 +630,52 @@ fn render_system_info(info: &SystemInfo, current_time_line: Option<&str>) -> Str
 #[cfg(test)]
 mod tests {
     use super::StatusBlock;
+    use crate::{AgentId, ChannelId, ProcessEvent};
+    use std::sync::Arc;
     use uuid::Uuid;
+
+    fn compaction_started(kind: &str) -> ProcessEvent {
+        ProcessEvent::CompactionStarted {
+            agent_id: Arc::<str>::from("agent"),
+            channel_id: Arc::<str>::from("channel"),
+            kind: kind.to_string(),
+        }
+    }
+
+    fn compaction_completed(success: bool) -> ProcessEvent {
+        ProcessEvent::CompactionCompleted {
+            agent_id: AgentId::from("agent"),
+            channel_id: ChannelId::from("channel"),
+            success,
+        }
+    }
+
+    #[test]
+    fn compaction_lifecycle_tracks_one_active_compaction() {
+        let mut status = StatusBlock::new();
+
+        status.update(&compaction_started("rolling"));
+        status.update(&compaction_started("chronicle"));
+
+        assert_eq!(
+            status
+                .active_compaction
+                .as_ref()
+                .map(|value| value.kind.as_str()),
+            Some("chronicle")
+        );
+    }
+
+    #[test]
+    fn compaction_completion_is_idempotent() {
+        let mut status = StatusBlock::new();
+
+        status.update(&compaction_started("rolling"));
+        status.update(&compaction_completed(true));
+        status.update(&compaction_completed(false));
+
+        assert!(status.active_compaction.is_none());
+    }
 
     #[test]
     fn render_with_time_context_renders_current_time_when_empty() {
@@ -716,7 +770,6 @@ mod tests {
             sandbox_active: true,
             warmup_state: "warm".into(),
             embedding_ready: true,
-            bulletin_age_minutes: Some(12),
             cron_job_count: Some(4),
         };
 
@@ -744,7 +797,6 @@ mod tests {
         // Warmup
         assert!(rendered.contains("warm"));
         assert!(rendered.contains("embeddings ready"));
-        assert!(rendered.contains("bulletin 12m ago"));
         // Cron
         assert!(rendered.contains("4 active jobs"));
     }

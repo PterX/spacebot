@@ -93,7 +93,7 @@ An earlier revision reused the rolling compactor's `[Compaction Summary]` head a
 
 ### Rollups add a level; they never replace a row
 
-When the level-0 count exceeds `rollup_threshold` (default 12), the oldest `rollup_batch` (default 8) are rolled into one level-1 row whose message range is the union of theirs. The level-0 rows stay, with `rolled_up_into` set to the rollup's id. Same mechanism at level 2 and above. Nothing is a summary-of-summary blob: every rollup names exactly which checkpoints it covers (`rolls_up_from_seq`/`rolls_up_to_seq`), each covered checkpoint names its rollup, and both directions are queryable and renderable in the UI. A rollup is a *view* over provenance that remains intact underneath it.
+After a level-0 checkpoint commits, the oldest `rollup_batch` (default 8) are rolled into one level-1 row once `rollup_threshold` (default 12) unrolled checkpoints exist. The rollup starts only from that commit path, never from an idle timer. The level-0 rows stay, with `rolled_up_into` set to the rollup's id. Nothing is a summary-of-summary blob: every rollup names exactly which checkpoints it covers (`rolls_up_from_seq`/`rolls_up_to_seq`), each covered checkpoint names its rollup, and both directions are queryable and renderable in the UI. A rollup is a *view* over provenance that remains intact underneath it.
 
 Rollup input is the constituent checkpoints' summaries, which is the one legitimate summary-of-summary — it is bounded (one level of recursion per rollup generation), explicit, and reversible by reading the level-0 rows.
 

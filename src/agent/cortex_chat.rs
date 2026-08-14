@@ -513,10 +513,27 @@ impl CortexChatSession {
                     continue;
                 };
 
-                // Persist completion to worker_runs (no channel handler does this
-                // for channel_id: None workers).
                 let run_logger = ProcessRunLogger::new(session.deps.sqlite_pool.clone());
-                run_logger.log_worker_completed(worker_id, &result, success);
+                let Some(terminal) = run_logger
+                    .read_worker_terminal(worker_id)
+                    .await
+                    .ok()
+                    .flatten()
+                else {
+                    tracing::warn!(%worker_id, "cortex chat worker completion was not durable");
+                    continue;
+                };
+                if terminal.outcome_version
+                    != match &event {
+                        ProcessEvent::WorkerComplete {
+                            outcome_version, ..
+                        } => *outcome_version,
+                        _ => 0,
+                    }
+                {
+                    tracing::warn!(%worker_id, "cortex chat worker completion version mismatch");
+                    continue;
+                }
 
                 tracing::info!(
                     %worker_id,
@@ -713,15 +730,12 @@ impl CortexChatSession {
         let thread_id = thread_id.to_string();
         let channel_context_id = channel_context_id.map(|s| s.to_string());
         let store = self.store.clone();
-        // Cortex chat is an interactive admin session that can do complex multi-step
-        // work (agent creation, memory audits, etc). Use worker_timeout_secs (default
-        // 600s) rather than branch_timeout_secs (60s) which is far too short.
         let prompt_timeout = Duration::from_secs(
             self.deps
                 .runtime_config
                 .cortex
                 .load()
-                .worker_timeout_secs
+                .worker_wall_clock_timeout_secs
                 .max(60),
         );
 
@@ -804,7 +818,6 @@ impl CortexChatSession {
         let prompt_engine = runtime_config.prompts.load();
 
         let identity_context = runtime_config.identity.load().render();
-        let memory_bulletin = runtime_config.memory_bulletin.load();
         let agents_manifest = crate::self_awareness::agents_manifest_for_prompt();
         let changelog_highlights = crate::self_awareness::changelog_highlights();
         let runtime_config_snapshot = crate::self_awareness::runtime_snapshot_pretty(
@@ -816,11 +829,18 @@ impl CortexChatSession {
         let web_search_enabled = runtime_config.brave_search_key.load().is_some();
         let opencode_enabled = runtime_config.opencode.load().enabled;
         let mcp_tool_names = self.deps.mcp_manager.get_tool_names().await;
+        // Cortex chat spawns detached workers: no channel to fork, no memory.
+        let worker_context = crate::conversation::settings::WorkerContextMode {
+            history: crate::conversation::settings::WorkerHistoryMode::Clean,
+            memory: crate::conversation::settings::WorkerMemoryMode::None,
+            ..Default::default()
+        };
         let worker_capabilities = prompt_engine.render_worker_capabilities(
             browser_enabled,
             web_search_enabled,
             opencode_enabled,
             &mcp_tool_names,
+            &worker_context,
         )?;
 
         // Load channel transcript if a channel context is active
@@ -837,7 +857,6 @@ impl CortexChatSession {
 
         let system_prompt = prompt_engine.render_cortex_chat_prompt(
             empty_to_none(identity_context),
-            empty_to_none(memory_bulletin.to_string()),
             channel_transcript,
             empty_to_none(agents_manifest),
             empty_to_none(changelog_highlights),

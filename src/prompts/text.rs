@@ -59,10 +59,6 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         ("en", "branch") => include_str!("../../prompts/en/branch.md.j2"),
         ("en", "worker") => include_str!("../../prompts/en/worker.md.j2"),
         ("en", "cortex") => include_str!("../../prompts/en/cortex.md.j2"),
-        ("en", "cortex_bulletin") => include_str!("../../prompts/en/cortex_bulletin.md.j2"),
-        ("en", "cortex_knowledge_synthesis") => {
-            include_str!("../../prompts/en/cortex_knowledge_synthesis.md.j2")
-        }
         ("en", "cortex_intraday_synthesis") => {
             include_str!("../../prompts/en/cortex_intraday_synthesis.md.j2")
         }
@@ -74,6 +70,7 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         ("en", "chronicle_checkpoint") => {
             include_str!("../../prompts/en/chronicle_checkpoint.md.j2")
         }
+        ("en", "chronicle_rollup") => include_str!("../../prompts/en/chronicle_rollup.md.j2"),
         ("en", "memory_persistence") => include_str!("../../prompts/en/memory_persistence.md.j2"),
         ("en", "ingestion") => include_str!("../../prompts/en/ingestion.md.j2"),
         ("en", "cortex_chat") => include_str!("../../prompts/en/cortex_chat.md.j2"),
@@ -83,6 +80,12 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         ("en", "adapters/email") => include_str!("../../prompts/en/adapters/email.md.j2"),
         ("en", "adapters/cron") => include_str!("../../prompts/en/adapters/cron.md.j2"),
         ("en", "adapters/signal") => include_str!("../../prompts/en/adapters/signal.md.j2"),
+        ("en", "adapters/discord") => include_str!("../../prompts/en/adapters/discord.md.j2"),
+        ("en", "adapters/slack") => include_str!("../../prompts/en/adapters/slack.md.j2"),
+        ("en", "adapters/mattermost") => include_str!("../../prompts/en/adapters/mattermost.md.j2"),
+        ("en", "adapters/portal") => include_str!("../../prompts/en/adapters/portal.md.j2"),
+        ("en", "adapters/twitch") => include_str!("../../prompts/en/adapters/twitch.md.j2"),
+        ("en", "adapters/webhook") => include_str!("../../prompts/en/adapters/webhook.md.j2"),
 
         // Slash-command agent-turn instructions
         ("en", "commands/tasks") => include_str!("../../prompts/en/commands/tasks.md.j2"),
@@ -114,10 +117,20 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         ("en", "fragments/available_channels") => {
             include_str!("../../prompts/en/fragments/available_channels.md.j2")
         }
+        ("en", "fragments/execution_standard") => {
+            include_str!("../../prompts/en/fragments/execution_standard.md.j2")
+        }
+        ("en", "fragments/execution_direct") => {
+            include_str!("../../prompts/en/fragments/execution_direct.md.j2")
+        }
+        ("en", "fragments/authority") => include_str!("../../prompts/en/fragments/authority.md.j2"),
 
         // System Message Fragments
         ("en", "fragments/system/retrigger") => {
             include_str!("../../prompts/en/fragments/system/retrigger.md.j2")
+        }
+        ("en", "fragments/system/retrigger_autonomy") => {
+            include_str!("../../prompts/en/fragments/system/retrigger_autonomy.md.j2")
         }
         ("en", "fragments/system/truncation") => {
             include_str!("../../prompts/en/fragments/system/truncation.md.j2")
@@ -144,9 +157,6 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         }
         ("en", "fragments/system/autonomy_hard_timeout") => {
             include_str!("../../prompts/en/fragments/system/autonomy_hard_timeout.md.j2")
-        }
-        ("en", "fragments/system/cortex_synthesis") => {
-            include_str!("../../prompts/en/fragments/system/cortex_synthesis.md.j2")
         }
         ("en", "fragments/system/profile_synthesis") => {
             include_str!("../../prompts/en/fragments/system/profile_synthesis.md.j2")
@@ -232,6 +242,9 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         }
         ("en", "tools/memory_delete") => {
             include_str!("../../prompts/en/tools/memory_delete_description.md.j2")
+        }
+        ("en", "tools/memory_consolidate") => {
+            include_str!("../../prompts/en/tools/memory_consolidate_description.md.j2")
         }
         ("en", "tools/channel_recall") => {
             include_str!("../../prompts/en/tools/channel_recall_description.md.j2")

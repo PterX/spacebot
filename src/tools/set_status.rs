@@ -1,5 +1,6 @@
 //! Set status tool for workers.
 
+use crate::conversation::{ProcessRunLogger, WorkerLifecycle, WorkerTransitionResult};
 use crate::{AgentId, ChannelId, ProcessEvent, WorkerId};
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
@@ -14,6 +15,8 @@ pub struct SetStatusTool {
     worker_id: WorkerId,
     channel_id: Option<ChannelId>,
     event_tx: broadcast::Sender<ProcessEvent>,
+    process_run_logger: ProcessRunLogger,
+    interactive: bool,
     /// Tool secret pairs for scrubbing status text before it reaches the channel.
     tool_secret_pairs: Vec<(String, String)>,
 }
@@ -25,12 +28,16 @@ impl SetStatusTool {
         worker_id: WorkerId,
         channel_id: Option<ChannelId>,
         event_tx: broadcast::Sender<ProcessEvent>,
+        process_run_logger: ProcessRunLogger,
+        interactive: bool,
     ) -> Self {
         Self {
             agent_id,
             worker_id,
             channel_id,
             event_tx,
+            process_run_logger,
+            interactive,
             tool_secret_pairs: Vec::new(),
         }
     }
@@ -141,6 +148,29 @@ impl Tool for SetStatusTool {
         let status = crate::secrets::scrub::scrub_secrets(&status, &self.tool_secret_pairs);
         let status = crate::secrets::scrub::scrub_leaks(&status);
 
+        if args.kind == StatusKind::Outcome && !self.interactive {
+            match self
+                .process_run_logger
+                .claim_worker_completion(self.worker_id, WorkerLifecycle::Running)
+                .await
+                .map_err(|error| SetStatusError(error.to_string()))?
+            {
+                WorkerTransitionResult::Applied { .. }
+                | WorkerTransitionResult::Conflict {
+                    current: WorkerLifecycle::Completing,
+                } => {}
+                WorkerTransitionResult::Conflict { current } => {
+                    return Err(SetStatusError(format!(
+                        "worker lifecycle conflict: expected running, found {}",
+                        current.as_str()
+                    )));
+                }
+                WorkerTransitionResult::NotFound => {
+                    return Err(SetStatusError("worker run was not found".to_string()));
+                }
+            }
+        }
+
         let event = ProcessEvent::WorkerStatus {
             agent_id: self.agent_id.clone(),
             worker_id: self.worker_id,
@@ -174,4 +204,129 @@ pub fn set_status(
     };
 
     let _ = event_tx.send(event);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SetStatusArgs, SetStatusTool, StatusKind};
+    use crate::conversation::{
+        ProcessRunLogger, WorkerLifecycle, WorkerOutcomeKind, WorkerTerminalOwner,
+        WorkerTransitionResult,
+    };
+    use rig::tool::Tool as _;
+    use std::sync::Arc;
+
+    async fn setup(interactive: bool) -> (SetStatusTool, ProcessRunLogger, uuid::Uuid) {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let logger = ProcessRunLogger::new(pool);
+        let worker_id = uuid::Uuid::new_v4();
+        logger
+            .log_worker_started(
+                None,
+                worker_id,
+                "task",
+                "builtin",
+                &Arc::from("agent"),
+                interactive,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let (event_tx, _) = tokio::sync::broadcast::channel(8);
+        (
+            SetStatusTool::new(
+                Arc::from("agent"),
+                worker_id,
+                None,
+                event_tx,
+                logger.clone(),
+                interactive,
+            ),
+            logger,
+            worker_id,
+        )
+    }
+
+    #[tokio::test]
+    async fn non_interactive_outcome_claims_completing_idempotently() {
+        let (tool, logger, worker_id) = setup(false).await;
+        let args = || SetStatusArgs {
+            status: "finished".to_string(),
+            kind: StatusKind::Outcome,
+        };
+        assert!(tool.call(args()).await.is_ok());
+        assert!(tool.call(args()).await.is_ok());
+        assert_eq!(
+            logger.read_worker_lifecycle(worker_id).await.unwrap(),
+            Some(WorkerLifecycle::Completing)
+        );
+    }
+
+    #[tokio::test]
+    async fn outcome_claim_beats_concurrent_cancel_transition() {
+        let (tool, logger, worker_id) = setup(false).await;
+        tool.call(SetStatusArgs {
+            status: "finished".to_string(),
+            kind: StatusKind::Outcome,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            logger
+                .transition_worker(
+                    worker_id,
+                    WorkerLifecycle::Running,
+                    WorkerLifecycle::Cancelling,
+                )
+                .await
+                .unwrap(),
+            WorkerTransitionResult::Conflict {
+                current: WorkerLifecycle::Completing,
+            }
+        );
+        logger
+            .complete_worker(
+                worker_id,
+                WorkerLifecycle::Completing,
+                WorkerOutcomeKind::Succeeded,
+                Some("finished"),
+                "finished",
+                None,
+                0,
+                WorkerTerminalOwner::Worker,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            logger
+                .read_worker_terminal(worker_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .outcome_kind,
+            WorkerOutcomeKind::Succeeded
+        );
+    }
+
+    #[tokio::test]
+    async fn interactive_outcome_does_not_claim_terminal_lifecycle() {
+        let (tool, logger, worker_id) = setup(true).await;
+        tool.call(SetStatusArgs {
+            status: "turn complete".to_string(),
+            kind: StatusKind::Outcome,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            logger.read_worker_lifecycle(worker_id).await.unwrap(),
+            Some(WorkerLifecycle::Running)
+        );
+    }
 }

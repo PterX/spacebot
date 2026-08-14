@@ -99,7 +99,7 @@ The branch result is injected into the channel's history as a distinct message t
 
 ### Workers
 
-Independent process that does a job. Gets a specific task, a focused system prompt, and task-appropriate tools. No channel context, no soul, no personality.
+Independent process that does a job. Gets a specific task, a focused system prompt, and task-appropriate tools. It has no channel soul or personality. Builtin workers fork bounded live channel history by default; OpenCode workers receive their task and system prompt only.
 
 Two kinds:
 - **Fire-and-forget:** Does a job and returns a result. Memory recall, summarization, one-shot tasks.
@@ -111,7 +111,7 @@ Workers are pluggable. A worker can be:
 - Any external process that accepts a task and reports status
 
 **Tools:** shell, file, set_status (varies by worker type)  
-**Context:** Fresh prompt + task description. No channel history.  
+**Context:** Builtin workers use the configured history mode (`Fork` by default); OpenCode workers use a fresh prompt and task description.
 **Lifecycle:** Fire-and-forget or long-running. Reports status via `set_status` tool.
 
 ### The Compactor
@@ -383,7 +383,7 @@ Phase 6 — Hardening:
 
 **Don't dump raw search results into channel context.** Memory recall goes through a branch, which curates. The channel gets clean conclusions, not 50 raw database rows.
 
-**Don't give workers channel context.** Workers get a fresh prompt and a task. If a worker needs conversation context, that's a branch, not a worker.
+**Don't assume worker history is empty.** Builtin workers fork bounded live channel history by default. Keep worker prompts task-focused, and use the configured history mode when isolation is required. OpenCode workers receive only their task and system prompt.
 
 **Don't make the compactor an LLM process.** The compactor is programmatic — it watches a number (context token count) and spawns workers. The LLM work happens in the compaction worker it spawns.
 

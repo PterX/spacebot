@@ -156,6 +156,14 @@ impl Compactor {
             }
         };
 
+        if let Err(error) = deps.event_tx.send(crate::ProcessEvent::CompactionStarted {
+            agent_id: deps.agent_id.clone(),
+            channel_id: channel_id.clone(),
+            kind: "rolling".to_string(),
+        }) {
+            tracing::debug!(channel_id = %channel_id, %error, "failed to emit compaction-started event");
+        }
+
         tokio::spawn(async move {
             let result = run_compaction(
                 &deps,
@@ -168,6 +176,7 @@ impl Compactor {
             )
             .await;
 
+            let success = result.is_ok();
             match result {
                 Ok(turns_compacted) => {
                     tracing::info!(
@@ -183,6 +192,17 @@ impl Compactor {
                         "compaction failed"
                     );
                 }
+            }
+
+            if let Err(error) = deps
+                .event_tx
+                .send(crate::ProcessEvent::CompactionCompleted {
+                    agent_id: deps.agent_id.clone(),
+                    channel_id: channel_id.clone(),
+                    success,
+                })
+            {
+                tracing::debug!(channel_id = %channel_id, %error, "failed to emit compaction-completed event");
             }
 
             let mut flag = is_compacting.write().await;

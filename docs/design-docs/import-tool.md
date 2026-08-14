@@ -1,5 +1,14 @@
 # Import Tool: migrating an agent from another harness
 
+> **Superseded by [external-sessions.md](external-sessions.md).** Session
+> chronicling over a read-only source replaces the transcript import, and the
+> remaining migration surface travels through existing mechanisms: identity
+> and memory files via the ingest route or plain file copies, credentials by
+> re-entry. Two pieces of this design remain independently valuable and may
+> be lifted out on their own merit: the bulk memory writer (a deterministic
+> batch path into SQLite + LanceDB) and the hazard analysis, the relevant
+> half of which external sessions inherits as its scrub pass.
+
 A mature agent is a corpus: identity, memories, skills, transcripts, scheduled
 jobs, credentials. Today the only way to move one into spacebot is the memory
 ingestion loop, which is LLM-mediated and lossy by design — nothing arrives

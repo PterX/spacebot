@@ -23,8 +23,11 @@ import {
 	type TaskCreateFormData,
 } from "@spacedrive/ai";
 import {
-	GithubMetadataBadges,
-	getGithubReferences,
+	ExecutionPlanSection,
+	GithubSection,
+	taskEnrichments,
+	taskListTitle,
+	TaskMetadataBadges,
 } from "@/components/TaskUtils";
 
 const TASK_LIMIT = 200;
@@ -119,8 +122,18 @@ export function GlobalTasks() {
 		queryFn: () => api.listTasks({limit: TASK_LIMIT}),
 		refetchInterval: 15_000,
 	});
+	const {data: autonomyRuns} = useQuery({
+		queryKey: ["autonomy-runs", "all"],
+		queryFn: () => api.autonomyRuns(undefined, 100),
+		staleTime: 30_000,
+	});
 
-	const tasks = (data?.tasks ?? []) as unknown as Task[];
+	const tasks = (data?.tasks ?? []) as TaskItem[];
+	const enrichments = useMemo(() => taskEnrichments(autonomyRuns?.runs ?? []), [autonomyRuns]);
+	const listTasks = useMemo(
+		() => tasks.map((task) => ({...task, title: taskListTitle(task, enrichments.get(task.task_number))})) as unknown as Task[],
+		[tasks, enrichments],
+	);
 
 	const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
 	const [collapsedGroups, setCollapsedGroups] = useState<Set<UiTaskStatus>>(
@@ -152,11 +165,6 @@ export function GlobalTasks() {
 		onSuccess: () => void invalidate(),
 	});
 
-	const executeMutation = useMutation({
-		mutationFn: (taskNumber: number) => api.executeTask(taskNumber),
-		onSuccess: () => void invalidate(),
-	});
-
 	const deleteMutation = useMutation({
 		mutationFn: (taskNumber: number) => api.deleteTask(taskNumber),
 		onSuccess: () => {
@@ -178,13 +186,11 @@ export function GlobalTasks() {
 			const t = task as unknown as TaskItem;
 			if (t.status === "pending_approval" && status === "ready") {
 				approveMutation.mutate(t.task_number);
-			} else if (t.status === "backlog" && status === "in_progress") {
-				executeMutation.mutate(t.task_number);
 			} else {
 				updateMutation.mutate({taskNumber: t.task_number, status});
 			}
 		},
-		[updateMutation, approveMutation, executeMutation],
+		[updateMutation, approveMutation],
 	);
 
 	const handleDelete = useCallback(
@@ -287,7 +293,7 @@ export function GlobalTasks() {
 				) : (
 					<div className="flex-1 overflow-y-auto">
 						<TaskList
-							tasks={tasks}
+							tasks={listTasks}
 							activeTaskId={activeTaskId ?? undefined}
 							collapsedGroups={collapsedGroups}
 							onToggleGroup={handleToggleGroup}
@@ -303,8 +309,14 @@ export function GlobalTasks() {
 			{/* Detail panel */}
 			{activeTask && (
 				<div className="w-[400px] shrink-0 overflow-y-auto border-l border-app-line">
+					{/* Sits above TaskDetail until @spacedrive/ai ships the
+					    beforeSubtasks slot, which places it in-card. */}
+					<ExecutionPlanSection task={activeTask} />
+					<div className="border-b border-app-line/40 px-4 py-2">
+						<TaskMetadataBadges task={activeTask} enrichment={enrichments.get(activeTask.task_number)} />
+					</div>
 					<TaskDetail
-						task={activeTask}
+						task={activeTask as unknown as Task}
 						resolveAgentName={resolveAgentName}
 						onStatusChange={handleStatusChange}
 						onSubtaskToggle={handleSubtaskToggle}
@@ -316,20 +328,6 @@ export function GlobalTasks() {
 					/>
 				</div>
 			)}
-		</div>
-	);
-}
-
-function GithubSection({metadata}: {metadata: Record<string, unknown>}) {
-	const refs = getGithubReferences(metadata);
-	if (refs.length === 0) return null;
-
-	return (
-		<div className="border-t border-app-line/40 px-4 py-3">
-			<h3 className="mb-2 text-xs font-medium uppercase tracking-wide text-ink-dull">
-				GitHub Links
-			</h3>
-			<GithubMetadataBadges references={refs} />
 		</div>
 	);
 }

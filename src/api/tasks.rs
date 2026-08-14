@@ -52,6 +52,41 @@ pub(super) struct CreateTaskRequest {
     source_memory_id: Option<String>,
     #[serde(default)]
     created_by: Option<String>,
+    #[serde(default)]
+    worker_type: Option<crate::tasks::TaskWorkerType>,
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    repo_id: Option<String>,
+    #[serde(default)]
+    worktree_mode: Option<crate::tasks::TaskWorktreeMode>,
+    #[serde(default)]
+    worktree_id: Option<String>,
+    #[serde(default)]
+    required_skills: Vec<String>,
+    #[serde(default)]
+    depends_on: Vec<TaskDependencyRequest>,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+pub(super) struct TaskDependencyRequest {
+    task: i64,
+    #[serde(default)]
+    kind: Option<crate::tasks::TaskDependencyKind>,
+}
+
+fn dependency_edges(
+    requests: &[TaskDependencyRequest],
+) -> Vec<(i64, crate::tasks::TaskDependencyKind)> {
+    requests
+        .iter()
+        .map(|r| {
+            (
+                r.task,
+                r.kind.unwrap_or(crate::tasks::TaskDependencyKind::Gate),
+            )
+        })
+        .collect()
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -76,6 +111,21 @@ pub(super) struct UpdateTaskRequest {
     worker_id: Option<String>,
     #[serde(default)]
     approved_by: Option<String>,
+    #[serde(default)]
+    worker_type: Option<crate::tasks::TaskWorkerType>,
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    repo_id: Option<String>,
+    #[serde(default)]
+    worktree_mode: Option<crate::tasks::TaskWorktreeMode>,
+    #[serde(default)]
+    worktree_id: Option<String>,
+    #[serde(default)]
+    required_skills: Option<Vec<String>>,
+    /// Full replacement of dependency edges; omit to leave unchanged.
+    #[serde(default)]
+    depends_on: Option<Vec<TaskDependencyRequest>>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -314,18 +364,27 @@ pub(super) async fn create_task(
         .unwrap_or_else(|| request.owner_agent_id.clone());
 
     let task = store
-        .create(crate::tasks::CreateTaskInput {
-            owner_agent_id: request.owner_agent_id,
-            assigned_agent_id: Some(assigned),
-            title: request.title,
-            description: request.description,
-            status,
-            priority,
-            subtasks: request.subtasks,
-            metadata: request.metadata.unwrap_or_else(|| serde_json::json!({})),
-            source_memory_id: request.source_memory_id,
-            created_by: request.created_by.unwrap_or_else(|| "human".to_string()),
-        })
+        .create_with_dependencies(
+            crate::tasks::CreateTaskInput {
+                owner_agent_id: request.owner_agent_id,
+                assigned_agent_id: Some(assigned),
+                title: request.title,
+                description: request.description,
+                status,
+                priority,
+                subtasks: request.subtasks,
+                metadata: request.metadata.unwrap_or_else(|| serde_json::json!({})),
+                source_memory_id: request.source_memory_id,
+                created_by: request.created_by.unwrap_or_else(|| "human".to_string()),
+                worker_type: request.worker_type,
+                project_id: request.project_id,
+                repo_id: request.repo_id,
+                worktree_mode: request.worktree_mode,
+                worktree_id: request.worktree_id,
+                required_skills: request.required_skills,
+            },
+            &dependency_edges(&request.depends_on),
+        )
         .await
         .map_err(|error| {
             tracing::warn!(%error, "failed to create task");
@@ -362,8 +421,10 @@ pub(super) async fn update_task(
     let status = parse_status(request.status.as_deref())?;
     let priority = parse_priority(request.priority.as_deref())?;
 
+    let edges = request.depends_on.as_deref().map(dependency_edges);
+
     let update = store
-        .update_with_status_transition(
+        .update_with_dependencies_and_status_override(
             number,
             crate::tasks::UpdateTaskInput {
                 title: request.title,
@@ -377,7 +438,14 @@ pub(super) async fn update_task(
                 clear_worker_id: false,
                 approved_by: request.approved_by,
                 complete_subtask: request.complete_subtask,
+                worker_type: request.worker_type,
+                project_id: request.project_id,
+                repo_id: request.repo_id,
+                worktree_mode: request.worktree_mode,
+                worktree_id: request.worktree_id,
+                required_skills: request.required_skills,
             },
+            edges.as_deref(),
         )
         .await
         .map_err(|error| {

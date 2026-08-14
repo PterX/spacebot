@@ -9,10 +9,16 @@ use std::path::PathBuf;
 use super::{Skill, SkillSource, parse_skill_markdown};
 
 /// Each entry is `(directory_name, raw SKILL.md content)`.
-const BUILTIN_SKILLS: &[(&str, &str)] = &[(
-    "wiki-writing",
-    include_str!("../../skills/builtin/wiki-writing/SKILL.md"),
-)];
+const BUILTIN_SKILLS: &[(&str, &str)] = &[
+    (
+        "wiki-writing",
+        include_str!("../../skills/builtin/wiki-writing/SKILL.md"),
+    ),
+    (
+        "workspace-organization",
+        include_str!("../../skills/builtin/workspace-organization/SKILL.md"),
+    ),
+];
 
 /// Parse all built-in skills from embedded content.
 pub fn load() -> Vec<Skill> {

@@ -67,6 +67,15 @@ pub struct TaskUpdateArgs {
     pub complete_subtask: Option<i32>,
     pub worker_id: Option<String>,
     pub approved_by: Option<String>,
+    pub worker_type: Option<String>,
+    pub project_id: Option<String>,
+    pub repo_id: Option<String>,
+    pub worktree_mode: Option<String>,
+    pub worktree_id: Option<String>,
+    pub required_skills: Option<Vec<String>>,
+    /// Full replacement of the task's dependency edges; omit to leave
+    /// unchanged.
+    pub depends_on: Option<Vec<crate::tools::task_create::TaskDependencyArg>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -142,7 +151,41 @@ impl Tool for TaskUpdateTool {
                     "metadata": { "type": "object", "description": "Metadata object deep-merged with current metadata" },
                     "complete_subtask": { "type": "integer", "description": "Subtask index to mark complete" },
                     "worker_id": { "type": "string", "description": "Optional worker ID to bind to this task" },
-                    "approved_by": { "type": "string", "description": "Optional approver identifier" }
+                    "approved_by": { "type": "string", "description": "Optional approver identifier" },
+                    "worker_type": {
+                        "type": "string",
+                        "enum": crate::tasks::TaskWorkerType::ALL.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
+                        "description": "Execution plan: which worker kind runs this task"
+                    },
+                    "project_id": { "type": "string", "description": "Execution plan: project ID the work belongs to" },
+                    "repo_id": { "type": "string", "description": "Execution plan: repo ID within the project" },
+                    "worktree_mode": {
+                        "type": "string",
+                        "enum": crate::tasks::TaskWorktreeMode::ALL.iter().map(|m| m.to_string()).collect::<Vec<_>>(),
+                        "description": "Execution plan: root, existing, or create"
+                    },
+                    "worktree_id": { "type": "string", "description": "Execution plan: existing worktree ID" },
+                    "required_skills": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Full replacement of the task's required skills list"
+                    },
+                    "depends_on": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "task": { "type": "integer", "description": "Task number this task depends on" },
+                                "kind": {
+                                    "type": "string",
+                                    "enum": crate::tasks::TaskDependencyKind::ALL.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
+                                    "description": "\"gate\" (default) waits for done; \"stack\" waits only for the dependency's branch"
+                                }
+                            },
+                            "required": ["task"]
+                        },
+                        "description": "Full replacement of this task's dependency edges"
+                    }
                 },
                 "required": ["task_number"]
             })
@@ -163,7 +206,14 @@ impl Tool for TaskUpdateTool {
                 || args.status.is_some()
                 || args.priority.is_some()
                 || args.worker_id.is_some()
-                || args.approved_by.is_some())
+                || args.approved_by.is_some()
+                || args.worker_type.is_some()
+                || args.project_id.is_some()
+                || args.repo_id.is_some()
+                || args.worktree_mode.is_some()
+                || args.worktree_id.is_some()
+                || args.required_skills.is_some()
+                || args.depends_on.is_some())
         {
             return Err(TaskUpdateError(
                 "workers can only update subtasks and metadata".to_string(),
@@ -192,6 +242,21 @@ impl Tool for TaskUpdateTool {
             ),
         };
 
+        let worker_type = match args.worker_type.as_deref() {
+            None => None,
+            Some(value) => Some(
+                crate::tasks::TaskWorkerType::parse(value)
+                    .ok_or_else(|| TaskUpdateError(format!("invalid worker_type: {value}")))?,
+            ),
+        };
+        let worktree_mode = match args.worktree_mode.as_deref() {
+            None => None,
+            Some(value) => Some(
+                crate::tasks::TaskWorktreeMode::parse(value)
+                    .ok_or_else(|| TaskUpdateError(format!("invalid worktree_mode: {value}")))?,
+            ),
+        };
+
         let input = UpdateTaskInput {
             title: args.title,
             description: args.description,
@@ -203,13 +268,30 @@ impl Tool for TaskUpdateTool {
             clear_worker_id: false,
             approved_by: args.approved_by,
             complete_subtask,
-            ..Default::default()
+            assigned_agent_id: None,
+            worker_type,
+            project_id: args.project_id,
+            repo_id: args.repo_id,
+            worktree_mode,
+            worktree_id: args.worktree_id,
+            required_skills: args.required_skills,
         };
+
+        let edges = args
+            .depends_on
+            .as_deref()
+            .map(crate::tools::task_create::parse_dependency_args)
+            .transpose()
+            .map_err(TaskUpdateError)?;
 
         let update_result = match &self.scope {
             TaskUpdateScope::Branch => self
                 .task_store
-                .update_with_status_transition(task_number, input)
+                .update_with_dependencies_and_status_transition(
+                    task_number,
+                    input,
+                    edges.as_deref(),
+                )
                 .await
                 .map_err(|error| TaskUpdateError(format!("{error}")))?
                 .ok_or_else(|| TaskUpdateError(format!("task #{} not found", task_number)))?,
@@ -330,6 +412,7 @@ mod tests {
                 metadata: serde_json::json!({}),
                 source_memory_id: None,
                 created_by: "branch".to_string(),
+                ..Default::default()
             })
             .await
             .expect("task should be created");
@@ -349,6 +432,13 @@ mod tests {
                 complete_subtask: None,
                 worker_id: None,
                 approved_by: None,
+                worker_type: None,
+                project_id: None,
+                repo_id: None,
+                worktree_mode: None,
+                worktree_id: None,
+                required_skills: None,
+                depends_on: None,
             })
             .await
             .expect("task update should succeed");
@@ -380,6 +470,7 @@ mod tests {
                 metadata: serde_json::json!({}),
                 source_memory_id: None,
                 created_by: "branch".to_string(),
+                ..Default::default()
             })
             .await
             .expect("task should be created");
@@ -399,6 +490,13 @@ mod tests {
                 complete_subtask: None,
                 worker_id: None,
                 approved_by: None,
+                worker_type: None,
+                project_id: None,
+                repo_id: None,
+                worktree_mode: None,
+                worktree_id: None,
+                required_skills: None,
+                depends_on: None,
             })
             .await
             .expect("task update should succeed");
@@ -428,6 +526,7 @@ mod tests {
                 metadata: serde_json::json!({}),
                 source_memory_id: None,
                 created_by: "branch".to_string(),
+                ..Default::default()
             })
             .await
             .expect("assigned task should be created");
@@ -443,6 +542,7 @@ mod tests {
                 metadata: serde_json::json!({}),
                 source_memory_id: None,
                 created_by: "branch".to_string(),
+                ..Default::default()
             })
             .await
             .expect("other task should be created");
@@ -472,6 +572,13 @@ mod tests {
                 complete_subtask: None,
                 worker_id: None,
                 approved_by: None,
+                worker_type: None,
+                project_id: None,
+                repo_id: None,
+                worktree_mode: None,
+                worktree_id: None,
+                required_skills: None,
+                depends_on: None,
             })
             .await
             .expect_err("foreign task should be rejected");
@@ -487,6 +594,13 @@ mod tests {
                 complete_subtask: None,
                 worker_id: None,
                 approved_by: None,
+                worker_type: None,
+                project_id: None,
+                repo_id: None,
+                worktree_mode: None,
+                worktree_id: None,
+                required_skills: None,
+                depends_on: None,
             })
             .await
             .expect_err("missing task should be rejected the same way");

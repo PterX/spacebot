@@ -15,8 +15,8 @@ use crate::wakes::{AutonomyRunStatus, AutonomyRunStore};
 use crate::{AgentDeps, InboundMessage, MessageContent, RoutedResponse};
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Conversation id (and channel id) for the autonomy channel. One per agent.
@@ -46,6 +46,13 @@ pub struct AutonomyRunHandle {
     pub run_id: String,
     pub store: Arc<AutonomyRunStore>,
     completed: Arc<AtomicBool>,
+    finish_request: Arc<Mutex<Option<AutonomyFinishRequest>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AutonomyFinishRequest {
+    pub summary: String,
+    pub actions: Vec<crate::wakes::AutonomyAction>,
 }
 
 impl AutonomyRunHandle {
@@ -54,6 +61,7 @@ impl AutonomyRunHandle {
             run_id,
             store,
             completed: Arc::new(AtomicBool::new(false)),
+            finish_request: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -65,15 +73,36 @@ impl AutonomyRunHandle {
     pub fn completed(&self) -> bool {
         self.completed.load(Ordering::Acquire)
     }
-}
 
-/// Whether the cortex may pick up `ready` tasks for execution.
-///
-/// Execution without a user present is Act-only: `observe` surveys, `suggest`
-/// enriches and proposes, but only `act` runs approved work. `off` disables
-/// autonomous pickup entirely.
-pub fn ready_pickup_allowed(level: AutonomyLevel) -> bool {
-    level == AutonomyLevel::Act
+    /// Store the first finish request so duplicate tool calls cannot replace
+    /// the summary that will be committed after child workers settle.
+    pub fn request_finish(&self, request: AutonomyFinishRequest) -> bool {
+        let mut finish_request = self
+            .finish_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if finish_request.is_some() {
+            return false;
+        }
+        *finish_request = Some(request);
+        true
+    }
+
+    pub fn finish_requested(&self) -> bool {
+        let finish_request = self
+            .finish_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        finish_request.is_some()
+    }
+
+    pub fn finish_request(&self) -> Option<AutonomyFinishRequest> {
+        let finish_request = self
+            .finish_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        finish_request.clone()
+    }
 }
 
 /// Whether an autonomy run is due right now.
@@ -207,7 +236,7 @@ pub async fn maybe_run_autonomy(deps: &AgentDeps) {
     tokio::spawn(async move {
         if let Err(error) = run_autonomy_channel(&deps, run_id.clone(), config).await {
             tracing::error!(%error, run_id = %run_id, "autonomy run failed");
-            if let Err(finish_error) = deps
+            match deps
                 .autonomy_run_store
                 .finish_run_status(
                     &run_id,
@@ -216,10 +245,21 @@ pub async fn maybe_run_autonomy(deps: &AgentDeps) {
                 )
                 .await
             {
-                tracing::warn!(%finish_error, run_id = %run_id, "failed to record autonomy run failure");
+                Ok(true) => {
+                    publish_terminal_summary(&deps, &run_id, &format!("run failed: {error}"))
+                }
+                Ok(false) => {}
+                Err(finish_error) => {
+                    tracing::warn!(%finish_error, run_id = %run_id, "failed to record autonomy run failure");
+                }
             }
         }
     });
+}
+
+/// Handle an external wake by checking whether an autonomy run is due.
+pub async fn wake_one(deps: &AgentDeps) {
+    maybe_run_autonomy(deps).await;
 }
 
 /// Execute a single autonomy run: consume pending wake events, assemble the
@@ -230,6 +270,7 @@ pub async fn run_autonomy_channel(
     run_id: String,
     config: AutonomyConfig,
 ) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
     // Consume pending wake events at run start. A crash after this point does
     // not replay events — crash semantics for tasks are handled by task
     // status, not event replay.
@@ -395,34 +436,55 @@ pub async fn run_autonomy_channel(
         None => None,
     };
 
-    // Record the run outcome if autonomy_complete didn't already.
-    if !handle.completed() {
+    // A finish request closes dispatch before the channel exits. Wait for the
+    // durable child rows instead of cancelling useful work to make closure fit
+    // the parent deadline.
+    let settled = settle_owned_children(&handle, deadline).await?;
+
+    // Record the run outcome after owned noninteractive children settled, or
+    // after the configured hard deadline. The latter retains child attribution
+    // and lets their normal terminal paths finish without parent cancellation.
+    if let Some(request) = handle.finish_request() {
+        let recorded = deps
+            .autonomy_run_store
+            .complete_run_if_children_settled(&run_id, &request.summary, &request.actions, !settled)
+            .await?;
+        if recorded {
+            handle.mark_completed();
+            publish_terminal_summary(deps, &run_id, &request.summary);
+        }
+    } else if !handle.completed() {
         if let Some(failure) = &channel_failed {
-            deps.autonomy_run_store
+            let recorded = deps
+                .autonomy_run_store
                 .finish_run_status(&run_id, AutonomyRunStatus::Failed, Some(failure))
                 .await?;
+            if recorded {
+                publish_terminal_summary(deps, &run_id, failure);
+            }
         } else if timed_out {
-            deps.autonomy_run_store
+            let recorded = deps
+                .autonomy_run_store
                 .finish_run_status(
                     &run_id,
                     AutonomyRunStatus::Timeout,
                     Some(AUTONOMY_FALLBACK_SUMMARY),
                 )
                 .await?;
+            if recorded {
+                publish_terminal_summary(deps, &run_id, AUTONOMY_FALLBACK_SUMMARY);
+            }
         } else {
             // The channel-side contract retries were exhausted without a
             // completion call — record the run with a synthesized summary.
-            deps.autonomy_run_store
+            let recorded = deps
+                .autonomy_run_store
                 .complete_run(&run_id, AUTONOMY_FALLBACK_SUMMARY, &[])
                 .await?;
+            if recorded {
+                publish_terminal_summary(deps, &run_id, AUTONOMY_FALLBACK_SUMMARY);
+            }
         }
-    }
-
-    // Wake the ready-task pickup so side-effect tasks created during the run
-    // (delegations, follow-ups) are noticed promptly. Fired after the channel
-    // exits so the one-shot wake actually finds the rows.
-    if let Some(wake_tx) = deps.wake_tx.as_ref() {
-        crate::agent::wake::fire_wake(wake_tx, &deps.agent_id);
     }
 
     if let Err(error) = deps
@@ -439,6 +501,46 @@ pub async fn run_autonomy_channel(
 
     tracing::info!(run_id = %run_id, timed_out, completed = handle.completed(), "autonomy run finished");
     Ok(())
+}
+
+/// The run table transition is the idempotency boundary. Only the caller that
+/// changes a run from `running` may add its conclusion to the channel record.
+fn publish_terminal_summary(deps: &AgentDeps, run_id: &str, summary: &str) {
+    let channel_id: crate::ChannelId = Arc::from(AUTONOMY_CONVERSATION_ID);
+    crate::conversation::ConversationLogger::new(deps.sqlite_pool.clone()).log_bot_message_with_id(
+        &channel_id,
+        &format!("autonomy-outcome:{run_id}"),
+        summary,
+    );
+    if let Err(error) = deps
+        .event_tx
+        .send(crate::ProcessEvent::ChannelAssistantMessage {
+            agent_id: deps.agent_id.clone(),
+            channel_id,
+            text: summary.to_string(),
+        })
+    {
+        tracing::debug!(%error, "failed to emit autonomy outcome for live timeline");
+    }
+}
+
+async fn settle_owned_children(
+    handle: &AutonomyRunHandle,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<bool> {
+    loop {
+        if !handle
+            .store
+            .has_active_owned_children(&handle.run_id)
+            .await?
+        {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 fn system_message(deps: &AgentDeps, text: String) -> InboundMessage {
@@ -634,6 +736,21 @@ fn render_task_line(task: &Task, agent_id: &str) -> String {
             300,
         ));
     }
+    // Surface the execution plan so runs execute tasks as configured instead
+    // of re-deciding where and how the work happens.
+    let plan = crate::tasks::ExecutionPlan::resolve(task, None);
+    if !plan.is_empty() {
+        line.push_str(&format!(" [{}]", plan.summary()));
+    }
+    // Surface ordering so runs don't re-derive the pipeline from prose.
+    let blocked_by = task.blocked_by();
+    if !blocked_by.is_empty() {
+        let numbers: Vec<String> = blocked_by.iter().map(|n| format!("#{n}")).collect();
+        line.push_str(&format!(" [blocked by {}]", numbers.join(", ")));
+    }
+    if let Some(parent) = task.stack_parent() {
+        line.push_str(&format!(" [stacks on #{parent}]"));
+    }
     line.push('\n');
     line
 }
@@ -780,14 +897,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn ready_pickup_is_act_only() {
-        assert!(!ready_pickup_allowed(AutonomyLevel::Off));
-        assert!(!ready_pickup_allowed(AutonomyLevel::Observe));
-        assert!(!ready_pickup_allowed(AutonomyLevel::Suggest));
-        assert!(ready_pickup_allowed(AutonomyLevel::Act));
-    }
-
     fn task_with_assignment(assigned: Option<&str>) -> Task {
         Task {
             id: "task-1".to_string(),
@@ -803,6 +912,13 @@ mod tests {
             goal_id: None,
             source_memory_id: None,
             worker_id: None,
+            worker_type: None,
+            project_id: None,
+            repo_id: None,
+            worktree_mode: None,
+            worktree_id: None,
+            required_skills: Vec::new(),
+            depends_on: Vec::new(),
             created_by: "user".to_string(),
             approved_at: None,
             approved_by: None,

@@ -93,6 +93,12 @@ impl ReplyTool {
 #[error("Reply failed: {0}")]
 pub struct ReplyError(String);
 
+fn scan_blocks_for_leaks(blocks: &[serde_json::Value]) -> Result<Option<String>, ReplyError> {
+    let serialized_blocks = serde_json::to_string(blocks)
+        .map_err(|error| ReplyError(format!("failed to serialize Slack blocks: {error}")))?;
+    Ok(crate::secrets::scrub::scan_for_leaks(&serialized_blocks))
+}
+
 /// Arguments for reply tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReplyArgs {
@@ -107,6 +113,10 @@ pub struct ReplyArgs {
     /// Great for structured reports, summaries, or visually distinct content.
     #[serde(default)]
     pub cards: Option<Vec<crate::Card>>,
+    /// Optional: Slack Block Kit blocks as raw JSON objects. Slack renders these
+    /// natively; other adapters use the message content fallback.
+    #[serde(default)]
+    pub blocks: Option<Vec<serde_json::Value>>,
     /// Optional: interactive elements (e.g. buttons, select menus) to attach.
     /// Button clicks will be sent back to you as an inbound InteractionEvent
     /// with the corresponding custom_id.
@@ -343,6 +353,11 @@ impl Tool for ReplyTool {
                         }
                     }
                 },
+                "blocks": {
+                    "type": "array",
+                    "description": "Optional: Slack Block Kit blocks as raw JSON objects. Slack renders them natively; provide content as a readable fallback for other adapters.",
+                    "items": { "type": "object" }
+                },
                 "interactive_elements": {
                     "type": "array",
                     "description": "Optional: interactive components to attach. Button clicks will be sent back to you as an inbound InteractionEvent with the corresponding custom_id. Max 5 elements (rows).",
@@ -468,6 +483,19 @@ impl Tool for ReplyTool {
             ));
         }
 
+        if let Some(blocks) = &args.blocks
+            && let Some(leak) = scan_blocks_for_leaks(blocks)?
+        {
+            tracing::error!(
+                conversation_id = %self.conversation_id,
+                leak_prefix = %&leak[..leak.len().min(8)],
+                "reply tool blocked Slack blocks matching secret pattern"
+            );
+            return Err(ReplyError(
+                "blocked reply blocks: potential secret detected".into(),
+            ));
+        }
+
         let response = if let Some(name) = thread_name {
             // Cap thread names at 100 characters (Discord limit)
             let thread_name = if name.len() > 100 {
@@ -479,10 +507,14 @@ impl Tool for ReplyTool {
                 thread_name,
                 text: converted_content.clone(),
             }
-        } else if args.cards.is_some() || args.interactive_elements.is_some() || poll.is_some() {
+        } else if args.cards.is_some()
+            || args.blocks.is_some()
+            || args.interactive_elements.is_some()
+            || poll.is_some()
+        {
             OutboundResponse::RichMessage {
                 text: converted_content.clone(),
-                blocks: vec![],
+                blocks: args.blocks.unwrap_or_default(),
                 cards: args.cards.unwrap_or_default(),
                 interactive_elements: args.interactive_elements.unwrap_or_default(),
                 poll,
@@ -536,7 +568,49 @@ impl Tool for ReplyTool {
 mod tests {
     use super::{
         normalize_discord_mention_tokens, normalize_poll_payload, sanitize_discord_user_id,
+        scan_blocks_for_leaks,
     };
+
+    #[test]
+    fn reply_schema_exposes_slack_blocks() {
+        let args: super::ReplyArgs = serde_json::from_value(serde_json::json!({
+            "content": "Fallback",
+            "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "Hello"}}]
+        }))
+        .expect("reply args accepts Slack blocks");
+        assert_eq!(args.blocks.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn detects_secret_in_serialized_slack_blocks() {
+        let blocks = vec![serde_json::json!({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "Token: sk-ant-abcdefghijklmnopqrstuvwxyz"
+            }
+        })];
+
+        let leak = scan_blocks_for_leaks(&blocks).expect("blocks scan");
+
+        assert!(leak.is_some());
+    }
+
+    #[test]
+    fn allows_slack_blocks_without_secrets() {
+        let blocks = vec![serde_json::json!({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "Deploy completed successfully."
+            }
+        })];
+
+        let leak = scan_blocks_for_leaks(&blocks).expect("blocks scan");
+
+        assert!(leak.is_none());
+    }
+
     use crate::Poll;
 
     #[test]

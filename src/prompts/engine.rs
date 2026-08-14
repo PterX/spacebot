@@ -58,14 +58,6 @@ impl PromptEngine {
         env.add_template("worker", crate::prompts::text::get("worker"))?;
         env.add_template("cortex", crate::prompts::text::get("cortex"))?;
         env.add_template(
-            "cortex_bulletin",
-            crate::prompts::text::get("cortex_bulletin"),
-        )?;
-        env.add_template(
-            "cortex_knowledge_synthesis",
-            crate::prompts::text::get("cortex_knowledge_synthesis"),
-        )?;
-        env.add_template(
             "cortex_intraday_synthesis",
             crate::prompts::text::get("cortex_intraday_synthesis"),
         )?;
@@ -79,6 +71,10 @@ impl PromptEngine {
             crate::prompts::text::get("chronicle_checkpoint"),
         )?;
         env.add_template(
+            "chronicle_rollup",
+            crate::prompts::text::get("chronicle_rollup"),
+        )?;
+        env.add_template(
             "memory_persistence",
             crate::prompts::text::get("memory_persistence"),
         )?;
@@ -90,16 +86,21 @@ impl PromptEngine {
         )?;
         env.add_template("factory", crate::prompts::text::get("factory"))?;
 
-        // Adapter-specific prompt fragments
-        env.add_template(
+        // Adapter-specific prompt fragments — every platform that
+        // `render_channel_adapter_prompt` maps must be registered here.
+        for adapter in [
             "adapters/email",
-            crate::prompts::text::get("adapters/email"),
-        )?;
-        env.add_template("adapters/cron", crate::prompts::text::get("adapters/cron"))?;
-        env.add_template(
+            "adapters/cron",
             "adapters/signal",
-            crate::prompts::text::get("adapters/signal"),
-        )?;
+            "adapters/discord",
+            "adapters/slack",
+            "adapters/mattermost",
+            "adapters/portal",
+            "adapters/twitch",
+            "adapters/webhook",
+        ] {
+            env.add_template(adapter, crate::prompts::text::get(adapter))?;
+        }
 
         // Slash-command agent-turn instructions
         env.add_template(
@@ -141,6 +142,18 @@ impl PromptEngine {
             crate::prompts::text::get("fragments/available_channels"),
         )?;
         env.add_template(
+            "fragments/execution_standard",
+            crate::prompts::text::get("fragments/execution_standard"),
+        )?;
+        env.add_template(
+            "fragments/execution_direct",
+            crate::prompts::text::get("fragments/execution_direct"),
+        )?;
+        env.add_template(
+            "fragments/authority",
+            crate::prompts::text::get("fragments/authority"),
+        )?;
+        env.add_template(
             "fragments/org_context",
             crate::prompts::text::get("fragments/org_context"),
         )?;
@@ -153,6 +166,10 @@ impl PromptEngine {
         env.add_template(
             "fragments/system/retrigger",
             crate::prompts::text::get("fragments/system/retrigger"),
+        )?;
+        env.add_template(
+            "fragments/system/retrigger_autonomy",
+            crate::prompts::text::get("fragments/system/retrigger_autonomy"),
         )?;
         env.add_template(
             "fragments/system/truncation",
@@ -185,10 +202,6 @@ impl PromptEngine {
         env.add_template(
             "fragments/system/autonomy_hard_timeout",
             crate::prompts::text::get("fragments/system/autonomy_hard_timeout"),
-        )?;
-        env.add_template(
-            "fragments/system/cortex_synthesis",
-            crate::prompts::text::get("fragments/system/cortex_synthesis"),
         )?;
         env.add_template(
             "fragments/system/profile_synthesis",
@@ -291,12 +304,15 @@ impl PromptEngine {
     }
 
     /// Convenience method for rendering worker capabilities fragment.
+    /// `worker_context` selects the context prose so the advertised behavior
+    /// matches this conversation's actual worker settings.
     pub fn render_worker_capabilities(
         &self,
         browser_enabled: bool,
         web_search_enabled: bool,
         opencode_enabled: bool,
         mcp_tool_names: &[String],
+        worker_context: &crate::conversation::settings::WorkerContextMode,
     ) -> Result<String> {
         self.render(
             "fragments/worker_capabilities",
@@ -305,6 +321,11 @@ impl PromptEngine {
                 web_search_enabled => web_search_enabled,
                 opencode_enabled => opencode_enabled,
                 mcp_tool_names => mcp_tool_names,
+                worker_history_fork => matches!(
+                    worker_context.history,
+                    crate::conversation::settings::WorkerHistoryMode::Fork
+                ),
+                worker_memory => worker_context.memory.as_str(),
             },
         )
     }
@@ -473,6 +494,18 @@ impl PromptEngine {
         )
     }
 
+    /// Render the retrigger message for autonomy channels, which have no
+    /// user-facing reply surface. Results are framed as run context to
+    /// incorporate, not content that must be relayed to a user.
+    pub fn render_system_retrigger_autonomy(&self, results: &[RetriggerResult]) -> Result<String> {
+        self.render(
+            "fragments/system/retrigger_autonomy",
+            context! {
+                results => results,
+            },
+        )
+    }
+
     /// Correction message when the LLM outputs tool call syntax as plain text.
     pub fn render_system_tool_syntax_correction(&self) -> Result<String> {
         self.render_static("fragments/system/tool_syntax_correction")
@@ -534,32 +567,15 @@ impl PromptEngine {
         self.render_static("fragments/system/autonomy_hard_timeout")
     }
 
-    /// Render the profile synthesis prompt with identity and bulletin context.
+    /// Render the profile synthesis prompt with identity context.
     pub fn render_system_profile_synthesis(
         &self,
         identity_context: Option<&str>,
-        memory_bulletin: Option<&str>,
     ) -> Result<String> {
         self.render(
             "fragments/system/profile_synthesis",
             context! {
                 identity_context => identity_context,
-                memory_bulletin => memory_bulletin,
-            },
-        )
-    }
-
-    /// Convenience method for rendering cortex synthesis prompt.
-    pub fn render_system_cortex_synthesis(
-        &self,
-        max_words: usize,
-        raw_sections: &str,
-    ) -> Result<String> {
-        self.render(
-            "fragments/system/cortex_synthesis",
-            context! {
-                max_words => max_words,
-                raw_sections => raw_sections,
             },
         )
     }
@@ -646,48 +662,10 @@ impl PromptEngine {
         )
     }
 
-    /// Render the complete channel system prompt with all dynamic components.
-    #[allow(clippy::too_many_arguments)]
-    pub fn render_channel_prompt(
-        &self,
-        identity_context: Option<String>,
-        memory_bulletin: Option<String>,
-        skills_prompt: Option<String>,
-        worker_capabilities: String,
-        conversation_context: Option<String>,
-        status_text: Option<String>,
-        coalesce_hint: Option<String>,
-        available_channels: Option<String>,
-        sandbox_enabled: bool,
-    ) -> Result<String> {
-        self.render_channel_prompt_with_links(
-            identity_context,
-            memory_bulletin,
-            None,
-            skills_prompt,
-            worker_capabilities,
-            conversation_context,
-            status_text,
-            coalesce_hint,
-            available_channels,
-            sandbox_enabled,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-        )
-    }
-
     /// Render the autonomy channel run briefing.
     ///
     /// This becomes the run's initial synthetic message; the channel's normal
-    /// system prompt (identity, bulletin, working memory) is layered on top
+    /// system prompt (identity, memory store, working memory) is layered on top
     /// by the channel machinery.
     #[allow(clippy::too_many_arguments)]
     pub fn render_autonomy_channel_prompt(
@@ -723,11 +701,22 @@ impl PromptEngine {
     }
 
     /// Render optional adapter-specific channel guidance.
+    ///
+    /// Only adapters whose formatting claims passed converter verification
+    /// (1.5) ship a rendering fragment; the rest stay silent until their
+    /// converter is fixed. cron/email/signal fragments are channel
+    /// semantics, not rendering — they stay as they are.
     pub fn render_channel_adapter_prompt(&self, adapter: &str) -> Option<String> {
         let template_name = match adapter {
             "email" => "adapters/email",
             "cron" => "adapters/cron",
             "signal" => "adapters/signal",
+            "discord" => "adapters/discord",
+            "slack" => "adapters/slack",
+            "mattermost" => "adapters/mattermost",
+            "portal" => "adapters/portal",
+            "twitch" => "adapters/twitch",
+            "webhook" => "adapters/webhook",
             _ => return None,
         };
 
@@ -748,7 +737,6 @@ impl PromptEngine {
     pub fn render_cortex_chat_prompt(
         &self,
         identity_context: Option<String>,
-        memory_bulletin: Option<String>,
         channel_transcript: Option<String>,
         agents_manifest: Option<String>,
         changelog_highlights: Option<String>,
@@ -760,7 +748,6 @@ impl PromptEngine {
             "cortex_chat",
             context! {
                 identity_context => identity_context,
-                memory_bulletin => memory_bulletin,
                 channel_transcript => channel_transcript,
                 agents_manifest => agents_manifest,
                 changelog_highlights => changelog_highlights,
@@ -775,32 +762,55 @@ impl PromptEngine {
     ///
     /// The factory prompt instructs the LLM on how to create and configure new agents
     /// using preset archetypes, organizational memory, and user preferences.
-    pub fn render_factory_prompt(
-        &self,
-        identity_context: Option<String>,
-        memory_bulletin: Option<String>,
-    ) -> Result<String> {
+    pub fn render_factory_prompt(&self, identity_context: Option<String>) -> Result<String> {
         self.render(
             "factory",
             context! {
                 identity_context => identity_context,
-                memory_bulletin => memory_bulletin,
             },
         )
     }
 
     /// Render the org context fragment showing the agent's position in the hierarchy.
-    pub fn render_org_context(&self, org_context: OrgContext) -> Result<String> {
+    ///
+    /// `human_profile_cap` caps each HUMAN.md profile: under 2x the cap the
+    /// profile renders in full (the block header reports utilization against
+    /// the pre-cap total, loudly past 100%); past 2x it truncates at a
+    /// section boundary and the header discloses the truncation.
+    pub fn render_org_context(
+        &self,
+        mut org_context: OrgContext,
+        human_profile_cap: usize,
+    ) -> Result<String> {
+        // A zero cap would divide by zero in the fragment's header math.
+        let human_profile_cap = human_profile_cap.max(1);
+        for group in [
+            &mut org_context.superiors,
+            &mut org_context.subordinates,
+            &mut org_context.peers,
+        ] {
+            for entry in group {
+                if let Some(description) = entry.description.take() {
+                    entry.description_total_chars = Some(description.chars().count());
+                    entry.description = Some(cap_human_description(description, human_profile_cap));
+                }
+            }
+        }
         self.render(
             "fragments/org_context",
             context! {
                 org_context => org_context,
+                human_profile_cap => human_profile_cap,
             },
         )
     }
 
     /// Render the projects context fragment listing active projects with repos and worktrees.
+    ///
+    /// Bounded to `MAX_PROJECTS` projects, unreported (2.2).
     pub fn render_projects_context(&self, projects: Vec<ProjectContext>) -> Result<String> {
+        const MAX_PROJECTS: usize = 10;
+        let projects: Vec<ProjectContext> = projects.into_iter().take(MAX_PROJECTS).collect();
         self.render(
             "fragments/projects_context",
             context! {
@@ -814,15 +824,13 @@ impl PromptEngine {
     pub fn render_channel_prompt_with_links(
         &self,
         identity_context: Option<String>,
-        memory_bulletin: Option<String>,
         knowledge_synthesis: Option<String>,
         skills_prompt: Option<String>,
         worker_capabilities: String,
         conversation_context: Option<String>,
         status_text: Option<String>,
-        coalesce_hint: Option<String>,
         available_channels: Option<String>,
-        sandbox_enabled: bool,
+        agent_links: bool,
         org_context: Option<String>,
         adapter_prompt: Option<String>,
         project_context: Option<String>,
@@ -832,20 +840,19 @@ impl PromptEngine {
         channel_activity_map: Option<String>,
         participant_context: Option<String>,
         active_goals: Option<String>,
-        direct_mode: bool,
+        execution_mode: String,
+        authority: String,
     ) -> Result<String> {
         self.render(
             "channel",
             context! {
                 identity_context => identity_context,
-                memory_bulletin => memory_bulletin,
                 skills_prompt => skills_prompt,
                 worker_capabilities => worker_capabilities,
                 conversation_context => conversation_context,
                 status_text => status_text,
-                coalesce_hint => coalesce_hint,
                 available_channels => available_channels,
-                sandbox_enabled => sandbox_enabled,
+                agent_links => agent_links,
                 org_context => org_context,
                 adapter_prompt => adapter_prompt,
                 project_context => project_context,
@@ -856,7 +863,8 @@ impl PromptEngine {
                 participant_context => participant_context,
                 active_goals => active_goals,
                 knowledge_synthesis => knowledge_synthesis,
-                direct_mode => direct_mode,
+                execution_mode => execution_mode,
+                authority => authority,
             },
         )
     }
@@ -864,6 +872,51 @@ impl PromptEngine {
     /// Get the configured language code.
     pub fn language(&self) -> &str {
         &self.language
+    }
+}
+
+/// Cap a human profile at a section boundary past 2x the budget. Under 2x the
+/// cap it renders in full — the utilization header reports >100% loudly, per
+/// the 2.2 design; past 2x it truncates at the last section heading within
+/// the ceiling so operator-authored standing rules in the tail are never
+/// silently cut mid-section.
+/// Cap an authored profile document for rendering.
+///
+/// Under 2x the cap the document renders in full — the header's utilization
+/// number is the pressure signal, and authored documents may carry standing
+/// rules in their tail, so silent truncation is never acceptable under the
+/// ceiling. Past the ceiling the cut lands only at a content boundary: the
+/// last markdown heading outside a code fence within the ceiling, or the
+/// last blank line if no heading exists. A document with neither renders in
+/// full — an oversized render is better than a mid-sentence cut.
+fn cap_human_description(description: String, cap: usize) -> String {
+    let ceiling = cap.saturating_mul(2);
+    if description.chars().count() <= ceiling {
+        return description;
+    }
+    let prefix: String = description.chars().take(ceiling).collect();
+
+    let mut in_fence = false;
+    let mut last_heading: Option<usize> = None;
+    let mut last_blank: Option<usize> = None;
+    let mut offset = 0;
+    for line in prefix.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+        } else if !in_fence {
+            if trimmed.starts_with('#') && offset > 0 {
+                last_heading = Some(offset);
+            } else if line.trim().is_empty() {
+                last_blank = Some(offset);
+            }
+        }
+        offset += line.len();
+    }
+
+    match last_heading.or(last_blank) {
+        Some(idx) if idx > 0 => format!("{}…\n", prefix[..idx].trim_end()),
+        _ => description,
     }
 }
 
@@ -889,6 +942,10 @@ pub struct LinkedAgent {
     /// style, etc. Loaded from `HUMAN.md` on disk. Only set for humans.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Character count of the profile before capping, so the block header
+    /// reports true utilization even when the render is truncated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description_total_chars: Option<usize>,
 }
 
 /// A pending wake event rendered into the autonomy run briefing.
@@ -1017,6 +1074,72 @@ mod tests {
     use crate::config::ToolUseEnforcement;
 
     #[test]
+    fn cap_human_description_renders_small_docs_in_full() {
+        let doc = "# Profile\n\nShort.".to_string();
+        assert_eq!(super::cap_human_description(doc.clone(), 4_000), doc);
+    }
+
+    #[test]
+    fn every_mapped_adapter_template_is_registered() {
+        let engine = PromptEngine::new("en").expect("engine builds");
+        for adapter in [
+            "email",
+            "cron",
+            "signal",
+            "discord",
+            "slack",
+            "mattermost",
+            "portal",
+            "twitch",
+            "webhook",
+        ] {
+            // A mapped adapter whose template is missing renders as None and
+            // logs an error; assert the render path finds the template.
+            assert!(
+                engine.render_channel_adapter_prompt(adapter).is_some(),
+                "adapter fragment for {adapter} failed to render"
+            );
+        }
+    }
+
+    #[test]
+    fn cap_human_description_over_cap_under_ceiling_is_untouched() {
+        // 1.5x the cap: over budget but under the 2x ceiling — the header
+        // carries the pressure signal, the content stays whole.
+        let doc = format!("# A\n\n{}", "x".repeat(150));
+        assert_eq!(super::cap_human_description(doc.clone(), 100), doc);
+    }
+
+    #[test]
+    fn cap_human_description_cuts_at_section_boundary_past_ceiling() {
+        let body = "y".repeat(120);
+        let doc = format!("# Head\n\n{body}\n\n# Tail\n\n{}", "z".repeat(200));
+        let capped = super::cap_human_description(doc, 100);
+        assert!(capped.contains(&body));
+        assert!(!capped.contains("# Tail"));
+        assert!(capped.ends_with("…\n"));
+    }
+
+    #[test]
+    fn cap_human_description_ignores_headings_inside_code_fences() {
+        let filler = "w".repeat(150);
+        let doc = format!(
+            "# Head\n\n```\n# not a heading\n```\n{filler}\n{}",
+            "v".repeat(200)
+        );
+        let capped = super::cap_human_description(doc, 100);
+        // The fenced pseudo-heading is not a cut point; the cut falls back
+        // to a blank-line boundary instead.
+        assert!(!capped.ends_with("# not a heading…\n"));
+    }
+
+    #[test]
+    fn cap_human_description_without_boundaries_renders_in_full() {
+        let doc = "q".repeat(500);
+        assert_eq!(super::cap_human_description(doc.clone(), 100), doc);
+    }
+
+    #[test]
     fn appends_tool_use_enforcement_for_matching_model() {
         let engine = PromptEngine::new("en").expect("prompt engine should build");
         let prompt = engine
@@ -1046,36 +1169,48 @@ mod tests {
     }
 
     #[test]
-    fn renders_memory_context_when_knowledge_synthesis_is_absent() {
+    fn renders_memory_store_and_gates_linked_agents() {
         let engine = PromptEngine::new("en").expect("prompt engine should build");
-        let prompt = engine
-            .render_channel_prompt_with_links(
-                None,
-                Some("Bulletin fallback".to_string()),
-                None,
-                None,
-                String::new(),
-                None,
-                None,
-                None,
-                None,
-                false,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                false,
-            )
-            .expect("channel prompt should render");
+        let render = |agent_links: bool| {
+            engine
+                .render_channel_prompt_with_links(
+                    None,
+                    Some("## Memory Store\n\nScope: global".to_string()),
+                    None,
+                    String::new(),
+                    None,
+                    None,
+                    None,
+                    agent_links,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    engine
+                        .render_static("fragments/execution_standard")
+                        .unwrap_or_default(),
+                    engine
+                        .render_static("fragments/authority")
+                        .unwrap_or_default(),
+                )
+                .expect("channel prompt should render")
+        };
 
-        assert!(prompt.contains("## Memory Context"));
-        assert!(prompt.contains("Bulletin fallback"));
-        assert!(!prompt.contains("## Knowledge Context"));
+        let unlinked = render(false);
+        assert!(unlinked.contains("## Memory Store"));
+        assert!(
+            !unlinked.contains("send_agent_message"),
+            "linked-agent guidance must not render when no link tool is registered"
+        );
+
+        let linked = render(true);
+        assert!(linked.contains("## Linked Agents"));
+        assert!(linked.contains("send_agent_message"));
     }
 
     #[test]
@@ -1087,9 +1222,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    None,
                     String::new(),
-                    None,
                     None,
                     None,
                     None,
@@ -1103,7 +1236,12 @@ mod tests {
                     None,
                     None,
                     None,
-                    false,
+                    engine
+                        .render_static("fragments/execution_standard")
+                        .unwrap_or_default(),
+                    engine
+                        .render_static("fragments/authority")
+                        .unwrap_or_default(),
                 )
                 .expect("channel prompt should render")
         };
@@ -1293,18 +1431,6 @@ mod tests {
             .render_system_memory_persistence_contract_retry()
             .expect("contract retry should render");
         assert!(retry.contains("memory_persistence_complete"));
-    }
-
-    #[test]
-    fn knowledge_synthesis_prompt_preserves_participant_roles() {
-        let engine = PromptEngine::new("en").expect("prompt engine should build");
-        let prompt = engine
-            .render_static("cortex_knowledge_synthesis")
-            .expect("knowledge synthesis prompt should render");
-
-        assert!(prompt.contains("Stable participant or user role facts"));
-        assert!(prompt.contains("the user is the CEO"));
-        assert!(!prompt.contains("\"The user is the CEO\" or similar role statements"));
     }
 }
 // to support multiple languages at compile time.

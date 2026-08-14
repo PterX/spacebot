@@ -321,6 +321,7 @@ pub(super) struct TomlDefaultsConfig {
     pub(super) opencode: Option<TomlOpenCodeConfig>,
     pub(super) worker_log_mode: Option<String>,
     pub(super) home_channel: Option<String>,
+    pub(super) human_profile_cap: Option<usize>,
     pub(super) projects: Option<TomlProjectsConfig>,
 }
 
@@ -404,22 +405,17 @@ pub(super) struct TomlChronicleConfig {
     pub(super) context_token_budget: Option<usize>,
     pub(super) expand_message_limit: Option<i64>,
     pub(super) max_messages_per_checkpoint: Option<i64>,
+    pub(super) rollup_threshold: Option<usize>,
+    pub(super) rollup_batch: Option<usize>,
 }
 
 #[derive(Deserialize)]
 pub(super) struct TomlCortexConfig {
     pub(super) mode: Option<crate::config::CortexMode>,
     pub(super) tick_interval_secs: Option<u64>,
-    pub(super) worker_timeout_secs: Option<u64>,
     pub(super) worker_wall_clock_timeout_secs: Option<u64>,
     pub(super) cron_default_timeout_secs: Option<u64>,
-    pub(super) branch_timeout_secs: Option<u64>,
-    pub(super) detached_worker_timeout_retry_limit: Option<u8>,
-    pub(super) supervisor_kill_budget_per_tick: Option<usize>,
     pub(super) circuit_breaker_threshold: Option<u8>,
-    pub(super) bulletin_interval_secs: Option<u64>,
-    pub(super) bulletin_max_words: Option<usize>,
-    pub(super) bulletin_max_turns: Option<usize>,
     pub(super) maintenance_interval_secs: Option<u64>,
     pub(super) maintenance_decay_rate: Option<f32>,
     pub(super) maintenance_prune_threshold: Option<f32>,
@@ -429,8 +425,9 @@ pub(super) struct TomlCortexConfig {
     pub(super) association_similarity_threshold: Option<f32>,
     pub(super) association_updates_threshold: Option<f32>,
     pub(super) association_max_per_pass: Option<usize>,
-    pub(super) knowledge_synthesis_max_words: Option<usize>,
-    pub(super) knowledge_synthesis_debounce_secs: Option<u64>,
+    pub(super) memory_render_max_words: Option<usize>,
+    pub(super) consolidation_partition_cap: Option<usize>,
+    pub(super) consolidation_near_duplicate_threshold: Option<f32>,
 }
 
 #[derive(Deserialize)]

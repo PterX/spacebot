@@ -25,7 +25,6 @@ const RESULT_HASH_TRUNCATION: usize = 1_000;
 pub struct LoopGuardConfig {
     pub warn_threshold: u32,
     pub block_threshold: u32,
-    pub global_circuit_breaker: u32,
     pub poll_multiplier: u32,
     pub outcome_warn_threshold: u32,
     pub outcome_block_threshold: u32,
@@ -41,7 +40,6 @@ impl LoopGuardConfig {
             ProcessType::Worker => Self {
                 warn_threshold: 4,
                 block_threshold: 7,
-                global_circuit_breaker: 80,
                 poll_multiplier: 3,
                 outcome_warn_threshold: 3,
                 outcome_block_threshold: 4,
@@ -52,7 +50,6 @@ impl LoopGuardConfig {
             ProcessType::Branch => Self {
                 warn_threshold: 3,
                 block_threshold: 5,
-                global_circuit_breaker: 40,
                 poll_multiplier: 2,
                 outcome_warn_threshold: 2,
                 outcome_block_threshold: 3,
@@ -64,7 +61,6 @@ impl LoopGuardConfig {
             ProcessType::Cortex => Self {
                 warn_threshold: 3,
                 block_threshold: 5,
-                global_circuit_breaker: 40,
                 poll_multiplier: 2,
                 outcome_warn_threshold: 2,
                 outcome_block_threshold: 3,
@@ -75,7 +71,6 @@ impl LoopGuardConfig {
             ProcessType::Channel | ProcessType::Compactor => Self {
                 warn_threshold: 2,
                 block_threshold: 4,
-                global_circuit_breaker: 20,
                 poll_multiplier: 2,
                 outcome_warn_threshold: 2,
                 outcome_block_threshold: 3,
@@ -87,12 +82,11 @@ impl LoopGuardConfig {
 }
 
 /// Maps to Rig hook actions: `Allow` -> `Continue`, `Block` -> `Skip` (message
-/// becomes the tool result the LLM sees), `CircuitBreak` -> `Terminate`.
+/// becomes the tool result the LLM sees).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoopGuardVerdict {
     Allow,
     Block(String),
-    CircuitBreak(String),
 }
 
 /// Held behind `Arc<Mutex<>>` on `SpacebotHook`. Persists across tool calls
@@ -108,7 +102,6 @@ pub struct LoopGuard {
     /// The call hash of the most recent `check()`. Used to detect whether the
     /// current call is a continuation of the same repeated sequence.
     last_call_hash: Option<String>,
-    total_calls: u32,
     outcome_counts: HashMap<String, u32>,
     // Call hashes poisoned by outcome detection — next check() auto-blocks.
     blocked_outcomes: HashSet<String>,
@@ -123,7 +116,6 @@ impl LoopGuard {
             config,
             call_counts: HashMap::new(),
             last_call_hash: None,
-            total_calls: 0,
             outcome_counts: HashMap::new(),
             blocked_outcomes: HashSet::new(),
             recent_calls: VecDeque::with_capacity(HISTORY_CAPACITY),
@@ -135,7 +127,6 @@ impl LoopGuard {
     pub fn reset(&mut self) {
         self.call_counts.clear();
         self.last_call_hash = None;
-        self.total_calls = 0;
         self.outcome_counts.clear();
         self.blocked_outcomes.clear();
         self.recent_calls.clear();
@@ -144,16 +135,6 @@ impl LoopGuard {
     }
 
     pub fn check(&mut self, tool_name: &str, args: &str) -> LoopGuardVerdict {
-        self.total_calls += 1;
-
-        if self.total_calls > self.config.global_circuit_breaker {
-            return LoopGuardVerdict::CircuitBreak(format!(
-                "Circuit breaker: exceeded {} total tool calls in this loop. \
-                 The agent appears to be stuck.",
-                self.config.global_circuit_breaker
-            ));
-        }
-
         let call_hash = Self::compute_call_hash(tool_name, args);
         self.hash_to_tool
             .entry(call_hash.clone())
@@ -514,30 +495,11 @@ mod tests {
     }
 
     #[test]
-    fn global_circuit_breaker() {
-        let config = LoopGuardConfig {
-            global_circuit_breaker: 5,
-            warn_threshold: 100,
-            block_threshold: 100,
-            ..worker_config()
-        };
-        let mut guard = LoopGuard::new(config);
-        for i in 0..5 {
-            let args = format!(r#"{{"n":{i}}}"#);
-            assert_eq!(guard.check("tool", &args), LoopGuardVerdict::Allow);
-        }
-        // Call 6 triggers circuit breaker (> 5).
-        let verdict = guard.check("tool", r#"{"n":5}"#);
-        assert!(matches!(verdict, LoopGuardVerdict::CircuitBreak(_)));
-    }
-
-    #[test]
     fn channel_has_stricter_thresholds_than_worker() {
         let channel = channel_config();
         let worker = worker_config();
         assert!(channel.warn_threshold < worker.warn_threshold);
         assert!(channel.block_threshold < worker.block_threshold);
-        assert!(channel.global_circuit_breaker < worker.global_circuit_breaker);
     }
 
     #[test]
@@ -686,7 +648,6 @@ mod tests {
 
         // After reset, the first call should be allowed again.
         assert_eq!(guard.check("shell", args), LoopGuardVerdict::Allow);
-        assert_eq!(guard.total_calls, 1);
     }
 
     #[test]

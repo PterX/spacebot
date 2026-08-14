@@ -38,10 +38,11 @@ Five process types, each implemented as a Rig `Agent<SpacebotModel, SpacebotHook
 │     │   Branch    │         │   Worker    │            │
 │     │             │         │             │            │
 │     │ Fork of     │         │ Independent │            │
-│     │ channel     │         │ task. No    │            │
-│     │ context.    │         │ channel     │            │
+│     │ channel     │         │ task with   │            │
+│     │ context.    │         │ bounded     │            │
 │     │ Thinks,     │         │ context.    │            │
-│     │ recalls,    │         │ Executes.   │            │
+│     │ recalls,    │         │ context.    │            │
+│     │             │         │ Executes.   │            │
 │     │ returns a   │         │             │            │
 │     │ conclusion. │         │ Shell, file,│            │
 │     │             │         │ exec, browse│            │
@@ -58,14 +59,14 @@ Five process types, each implemented as a Rig `Agent<SpacebotModel, SpacebotHook
 ├─────────────────────────────────────────────────────────┤
 │                       Cortex                            │
 │  System-level observer. Sees across all channels.       │
-│  Generates the memory bulletin — an LLM-curated         │
-│  briefing injected into every channel's prompt.         │
+│  Coordinates maintenance, circuit breakers, and         │
+│  process-registry cleanup for one agent.                │
 └─────────────────────────────────────────────────────────┘
 ```
 
 ### How Delegation Works
 
-The channel never searches memories, executes shell commands, or does heavy work. When it needs to think, it creates a **branch** -- a fork of its conversation context that goes off to reason, recall memories, and return a conclusion. When it needs work done, it spawns a **worker** -- an independent process with task tools and no conversation context.
+The channel never searches memories, executes shell commands, or does heavy work. When it needs to think, it creates a **branch** -- a fork of its conversation context that goes off to reason, recall memories, and return a conclusion. When it needs work done, it spawns a **worker** with a focused task and the relevant bounded channel context.
 
 The channel is always responsive. Branches and workers run concurrently in `tokio::spawn`. Multiple branches can run simultaneously (configurable limit). Multiple workers can run simultaneously. The channel continues accepting messages while they work.
 
@@ -160,9 +161,9 @@ The primary database. Stores everything that benefits from relational queries:
 | `cron_executions` | Execution history for cron jobs |
 | `worker_runs` | Worker execution history with transcripts |
 | `branch_runs` | Branch execution history |
-| `cortex_events` | Cortex action log (bulletin generations, maintenance) |
+| `cortex_events` | Cortex action log for maintenance and operational coordination |
 | `cortex_chat_messages` | Persistent admin chat with cortex |
-| `tasks` | Structured task board (backlog → in_progress → done) |
+| `tasks` | Instance-wide task records, plans, dependencies, and execution state |
 | `ingestion_progress` | Chunk-level progress for file ingestion |
 | `agent_profile` | Cortex-generated personality data |
 | `portal_conversations` | Portal chat conversation persistence with settings |
@@ -304,8 +305,6 @@ Two hook implementations control process behavior:
 
 Hooks return `Continue`, `Terminate`, or `Skip` after each LLM turn, giving the system fine-grained control over process lifecycle.
 
-For profile synthesis, cortex uses Rig structured output (`prompt_typed`) so profile fields are schema-validated instead of parsed from free-form fenced JSON.
-
 ### Max Turns
 
 Rig defaults to 0 (single call). Spacebot sets explicit limits per process type:
@@ -316,7 +315,7 @@ Rig defaults to 0 (single call). Spacebot sets explicit limits per process type:
 | Branch | 10 | A few iterations to think, recall, and conclude. |
 | Worker | 50 | Many iterations for complex tasks. Segmented into 25-turn blocks. |
 | Compactor | 10 | Summarize and extract memories. Bounded. |
-| Cortex | 10 | Bulletin generation. Single-pass with tool calls. |
+| Cortex | 10 | Administrative cortex-chat turns. |
 
 ## Control API
 
@@ -329,7 +328,7 @@ An embedded Axum HTTP server provides the control API for the dashboard and exte
 | Agents | `/api/agents` | CRUD for agent definitions |
 | Channels | `/api/channels` | Channel listing, history, settings, deletion |
 | Workers | `/api/workers` | Worker status, history, timeline |
-| Cortex | `/api/cortex` | Bulletin, profile, cortex chat |
+| Cortex | `/api/cortex` | Cortex chat and operational inspection |
 | Memory | `/api/memories` | Memory CRUD, graph queries |
 | Config | `/api/config` | Runtime configuration read/write |
 | Providers | `/api/providers` | LLM provider key management |
@@ -369,10 +368,10 @@ CLI (clap) → parse args
         → Run SQLite migrations
         → Initialize MemoryStore, LanceDB tables
         → Load RuntimeConfig + identity + skills
-    → Best-effort startup warmup pass (bounded wait)
+    → Optional startup warmup pass (embedding readiness)
     → Initialize MessagingManager (start all platform adapters)
     → Initialize CronScheduler
-    → Start Cortex loops (warmup, bulletin fallback, association, ready-task)
+    → Start Cortex loops (maintenance, associations, health observations)
         → Register agent in active agents map
     → Enter main event loop (tokio::select!)
         → Inbound messages → route to Channel instances

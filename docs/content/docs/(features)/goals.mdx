@@ -1,0 +1,46 @@
+---
+title: Goals
+description: Persistent objectives that orient autonomous task work.
+---
+
+# Goals
+
+Goals provide standing direction for an agent. A goal is not a work queue and does not complete itself when its linked tasks finish. Operators create, pause, complete, or abandon goals deliberately.
+
+Goals are instance-scoped. Every agent can see active goals in its prompt, while tasks retain their own owner and assignee.
+
+## Goal State
+
+| Status | Meaning |
+| --- | --- |
+| `active` | Included in agent context and available for autonomous work. |
+| `paused` | Preserved but excluded from current direction. |
+| `completed` | Closed by an operator. |
+| `abandoned` | Preserved as a record but no longer pursued. |
+
+A goal has a title, optional description, priority, due date, notes, metadata, and task-progress counts. Notes are a current operator-facing progress summary. Tasks carry the detailed plan and execution record.
+
+## Linking Work
+
+Tasks can link to a goal. The goal view reports counts for pending approval, ready, in-progress, completed, and failed work. This lets an autonomy run assess progress without turning a goal into a mutable checklist.
+
+The prompt receives a compact list of active goals. The autonomy channel receives the expanded goal record and linked-task counts when it wakes.
+
+## Operations
+
+Create and manage goals from the dashboard or API:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/goals` | List goals, optionally filtered by status. |
+| `POST` | `/api/goals` | Create a goal. |
+| `GET` | `/api/goals/{id}` | Read a goal and linked-task counts. |
+| `PUT` | `/api/goals/{id}` | Update goal fields, notes, or lifecycle state. |
+
+Set `status` to `completed` or `abandoned` when the objective is actually closed. Updating a goal emits a typed wake event for agents that subscribe to it.
+
+## Related Documentation
+
+- [Autonomy](/docs/autonomy)
+- [Tasks](/docs/tasks)
+- [Wakes](/docs/wakes)

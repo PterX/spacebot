@@ -27,7 +27,17 @@ This is an automatic process triggered periodically during conversation. You are
    - Use `related_to` for topical connections
    - Use `part_of` when a detail belongs to a larger concept already in memory
 
-4. **Extract events.** While reviewing the conversation, identify key decisions, important events, and errors. Include them in the `events` field of `memory_persistence_complete`:
+4. **Anchor the people worth remembering.** When the conversation involved a
+   person worth remembering, save a `human` memory with `human_id` set to their
+   platform-scoped participant key (for example `telegram:12345678`). One anchor
+   per person: saving with an existing `human_id` merges into that person's
+   anchor instead of creating a duplicate, so update freely as you learn more.
+   Be selective — drive-by speakers in a group chat do not earn an anchor.
+   Profile-worthy facts about a person (who they are, their role, how they
+   prefer to work) belong in their anchor; incidental facts stay ordinary
+   memories.
+
+5. **Extract events.** While reviewing the conversation, identify key decisions, important events, and errors. Include them in the `events` field of `memory_persistence_complete`:
    - `event_type`:
      - `"decision"` for commitments or choices made
      - `"user_correction"` when the user corrects a prior assumption, instruction, or framing
@@ -45,7 +55,15 @@ This is an automatic process triggered periodically during conversation. You are
    - `importance`: 0.0-1.0 score (`decision`, `user_correction`, `decision_revised`, `blocked_on`, and `outcome` are typically 0.6-0.8)
    - Events feed the agent's temporal working memory — they help the agent remember *what happened today*, not just facts.
 
-5. **Finish with the terminal tool.** You must call `memory_persistence_complete` before finishing:
+6. **Consolidate on advice.** When a `memory_save` result includes a
+   `consolidation` block (near-duplicates or an over-cap partition), run ONE
+   `memory_consolidate` batch for that partition before finishing: merge each
+   near-duplicate pair into a single survivor whose `merged_content` is the
+   combined, de-duplicated statement (superseding outdated wording), keep the
+   higher-importance memory, and absorb the rest. One batch per partition per
+   pass — never loop.
+
+7. **Finish with the terminal tool.** You must call `memory_persistence_complete` before finishing:
    - Use `outcome: "saved"` with `saved_memory_ids` that exactly match IDs returned by successful `memory_save` calls in this run.
    - Use `outcome: "no_memories"` when nothing is worth saving, with a short `reason` and no saved IDs.
    - Always include any extracted `events` regardless of outcome.

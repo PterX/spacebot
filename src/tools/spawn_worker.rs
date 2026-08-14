@@ -14,19 +14,248 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::Instrument as _;
+
+/// Records the first successful delegation made by a normal branch.
+#[derive(Debug)]
+pub struct BranchDelegationState {
+    branch_id: crate::BranchId,
+    delegation: Mutex<Option<BranchDelegation>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BranchDelegation {
+    pub worker_id: WorkerId,
+    pub task: String,
+    pub interactive: bool,
+}
+
+impl BranchDelegationState {
+    pub fn new(branch_id: crate::BranchId) -> Self {
+        Self {
+            branch_id,
+            delegation: Mutex::new(None),
+        }
+    }
+
+    pub async fn delegation(&self) -> Option<BranchDelegation> {
+        self.delegation.lock().await.clone()
+    }
+}
 
 /// Tool for spawning workers.
 #[derive(Debug, Clone)]
 pub struct SpawnWorkerTool {
     state: ChannelState,
+    branch_delegation: Option<Arc<BranchDelegationState>>,
 }
 
 impl SpawnWorkerTool {
     /// Create a new spawn worker tool with access to channel state.
     pub fn new(state: ChannelState) -> Self {
-        Self { state }
+        Self {
+            state,
+            branch_delegation: None,
+        }
     }
+
+    pub fn for_branch(state: ChannelState, branch_delegation: Arc<BranchDelegationState>) -> Self {
+        Self {
+            state,
+            branch_delegation: Some(branch_delegation),
+        }
+    }
+
+    /// Load a task's execution plan and resolve it to spawn parameters.
+    ///
+    /// Enforces the approval gate (pending-approval tasks cannot spawn),
+    /// merges project defaults under the task's own plan fields, validates
+    /// required skills, and — for `worktree_mode: create` — provisions the
+    /// task's worktree, reusing one from an earlier spawn attempt.
+    async fn resolve_task_plan(&self, number: i64) -> Result<PlannedSpawn, SpawnWorkerError> {
+        use crate::tasks::{ExecutionPlan, TaskStatus, TaskWorktreeMode};
+
+        let deps = &self.state.deps;
+        let task = deps
+            .task_store
+            .get_by_number(number)
+            .await
+            .map_err(|error| SpawnWorkerError(format!("failed to load task #{number}: {error}")))?
+            .ok_or_else(|| SpawnWorkerError(format!("task #{number} not found")))?;
+
+        match task.status {
+            TaskStatus::Ready | TaskStatus::InProgress => {}
+            TaskStatus::PendingApproval | TaskStatus::Backlog => {
+                return Err(SpawnWorkerError(format!(
+                    "task #{number} is {} — it must be approved (ready) before work starts",
+                    task.status
+                )));
+            }
+            TaskStatus::Done | TaskStatus::Failed => {
+                return Err(SpawnWorkerError(format!(
+                    "task #{number} is already {}",
+                    task.status
+                )));
+            }
+        }
+
+        let project = match &task.project_id {
+            Some(project_id) => Some(
+                deps.project_store
+                    .get_project(project_id)
+                    .await
+                    .map_err(|error| {
+                        SpawnWorkerError(format!("failed to load project {project_id}: {error}"))
+                    })?
+                    .ok_or_else(|| {
+                        SpawnWorkerError(format!(
+                            "task #{number} references unknown project {project_id}"
+                        ))
+                    })?,
+            ),
+            None => None,
+        };
+
+        let defaults = project
+            .as_ref()
+            .map(|p| p.typed_settings().execution_defaults());
+        let plan = ExecutionPlan::resolve(&task, defaults.as_ref());
+
+        // A required skill that doesn't resolve would be silently absent from
+        // the worker's contract — fail the spawn instead.
+        {
+            let registry = deps.runtime_config.skills.load();
+            let missing: Vec<&str> = plan
+                .required_skills
+                .iter()
+                .filter(|name| registry.get(name).is_none())
+                .map(String::as_str)
+                .collect();
+            if !missing.is_empty() {
+                return Err(SpawnWorkerError(format!(
+                    "task #{number} requires unknown skill(s): {}",
+                    missing.join(", ")
+                )));
+            }
+        }
+
+        let (directory, worktree_id) = match plan.worktree_mode {
+            Some(TaskWorktreeMode::Root) => {
+                let project = project.as_ref().ok_or_else(|| {
+                    SpawnWorkerError(format!(
+                        "task #{number} has worktree_mode \"root\" but no project"
+                    ))
+                })?;
+                (Some(project.root_path.clone()), None)
+            }
+            Some(TaskWorktreeMode::Existing) => {
+                let worktree_id = plan.worktree_id.clone().ok_or_else(|| {
+                    SpawnWorkerError(format!(
+                        "task #{number} has worktree_mode \"existing\" but no worktree_id"
+                    ))
+                })?;
+                let directory =
+                    resolve_directory_from_project(deps, None, None, Some(&worktree_id))
+                        .await
+                        .ok_or_else(|| {
+                            SpawnWorkerError(format!(
+                                "task #{number}: worktree {worktree_id} could not be resolved"
+                            ))
+                        })?;
+                (Some(directory), Some(worktree_id))
+            }
+            Some(TaskWorktreeMode::Create) => {
+                let project = project.as_ref().ok_or_else(|| {
+                    SpawnWorkerError(format!(
+                        "task #{number} has worktree_mode \"create\" but no project"
+                    ))
+                })?;
+                let worktree_name = format!("task-{number}");
+
+                // Reuse the worktree from an earlier spawn attempt instead of
+                // failing on the existing path.
+                let existing = deps
+                    .project_store
+                    .list_worktrees(&project.id)
+                    .await
+                    .ok()
+                    .and_then(|worktrees| worktrees.into_iter().find(|w| w.name == worktree_name));
+
+                match existing {
+                    Some(worktree) => {
+                        let directory = resolve_directory_from_project(
+                            deps,
+                            None,
+                            None,
+                            Some(&worktree.id),
+                        )
+                        .await
+                        .ok_or_else(|| {
+                            SpawnWorkerError(format!(
+                                "task #{number}: existing worktree {} could not be resolved",
+                                worktree.id
+                            ))
+                        })?;
+                        (Some(directory), Some(worktree.id))
+                    }
+                    None => {
+                        let provisioned = crate::projects::provision_worktree(
+                            &deps.project_store,
+                            &project.id,
+                            plan.repo_id.as_deref(),
+                            &format!("task/{number}"),
+                            Some(&worktree_name),
+                            "task",
+                        )
+                        .await
+                        .map_err(|error| {
+                            SpawnWorkerError(format!(
+                                "task #{number}: failed to create worktree: {error:#}"
+                            ))
+                        })?;
+                        (
+                            Some(provisioned.abs_path.to_string_lossy().to_string()),
+                            Some(provisioned.worktree.id),
+                        )
+                    }
+                }
+            }
+            None => (
+                project.as_ref().map(|p| p.root_path.clone()),
+                plan.worktree_id.clone(),
+            ),
+        };
+
+        Ok(PlannedSpawn {
+            task_number: number,
+            worker_type: plan.worker_type,
+            directory,
+            project_id: plan.project_id,
+            worktree_id,
+            required_skills: plan.required_skills,
+            previous_status: task.status,
+        })
+    }
+}
+
+fn normalize_task_number(task_number: Option<i64>) -> Result<Option<i64>, SpawnWorkerError> {
+    match task_number {
+        None | Some(0) => Ok(None),
+        Some(number) if number > 0 => Ok(Some(number)),
+        Some(number) => Err(SpawnWorkerError(format!(
+            "task_number must be positive when provided, got {number}; omit it or use null for ad-hoc work"
+        ))),
+    }
+}
+
+fn task_number_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": ["integer", "null"],
+        "minimum": 1,
+        "default": null,
+        "description": "Positive task-board number (#N) when this spawn executes an existing board task. Omit or use null for ad-hoc work. The task must be approved; its execution plan (worker type, project, worktree, required skills) is enforced over the other arguments, and the worker is bound to the task."
+    })
 }
 
 fn summarize_duplicate_task(task: &str) -> String {
@@ -82,6 +311,22 @@ pub struct SpawnWorkerArgs {
     /// automatically set to the worktree path.
     #[serde(default)]
     pub worktree_id: Option<String>,
+    /// Positive task-board number this spawn executes. Omit for ad-hoc work.
+    /// The task's execution plan (worker type, project, worktree, required
+    /// skills) is loaded and enforced, and the worker is bound to the task.
+    #[serde(default)]
+    pub task_number: Option<i64>,
+}
+
+/// A task's execution plan resolved to concrete spawn parameters.
+struct PlannedSpawn {
+    task_number: i64,
+    worker_type: Option<crate::tasks::TaskWorkerType>,
+    directory: Option<String>,
+    project_id: Option<String>,
+    worktree_id: Option<String>,
+    required_skills: Vec<String>,
+    previous_status: crate::tasks::TaskStatus,
 }
 
 /// Output from spawn worker tool.
@@ -143,10 +388,19 @@ impl Tool for SpawnWorkerTool {
         };
 
         let base_description = crate::prompts::text::get("tools/spawn_worker");
+        // Sandbox posture for the workers this tool spawns, reflecting the
+        // live containment state (moved here from the channel template's
+        // Builtin Worker Sandbox section).
+        let sandbox_note = if self.state.deps.sandbox.containment_active() {
+            "Builtin workers run sandboxed: `shell` executes under OS-level containment while `file` stays workspace-scoped by path validation."
+        } else {
+            "Builtin workers run unsandboxed: `shell`/`file` have full host filesystem access (OS permissions apply). Environment sanitization still applies."
+        };
         let description = base_description
             .replace("{tools}", &tools_list.join(", "))
             .replace("{history_note}", history_note)
-            .replace("{opencode_note}", opencode_note);
+            .replace("{opencode_note}", opencode_note)
+            .replace("{sandbox_note}", sandbox_note);
 
         let mut properties = serde_json::json!({
             "task": {
@@ -162,7 +416,8 @@ impl Tool for SpawnWorkerTool {
                 "type": "array",
                 "items": { "type": "string" },
                 "description": "Skill names from <available_skills> that are likely relevant to this task. The worker sees all skills and decides what to read, but suggested skills are flagged as recommended."
-            }
+            },
+            "task_number": task_number_schema()
         });
 
         if opencode_enabled && let Some(obj) = properties.as_object_mut() {
@@ -210,8 +465,84 @@ impl Tool for SpawnWorkerTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        if let Some(branch_delegation) = &self.branch_delegation {
+            if let Some((worker_id, task, interactive)) = self
+                .state
+                .process_run_logger
+                .worker_for_origin_branch(branch_delegation.branch_id)
+                .await
+                .map_err(|error| SpawnWorkerError(error.to_string()))?
+            {
+                return Ok(SpawnWorkerOutput {
+                    worker_id,
+                    spawned: false,
+                    interactive,
+                    message: format!("Worker {worker_id} is already delegated for: {task}"),
+                });
+            }
+
+            let mut delegation = branch_delegation.delegation.lock().await;
+            if let Some(existing) = delegation.as_ref() {
+                return Ok(SpawnWorkerOutput {
+                    worker_id: existing.worker_id,
+                    spawned: false,
+                    interactive: existing.interactive,
+                    message: format!(
+                        "Worker {} is already delegated for: {}",
+                        existing.worker_id, existing.task
+                    ),
+                });
+            }
+
+            let task = args.task.clone();
+            let output = self.call_untracked(args).await?;
+            if output.spawned {
+                *delegation = Some(BranchDelegation {
+                    worker_id: output.worker_id,
+                    task,
+                    interactive: output.interactive,
+                });
+            }
+            return Ok(output);
+        }
+
+        self.call_untracked(args).await
+    }
+}
+
+impl SpawnWorkerTool {
+    async fn call_untracked(
+        &self,
+        args: SpawnWorkerArgs,
+    ) -> Result<SpawnWorkerOutput, SpawnWorkerError> {
         let readiness = self.state.deps.runtime_config.work_readiness();
-        let is_opencode = args.worker_type.as_deref() == Some("opencode");
+
+        // A task-bound spawn loads the task's execution plan; plan fields win
+        // over the equivalent arguments.
+        let task_number = normalize_task_number(args.task_number)?;
+        let planned = match task_number {
+            Some(number) => Some(self.resolve_task_plan(number).await?),
+            None => None,
+        };
+
+        let effective_worker_type = planned
+            .as_ref()
+            .and_then(|plan| plan.worker_type)
+            .map(|worker_type| worker_type.as_str().to_string())
+            .or_else(|| args.worker_type.clone());
+        if let (Some(planned_type), Some(arg_type)) = (
+            planned.as_ref().and_then(|plan| plan.worker_type),
+            args.worker_type.as_deref(),
+        ) && planned_type.as_str() != arg_type
+        {
+            tracing::warn!(
+                task_number = ?args.task_number,
+                plan = planned_type.as_str(),
+                argument = arg_type,
+                "worker_type argument conflicts with task plan — plan wins"
+            );
+        }
+        let is_opencode = effective_worker_type.as_deref() == Some("opencode");
 
         // Reject if an active worker already has the same task. This prevents
         // duplicate workers when the LLM emits multiple spawn_worker calls in
@@ -248,14 +579,25 @@ impl Tool for SpawnWorkerTool {
             }
         }
 
-        // Resolve working directory from project/worktree if not explicitly set.
-        let resolved_directory = resolve_directory_from_project(
-            &self.state.deps,
-            args.directory.as_deref(),
-            args.project_id.as_deref(),
-            args.worktree_id.as_deref(),
-        )
-        .await;
+        // Resolve working directory: the task plan's directory wins, then the
+        // explicit argument, then project/worktree lookup.
+        let resolved_directory = match planned.as_ref().and_then(|plan| plan.directory.clone()) {
+            Some(directory) => Some(directory),
+            None => {
+                resolve_directory_from_project(
+                    &self.state.deps,
+                    args.directory.as_deref(),
+                    args.project_id.as_deref(),
+                    args.worktree_id.as_deref(),
+                )
+                .await
+            }
+        };
+
+        let required_skills: Vec<&str> = planned
+            .as_ref()
+            .map(|plan| plan.required_skills.iter().map(String::as_str).collect())
+            .unwrap_or_default();
 
         let worker_id = if is_opencode {
             let directory = resolved_directory.as_deref().ok_or_else(|| {
@@ -265,9 +607,16 @@ impl Tool for SpawnWorkerTool {
             })?;
 
             // OpenCode workers are always interactive — ignore args.interactive.
-            spawn_opencode_worker_from_state(&self.state, &args.task, directory, true)
-                .await
-                .map_err(|e| SpawnWorkerError(format!("{e}")))?
+            spawn_opencode_worker_from_state(
+                &self.state,
+                &args.task,
+                directory,
+                true,
+                &required_skills,
+                self.branch_delegation.as_ref().map(|state| state.branch_id),
+            )
+            .await
+            .map_err(|e| SpawnWorkerError(format!("{e}")))?
         } else {
             // Read worker context settings from ChannelState
             let worker_context = {
@@ -284,18 +633,57 @@ impl Tool for SpawnWorkerTool {
                     .iter()
                     .map(String::as_str)
                     .collect::<Vec<_>>(),
+                &required_skills,
                 &worker_context,
+                self.branch_delegation.as_ref().map(|state| state.branch_id),
             )
             .await
             .map_err(|e| SpawnWorkerError(format!("{e}")))?
         };
 
+        // Bind the worker to its task and move an approved task into
+        // progress. Fire-and-forget consistency: the spawn already happened,
+        // so a binding failure is logged rather than unwinding the worker.
+        if let Some(plan) = &planned {
+            let status_change = (plan.previous_status == crate::tasks::TaskStatus::Ready)
+                .then_some(crate::tasks::TaskStatus::InProgress);
+            if let Err(error) = self
+                .state
+                .deps
+                .task_store
+                .update(
+                    plan.task_number,
+                    crate::tasks::UpdateTaskInput {
+                        worker_id: Some(worker_id.to_string()),
+                        status: status_change,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                tracing::warn!(
+                    %error,
+                    task_number = plan.task_number,
+                    %worker_id,
+                    "failed to bind spawned worker to task"
+                );
+            }
+        }
+
         // Link the worker to project/worktree if specified (fire-and-forget update).
-        if args.project_id.is_some() || args.worktree_id.is_some() {
+        let link_project_id = planned
+            .as_ref()
+            .and_then(|plan| plan.project_id.as_deref())
+            .or(args.project_id.as_deref());
+        let link_worktree_id = planned
+            .as_ref()
+            .and_then(|plan| plan.worktree_id.as_deref())
+            .or(args.worktree_id.as_deref());
+        if link_project_id.is_some() || link_worktree_id.is_some() {
             self.state.process_run_logger.log_worker_project_link(
                 worker_id,
-                args.project_id.as_deref(),
-                args.worktree_id.as_deref(),
+                link_project_id,
+                link_worktree_id,
             );
         }
 
@@ -332,6 +720,68 @@ impl Tool for SpawnWorkerTool {
             interactive: effectively_interactive,
             message: format!("{message}{readiness_note}"),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn branch_delegation_returns_its_first_worker() {
+        let state = BranchDelegationState::new(uuid::Uuid::new_v4());
+        let worker_id = uuid::Uuid::new_v4();
+        *state.delegation.lock().await = Some(BranchDelegation {
+            worker_id,
+            task: "inspect the repository".to_string(),
+            interactive: false,
+        });
+
+        assert_eq!(state.delegation().await.unwrap().worker_id, worker_id);
+    }
+
+    #[test]
+    fn task_number_wire_values_preserve_ad_hoc_spawns() {
+        let omitted: SpawnWorkerArgs = serde_json::from_value(serde_json::json!({
+            "task": "inspect the repository"
+        }))
+        .expect("omitted task_number should deserialize");
+        let null: SpawnWorkerArgs = serde_json::from_value(serde_json::json!({
+            "task": "inspect the repository",
+            "task_number": null
+        }))
+        .expect("null task_number should deserialize");
+        let zero: SpawnWorkerArgs = serde_json::from_value(serde_json::json!({
+            "task": "inspect the repository",
+            "task_number": 0
+        }))
+        .expect("legacy zero task_number should deserialize");
+
+        assert_eq!(normalize_task_number(omitted.task_number).unwrap(), None);
+        assert_eq!(normalize_task_number(null.task_number).unwrap(), None);
+        assert_eq!(normalize_task_number(zero.task_number).unwrap(), None);
+    }
+
+    #[test]
+    fn task_number_normalization_accepts_only_positive_board_numbers() {
+        assert_eq!(normalize_task_number(Some(42)).unwrap(), Some(42));
+
+        let error = normalize_task_number(Some(-1)).unwrap_err();
+        assert!(error.to_string().contains("task_number must be positive"));
+    }
+
+    #[test]
+    fn task_number_schema_exposes_nullable_positive_integer() {
+        let schema = task_number_schema();
+
+        assert_eq!(schema["type"], serde_json::json!(["integer", "null"]));
+        assert_eq!(schema["minimum"], 1);
+        assert_eq!(schema["default"], serde_json::Value::Null);
+        assert!(
+            schema["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("Omit or use null for ad-hoc work"))
+        );
     }
 }
 
@@ -520,7 +970,26 @@ impl Tool for DetachedSpawnWorkerTool {
         let (worker, _input_tx) = worker;
         let worker_id = worker.id;
 
-        // Emit WorkerStarted event so the UI can track it.
+        // Log to worker_runs directly since there's no parent channel to do it.
+        let run_logger =
+            crate::conversation::history::ProcessRunLogger::new(self.deps.sqlite_pool.clone());
+        run_logger
+            .log_worker_started(
+                None,
+                worker_id,
+                &args.task,
+                "cortex",
+                &self.deps.agent_id,
+                false,
+                None,
+                None,
+                None,
+            )
+            .await
+            .map_err(|error| {
+                SpawnWorkerError(format!("failed to persist worker start: {error}"))
+            })?;
+
         let _ = self.deps.event_tx.send(crate::ProcessEvent::WorkerStarted {
             agent_id: self.deps.agent_id.clone(),
             worker_id,
@@ -540,19 +1009,6 @@ impl Tool for DetachedSpawnWorkerTool {
             .importance(0.5)
             .record();
 
-        // Log to worker_runs directly since there's no parent channel to do it.
-        let run_logger =
-            crate::conversation::history::ProcessRunLogger::new(self.deps.sqlite_pool.clone());
-        run_logger.log_worker_started(
-            None,
-            worker_id,
-            &args.task,
-            "cortex",
-            &self.deps.agent_id,
-            false,
-            None,
-        );
-
         let secrets_store = rc.secrets.load().as_ref().clone();
         let worker_span = tracing::info_span!(
             "worker.run",
@@ -563,6 +1019,10 @@ impl Tool for DetachedSpawnWorkerTool {
             worker_id,
             self.deps.event_tx.clone(),
             self.deps.agent_id.clone(),
+            None,
+            run_logger,
+            worker.transcript_snapshot(),
+            None,
             None,
             secrets_store,
             "builtin",

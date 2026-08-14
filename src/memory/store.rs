@@ -69,8 +69,9 @@ impl MemoryStore {
         sqlx::query(
             r#"
             INSERT INTO memories (id, content, memory_type, importance, created_at, updated_at,
-                                 last_accessed_at, access_count, source, channel_id, forgotten)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 last_accessed_at, access_count, source, channel_id, forgotten,
+                                 supersedes_checkpoint_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&memory.id)
@@ -84,6 +85,7 @@ impl MemoryStore {
         .bind(&memory.source)
         .bind(memory.channel_id.as_deref())
         .bind(memory.forgotten)
+        .bind(memory.supersedes_checkpoint_id.as_deref())
         .execute(&self.pool)
         .await
         .with_context(|| format!("failed to save memory {}", memory.id))?;
@@ -114,7 +116,8 @@ impl MemoryStore {
         let row = sqlx::query(
             r#"
             SELECT id, content, memory_type, importance, created_at, updated_at,
-                   last_accessed_at, access_count, source, channel_id, forgotten
+                   last_accessed_at, access_count, source, channel_id, forgotten,
+                   supersedes_checkpoint_id
             FROM memories
             WHERE id = ?
             "#,
@@ -148,7 +151,7 @@ impl MemoryStore {
             UPDATE memories
             SET content = ?, memory_type = ?, importance = ?, updated_at = ?,
                 last_accessed_at = ?, access_count = ?, source = ?, channel_id = ?,
-                forgotten = ?
+                forgotten = ?, supersedes_checkpoint_id = ?
             WHERE id = ?
             "#,
         )
@@ -161,6 +164,7 @@ impl MemoryStore {
         .bind(&memory.source)
         .bind(memory.channel_id.as_deref())
         .bind(memory.forgotten)
+        .bind(memory.supersedes_checkpoint_id.as_deref())
         .bind(&memory.id)
         .execute(&self.pool)
         .await
@@ -274,107 +278,7 @@ impl MemoryStore {
             .await
             .with_context(|| "failed to start memory merge transaction")?;
 
-        sqlx::query(
-            r#"
-            UPDATE memories
-            SET content = ?, memory_type = ?, importance = ?, updated_at = ?,
-                last_accessed_at = ?, access_count = ?, source = ?, channel_id = ?,
-                forgotten = ?
-            WHERE id = ?
-            "#,
-        )
-        .bind(&updated_survivor.content)
-        .bind(updated_survivor.memory_type.to_string())
-        .bind(updated_survivor.importance)
-        .bind(updated_survivor.updated_at)
-        .bind(updated_survivor.last_accessed_at)
-        .bind(updated_survivor.access_count)
-        .bind(&updated_survivor.source)
-        .bind(updated_survivor.channel_id.as_deref())
-        .bind(updated_survivor.forgotten)
-        .bind(&updated_survivor.id)
-        .execute(&mut *transaction)
-        .await
-        .with_context(|| format!("failed to update survivor memory {}", updated_survivor.id))?;
-
-        sqlx::query(
-            r#"
-            INSERT INTO associations (id, source_id, target_id, relation_type, weight, created_at)
-            SELECT
-                lower(hex(randomblob(16))),
-                CASE WHEN source_id = ?2 THEN ?1 ELSE source_id END,
-                CASE WHEN target_id = ?2 THEN ?1 ELSE target_id END,
-                relation_type,
-                weight,
-                created_at
-            FROM associations
-            WHERE (source_id = ?2 OR target_id = ?2)
-              AND source_id != ?1
-              AND CASE WHEN source_id = ?2 THEN ?1 ELSE source_id END != CASE WHEN target_id = ?2 THEN ?1 ELSE target_id END
-            ON CONFLICT(source_id, target_id, relation_type) DO UPDATE SET
-                weight = excluded.weight
-            "#,
-        )
-        .bind(&updated_survivor.id)
-        .bind(&merged_memory.id)
-        .execute(&mut *transaction)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to rewire associations while merging {} into {}",
-                merged_memory.id, updated_survivor.id
-            )
-        })?;
-
-        sqlx::query("DELETE FROM associations WHERE source_id = ? OR target_id = ?")
-            .bind(&merged_memory.id)
-            .bind(&merged_memory.id)
-            .execute(&mut *transaction)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to delete associations for merged memory {}",
-                    merged_memory.id
-                )
-            })?;
-
-        let updates_association = Association::new(
-            &updated_survivor.id,
-            &merged_memory.id,
-            RelationType::Updates,
-        )
-        .with_weight(1.0);
-        sqlx::query(
-            r#"
-            INSERT INTO associations (id, source_id, target_id, relation_type, weight, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(source_id, target_id, relation_type) DO UPDATE SET
-                weight = excluded.weight
-            "#,
-        )
-        .bind(&updates_association.id)
-        .bind(&updates_association.source_id)
-        .bind(&updates_association.target_id)
-        .bind(updates_association.relation_type.to_string())
-        .bind(updates_association.weight)
-        .bind(updates_association.created_at)
-        .execute(&mut *transaction)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to create updates association {} -> {}",
-                updated_survivor.id, merged_memory.id
-            )
-        })?;
-
-        sqlx::query(
-            "UPDATE memories SET forgotten = 1, updated_at = ? WHERE id = ? AND forgotten = 0",
-        )
-        .bind(chrono::Utc::now())
-        .bind(&merged_memory.id)
-        .execute(&mut *transaction)
-        .await
-        .with_context(|| format!("failed to forget merged memory {}", merged_memory.id))?;
+        merge_memories_in_tx(&mut transaction, updated_survivor, merged_memory).await?;
 
         transaction
             .commit()
@@ -554,10 +458,11 @@ impl MemoryStore {
         let rows = sqlx::query(
             r#"
             SELECT id, content, memory_type, importance, created_at, updated_at,
-                   last_accessed_at, access_count, source, channel_id, forgotten
+                   last_accessed_at, access_count, source, channel_id, forgotten,
+                   supersedes_checkpoint_id
             FROM memories
             WHERE memory_type = ? AND forgotten = 0
-            ORDER BY importance DESC, updated_at DESC
+            ORDER BY importance DESC, updated_at DESC, id ASC
             LIMIT ?
             "#,
         )
@@ -570,12 +475,80 @@ impl MemoryStore {
         Ok(rows.into_iter().map(|row| row_to_memory(&row)).collect())
     }
 
+    /// Count memories of a type (excluding forgotten ones), for the
+    /// shown-of-total counts in the deterministic memory-store render.
+    pub async fn count_by_type(&self, memory_type: MemoryType) -> Result<i64> {
+        let type_str = memory_type.to_string();
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM memories WHERE memory_type = ? AND forgotten = 0")
+                .bind(&type_str)
+                .fetch_one(&self.pool)
+                .await
+                .with_context(|| format!("failed to count memories of type {:?}", memory_type))?;
+        Ok(count)
+    }
+
+    /// Point a human at their anchor memory. Remapping an already-mapped
+    /// human repoints the identity at the new anchor (the old anchor memory
+    /// stays in the store, unmapped).
+    pub async fn set_human_anchor(&self, human_id: &str, memory_id: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO human_identities (human_id, memory_id) VALUES (?, ?) \
+             ON CONFLICT(human_id) DO UPDATE SET memory_id = excluded.memory_id",
+        )
+        .bind(human_id)
+        .bind(memory_id)
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("failed to map human anchor for {human_id}"))?;
+        Ok(())
+    }
+
+    /// Resolve a human to their anchor memory by exact participant key.
+    /// `None` when the human has no anchor yet (3.1a in-turn resolution).
+    pub async fn get_human_anchor(&self, human_id: &str) -> Result<Option<Memory>> {
+        let row = sqlx::query(
+            "SELECT m.id, m.content, m.memory_type, m.importance, m.created_at, m.updated_at, \
+             m.last_accessed_at, m.access_count, m.source, m.channel_id, m.forgotten, \
+             m.supersedes_checkpoint_id \
+             FROM human_identities h \
+             JOIN memories m ON m.id = h.memory_id \
+             WHERE h.human_id = ? AND m.forgotten = 0",
+        )
+        .bind(human_id)
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("failed to resolve human anchor for {human_id}"))?;
+        Ok(row.map(|r| row_to_memory(&r)))
+    }
+
+    /// All human → anchor mappings (human_id, anchor memory). Used for the
+    /// ambient → org promotion pass.
+    pub async fn list_human_anchors(&self) -> Result<Vec<(String, Memory)>> {
+        let rows = sqlx::query(
+            "SELECT h.human_id, m.id, m.content, m.memory_type, m.importance, \
+             m.created_at, m.updated_at, m.last_accessed_at, m.access_count, \
+             m.source, m.channel_id, m.forgotten, m.supersedes_checkpoint_id \
+             FROM human_identities h \
+             JOIN memories m ON m.id = h.memory_id \
+             WHERE m.forgotten = 0",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list human anchors")?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get("human_id"), row_to_memory(&row)))
+            .collect())
+    }
+
     /// Get high-importance memories for injection into context.
     pub async fn get_high_importance(&self, threshold: f32, limit: i64) -> Result<Vec<Memory>> {
         let rows = sqlx::query(
             r#"
             SELECT id, content, memory_type, importance, created_at, updated_at,
-                   last_accessed_at, access_count, source, channel_id, forgotten
+                   last_accessed_at, access_count, source, channel_id, forgotten,
+                   supersedes_checkpoint_id
             FROM memories
             WHERE importance >= ? AND forgotten = 0
             ORDER BY importance DESC, updated_at DESC
@@ -611,7 +584,8 @@ impl MemoryStore {
             (
                 format!(
                     "SELECT id, content, memory_type, importance, created_at, updated_at, \
-                     last_accessed_at, access_count, source, channel_id, forgotten \
+                     last_accessed_at, access_count, source, channel_id, forgotten, \
+                     supersedes_checkpoint_id \
                      FROM memories WHERE memory_type = ? AND forgotten = 0 {order_clause} LIMIT ?"
                 ),
                 Some(memory_type.to_string()),
@@ -620,7 +594,8 @@ impl MemoryStore {
             (
                 format!(
                     "SELECT id, content, memory_type, importance, created_at, updated_at, \
-                     last_accessed_at, access_count, source, channel_id, forgotten \
+                     last_accessed_at, access_count, source, channel_id, forgotten, \
+                     supersedes_checkpoint_id \
                      FROM memories WHERE forgotten = 0 {order_clause} LIMIT ?"
                 ),
                 None,
@@ -671,6 +646,141 @@ impl MemoryStore {
     }
 }
 
+/// Load a memory by ID inside an open transaction.
+pub(crate) async fn load_in_tx(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+) -> Result<Option<Memory>> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, content, memory_type, importance, created_at, updated_at,
+               last_accessed_at, access_count, source, channel_id, forgotten,
+               supersedes_checkpoint_id
+        FROM memories
+        WHERE id = ?
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(conn)
+    .await
+    .with_context(|| format!("failed to load memory {}", id))?;
+
+    Ok(row.map(|row| row_to_memory(&row)))
+}
+
+/// Merge one memory into a survivor inside an open transaction: update
+/// survivor content/metadata, rewire associations, record an Updates edge,
+/// and mark the merged memory forgotten. The caller owns commit/rollback,
+/// so a batch of merges can share one transaction.
+pub(crate) async fn merge_memories_in_tx(
+    conn: &mut sqlx::SqliteConnection,
+    updated_survivor: &Memory,
+    merged_memory: &Memory,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE memories
+        SET content = ?, memory_type = ?, importance = ?, updated_at = ?,
+            last_accessed_at = ?, access_count = ?, source = ?, channel_id = ?,
+            forgotten = ?, supersedes_checkpoint_id = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(&updated_survivor.content)
+    .bind(updated_survivor.memory_type.to_string())
+    .bind(updated_survivor.importance)
+    .bind(updated_survivor.updated_at)
+    .bind(updated_survivor.last_accessed_at)
+    .bind(updated_survivor.access_count)
+    .bind(&updated_survivor.source)
+    .bind(updated_survivor.channel_id.as_deref())
+    .bind(updated_survivor.forgotten)
+    .bind(updated_survivor.supersedes_checkpoint_id.as_deref())
+    .bind(&updated_survivor.id)
+    .execute(&mut *conn)
+    .await
+    .with_context(|| format!("failed to update survivor memory {}", updated_survivor.id))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO associations (id, source_id, target_id, relation_type, weight, created_at)
+        SELECT
+            lower(hex(randomblob(16))),
+            CASE WHEN source_id = ?2 THEN ?1 ELSE source_id END,
+            CASE WHEN target_id = ?2 THEN ?1 ELSE target_id END,
+            relation_type,
+            weight,
+            created_at
+        FROM associations
+        WHERE (source_id = ?2 OR target_id = ?2)
+          AND source_id != ?1
+          AND CASE WHEN source_id = ?2 THEN ?1 ELSE source_id END != CASE WHEN target_id = ?2 THEN ?1 ELSE target_id END
+        ON CONFLICT(source_id, target_id, relation_type) DO UPDATE SET
+            weight = excluded.weight
+        "#,
+    )
+    .bind(&updated_survivor.id)
+    .bind(&merged_memory.id)
+    .execute(&mut *conn)
+    .await
+    .with_context(|| {
+        format!(
+            "failed to rewire associations while merging {} into {}",
+            merged_memory.id, updated_survivor.id
+        )
+    })?;
+
+    sqlx::query("DELETE FROM associations WHERE source_id = ? OR target_id = ?")
+        .bind(&merged_memory.id)
+        .bind(&merged_memory.id)
+        .execute(&mut *conn)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to delete associations for merged memory {}",
+                merged_memory.id
+            )
+        })?;
+
+    let updates_association = Association::new(
+        &updated_survivor.id,
+        &merged_memory.id,
+        RelationType::Updates,
+    )
+    .with_weight(1.0);
+    sqlx::query(
+        r#"
+        INSERT INTO associations (id, source_id, target_id, relation_type, weight, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_id, target_id, relation_type) DO UPDATE SET
+            weight = excluded.weight
+        "#,
+    )
+    .bind(&updates_association.id)
+    .bind(&updates_association.source_id)
+    .bind(&updates_association.target_id)
+    .bind(updates_association.relation_type.to_string())
+    .bind(updates_association.weight)
+    .bind(updates_association.created_at)
+    .execute(&mut *conn)
+    .await
+    .with_context(|| {
+        format!(
+            "failed to create updates association {} -> {}",
+            updated_survivor.id, merged_memory.id
+        )
+    })?;
+
+    sqlx::query("UPDATE memories SET forgotten = 1, updated_at = ? WHERE id = ? AND forgotten = 0")
+        .bind(chrono::Utc::now())
+        .bind(&merged_memory.id)
+        .execute(&mut *conn)
+        .await
+        .with_context(|| format!("failed to forget merged memory {}", merged_memory.id))?;
+
+    Ok(())
+}
+
 /// Helper: Convert a database row to a Memory.
 fn row_to_memory(row: &sqlx::sqlite::SqliteRow) -> Memory {
     let mem_type_str: String = row.try_get("memory_type").unwrap_or_default();
@@ -695,23 +805,14 @@ fn row_to_memory(row: &sqlx::sqlite::SqliteRow) -> Memory {
         access_count: row.try_get("access_count").unwrap_or(0),
         source: row.try_get("source").ok(),
         channel_id,
-        forgotten: row.try_get::<bool, _>("forgotten").unwrap_or(false),
+        forgotten: row.try_get("forgotten").unwrap_or(false),
+        supersedes_checkpoint_id: row.try_get("supersedes_checkpoint_id").ok(),
     }
 }
 
 /// Helper: Parse memory type from string.
 fn parse_memory_type(s: &str) -> MemoryType {
-    match s {
-        "fact" => MemoryType::Fact,
-        "preference" => MemoryType::Preference,
-        "decision" => MemoryType::Decision,
-        "identity" => MemoryType::Identity,
-        "event" => MemoryType::Event,
-        "observation" => MemoryType::Observation,
-        "goal" => MemoryType::Goal,
-        "todo" => MemoryType::Todo,
-        _ => MemoryType::Fact,
-    }
+    MemoryType::from_label(s).unwrap_or(MemoryType::Fact)
 }
 
 /// Helper: Convert a database row to an Association.
@@ -774,6 +875,28 @@ mod tests {
         let loaded = store.load(&memory.id).await.unwrap().unwrap();
         assert_eq!(loaded.content, "Rust is great");
         assert_eq!(loaded.memory_type, MemoryType::Fact);
+    }
+
+    #[tokio::test]
+    async fn test_get_by_type_breaks_ties_by_id() {
+        let store = MemoryStore::connect_in_memory().await;
+        let now = Utc::now();
+
+        // Identical importance and updated_at: only the id tie-break decides
+        // which rows fall inside the limit, so the selection stays stable.
+        for id in ["tie-c", "tie-a", "tie-d", "tie-b"] {
+            let mut memory =
+                Memory::new(format!("tied {id}"), MemoryType::Fact).with_importance(0.5);
+            memory.id = id.to_string();
+            memory.created_at = now;
+            memory.updated_at = now;
+            memory.last_accessed_at = now;
+            store.save(&memory).await.unwrap();
+        }
+
+        let results = store.get_by_type(MemoryType::Fact, 2).await.unwrap();
+        let ids: Vec<&str> = results.iter().map(|memory| memory.id.as_str()).collect();
+        assert_eq!(ids, vec!["tie-a", "tie-b"]);
     }
 
     #[tokio::test]

@@ -107,10 +107,140 @@ impl std::fmt::Display for TaskPriority {
     }
 }
 
+/// Which kind of worker executes a task.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskWorkerType {
+    Builtin,
+    Opencode,
+}
+
+impl TaskWorkerType {
+    pub const ALL: [TaskWorkerType; 2] = [TaskWorkerType::Builtin, TaskWorkerType::Opencode];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskWorkerType::Builtin => "builtin",
+            TaskWorkerType::Opencode => "opencode",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "builtin" => Some(TaskWorkerType::Builtin),
+            "opencode" => Some(TaskWorkerType::Opencode),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for TaskWorkerType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Where a task's worker runs relative to its project checkout.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskWorktreeMode {
+    /// Run in the project (or repo) root checkout.
+    Root,
+    /// Run in an existing worktree, selected by the task's `worktree_id`.
+    Existing,
+    /// Create a fresh worktree for this task at spawn time.
+    Create,
+}
+
+impl TaskWorktreeMode {
+    pub const ALL: [TaskWorktreeMode; 3] = [
+        TaskWorktreeMode::Root,
+        TaskWorktreeMode::Existing,
+        TaskWorktreeMode::Create,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskWorktreeMode::Root => "root",
+            TaskWorktreeMode::Existing => "existing",
+            TaskWorktreeMode::Create => "create",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "root" => Some(TaskWorktreeMode::Root),
+            "existing" => Some(TaskWorktreeMode::Existing),
+            "create" => Some(TaskWorktreeMode::Create),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for TaskWorktreeMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 pub struct TaskSubtask {
     pub title: String,
     pub completed: bool,
+}
+
+/// How a dependency edge blocks its dependent.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskDependencyKind {
+    /// The dependent needs the dependency's outcome — blocked until done.
+    Gate,
+    /// The dependent builds on the dependency's code — blocked only until
+    /// its branch exists (worktree provisioned) or it is done.
+    Stack,
+}
+
+impl TaskDependencyKind {
+    pub const ALL: [TaskDependencyKind; 2] = [TaskDependencyKind::Gate, TaskDependencyKind::Stack];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskDependencyKind::Gate => "gate",
+            TaskDependencyKind::Stack => "stack",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "gate" => Some(TaskDependencyKind::Gate),
+            "stack" => Some(TaskDependencyKind::Stack),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for TaskDependencyKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// A dependency edge as seen from the dependent task, with enough context to
+/// render and to compute blockedness without another query.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct TaskDependencyEdge {
+    pub depends_on_task_number: i64,
+    pub depends_on_title: String,
+    pub depends_on_status: TaskStatus,
+    pub kind: TaskDependencyKind,
+    /// Whether this edge currently permits the dependent to run.
+    pub satisfied: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -129,6 +259,25 @@ pub struct Task {
     pub goal_id: Option<String>,
     pub source_memory_id: Option<String>,
     pub worker_id: Option<String>,
+    /// Execution plan: which worker kind runs this task. `None` inherits the
+    /// project default, or leaves the choice to the executing turn.
+    pub worker_type: Option<TaskWorkerType>,
+    /// Execution plan: project this task's work belongs to.
+    pub project_id: Option<String>,
+    /// Execution plan: repo within the project, needed when `worktree_mode`
+    /// is `create` on a multi-repo project.
+    pub repo_id: Option<String>,
+    /// Execution plan: where the worker runs relative to the checkout.
+    pub worktree_mode: Option<TaskWorktreeMode>,
+    /// Execution plan: existing worktree to run in (`worktree_mode: existing`).
+    pub worktree_id: Option<String>,
+    /// Skills whose content is injected into the executing worker's context
+    /// unconditionally — a contract, unlike advisory `suggested_skills`.
+    pub required_skills: Vec<String>,
+    /// Dependency edges, hydrated by the store's read paths (not stored on
+    /// the tasks row).
+    #[serde(default)]
+    pub depends_on: Vec<TaskDependencyEdge>,
     pub created_by: String,
     pub approved_at: Option<String>,
     pub approved_by: Option<String>,
@@ -145,6 +294,108 @@ impl Task {
             .as_deref()
             .unwrap_or(&self.owner_agent_id)
     }
+
+    /// Task numbers of unsatisfied dependencies.
+    pub fn blocked_by(&self) -> Vec<i64> {
+        self.depends_on
+            .iter()
+            .filter(|edge| !edge.satisfied)
+            .map(|edge| edge.depends_on_task_number)
+            .collect()
+    }
+
+    /// The stack parent's task number, when this task has a stack edge.
+    pub fn stack_parent(&self) -> Option<i64> {
+        self.depends_on
+            .iter()
+            .find(|edge| edge.kind == TaskDependencyKind::Stack)
+            .map(|edge| edge.depends_on_task_number)
+    }
+}
+
+/// Project-level execution defaults that a task's own fields override.
+///
+/// Kept here (rather than importing `ProjectSettings`) so plan resolution
+/// stays decoupled from how projects store their settings blob.
+#[derive(Debug, Clone, Default)]
+pub struct ExecutionDefaults {
+    pub worker_type: Option<TaskWorkerType>,
+    pub worktree_mode: Option<TaskWorktreeMode>,
+    pub required_skills: Vec<String>,
+}
+
+/// The resolved answer to "how and where does this task run".
+///
+/// Task fields win over project defaults; `required_skills` is the union,
+/// project defaults first.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, utoipa::ToSchema)]
+pub struct ExecutionPlan {
+    pub worker_type: Option<TaskWorkerType>,
+    pub project_id: Option<String>,
+    pub repo_id: Option<String>,
+    pub worktree_mode: Option<TaskWorktreeMode>,
+    pub worktree_id: Option<String>,
+    pub required_skills: Vec<String>,
+}
+
+impl ExecutionPlan {
+    pub fn resolve(task: &Task, project_defaults: Option<&ExecutionDefaults>) -> Self {
+        let defaults = project_defaults.cloned().unwrap_or_default();
+
+        let mut required_skills = defaults.required_skills;
+        for skill in &task.required_skills {
+            if !required_skills
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(skill))
+            {
+                required_skills.push(skill.clone());
+            }
+        }
+
+        Self {
+            worker_type: task.worker_type.or(defaults.worker_type),
+            project_id: task.project_id.clone(),
+            repo_id: task.repo_id.clone(),
+            worktree_mode: task.worktree_mode.or(defaults.worktree_mode),
+            worktree_id: task.worktree_id.clone(),
+            required_skills,
+        }
+    }
+
+    /// True when nothing in the plan is specified.
+    pub fn is_empty(&self) -> bool {
+        self.worker_type.is_none()
+            && self.project_id.is_none()
+            && self.worktree_mode.is_none()
+            && self.worktree_id.is_none()
+            && self.required_skills.is_empty()
+    }
+
+    /// One-line human summary for prompts and approval surfaces.
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(worker_type) = self.worker_type {
+            parts.push(format!("worker: {worker_type}"));
+        }
+        if let Some(project_id) = &self.project_id {
+            parts.push(format!("project: {project_id}"));
+        }
+        if let Some(mode) = self.worktree_mode {
+            match (mode, &self.worktree_id) {
+                (TaskWorktreeMode::Existing, Some(id)) => {
+                    parts.push(format!("worktree: existing ({id})"));
+                }
+                _ => parts.push(format!("worktree: {mode}")),
+            }
+        }
+        if !self.required_skills.is_empty() {
+            parts.push(format!(
+                "requires skills: {}",
+                self.required_skills.join(", ")
+            ));
+        }
+        parts.join(" · ")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -159,6 +410,35 @@ pub struct CreateTaskInput {
     pub metadata: Value,
     pub source_memory_id: Option<String>,
     pub created_by: String,
+    pub worker_type: Option<TaskWorkerType>,
+    pub project_id: Option<String>,
+    pub repo_id: Option<String>,
+    pub worktree_mode: Option<TaskWorktreeMode>,
+    pub worktree_id: Option<String>,
+    pub required_skills: Vec<String>,
+}
+
+impl Default for CreateTaskInput {
+    fn default() -> Self {
+        Self {
+            owner_agent_id: String::new(),
+            assigned_agent_id: None,
+            title: String::new(),
+            description: None,
+            status: TaskStatus::Backlog,
+            priority: TaskPriority::Medium,
+            subtasks: Vec::new(),
+            metadata: serde_json::json!({}),
+            source_memory_id: None,
+            created_by: String::new(),
+            worker_type: None,
+            project_id: None,
+            repo_id: None,
+            worktree_mode: None,
+            worktree_id: None,
+            required_skills: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -175,6 +455,12 @@ pub struct UpdateTaskInput {
     pub complete_subtask: Option<usize>,
     /// Reassign the task to a different agent.
     pub assigned_agent_id: Option<String>,
+    pub worker_type: Option<TaskWorkerType>,
+    pub project_id: Option<String>,
+    pub repo_id: Option<String>,
+    pub worktree_mode: Option<TaskWorktreeMode>,
+    pub worktree_id: Option<String>,
+    pub required_skills: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -224,9 +510,20 @@ impl TaskStore {
     const MAX_CREATE_RETRIES: usize = 3;
 
     pub async fn create(&self, input: CreateTaskInput) -> Result<Task> {
+        self.create_with_dependencies(input, &[]).await
+    }
+
+    /// Create a task and its initial dependency edges atomically.
+    pub async fn create_with_dependencies(
+        &self,
+        input: CreateTaskInput,
+        edges: &[(i64, TaskDependencyKind)],
+    ) -> Result<Task> {
         let subtasks_json =
             serde_json::to_string(&input.subtasks).context("failed to serialize subtasks")?;
         let metadata_json = input.metadata.to_string();
+        let required_skills_json = serde_json::to_string(&input.required_skills)
+            .context("failed to serialize required skills")?;
 
         for attempt in 0..Self::MAX_CREATE_RETRIES {
             let mut tx = self
@@ -252,9 +549,11 @@ impl TaskStore {
                 INSERT INTO tasks (
                     id, task_number, title, description, status, priority,
                     owner_agent_id, assigned_agent_id,
-                    subtasks, metadata, source_memory_id, created_by
+                    subtasks, metadata, source_memory_id, created_by,
+                    worker_type, project_id, repo_id, worktree_mode, worktree_id,
+                    required_skills
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(&task_id)
@@ -269,11 +568,28 @@ impl TaskStore {
             .bind(&metadata_json)
             .bind(&input.source_memory_id)
             .bind(&input.created_by)
+            .bind(input.worker_type.map(TaskWorkerType::as_str))
+            .bind(&input.project_id)
+            .bind(&input.repo_id)
+            .bind(input.worktree_mode.map(TaskWorktreeMode::as_str))
+            .bind(&input.worktree_id)
+            .bind(&required_skills_json)
             .execute(&mut *tx)
             .await;
 
             match insert_result {
                 Ok(_) => {
+                    let task = sqlx::query(&format!(
+                        "{SELECT_COLUMNS} FROM tasks WHERE task_number = ?"
+                    ))
+                    .bind(task_number)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .context("failed to fetch created task")?;
+                    let task = task_from_row(task)?;
+
+                    Self::replace_dependencies_in_tx(&mut tx, &task, edges).await?;
+
                     tx.commit()
                         .await
                         .context("failed to commit task create transaction")?;
@@ -358,7 +674,99 @@ impl TaskStore {
             .await
             .context("failed to list tasks")?;
 
-        rows.into_iter().map(task_from_row).collect()
+        let mut tasks: Vec<Task> = rows.into_iter().map(task_from_row).collect::<Result<_>>()?;
+        self.hydrate_dependencies(&mut tasks).await?;
+        Ok(tasks)
+    }
+
+    /// Attach dependency edges to the given tasks in one batch query.
+    async fn hydrate_dependencies(&self, tasks: &mut [Task]) -> Result<()> {
+        if tasks.is_empty() {
+            return Ok(());
+        }
+
+        let placeholders = vec!["?"; tasks.len()].join(", ");
+        let query = format!(
+            "SELECT d.task_id, d.kind, dep.task_number, dep.title, dep.status, dep.worktree_id \
+             FROM task_dependencies d \
+             JOIN tasks dep ON dep.id = d.depends_on_task_id \
+             WHERE d.task_id IN ({placeholders}) \
+             ORDER BY dep.task_number ASC"
+        );
+        let mut sql = sqlx::query(&query);
+        for task in tasks.iter() {
+            sql = sql.bind(&task.id);
+        }
+        let rows = sql
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to load task dependencies")?;
+
+        let mut edges: std::collections::HashMap<String, Vec<TaskDependencyEdge>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let task_id: String = row.try_get("task_id").context("dependency task_id")?;
+            let kind_value: String = row.try_get("kind").context("dependency kind")?;
+            let kind = TaskDependencyKind::parse(&kind_value)
+                .with_context(|| format!("invalid dependency kind in database: {kind_value}"))?;
+            let status_value: String = row.try_get("status").context("dependency status")?;
+            let status = TaskStatus::parse(&status_value)
+                .with_context(|| format!("invalid task status in database: {status_value}"))?;
+            let worktree_id: Option<String> = row
+                .try_get::<Option<String>, _>("worktree_id")
+                .ok()
+                .flatten();
+
+            let satisfied = match kind {
+                TaskDependencyKind::Gate => status == TaskStatus::Done,
+                TaskDependencyKind::Stack => status == TaskStatus::Done || worktree_id.is_some(),
+            };
+
+            edges.entry(task_id).or_default().push(TaskDependencyEdge {
+                depends_on_task_number: row
+                    .try_get("task_number")
+                    .context("dependency task_number")?,
+                depends_on_title: row.try_get("title").context("dependency title")?,
+                depends_on_status: status,
+                kind,
+                satisfied,
+            });
+        }
+
+        for task in tasks.iter_mut() {
+            task.depends_on = edges.remove(&task.id).unwrap_or_default();
+        }
+        Ok(())
+    }
+
+    /// Replace a task's dependency edges.
+    ///
+    /// Rejects unknown task numbers, self-dependencies, more than one stack
+    /// edge, and any edge that would create a cycle.
+    pub async fn set_dependencies(
+        &self,
+        task_number: i64,
+        edges: &[(i64, TaskDependencyKind)],
+    ) -> Result<Task> {
+        let task = self
+            .get_by_number(task_number)
+            .await?
+            .with_context(|| format!("task #{task_number} not found"))?;
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to open dependency transaction")?;
+        Self::replace_dependencies_in_tx(&mut tx, &task, edges).await?;
+        tx.commit()
+            .await
+            .context("failed to commit dependency transaction")?;
+
+        self.get_by_number(task_number)
+            .await?
+            .context("task vanished during dependency update")
+            .map_err(Into::into)
     }
 
     /// List ready tasks assigned to the given agent.
@@ -382,7 +790,13 @@ impl TaskStore {
         .await
         .context("failed to fetch task by number")?;
 
-        row.map(task_from_row).transpose()
+        let Some(task) = row.map(task_from_row).transpose()? else {
+            return Ok(None);
+        };
+        let mut tasks = [task];
+        self.hydrate_dependencies(&mut tasks).await?;
+        let [task] = tasks;
+        Ok(Some(task))
     }
 
     pub async fn update(&self, task_number: i64, input: UpdateTaskInput) -> Result<Option<Task>> {
@@ -396,6 +810,71 @@ impl TaskStore {
         &self,
         task_number: i64,
         input: UpdateTaskInput,
+    ) -> Result<Option<TaskUpdateResult>> {
+        self.update_with_status_policy(task_number, input, StatusTransitionPolicy::Enforce)
+            .await
+    }
+
+    /// Update a task and optionally replace its dependency edges atomically.
+    pub async fn update_with_dependencies_and_status_transition(
+        &self,
+        task_number: i64,
+        input: UpdateTaskInput,
+        edges: Option<&[(i64, TaskDependencyKind)]>,
+    ) -> Result<Option<TaskUpdateResult>> {
+        self.update_with_dependencies_and_status_policy(
+            task_number,
+            input,
+            edges,
+            StatusTransitionPolicy::Enforce,
+        )
+        .await
+    }
+
+    /// Update a task from an operator-facing API without enforcing agent
+    /// lifecycle transitions. This reconciles work completed outside Spacebot.
+    pub async fn update_with_status_override(
+        &self,
+        task_number: i64,
+        input: UpdateTaskInput,
+    ) -> Result<Option<TaskUpdateResult>> {
+        self.update_with_status_policy(task_number, input, StatusTransitionPolicy::Override)
+            .await
+    }
+
+    /// Update a task and optionally replace its dependency edges atomically,
+    /// without enforcing agent lifecycle status transitions.
+    pub async fn update_with_dependencies_and_status_override(
+        &self,
+        task_number: i64,
+        input: UpdateTaskInput,
+        edges: Option<&[(i64, TaskDependencyKind)]>,
+    ) -> Result<Option<TaskUpdateResult>> {
+        self.update_with_dependencies_and_status_policy(
+            task_number,
+            input,
+            edges,
+            StatusTransitionPolicy::Override,
+        )
+        .await
+    }
+
+    async fn update_with_status_policy(
+        &self,
+        task_number: i64,
+        input: UpdateTaskInput,
+        status_policy: StatusTransitionPolicy,
+    ) -> Result<Option<TaskUpdateResult>> {
+        self.update_with_dependencies_and_status_policy(task_number, input, None, status_policy)
+            .await
+    }
+
+    async fn update_with_dependencies_and_status_policy(
+        &self,
+        task_number: i64,
+        input: UpdateTaskInput,
+        edges: Option<&[(i64, TaskDependencyKind)]>,
+        status_policy: StatusTransitionPolicy,
     ) -> Result<Option<TaskUpdateResult>> {
         let mut tx = self
             .pool
@@ -420,16 +899,107 @@ impl TaskStore {
 
         let current = task_from_row(row)?;
         let previous_status = current.status;
-        let task = Self::update_current_in_tx(&mut tx, task_number, current, input).await?;
+        let mut task =
+            Self::update_current_in_tx(&mut tx, task_number, current, input, status_policy).await?;
+
+        if let Some(edges) = edges {
+            Self::replace_dependencies_in_tx(&mut tx, &task, edges).await?;
+        }
 
         tx.commit()
             .await
             .context("failed to commit task update transaction")?;
 
+        if edges.is_some() {
+            task = self
+                .get_by_number(task_number)
+                .await?
+                .context("task vanished during dependency update")?;
+        }
+
         Ok(Some(TaskUpdateResult {
             previous_status,
             task,
         }))
+    }
+
+    async fn replace_dependencies_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        task: &Task,
+        edges: &[(i64, TaskDependencyKind)],
+    ) -> Result<()> {
+        let stack_edges = edges
+            .iter()
+            .filter(|(_, kind)| *kind == TaskDependencyKind::Stack)
+            .count();
+        if stack_edges > 1 {
+            return Err(crate::error::Error::Other(anyhow::anyhow!(
+                "a task can stack on at most one parent"
+            )));
+        }
+
+        let mut resolved: Vec<(String, TaskDependencyKind)> = Vec::with_capacity(edges.len());
+        for (dep_number, kind) in edges {
+            if *dep_number == task.task_number {
+                return Err(crate::error::Error::Other(anyhow::anyhow!(
+                    "task #{} cannot depend on itself",
+                    task.task_number
+                )));
+            }
+            let dep = sqlx::query(&format!(
+                "{SELECT_COLUMNS} FROM tasks WHERE task_number = ?"
+            ))
+            .bind(dep_number)
+            .fetch_optional(&mut **tx)
+            .await
+            .context("failed to fetch dependency task")?
+            .map(task_from_row)
+            .transpose()?
+            .with_context(|| format!("dependency task #{dep_number} not found"))?;
+
+            // A cycle exists when the dependency can already reach this task
+            // through existing edges.
+            let reaches: Option<i64> = sqlx::query_scalar(
+                "WITH RECURSIVE reachable(id) AS ( \
+                     SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ? \
+                     UNION \
+                     SELECT d.depends_on_task_id FROM task_dependencies d \
+                     JOIN reachable r ON d.task_id = r.id \
+                  ) SELECT 1 FROM reachable WHERE id = ? LIMIT 1",
+            )
+            .bind(&dep.id)
+            .bind(&task.id)
+            .fetch_optional(&mut **tx)
+            .await
+            .context("failed to run dependency cycle check")?;
+            if reaches.is_some() {
+                return Err(crate::error::Error::Other(anyhow::anyhow!(
+                    "dependency on #{dep_number} would create a cycle"
+                )));
+            }
+
+            resolved.push((dep.id, *kind));
+        }
+
+        sqlx::query("DELETE FROM task_dependencies WHERE task_id = ?")
+            .bind(&task.id)
+            .execute(&mut **tx)
+            .await
+            .context("failed to clear task dependencies")?;
+        for (dep_id, kind) in resolved {
+            sqlx::query(
+                "INSERT INTO task_dependencies (task_id, depends_on_task_id, kind) \
+                 VALUES (?, ?, ?)",
+            )
+            .bind(&task.id)
+            .bind(dep_id)
+            .bind(kind.as_str())
+            .execute(&mut **tx)
+            .await
+            .context("failed to insert task dependency")?;
+        }
+
+        Ok(())
     }
 
     pub async fn update_worker_task(
@@ -475,7 +1045,14 @@ impl TaskStore {
 
         let current = task_from_row(row)?;
         let previous_status = current.status;
-        let task = Self::update_current_in_tx(&mut tx, task_number, current, input).await?;
+        let task = Self::update_current_in_tx(
+            &mut tx,
+            task_number,
+            current,
+            input,
+            StatusTransitionPolicy::Enforce,
+        )
+        .await?;
 
         tx.commit()
             .await
@@ -494,8 +1071,10 @@ impl TaskStore {
         task_number: i64,
         current: Task,
         input: UpdateTaskInput,
+        status_policy: StatusTransitionPolicy,
     ) -> Result<Task> {
         if let Some(next_status) = input.status
+            && status_policy == StatusTransitionPolicy::Enforce
             && !can_transition(current.status, next_status)
         {
             return Err(crate::error::Error::Other(anyhow::anyhow!(
@@ -538,17 +1117,29 @@ impl TaskStore {
             None
         };
 
-        let completed_at = if next_status == TaskStatus::Done {
+        let completed_at = if current.status != TaskStatus::Done && next_status == TaskStatus::Done
+        {
             Some("SET")
-        } else if current.completed_at.is_some() && next_status != TaskStatus::Done {
+        } else if current.status == TaskStatus::Done && next_status != TaskStatus::Done {
             Some("NULL")
         } else {
             None
         };
 
+        let next_worker_type = input.worker_type.or(current.worker_type);
+        let next_project_id = input.project_id.or(current.project_id);
+        let next_repo_id = input.repo_id.or(current.repo_id);
+        let next_worktree_mode = input.worktree_mode.or(current.worktree_mode);
+        let next_worktree_id = input.worktree_id.or(current.worktree_id);
+        let next_required_skills = input.required_skills.unwrap_or(current.required_skills);
+        let required_skills_json = serde_json::to_string(&next_required_skills)
+            .context("failed to serialize required skills")?;
+
         let mut query = String::from(
             "UPDATE tasks SET title = ?, description = ?, status = ?, priority = ?, \
-             assigned_agent_id = ?, subtasks = ?, metadata = ?, ",
+             assigned_agent_id = ?, subtasks = ?, metadata = ?, \
+             worker_type = ?, project_id = ?, repo_id = ?, worktree_mode = ?, \
+             worktree_id = ?, required_skills = ?, ",
         );
 
         if clear_worker {
@@ -582,7 +1173,13 @@ impl TaskStore {
             .bind(next_priority.as_str())
             .bind(&next_assigned)
             .bind(serde_json::to_string(&subtasks).context("failed to serialize subtasks")?)
-            .bind(next_metadata.to_string());
+            .bind(next_metadata.to_string())
+            .bind(next_worker_type.map(TaskWorkerType::as_str))
+            .bind(&next_project_id)
+            .bind(&next_repo_id)
+            .bind(next_worktree_mode.map(TaskWorktreeMode::as_str))
+            .bind(&next_worktree_id)
+            .bind(&required_skills_json);
 
         if !clear_worker {
             sql = sql.bind(next_worker_id);
@@ -615,49 +1212,6 @@ impl TaskStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Atomically claim the highest-priority ready task assigned to the given
-    /// agent. Moves it to `in_progress` and returns it.
-    pub async fn claim_next_ready(&self, assigned_agent_id: &str) -> Result<Option<Task>> {
-        let row = sqlx::query(
-            "SELECT task_number FROM tasks WHERE assigned_agent_id = ? AND status = 'ready' \
-             ORDER BY CASE priority \
-               WHEN 'critical' THEN 0 \
-               WHEN 'high' THEN 1 \
-               WHEN 'medium' THEN 2 \
-               WHEN 'low' THEN 3 \
-               ELSE 4 END ASC, \
-             task_number ASC \
-             LIMIT 1",
-        )
-        .bind(assigned_agent_id)
-        .fetch_optional(&self.pool)
-        .await
-        .context("failed to find ready task")?;
-
-        let Some(row) = row else {
-            return Ok(None);
-        };
-
-        let task_number: i64 = row
-            .try_get("task_number")
-            .context("failed to read task_number from ready task row")?;
-        let result = sqlx::query(
-            "UPDATE tasks SET status = 'in_progress', \
-             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') \
-             WHERE task_number = ? AND status = 'ready'",
-        )
-        .bind(task_number)
-        .execute(&self.pool)
-        .await
-        .context("failed to claim ready task")?;
-
-        if result.rows_affected() == 0 {
-            return Ok(None);
-        }
-
-        self.get_by_number(task_number).await
-    }
-
     pub async fn get_by_worker_id(&self, worker_id: &str) -> Result<Option<Task>> {
         let row = sqlx::query(&format!(
             "{SELECT_COLUMNS} FROM tasks WHERE worker_id = ? ORDER BY updated_at DESC LIMIT 1"
@@ -671,9 +1225,16 @@ impl TaskStore {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusTransitionPolicy {
+    Enforce,
+    Override,
+}
+
 /// Column list used by all SELECT queries. Kept in sync with `task_from_row`.
 const SELECT_COLUMNS: &str = "SELECT id, task_number, title, description, status, priority, \
      owner_agent_id, assigned_agent_id, subtasks, metadata, goal_id, source_memory_id, worker_id, \
+     worker_type, project_id, repo_id, worktree_mode, worktree_id, required_skills, \
      created_by, approved_at, approved_by, created_at, updated_at, completed_at";
 
 pub fn can_transition(current: TaskStatus, next: TaskStatus) -> bool {
@@ -789,6 +1350,34 @@ fn task_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Task> {
             .ok()
             .flatten()
             .filter(|value| !value.is_empty()),
+        worker_type: row
+            .try_get::<Option<String>, _>("worker_type")
+            .ok()
+            .flatten()
+            .as_deref()
+            .and_then(TaskWorkerType::parse),
+        project_id: row
+            .try_get::<Option<String>, _>("project_id")
+            .ok()
+            .flatten(),
+        repo_id: row.try_get::<Option<String>, _>("repo_id").ok().flatten(),
+        worktree_mode: row
+            .try_get::<Option<String>, _>("worktree_mode")
+            .ok()
+            .flatten()
+            .as_deref()
+            .and_then(TaskWorktreeMode::parse),
+        worktree_id: row
+            .try_get::<Option<String>, _>("worktree_id")
+            .ok()
+            .flatten(),
+        required_skills: row
+            .try_get::<Option<String>, _>("required_skills")
+            .ok()
+            .flatten()
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default(),
+        depends_on: Vec::new(),
         created_by: row
             .try_get("created_by")
             .context("failed to read task created_by")?,
@@ -849,6 +1438,12 @@ pub(crate) async fn setup_test_store() -> TaskStore {
             goal_id TEXT,
             source_memory_id TEXT,
             worker_id TEXT,
+            worker_type TEXT,
+            project_id TEXT,
+            repo_id TEXT,
+            worktree_mode TEXT,
+            worktree_id TEXT,
+            required_skills TEXT NOT NULL DEFAULT '[]',
             created_by TEXT NOT NULL,
             approved_at TEXT,
             approved_by TEXT,
@@ -871,6 +1466,19 @@ pub(crate) async fn setup_test_store() -> TaskStore {
     .execute(&pool)
     .await
     .expect("task_number_seq should be created");
+
+    sqlx::query(
+        "CREATE TABLE task_dependencies (
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            depends_on_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL DEFAULT 'gate',
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            PRIMARY KEY (task_id, depends_on_task_id)
+        )",
+    )
+    .execute(&pool)
+    .await
+    .expect("task_dependencies should be created");
 
     sqlx::query("INSERT INTO task_number_seq (id, next_number) VALUES (1, 1)")
         .execute(&pool)
@@ -900,6 +1508,7 @@ mod tests {
             metadata: serde_json::json!({}),
             source_memory_id: None,
             created_by: "branch".to_string(),
+            ..Default::default()
         }
     }
 
@@ -921,6 +1530,285 @@ mod tests {
             .expect("task should exist");
         assert_eq!(loaded.assigned_agent_id, None);
         assert_eq!(loaded.effective_agent_id(), "agent-test");
+    }
+
+    #[tokio::test]
+    async fn dependencies_reject_self_references_and_cycles() {
+        let store = setup_store().await;
+        let first = store
+            .create(self_assigned_input("first", TaskStatus::Ready))
+            .await
+            .expect("first task");
+        let second = store
+            .create(self_assigned_input("second", TaskStatus::Ready))
+            .await
+            .expect("second task");
+
+        store
+            .set_dependencies(
+                second.task_number,
+                &[(first.task_number, TaskDependencyKind::Gate)],
+            )
+            .await
+            .expect("dependency should be accepted");
+
+        assert!(
+            store
+                .set_dependencies(
+                    first.task_number,
+                    &[(first.task_number, TaskDependencyKind::Gate)],
+                )
+                .await
+                .is_err(),
+            "self-dependency must be rejected"
+        );
+        assert!(
+            store
+                .set_dependencies(
+                    first.task_number,
+                    &[(second.task_number, TaskDependencyKind::Gate)],
+                )
+                .await
+                .is_err(),
+            "cyclic dependency must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_create_with_dependencies_leaves_no_task() {
+        let store = setup_store().await;
+
+        let error = store
+            .create_with_dependencies(
+                self_assigned_input("invalid dependency", TaskStatus::Ready),
+                &[(999, TaskDependencyKind::Gate)],
+            )
+            .await
+            .expect_err("unknown dependency should reject task creation");
+
+        assert!(error.to_string().contains("dependency task #999 not found"));
+        assert!(
+            store
+                .list(TaskListFilter::default())
+                .await
+                .expect("tasks should list")
+                .is_empty(),
+            "failed creation must not persist a task row"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_combined_update_preserves_task_and_dependencies() {
+        let store = setup_store().await;
+        let dependency = store
+            .create(self_assigned_input("dependency", TaskStatus::Ready))
+            .await
+            .expect("dependency should be created");
+        let task = store
+            .create_with_dependencies(
+                self_assigned_input("original title", TaskStatus::PendingApproval),
+                &[(dependency.task_number, TaskDependencyKind::Gate)],
+            )
+            .await
+            .expect("task should be created");
+
+        assert!(
+            store
+                .update_with_dependencies_and_status_transition(
+                    task.task_number,
+                    UpdateTaskInput {
+                        status: Some(TaskStatus::InProgress),
+                        ..Default::default()
+                    },
+                    Some(&[]),
+                )
+                .await
+                .is_err(),
+            "invalid task update should fail"
+        );
+
+        let unchanged = store
+            .get_by_number(task.task_number)
+            .await
+            .expect("task should load")
+            .expect("task should exist");
+        assert_eq!(unchanged.status, TaskStatus::PendingApproval);
+        assert_eq!(unchanged.depends_on.len(), 1);
+        assert_eq!(
+            unchanged.depends_on[0].depends_on_task_number,
+            dependency.task_number
+        );
+
+        assert!(
+            store
+                .update_with_dependencies_and_status_transition(
+                    task.task_number,
+                    UpdateTaskInput {
+                        title: Some("updated title".to_string()),
+                        ..Default::default()
+                    },
+                    Some(&[(999, TaskDependencyKind::Gate)]),
+                )
+                .await
+                .is_err(),
+            "invalid dependencies should fail"
+        );
+
+        let unchanged = store
+            .get_by_number(task.task_number)
+            .await
+            .expect("task should load")
+            .expect("task should exist");
+        assert_eq!(unchanged.title, "original title");
+        assert_eq!(unchanged.depends_on.len(), 1);
+        assert_eq!(
+            unchanged.depends_on[0].depends_on_task_number,
+            dependency.task_number
+        );
+    }
+
+    #[tokio::test]
+    async fn at_most_one_stack_parent() {
+        let store = setup_store().await;
+        let a = store
+            .create(self_assigned_input("a", TaskStatus::Backlog))
+            .await
+            .expect("a");
+        let b = store
+            .create(self_assigned_input("b", TaskStatus::Backlog))
+            .await
+            .expect("b");
+        let c = store
+            .create(self_assigned_input("c", TaskStatus::Backlog))
+            .await
+            .expect("c");
+
+        assert!(
+            store
+                .set_dependencies(
+                    c.task_number,
+                    &[
+                        (a.task_number, TaskDependencyKind::Stack),
+                        (b.task_number, TaskDependencyKind::Stack),
+                    ],
+                )
+                .await
+                .is_err(),
+            "two stack parents must be rejected"
+        );
+
+        // One stack parent plus a gate is fine.
+        let c = store
+            .set_dependencies(
+                c.task_number,
+                &[
+                    (a.task_number, TaskDependencyKind::Stack),
+                    (b.task_number, TaskDependencyKind::Gate),
+                ],
+            )
+            .await
+            .expect("mixed edges should insert");
+        assert_eq!(c.depends_on.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn execution_plan_fields_round_trip() {
+        let store = setup_store().await;
+        let created = store
+            .create(CreateTaskInput {
+                worker_type: Some(TaskWorkerType::Opencode),
+                project_id: Some("proj-1".to_string()),
+                repo_id: Some("repo-1".to_string()),
+                worktree_mode: Some(TaskWorktreeMode::Create),
+                required_skills: vec!["spacebot-dev".to_string()],
+                ..self_assigned_input("planned task", TaskStatus::Backlog)
+            })
+            .await
+            .expect("task should be created");
+
+        let loaded = store
+            .get_by_number(created.task_number)
+            .await
+            .expect("task should load")
+            .expect("task should exist");
+        assert_eq!(loaded.worker_type, Some(TaskWorkerType::Opencode));
+        assert_eq!(loaded.project_id.as_deref(), Some("proj-1"));
+        assert_eq!(loaded.repo_id.as_deref(), Some("repo-1"));
+        assert_eq!(loaded.worktree_mode, Some(TaskWorktreeMode::Create));
+        assert_eq!(loaded.worktree_id, None);
+        assert_eq!(loaded.required_skills, vec!["spacebot-dev".to_string()]);
+
+        // Updates set individual plan fields without disturbing the rest.
+        let updated = store
+            .update(
+                created.task_number,
+                UpdateTaskInput {
+                    worktree_id: Some("wt-1".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update should succeed")
+            .expect("task should exist");
+        assert_eq!(updated.worktree_id.as_deref(), Some("wt-1"));
+        assert_eq!(updated.worker_type, Some(TaskWorkerType::Opencode));
+        assert_eq!(updated.required_skills, vec!["spacebot-dev".to_string()]);
+    }
+
+    #[test]
+    fn execution_plan_resolution_merges_project_defaults() {
+        let task = Task {
+            id: "t".to_string(),
+            task_number: 1,
+            title: "t".to_string(),
+            description: None,
+            status: TaskStatus::Ready,
+            priority: TaskPriority::Medium,
+            owner_agent_id: "a".to_string(),
+            assigned_agent_id: None,
+            subtasks: Vec::new(),
+            metadata: serde_json::json!({}),
+            goal_id: None,
+            source_memory_id: None,
+            worker_id: None,
+            worker_type: None,
+            project_id: Some("proj-1".to_string()),
+            repo_id: None,
+            worktree_mode: Some(TaskWorktreeMode::Root),
+            worktree_id: None,
+            required_skills: vec!["Task-Skill".to_string(), "shared".to_string()],
+            depends_on: Vec::new(),
+            created_by: "branch".to_string(),
+            approved_at: None,
+            approved_by: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            completed_at: None,
+        };
+        let defaults = ExecutionDefaults {
+            worker_type: Some(TaskWorkerType::Opencode),
+            worktree_mode: Some(TaskWorktreeMode::Create),
+            required_skills: vec!["shared".to_string(), "project-skill".to_string()],
+        };
+
+        let plan = ExecutionPlan::resolve(&task, Some(&defaults));
+
+        // Task fields win; unset fields inherit the defaults.
+        assert_eq!(plan.worker_type, Some(TaskWorkerType::Opencode));
+        assert_eq!(plan.worktree_mode, Some(TaskWorktreeMode::Root));
+        // Union keeps project defaults first and dedups case-insensitively.
+        assert_eq!(
+            plan.required_skills,
+            vec![
+                "shared".to_string(),
+                "project-skill".to_string(),
+                "Task-Skill".to_string(),
+            ]
+        );
+
+        let bare = ExecutionPlan::resolve(&task, None);
+        assert_eq!(bare.worker_type, None);
+        assert_eq!(bare.worktree_mode, Some(TaskWorktreeMode::Root));
     }
 
     #[tokio::test]
@@ -973,6 +1861,68 @@ mod tests {
 
         assert_eq!(result.previous_status, TaskStatus::InProgress);
         assert_eq!(result.task.status, TaskStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn operator_override_accepts_status_outside_agent_lifecycle() {
+        let store = setup_store().await;
+        let created = store
+            .create(CreateTaskInput {
+                created_by: "human".to_string(),
+                ..self_assigned_input("completed elsewhere", TaskStatus::PendingApproval)
+            })
+            .await
+            .expect("task should be created");
+
+        let result = store
+            .update_with_status_override(
+                created.task_number,
+                UpdateTaskInput {
+                    status: Some(TaskStatus::Done),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("operator override should succeed")
+            .expect("task should exist");
+
+        assert_eq!(result.previous_status, TaskStatus::PendingApproval);
+        assert_eq!(result.task.status, TaskStatus::Done);
+        assert!(result.task.completed_at.is_some());
+        assert!(result.task.approved_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn repeated_operator_done_override_preserves_completion_time() {
+        let store = setup_store().await;
+        let created = store
+            .create(self_assigned_input("already done", TaskStatus::Backlog))
+            .await
+            .expect("task should be created");
+        let first = store
+            .update_with_status_override(
+                created.task_number,
+                UpdateTaskInput {
+                    status: Some(TaskStatus::Done),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("first override should succeed")
+            .expect("task should exist");
+        let second = store
+            .update_with_status_override(
+                created.task_number,
+                UpdateTaskInput {
+                    status: Some(TaskStatus::Done),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("repeated override should succeed")
+            .expect("task should exist");
+
+        assert_eq!(first.task.completed_at, second.task.completed_at);
     }
 
     #[tokio::test]
@@ -1210,46 +2160,6 @@ mod tests {
             .await
             .expect("list should succeed");
         assert_eq!(all.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn claim_next_ready_scopes_by_assigned_agent() {
-        let store = setup_store().await;
-
-        // Create a ready task assigned to agent-other
-        store
-            .create(CreateTaskInput {
-                owner_agent_id: "agent-test".to_string(),
-                assigned_agent_id: Some("agent-other".to_string()),
-                title: "not mine".to_string(),
-                description: None,
-                status: TaskStatus::Ready,
-                priority: TaskPriority::High,
-                subtasks: Vec::new(),
-                metadata: serde_json::json!({}),
-                source_memory_id: None,
-                created_by: "branch".to_string(),
-            })
-            .await
-            .expect("should create");
-
-        // agent-test should not be able to claim it
-        let claimed = store
-            .claim_next_ready("agent-test")
-            .await
-            .expect("claim should succeed");
-        assert!(
-            claimed.is_none(),
-            "should not claim task assigned to other agent"
-        );
-
-        // agent-other should be able to claim it
-        let claimed = store
-            .claim_next_ready("agent-other")
-            .await
-            .expect("claim should succeed");
-        assert!(claimed.is_some());
-        assert_eq!(claimed.unwrap().status, TaskStatus::InProgress);
     }
 
     #[tokio::test]

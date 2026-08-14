@@ -529,8 +529,21 @@ pub(super) async fn inspect_prompt(
 
     // ── Gather all dynamic sections ──
     let identity_context = rc.identity.load().render();
-    let memory_bulletin = rc.memory_bulletin.load();
-    let knowledge_synthesis = rc.knowledge_synthesis.load();
+    let cortex_config = **rc.cortex.load();
+    let knowledge_synthesis = match crate::memory::render::render_memory_store(
+        channel_state.deps.memory_search.store(),
+        &channel_state.deps.task_store,
+        &channel_state.deps.agent_id,
+        cortex_config.memory_render_max_words,
+    )
+    .await
+    {
+        Ok(text) => text,
+        Err(error) => {
+            tracing::warn!(%error, "inspect prompt memory store render failed");
+            String::new()
+        }
+    };
     let skills = rc.skills.load();
     let skills_prompt = skills
         .render_channel_prompt(&prompt_engine)
@@ -540,12 +553,14 @@ pub(super) async fn inspect_prompt(
     let web_search_enabled = rc.brave_search_key.load().is_some();
     let opencode_enabled = rc.opencode.load().enabled;
     let mcp_tool_names = channel_state.deps.mcp_manager.get_tool_names().await;
+    let worker_context = channel_state.worker_context_settings.read().await.clone();
     let worker_capabilities = prompt_engine
         .render_worker_capabilities(
             browser_enabled,
             web_search_enabled,
             opencode_enabled,
             &mcp_tool_names,
+            &worker_context,
         )
         .unwrap_or_default();
 
@@ -553,11 +568,11 @@ pub(super) async fn inspect_prompt(
         rc.as_ref(),
         &channel_state.deps.sandbox,
     );
-    let temporal_context = crate::agent::channel_prompt::TemporalContext::from_runtime(rc.as_ref());
-    let current_time_line = temporal_context.current_time_line();
+    // The status block renders without the clock, matching the live channel
+    // system prompt — time rides on the user message envelope (`with_time_envelope`).
     let status_text = {
         let status = channel_state.status_block.read().await;
-        status.render_full(&current_time_line, &system_info)
+        status.render_with_context(None, Some(&system_info))
     };
 
     let conversation_context = match channel_state.channel_store.get(&query.channel_id).await {
@@ -582,7 +597,6 @@ pub(super) async fn inspect_prompt(
         _ => None,
     };
 
-    let sandbox_enabled = channel_state.deps.sandbox.containment_active();
     let adapter = query.channel_id.split(':').next().filter(|a| !a.is_empty());
 
     // ── Render working memory layers (Layers 2 + 3) ──
@@ -617,6 +631,8 @@ pub(super) async fn inspect_prompt(
         &tracked_participants,
         &query.channel_id,
         &participant_config,
+        channel_state.deps.memory_search.store(),
+        &tokio::sync::Mutex::new(std::collections::HashMap::new()),
     )
     .await
     .unwrap_or_else(|error| {
@@ -656,6 +672,10 @@ pub(super) async fn inspect_prompt(
     };
 
     // ── Org context ──
+    let agent_links = {
+        let all_links = channel_state.deps.links.load();
+        !crate::links::links_for_agent(&all_links, channel_state.deps.agent_id.as_ref()).is_empty()
+    };
     let org_context = {
         let agent_id = channel_state.deps.agent_id.as_ref();
         let all_links = channel_state.deps.links.load();
@@ -701,6 +721,7 @@ pub(super) async fn inspect_prompt(
                     is_human,
                     role,
                     description,
+                    description_total_chars: None,
                 };
                 match link.kind {
                     crate::links::LinkKind::Hierarchical => {
@@ -718,11 +739,14 @@ pub(super) async fn inspect_prompt(
                 None
             } else {
                 prompt_engine
-                    .render_org_context(crate::prompts::engine::OrgContext {
-                        superiors,
-                        subordinates,
-                        peers,
-                    })
+                    .render_org_context(
+                        crate::prompts::engine::OrgContext {
+                            superiors,
+                            subordinates,
+                            peers,
+                        },
+                        **rc.human_profile_cap.load(),
+                    )
                     .ok()
             }
         }
@@ -823,15 +847,13 @@ pub(super) async fn inspect_prompt(
     let system_prompt = prompt_engine
         .render_channel_prompt_with_links(
             empty_to_none(identity_context),
-            empty_to_none(memory_bulletin.to_string()),
             empty_to_none(knowledge_synthesis.to_string()),
             empty_to_none(skills_prompt),
             worker_capabilities,
             conversation_context,
             empty_to_none(status_text),
-            None, // coalesce_hint — only set during batched message handling
             available_channels,
-            sandbox_enabled,
+            agent_links,
             org_context,
             adapter_prompt,
             project_context,
@@ -841,7 +863,21 @@ pub(super) async fn inspect_prompt(
             empty_to_none(channel_activity_map),
             empty_to_none(participant_context),
             empty_to_none(active_goals),
-            false, // direct_mode — resolved at runtime by the channel, not available here
+            {
+                // Render the execution fragment for the channel's actual
+                // delegation mode so inspection shows the prompt it sends.
+                let fragment = if channel_state.model_overrides.delegation
+                    == crate::conversation::settings::DelegationMode::Direct
+                {
+                    "fragments/execution_direct"
+                } else {
+                    "fragments/execution_standard"
+                };
+                prompt_engine.render_static(fragment).unwrap_or_default()
+            },
+            prompt_engine
+                .render_static("fragments/authority")
+                .unwrap_or_default(),
         )
         .unwrap_or_default();
 

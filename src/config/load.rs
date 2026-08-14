@@ -80,6 +80,10 @@ fn resolve_compaction_config(
                     max_messages_per_checkpoint: c
                         .max_messages_per_checkpoint
                         .unwrap_or(base.chronicle.max_messages_per_checkpoint),
+                    rollup_threshold: c
+                        .rollup_threshold
+                        .unwrap_or(base.chronicle.rollup_threshold),
+                    rollup_batch: c.rollup_batch.unwrap_or(base.chronicle.rollup_batch),
                 })
                 .unwrap_or(base.chronicle),
         ),
@@ -111,6 +115,8 @@ fn clamp_chronicle_config(mut config: ChronicleConfig) -> ChronicleConfig {
     config.max_messages_per_checkpoint = config
         .max_messages_per_checkpoint
         .clamp(1, MAX_MESSAGES_PER_CHECKPOINT);
+    config.rollup_threshold = config.rollup_threshold.max(1);
+    config.rollup_batch = config.rollup_batch.clamp(1, config.rollup_threshold);
     config
 }
 
@@ -296,34 +302,13 @@ impl CortexConfig {
             tick_interval_secs: overrides
                 .tick_interval_secs
                 .unwrap_or(defaults.tick_interval_secs),
-            worker_timeout_secs: overrides
-                .worker_timeout_secs
-                .unwrap_or(defaults.worker_timeout_secs),
             worker_wall_clock_timeout_secs,
             cron_default_timeout_secs: overrides
                 .cron_default_timeout_secs
                 .or(defaults.cron_default_timeout_secs),
-            branch_timeout_secs: overrides
-                .branch_timeout_secs
-                .unwrap_or(defaults.branch_timeout_secs),
-            detached_worker_timeout_retry_limit: overrides
-                .detached_worker_timeout_retry_limit
-                .unwrap_or(defaults.detached_worker_timeout_retry_limit),
-            supervisor_kill_budget_per_tick: overrides
-                .supervisor_kill_budget_per_tick
-                .unwrap_or(defaults.supervisor_kill_budget_per_tick),
             circuit_breaker_threshold: overrides
                 .circuit_breaker_threshold
                 .unwrap_or(defaults.circuit_breaker_threshold),
-            bulletin_interval_secs: overrides
-                .bulletin_interval_secs
-                .unwrap_or(defaults.bulletin_interval_secs),
-            bulletin_max_words: overrides
-                .bulletin_max_words
-                .unwrap_or(defaults.bulletin_max_words),
-            bulletin_max_turns: overrides
-                .bulletin_max_turns
-                .unwrap_or(defaults.bulletin_max_turns),
             maintenance_interval_secs,
             maintenance_decay_rate: overrides
                 .maintenance_decay_rate
@@ -349,12 +334,15 @@ impl CortexConfig {
             association_max_per_pass: overrides
                 .association_max_per_pass
                 .unwrap_or(defaults.association_max_per_pass),
-            knowledge_synthesis_max_words: overrides
-                .knowledge_synthesis_max_words
-                .unwrap_or(defaults.knowledge_synthesis_max_words),
-            knowledge_synthesis_debounce_secs: overrides
-                .knowledge_synthesis_debounce_secs
-                .unwrap_or(defaults.knowledge_synthesis_debounce_secs),
+            memory_render_max_words: overrides
+                .memory_render_max_words
+                .unwrap_or(defaults.memory_render_max_words),
+            consolidation_partition_cap: overrides
+                .consolidation_partition_cap
+                .unwrap_or(defaults.consolidation_partition_cap),
+            consolidation_near_duplicate_threshold: overrides
+                .consolidation_near_duplicate_threshold
+                .unwrap_or(defaults.consolidation_near_duplicate_threshold),
         };
         config.validate_maintenance_bounds()?;
         Ok(config)
@@ -1850,6 +1838,10 @@ impl Config {
                 .as_deref()
                 .and_then(resolve_env_value),
             history_backfill_count: base_defaults.history_backfill_count,
+            human_profile_cap: toml
+                .defaults
+                .human_profile_cap
+                .unwrap_or(base_defaults.human_profile_cap),
             cron: Vec::new(),
             opencode: toml
                 .defaults

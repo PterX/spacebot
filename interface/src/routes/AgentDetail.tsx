@@ -112,11 +112,6 @@ export function AgentDetail({agentId, liveStates}: AgentDetailProps) {
 					agentId={agentId}
 				/>
 
-				{/* Bulletin - the most important text */}
-				{overviewData?.latest_bulletin && (
-					<BulletinSection bulletin={overviewData.latest_bulletin} />
-				)}
-
 				{/* Charts Grid */}
 				{overviewData && (
 					<div className="mt-8 grid grid-cols-1 gap-6 lg:grid-cols-2">
@@ -250,7 +245,6 @@ export function AgentDetail({agentId, liveStates}: AgentDetailProps) {
 					<CortexEventsSection
 						agentId={agentId}
 						events={overviewData.recent_cortex_events as CortexEvent[]}
-						lastBulletinAt={overviewData.last_bulletin_at ?? null}
 					/>
 				)}
 			</div>
@@ -332,38 +326,6 @@ function HeroSection({
 						</div>
 					)}
 				</div>
-			)}
-		</div>
-	);
-}
-
-function BulletinSection({bulletin}: {bulletin: string}) {
-	const [expanded, setExpanded] = useState(false);
-	const lines = bulletin.split("\n");
-	const shouldTruncate = lines.length > 6;
-	const displayText =
-		expanded || !shouldTruncate
-			? bulletin
-			: lines.slice(0, 6).join("\n") + "\n...";
-
-	return (
-		<div className="mt-6 rounded-xl border border-accent/20 bg-accent/5 p-5">
-			<div className="mb-3 flex items-center gap-2">
-				<div className="h-2 w-2 rounded-full bg-accent" />
-				<h3 className="font-plex text-sm font-medium text-accent">
-					Latest Memory Bulletin
-				</h3>
-			</div>
-			<div className="whitespace-pre-wrap text-sm leading-relaxed text-ink-dull">
-				{displayText}
-			</div>
-			{shouldTruncate && (
-				<button
-					onClick={() => setExpanded(!expanded)}
-					className="mt-3 text-tiny text-accent hover:text-accent/80"
-				>
-					{expanded ? "Show less" : "Show more"}
-				</button>
 			)}
 		</div>
 	);
@@ -949,11 +911,9 @@ const CORTEX_EVENT_COLORS: Record<string, string> = {
 function CortexEventsSection({
 	agentId,
 	events,
-	lastBulletinAt,
 }: {
 	agentId: string;
 	events: CortexEvent[];
-	lastBulletinAt: string | null;
 }) {
 	return (
 		<section className="mt-6">
@@ -962,11 +922,6 @@ function CortexEventsSection({
 					Recent Cortex Events
 				</h3>
 				<div className="flex items-center gap-4">
-					{lastBulletinAt && (
-						<span className="text-tiny text-ink-faint">
-							Bulletin {formatTimeAgo(lastBulletinAt)}
-						</span>
-					)}
 					<Link
 						to="/agents/$agentId/cortex"
 						params={{agentId}}

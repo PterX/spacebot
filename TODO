@@ -2,9 +2,25 @@ Things to Fix:
   ☐ Add behaviour settings per channel
   ☐ Force branching before response
 
+Prompt / memory rework (remaining, see docs/design-docs/execution-plan.md):
+  ☐ Run the live behavioral fixtures against 06178a6d (pre-rewrite) and HEAD
+    to record the baseline the rewrite shipped without — needs
+    SPACEBOT_FIXTURE_API_KEY, `cargo test --test behavioral_fixtures -- --ignored`
+  ☐ Memory-first phases 3.1b/3.1c: project scoping with hysteresis, then the
+    loaded set (per-channel stored state, branch curation, loader provenance)
+  ☐ Daily digest cron + retire intraday synthesis (memory-first phase 5)
+  ☐ Memory-first phase 6 UI: store sizes, consolidation debt surfacing
+    (debt is process-local until then), digests in the chronicle timeline
+  ☐ Cache breakpoint after durable context (rework 5.18) — needs section
+    ordering settled; measure whether the memory block earns its own slot
+  ☐ inspect_prompt in api/channels.rs is still a hand-maintained copy of
+    build_system_prompt — consolidate so inspection can't drift from the
+    real prompt
+  ☐ Fuse chronicle FTS into search_with_chronicle scoring (RRF pass like
+    memory hybrid search; index and text_search surface already exist)
+
 Cortex Loops:
   ☐ Check tasks + elevate todos
-  ☐ Improve bulletin
   ☐ Better cortex loop context
 
 Improvements:

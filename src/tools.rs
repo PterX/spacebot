@@ -12,7 +12,8 @@
 //! - No memory tools — the channel delegates memory work to branches.
 //!
 //! **Branch ToolServer** (one per branch, isolated):
-//! - `memory_save` + `memory_recall` + `memory_delete` + `channel_recall`
+//! - `memory_save` + `memory_recall` + `memory_delete` + `memory_consolidate`
+//!   + `channel_recall`
 //! - `spacebot_docs` for embedded self-documentation lookup
 //! - `task_create` + `task_list` + `task_update`
 //! - `spawn_worker` is included for channel-originated branches only
@@ -23,9 +24,6 @@
 //! - `task_update` — scoped to the worker's assigned task
 //! - `set_status` — per-worker instance, registered at creation
 //! - `restart` when the daemon lifecycle handle is available
-//!
-//! **Cortex ToolServer** (one per agent):
-//! - `memory_save` — registered at startup
 //!
 //! **Cortex Chat ToolServer** (interactive admin chat):
 //! - branch + worker tool superset plus `spacebot_docs`, `config_inspect`, `spawn_worker`,
@@ -49,6 +47,7 @@ pub mod goal_list;
 pub mod goal_update;
 pub mod install_skill;
 pub mod mcp;
+pub mod memory_consolidate;
 pub mod memory_delete;
 pub mod memory_persistence_complete;
 pub mod memory_recall;
@@ -129,6 +128,10 @@ pub use install_skill::{
     InstallSkillArgs, InstallSkillError, InstallSkillOutput, InstallSkillTool,
 };
 pub use mcp::{McpToolAdapter, McpToolError, McpToolOutput};
+pub use memory_consolidate::{
+    ConsolidateOpArgs, MemoryConsolidateArgs, MemoryConsolidateError, MemoryConsolidateOutput,
+    MemoryConsolidateTool,
+};
 pub use memory_delete::{
     MemoryDeleteArgs, MemoryDeleteError, MemoryDeleteOutput, MemoryDeleteTool,
 };
@@ -180,7 +183,8 @@ pub use spacebot_docs::{
     SpacebotDocContent, SpacebotDocsArgs, SpacebotDocsError, SpacebotDocsOutput, SpacebotDocsTool,
 };
 pub use spawn_worker::{
-    DetachedSpawnWorkerTool, SpawnWorkerArgs, SpawnWorkerError, SpawnWorkerOutput, SpawnWorkerTool,
+    BranchDelegationState, DetachedSpawnWorkerTool, SpawnWorkerArgs, SpawnWorkerError,
+    SpawnWorkerOutput, SpawnWorkerTool,
 };
 pub use task_create::{TaskCreateArgs, TaskCreateError, TaskCreateOutput, TaskCreateTool};
 pub use task_list::{TaskListArgs, TaskListError, TaskListOutput, TaskListTool};
@@ -315,6 +319,15 @@ pub enum BranchToolProfile {
         /// branch gets skill tools under agent-origin rails.
         skill_reflection: bool,
     },
+}
+
+impl BranchToolProfile {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::MemoryPersistence { .. } => "memory_persistence",
+        }
+    }
 }
 
 /// Deserialize a `u64` that may arrive as either a JSON number or a JSON string.
@@ -557,6 +570,7 @@ pub async fn add_channel_tools(
                 state.conversation_logger.clone(),
                 send_message_display_name,
                 current_adapter.clone(),
+                state.deps.process_control_registry.clone(),
             ))
             .await?;
     }
@@ -990,6 +1004,7 @@ pub fn create_branch_tool_server(
     agent_id: AgentId,
     task_store: Arc<TaskStore>,
     goal_store: Arc<GoalStore>,
+    project_store: Arc<crate::projects::ProjectStore>,
     memory_search: Arc<MemorySearch>,
     runtime_config: Arc<RuntimeConfig>,
     memory_event_tx: broadcast::Sender<ProcessEvent>,
@@ -1000,18 +1015,21 @@ pub fn create_branch_tool_server(
     api_state: Option<Arc<crate::api::ApiState>>,
     wiki_store: Option<Arc<crate::wiki::WikiStore>>,
     sandbox: Arc<crate::sandbox::Sandbox>,
+    branch_delegation: Option<Arc<BranchDelegationState>>,
 ) -> ToolServerHandle {
     let mut memory_save = memory_save_with_events(
         memory_search.clone(),
         agent_id.clone(),
         memory_event_tx.clone(),
         None,
-    );
+    )
+    .with_runtime_config(runtime_config.clone());
     if let BranchToolProfile::MemoryPersistence { contract_state, .. } = &profile {
         memory_save = memory_save.with_contract_state(contract_state.clone());
     }
 
-    let mut task_create = TaskCreateTool::new(task_store.clone(), agent_id.to_string(), "branch");
+    let mut task_create = TaskCreateTool::new(task_store.clone(), agent_id.to_string(), "branch")
+        .with_execution_context(project_store, runtime_config.clone());
     if let Some(ref api) = api_state {
         task_create = task_create.with_api_state(api.clone());
     }
@@ -1032,11 +1050,11 @@ pub fn create_branch_tool_server(
     let mut server = ToolServer::new()
         .tool(memory_save)
         .tool(MemoryRecallTool::new(memory_search.clone()))
-        .tool(MemoryDeleteTool::new(memory_search))
+        .tool(MemoryDeleteTool::new(memory_search.clone()))
+        .tool(MemoryConsolidateTool::new(memory_search))
         .tool(ChannelRecallTool::new(conversation_logger, channel_store))
         .tool(SpacebotDocsTool::new())
         .tool(EmailSearchTool::new(runtime_config.clone()))
-        .tool(worker_inspect)
         .tool(task_create)
         .tool(TaskListTool::new(task_store.clone(), agent_id.to_string()))
         .tool(TaskUpdateTool::for_branch(task_store, agent_id.clone()))
@@ -1045,6 +1063,16 @@ pub fn create_branch_tool_server(
             runtime_config.workspace_dir.clone(),
             sandbox,
         ));
+
+    if matches!(
+        &profile,
+        BranchToolProfile::MemoryPersistence {
+            skill_reflection: true,
+            ..
+        }
+    ) {
+        server = server.tool(worker_inspect);
+    }
 
     // Branches carry the expand capability: raw transcript is curated here and
     // reaches the channel as a conclusion, never as rows. Scoped to the
@@ -1136,7 +1164,10 @@ pub fn create_branch_tool_server(
     }
 
     if let Some(state) = state {
-        server = server.tool(SpawnWorkerTool::new(state));
+        server = server.tool(match branch_delegation {
+            Some(delegation) => SpawnWorkerTool::for_branch(state, delegation),
+            None => SpawnWorkerTool::new(state),
+        });
     }
 
     if let Some(lifecycle) = api_state
@@ -1184,6 +1215,8 @@ pub fn create_worker_tool_server(
     wiki_store: Option<Arc<crate::wiki::WikiStore>>,
     blocked_signal: Option<crate::agent::worker::BlockSignal>,
     lifecycle: Option<crate::lifecycle::LifecycleHandle>,
+    process_run_logger: crate::conversation::ProcessRunLogger,
+    interactive: bool,
 ) -> ToolServerHandle {
     let mut server = ToolServer::new()
         .tool(
@@ -1201,8 +1234,14 @@ pub fn create_worker_tool_server(
             worker_id,
         ))
         .tool({
-            let mut status_tool =
-                SetStatusTool::new(agent_id.clone(), worker_id, channel_id, event_tx.clone());
+            let mut status_tool = SetStatusTool::new(
+                agent_id.clone(),
+                worker_id,
+                channel_id,
+                event_tx.clone(),
+                process_run_logger,
+                interactive,
+            );
             if let Some(store) = runtime_config.secrets.load().as_ref() {
                 status_tool = status_tool.with_tool_secrets(store.tool_secret_pairs(&agent_id));
             }
@@ -1279,26 +1318,6 @@ pub fn create_worker_tool_server(
     }
 
     server.run()
-}
-
-/// Create a ToolServer for the cortex process.
-///
-/// Retained for potential future use. The compactor no longer uses this
-/// (Phase 5b removed compactor memory_save).
-#[allow(dead_code)]
-pub fn create_cortex_tool_server(
-    agent_id: AgentId,
-    memory_event_tx: broadcast::Sender<ProcessEvent>,
-    memory_search: Arc<MemorySearch>,
-) -> ToolServerHandle {
-    ToolServer::new()
-        .tool(memory_save_with_events(
-            memory_search,
-            agent_id,
-            memory_event_tx,
-            None,
-        ))
-        .run()
 }
 
 /// Create a ToolServer for cortex chat sessions.

@@ -3632,22 +3632,50 @@ fn parse_openai_responses_response(
         }
     }
 
-    let choice = OneOrMany::many(assistant_content).map_err(|_| {
-        let output_types = output_items
-            .iter()
-            .map(|item| item["type"].as_str().unwrap_or("<missing-type>"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        tracing::warn!(
-            provider = %provider_label,
-            output_items = output_items.len(),
-            output_types = %output_types,
-            "empty response from responses API"
-        );
-        CompletionError::ResponseError(format!(
-            "empty or unsupported response from {provider_label} Responses API; expected text-bearing message content (output_text/text/summary/refusal/content) or function_call output items; received output types: {output_types}"
-        ))
-    })?;
+    let choice = match OneOrMany::many(assistant_content) {
+        Ok(choice) => choice,
+        Err(_) => {
+            let output_types = output_items
+                .iter()
+                .map(|item| item["type"].as_str().unwrap_or("<missing-type>"))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            if output_items.is_empty() {
+                // No output items at all — there is nothing that could be a
+                // legitimate completion. Genuinely malformed/empty response.
+                return Err(CompletionError::ResponseError(format!(
+                    "empty response from {provider_label} Responses API; received no output items"
+                )));
+            }
+
+            // A response made only of item types known to legitimately carry
+            // no text — a message whose content is empty or thinking-only, or
+            // a standalone reasoning item — is the model saying nothing, not
+            // a malformed response. Surface it as empty text so the turn can
+            // treat it as an empty completion. An unrecognized item type
+            // still errors: silently swallowing it would hide real protocol
+            // or provider breakage.
+            let all_known_textless = output_items
+                .iter()
+                .all(|item| matches!(item["type"].as_str(), Some("message") | Some("reasoning")));
+            if !all_known_textless {
+                return Err(CompletionError::ResponseError(format!(
+                    "empty or unsupported response from {provider_label} Responses API; expected text-bearing message content (output_text/text/summary/refusal/content) or function_call output items; received output types: {output_types}"
+                )));
+            }
+
+            tracing::warn!(
+                provider = %provider_label,
+                output_items = output_items.len(),
+                output_types = %output_types,
+                "responses API returned message/reasoning items with no text-bearing content — treating as empty completion"
+            );
+            OneOrMany::one(AssistantContent::Text(Text {
+                text: String::new(),
+            }))
+        }
+    };
 
     let input_tokens = body["usage"]["input_tokens"].as_u64().unwrap_or(0);
     let output_tokens = body["usage"]["output_tokens"].as_u64().unwrap_or(0);
@@ -3693,6 +3721,7 @@ fn parse_openai_responses_sse_response(
 
     let mut output_acc: BTreeMap<usize, OutputItemAcc> = BTreeMap::new();
     let mut completed_response: Option<Value> = None;
+    let mut failure_message: Option<String> = None;
 
     for line in response_text.lines() {
         let Some(data) = line.strip_prefix("data: ") else {
@@ -3752,13 +3781,43 @@ fn parse_openai_responses_sse_response(
             Some("response.completed") => {
                 completed_response = event_body.get("response").cloned();
             }
+            // Terminal event with partial output (e.g. max_output_tokens
+            // hit); surface what arrived rather than erroring.
+            Some("response.incomplete") => {
+                if completed_response.is_none() {
+                    completed_response = event_body.get("response").cloned();
+                }
+            }
+            Some("response.failed") => {
+                let message = event_body["response"]["error"]["message"]
+                    .as_str()
+                    .unwrap_or("no error message in response.failed event")
+                    .to_string();
+                failure_message = Some(message);
+            }
+            Some("error") => {
+                let message = event_body["message"]
+                    .as_str()
+                    .unwrap_or("no error message in error event")
+                    .to_string();
+                failure_message = Some(message);
+            }
             _ => {}
         }
     }
 
+    if completed_response.is_none()
+        && let Some(message) = failure_message
+    {
+        return Err(CompletionError::ProviderError(format!(
+            "{provider_label} Responses API reported failure: {message}"
+        )));
+    }
+
     let mut response = completed_response.ok_or_else(|| {
         CompletionError::ProviderError(format!(
-            "{provider_label} Responses SSE stream missing response.completed event.\nBody: {}",
+            "{provider_label} Responses SSE stream missing response.completed event \
+             (stream ended without a terminal event; connection likely dropped).\nBody: {}",
             truncate_body(response_text)
         ))
     })?;
@@ -4430,6 +4489,50 @@ mod tests {
         let error = parse_openai_chat_sse_response("{\"choices\":[]}", "OpenRouter")
             .expect_err("should fail");
         assert!(error.to_string().contains("missing SSE data events"));
+    }
+
+    #[test]
+    fn responses_sse_failure_event_surfaces_provider_message() {
+        let sse = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n",
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"The model is overloaded\"}}}\n\n"
+        );
+
+        let error =
+            parse_openai_responses_sse_response(sse, "OpenAI ChatGPT").expect_err("should fail");
+        let message = error.to_string();
+        assert!(message.contains("The model is overloaded"), "{message}");
+        assert!(!message.contains("missing response.completed"), "{message}");
+        assert!(crate::llm::routing::is_retriable_error(&message));
+    }
+
+    #[test]
+    fn responses_sse_truncated_stream_is_retriable() {
+        let sse = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n"
+        );
+
+        let error =
+            parse_openai_responses_sse_response(sse, "OpenAI ChatGPT").expect_err("should fail");
+        let message = error.to_string();
+        assert!(message.contains("missing response.completed"), "{message}");
+        assert!(crate::llm::routing::is_retriable_error(&message));
+    }
+
+    #[test]
+    fn responses_sse_incomplete_event_yields_partial_output() {
+        let sse = concat!(
+            "event: response.incomplete\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_1\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"partial\"}]}]}}\n\n"
+        );
+
+        let parsed = parse_openai_responses_sse_response(sse, "OpenAI ChatGPT")
+            .expect("incomplete is a terminal event with usable output");
+        assert_eq!(parsed["status"], "incomplete");
+        assert_eq!(parsed["output"][0]["content"][0]["text"], "partial");
     }
 
     #[test]

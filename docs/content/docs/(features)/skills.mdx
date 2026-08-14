@@ -9,7 +9,7 @@ How Spacebot extends agent capabilities with reusable skills from skills.sh.
 
 ## Overview
 
-Skills are packaged instructions and workflows that give agents domain-specific knowledge. They're markdown files with frontmatter containing procedural knowledge, tool usage patterns, and bundled resources.
+Skills are packaged instructions and workflows that give agents domain-specific knowledge. They're markdown files with typed frontmatter, procedural guidance, and optional bundled resources.
 
 Spacebot's skill system is fully compatible with [skills.sh](https://skills.sh) — the open agent skills ecosystem. Install any skill from the registry or create your own.
 
@@ -19,6 +19,12 @@ Spacebot's skill system is fully compatible with [skills.sh](https://skills.sh) 
 - **Two-level loading** — instance-level (shared) and agent-level (workspace) skills
 - **Worker injection** — skills are injected into worker system prompts, not channels
 - **Hot-reloadable** — file watcher picks up skill changes without restart
+- **Categories and ranking** — channels receive a compact category index ranked by usage
+- **Protected origins** — built-in and installed skills cannot be overwritten by agent reflection
+
+### Reflection
+
+After successful multi-step work, the next eligible persistence pass can turn the procedure into a new agent-authored skill or improve an existing agent-authored skill. Reflection is rate-limited per conversation and only writes within its origin boundary. Installed and built-in skills remain read-only to the agent.
 
 ## Setting Up an Integration
 

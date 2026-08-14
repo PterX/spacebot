@@ -87,9 +87,9 @@ When the compactor triggers a compaction worker, that worker does two things in 
 
 This mirrors OpenClaw's memory flush pattern -- the best idea in OpenClaw's memory system. Before context is lost, an LLM pass pulls out anything worth keeping. But unlike OpenClaw, this happens in a background worker. The channel never blocks.
 
-### 3. Cortex-initiated (system-level)
+### 3. Ingestion and maintenance
 
-The cortex observes patterns across channels and can create memories at the system level. It consolidates related memories, creates observations ("James has been asking about authentication a lot this week"), and manages the graph.
+File ingestion can save structured memories from imported material. Memory saves perform near-duplicate checks and can consolidate related entries before they enter an overgrown partition. Periodic maintenance handles decay, pruning, and association work.
 
 ## How Memories Are Recalled
 
@@ -174,12 +174,7 @@ What's gone:
 
 ## Context Injection
 
-When a channel starts or a cron job fires, memories are injected into the system prompt. This isn't a raw dump -- it's a curated selection:
-
-1. Identity-tagged memories are always included
-2. High-importance memories above a threshold are included
-3. Recently accessed memories get a boost
-4. The rest depends on what the conversation is about (populated by recall workers during the session)
+When a channel starts, Spacebot renders a bounded deterministic view of the memory store into the system prompt. It groups current memory records by type and includes active goals. The render does not need an LLM synthesis pass, so it reflects the store on every turn.
 
 The injected memories are grouped by type and formatted cleanly. The channel sees something like:
 
@@ -201,6 +196,6 @@ A periodic background process handles graph hygiene:
 
 - **Decay** -- reduce importance of old, unaccessed memories
 - **Prune** -- delete memories below an importance floor (identity/permanent exempt)
-- **Merge** -- combine near-duplicate memories (>0.95 similarity)
+- **Associations** -- create graph links for related memories
 
-This is a scheduled job managed by the cortex. It runs as an internal background task in the cortex loop, doesn't block channels, and keeps the graph healthy over time.
+Near-duplicate consolidation also happens at write time, before maintenance is required. Maintenance runs in the cortex loop and does not block channels.

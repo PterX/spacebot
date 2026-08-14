@@ -1,15 +1,17 @@
 //! Memory storage and retrieval system.
 
+pub mod consolidation;
 pub mod embedding;
 pub mod lance;
 pub mod maintenance;
+pub mod render;
 pub mod search;
 pub mod store;
 pub mod types;
 pub mod working;
 
 pub use embedding::EmbeddingModel;
-pub use lance::EmbeddingTable;
+pub use lance::{ChronicleEmbeddingTable, ChronicleHit, EmbeddingTable};
 pub use search::{MemorySearch, SearchConfig, SearchMode, SearchSort, curate_results};
 pub use store::MemoryStore;
 pub use types::{Association, Memory, MemoryType, RelationType};

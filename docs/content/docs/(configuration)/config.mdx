@@ -118,13 +118,25 @@ max_older = 12                   # older checkpoints listed, collapsed first und
 context_token_budget = 2000      # token budget for the whole chronicle section
 expand_message_limit = 100       # raw messages a single `chronicle expand` returns
 max_messages_per_checkpoint = 400 # raw messages one checkpoint may summarize
+rollup_threshold = 12             # unrolled checkpoints before a level-1 rollup
+rollup_batch = 8                  # oldest checkpoints summarized by one rollup
 
 # Cortex (system observer) settings.
 [defaults.cortex]
 tick_interval_secs = 30
-worker_timeout_secs = 600
-branch_timeout_secs = 60
+worker_wall_clock_timeout_secs = 600
 circuit_breaker_threshold = 3  # consecutive failures before auto-disable
+
+# Goal-oriented background work. `off` disables autonomous runs.
+[defaults.autonomy]
+level = "off"                 # "off", "observe", "suggest", or "act"
+interval_secs = 1800
+max_turns = 20
+max_tasks_per_run = 2
+timeout_secs = 600
+warn_secs = 480
+run_history_count = 5
+claim_unowned = true
 
 # Warmup controls for cold-start behavior and manual rewarm.
 [defaults.warmup]
@@ -171,6 +183,22 @@ delivery_target = "discord:123456789"
 active_start_hour = 9
 active_end_hour = 17
 enabled = true
+
+# Durable autonomy wakes. Each wake sets exactly one trigger:
+# `schedule`/`interval_secs`, `webhook = true`, or a typed `event`.
+[[agents.wakes]]
+id = "morning-review"
+name = "Morning review"
+schedule = "0 9 * * 1-5"
+instructions = "Review active goals and ready tasks."
+min_level = "observe"
+
+[[agents.wakes]]
+id = "deployment-hook"
+name = "Deployment webhook"
+webhook = true
+instructions = "Inspect the deployment payload and create work only when needed."
+min_level = "suggest"
 
 # --- Messaging Platforms ---
 [messaging.discord]
@@ -540,6 +568,7 @@ Map of model names to ordered fallback chains. Used when the primary model retur
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
+| `mode` | string | `rolling` | `rolling` summaries or durable `chronicle` checkpoints |
 | `background_threshold` | float | 0.80 | Start background summarization |
 | `aggressive_threshold` | float | 0.85 | Start aggressive summarization |
 | `emergency_threshold` | float | 0.95 | Emergency truncation (no LLM, drop oldest 50%) |
@@ -551,10 +580,7 @@ Thresholds are fractions of `context_window`.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `tick_interval_secs` | integer | 30 | How often the cortex runtime loop runs maintenance ticks while continuously observing events |
-| `worker_timeout_secs` | integer | 600 | Worker idle timeout before cancellation |
-| `branch_timeout_secs` | integer | 60 | Branch timeout before cancellation |
-| `detached_worker_timeout_retry_limit` | integer | 2 | Retry limit before quarantining detached workers to backlog |
-| `supervisor_kill_budget_per_tick` | integer | 8 | Max number of overdue processes supervisor may cancel per health tick |
+| `worker_wall_clock_timeout_secs` | integer | 600 | Maximum duration of one worker run |
 | `circuit_breaker_threshold` | integer | 3 | Consecutive failures before auto-disable |
 
 ### `[defaults.warmup]`

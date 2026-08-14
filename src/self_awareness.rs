@@ -135,7 +135,6 @@ pub fn runtime_snapshot_value(agent_id: &str, runtime_config: &RuntimeConfig) ->
         .collect::<Vec<_>>();
 
     let readiness = runtime_config.work_readiness();
-    let memory_bulletin = runtime_config.memory_bulletin.load();
     let secrets = runtime_config.secrets.load();
     let secrets_snapshot = if let Some(store) = secrets.as_ref() {
         match store.status(false) {
@@ -201,6 +200,8 @@ pub fn runtime_snapshot_value(agent_id: &str, runtime_config: &RuntimeConfig) ->
                 "context_token_budget": compaction.chronicle.context_token_budget,
                 "expand_message_limit": compaction.chronicle.expand_message_limit,
                 "max_messages_per_checkpoint": compaction.chronicle.max_messages_per_checkpoint,
+                "rollup_threshold": compaction.chronicle.rollup_threshold,
+                "rollup_batch": compaction.chronicle.rollup_batch,
             },
         },
         "memory_persistence": {
@@ -221,12 +222,8 @@ pub fn runtime_snapshot_value(agent_id: &str, runtime_config: &RuntimeConfig) ->
         },
         "cortex": {
             "tick_interval_secs": cortex.tick_interval_secs,
-            "worker_timeout_secs": cortex.worker_timeout_secs,
-            "branch_timeout_secs": cortex.branch_timeout_secs,
+            "worker_wall_clock_timeout_secs": cortex.worker_wall_clock_timeout_secs,
             "circuit_breaker_threshold": cortex.circuit_breaker_threshold,
-            "bulletin_interval_secs": cortex.bulletin_interval_secs,
-            "bulletin_max_words": cortex.bulletin_max_words,
-            "bulletin_max_turns": cortex.bulletin_max_turns,
             "association_interval_secs": cortex.association_interval_secs,
             "association_similarity_threshold": cortex.association_similarity_threshold,
             "association_updates_threshold": cortex.association_updates_threshold,
@@ -241,14 +238,14 @@ pub fn runtime_snapshot_value(agent_id: &str, runtime_config: &RuntimeConfig) ->
             "embedding_ready": warmup_status.embedding_ready,
             "last_refresh_unix_ms": warmup_status.last_refresh_unix_ms,
             "last_error": warmup_status.last_error,
-            "bulletin_age_secs": warmup_status.bulletin_age_secs,
+            "refresh_age_secs": warmup_status.refresh_age_secs,
         },
         "work_readiness": {
             "ready": readiness.ready,
             "reason": readiness.reason.map(|reason| reason.as_str()),
             "warmup_state": readiness.warmup_state,
             "embedding_ready": readiness.embedding_ready,
-            "bulletin_age_secs": readiness.bulletin_age_secs,
+            "refresh_age_secs": readiness.refresh_age_secs,
             "stale_after_secs": readiness.stale_after_secs,
         },
         "browser": {
@@ -289,10 +286,6 @@ pub fn runtime_snapshot_value(agent_id: &str, runtime_config: &RuntimeConfig) ->
         "timezones": {
             "cron_timezone": runtime_config.cron_timezone.load().as_ref().clone(),
             "user_timezone": runtime_config.user_timezone.load().as_ref().clone(),
-        },
-        "bulletin": {
-            "is_empty": memory_bulletin.trim().is_empty(),
-            "char_count": memory_bulletin.len(),
         },
         "secrets": secrets_snapshot,
     })

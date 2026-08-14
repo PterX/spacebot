@@ -805,7 +805,7 @@ On `CortexConfig`, replace `bulletin_interval_secs` and `bulletin_max_words` wit
 
 ```rust
 pub struct CortexConfig {
-    // ... existing fields (tick_interval_secs, worker_timeout_secs, etc.)
+    // ... existing fields (tick_interval_secs, worker_wall_clock_timeout_secs, etc.)
 
     /// Knowledge synthesis max words (default: 500). Replaces bulletin_max_words.
     pub knowledge_synthesis_max_words: usize,

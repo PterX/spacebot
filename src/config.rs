@@ -1022,9 +1022,6 @@ startup_delay_secs = 2
         let toml = r#"
 [defaults.cortex]
 tick_interval_secs = 45
-detached_worker_timeout_retry_limit = 4
-supervisor_kill_budget_per_tick = 12
-bulletin_max_words = 1200
 maintenance_interval_secs = 1200
 maintenance_prune_threshold = 0.21
 maintenance_min_age_days = 17
@@ -1033,8 +1030,6 @@ maintenance_min_age_days = 17
 id = "main"
 
 [agents.cortex]
-branch_timeout_secs = 77
-supervisor_kill_budget_per_tick = 3
 association_max_per_pass = 55
 maintenance_decay_rate = 0.33
 "#;
@@ -1043,21 +1038,11 @@ maintenance_decay_rate = 0.33
         let resolved = config.agents[0].resolve(&config.instance_dir, &config.defaults);
 
         assert_eq!(config.defaults.cortex.tick_interval_secs, 45);
-        assert_eq!(
-            config.defaults.cortex.detached_worker_timeout_retry_limit,
-            4
-        );
-        assert_eq!(config.defaults.cortex.supervisor_kill_budget_per_tick, 12);
-        assert_eq!(config.defaults.cortex.bulletin_max_words, 1200);
         assert_eq!(config.defaults.cortex.maintenance_interval_secs, 1200);
         assert_eq!(config.defaults.cortex.maintenance_prune_threshold, 0.21);
         assert_eq!(config.defaults.cortex.maintenance_min_age_days, 17);
 
         assert_eq!(resolved.cortex.tick_interval_secs, 45);
-        assert_eq!(resolved.cortex.branch_timeout_secs, 77);
-        assert_eq!(resolved.cortex.detached_worker_timeout_retry_limit, 4);
-        assert_eq!(resolved.cortex.supervisor_kill_budget_per_tick, 3);
-        assert_eq!(resolved.cortex.bulletin_max_words, 1200);
         assert_eq!(resolved.cortex.maintenance_interval_secs, 1200);
         assert_eq!(resolved.cortex.maintenance_decay_rate, 0.33);
         assert_eq!(resolved.cortex.maintenance_prune_threshold, 0.21);
@@ -1190,7 +1175,7 @@ id = "main"
                 embedding_ready: true,
                 last_refresh_unix_ms: Some(1_000),
                 last_error: None,
-                bulletin_age_secs: None,
+                refresh_age_secs: None,
             },
             2_000,
         );
@@ -1208,7 +1193,7 @@ id = "main"
                 embedding_ready: false,
                 last_refresh_unix_ms: Some(1_000),
                 last_error: None,
-                bulletin_age_secs: None,
+                refresh_age_secs: None,
             },
             2_000,
         );
@@ -1232,7 +1217,7 @@ id = "main"
                 embedding_ready: false,
                 last_refresh_unix_ms: Some(1_000),
                 last_error: None,
-                bulletin_age_secs: None,
+                refresh_age_secs: None,
             },
             2_000,
         );
@@ -1242,7 +1227,7 @@ id = "main"
     }
 
     #[test]
-    fn test_work_readiness_requires_bulletin_timestamp() {
+    fn test_work_readiness_requires_completed_warmup() {
         let readiness = evaluate_work_readiness(
             WarmupConfig::default(),
             WarmupStatus {
@@ -1250,13 +1235,16 @@ id = "main"
                 embedding_ready: true,
                 last_refresh_unix_ms: None,
                 last_error: None,
-                bulletin_age_secs: None,
+                refresh_age_secs: None,
             },
             2_000,
         );
 
         assert!(!readiness.ready);
-        assert_eq!(readiness.reason, Some(WorkReadinessReason::BulletinMissing));
+        assert_eq!(
+            readiness.reason,
+            Some(WorkReadinessReason::WarmupNeverCompleted)
+        );
     }
 
     #[test]
@@ -1272,12 +1260,12 @@ id = "main"
                 embedding_ready: true,
                 last_refresh_unix_ms: Some(1_000),
                 last_error: None,
-                bulletin_age_secs: None,
+                refresh_age_secs: None,
             },
             122_000,
         );
 
-        assert_eq!(readiness.bulletin_age_secs, Some(121));
+        assert_eq!(readiness.refresh_age_secs, Some(121));
         assert!(readiness.ready, "old synthesis should not block readiness");
         assert_eq!(readiness.reason, None);
     }
@@ -1294,14 +1282,14 @@ id = "main"
                 embedding_ready: true,
                 last_refresh_unix_ms: Some(200_000),
                 last_error: None,
-                bulletin_age_secs: None,
+                refresh_age_secs: None,
             },
             310_000,
         );
 
         assert!(readiness.ready);
         assert_eq!(readiness.reason, None);
-        assert_eq!(readiness.bulletin_age_secs, Some(110));
+        assert_eq!(readiness.refresh_age_secs, Some(110));
     }
 
     /// Verify that every shorthand key field in `LlmConfig` actually registers a provider.

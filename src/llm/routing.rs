@@ -142,6 +142,8 @@ pub fn is_retriable_error(error_message: &str) -> bool {
         || lower.contains("empty response")
         || lower.contains("failed to read response body")
         || lower.contains("error decoding response body")
+        // SSE stream cut off before its terminal event
+        || lower.contains("missing response.completed")
 }
 
 /// Whether a completion error indicates the provider rejected the model id

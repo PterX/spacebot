@@ -1,7 +1,9 @@
 //! SpacebotHook: Prompt hook for channels, branches, and workers.
 
 use crate::hooks::loop_guard::{LoopGuard, LoopGuardConfig, LoopGuardVerdict};
-use crate::tools::{MemoryPersistenceContractState, MemoryPersistenceTerminalOutcome};
+use crate::tools::{
+    BranchDelegationState, MemoryPersistenceContractState, MemoryPersistenceTerminalOutcome,
+};
 use crate::{AgentId, ChannelId, ProcessEvent, ProcessId, ProcessType};
 use futures::StreamExt;
 use rig::agent::{HookAction, PromptHook, ToolCallHookAction};
@@ -50,6 +52,9 @@ pub struct SpacebotHook {
     /// Once signaled, the nudge system allows text-only responses to pass
     /// through as legitimate completions.
     outcome_signaled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// One-shot workers terminate immediately after recording an outcome.
+    /// Interactive workers keep their session open for follow-up input.
+    terminate_on_outcome: bool,
     /// Counts consecutive text-only nudge attempts. Reset to zero whenever a
     /// tool call completes successfully, so the budget tracks *consecutive*
     /// text-only responses rather than total across the worker's lifetime.
@@ -66,6 +71,7 @@ pub struct SpacebotHook {
     /// append the messages to history before re-prompting.
     injected_messages: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     memory_persistence_contract: Option<Arc<MemoryPersistenceContractState>>,
+    branch_delegation: Option<Arc<BranchDelegationState>>,
     tool_call_registry: Option<crate::tools::ToolCallRegistry>,
     reply_tool_delta_state:
         std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, ReplyToolDeltaState>>>,
@@ -93,6 +99,9 @@ impl SpacebotHook {
     /// PromptCancelled reason used once a memory-persistence run has recorded
     /// its terminal outcome and the loop should stop.
     pub const MEMORY_PERSISTENCE_COMPLETE_REASON: &str = "spacebot_memory_persistence_complete";
+    /// PromptCancelled reason used once a one-shot worker has claimed its
+    /// terminal outcome through `set_status`.
+    pub const WORKER_OUTCOME_RECORDED_REASON: &str = "spacebot_worker_outcome_recorded";
     /// Maximum nudge retries per prompt request.
     pub const TOOL_NUDGE_MAX_RETRIES: usize = 2;
     /// Maximum completion-contract retries per prompt request.
@@ -126,6 +135,7 @@ impl SpacebotHook {
                 std::sync::atomic::AtomicBool::new(false),
             ),
             outcome_signaled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            terminate_on_outcome: false,
             nudge_attempts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             loop_guard: std::sync::Arc::new(std::sync::Mutex::new(LoopGuard::new(
                 loop_guard_config,
@@ -133,6 +143,7 @@ impl SpacebotHook {
             inject_rx: None,
             injected_messages: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             memory_persistence_contract: None,
+            branch_delegation: None,
             tool_call_registry: None,
             reply_tool_delta_state: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -146,11 +157,22 @@ impl SpacebotHook {
         self
     }
 
+    /// End the current prompt loop after a successful worker outcome.
+    pub fn with_terminate_on_outcome(mut self, terminate_on_outcome: bool) -> Self {
+        self.terminate_on_outcome = terminate_on_outcome;
+        self
+    }
+
     pub fn with_memory_persistence_contract(
         mut self,
         contract_state: Arc<MemoryPersistenceContractState>,
     ) -> Self {
         self.memory_persistence_contract = Some(contract_state);
+        self
+    }
+
+    pub fn with_branch_delegation(mut self, delegation: Arc<BranchDelegationState>) -> Self {
+        self.branch_delegation = Some(delegation);
         self
     }
 
@@ -266,6 +288,10 @@ impl SpacebotHook {
     /// run recorded its terminal outcome and stopped deliberately.
     pub fn is_memory_persistence_complete_reason(reason: &str) -> bool {
         reason == Self::MEMORY_PERSISTENCE_COMPLETE_REASON
+    }
+
+    pub fn is_branch_delegated_reason(reason: &str) -> bool {
+        reason == "spacebot_branch_delegated"
     }
 
     /// Drain and return all buffered injected messages.
@@ -479,6 +505,7 @@ impl SpacebotHook {
 
         let mut current_max_turns = 0usize;
         let mut last_text_response = String::new();
+        let mut aggregated_reasoning = String::new();
         let mut did_call_tool = false;
 
         loop {
@@ -679,9 +706,37 @@ impl SpacebotHook {
                             is_text_response = false;
                         }
                     }
-                    StreamedAssistantContent::Reasoning(_)
-                    | StreamedAssistantContent::ReasoningDelta { .. } => {
-                        did_call_tool = false;
+                    StreamedAssistantContent::Reasoning(reasoning) => {
+                        // Full reasoning block (e.g. assembled from an
+                        // `output_item.done` snapshot). Extract the readable
+                        // parts and forward them for the portal. The
+                        // `ends_with` check dedupes the common case where the
+                        // same reasoning was already streamed as deltas.
+                        let mut parts = Vec::new();
+                        for content in reasoning.content {
+                            match content {
+                                rig::message::ReasoningContent::Text { text, .. } => {
+                                    parts.push(text)
+                                }
+                                rig::message::ReasoningContent::Summary(summary) => {
+                                    parts.push(summary)
+                                }
+                                _ => {}
+                            }
+                        }
+                        let full = parts.join("\n");
+                        if !full.is_empty() && !aggregated_reasoning.ends_with(&full) {
+                            aggregated_reasoning.push_str(&full);
+                            self.forward_reasoning_delta(&full, &aggregated_reasoning)
+                                .await;
+                        }
+                    }
+                    StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
+                        if !reasoning.is_empty() {
+                            aggregated_reasoning.push_str(&reasoning);
+                            self.forward_reasoning_delta(&reasoning, &aggregated_reasoning)
+                                .await;
+                        }
                     }
                 }
             }
@@ -734,6 +789,24 @@ impl SpacebotHook {
             status: status.into(),
         };
         self.event_tx.send(event).ok();
+    }
+
+    /// Forward a reasoning/thinking delta to the portal (channel processes
+    /// only, mirroring text delta forwarding). Reasoning is not user-facing
+    /// text, so it rides its own event rather than the `TextDelta` path.
+    async fn forward_reasoning_delta(&self, reasoning_delta: &str, aggregated: &str) {
+        if self.process_type == ProcessType::Channel
+            && let Some(channel_id) = self.channel_id.clone()
+        {
+            let event = ProcessEvent::ReasoningDelta {
+                agent_id: self.agent_id.clone(),
+                process_id: self.process_id.clone(),
+                channel_id: Some(channel_id),
+                reasoning_delta: reasoning_delta.to_string(),
+                aggregated_reasoning: aggregated.to_string(),
+            };
+            self.event_tx.send(event).ok();
+        }
     }
 
     /// Send a worker idle event. Only valid for worker processes.
@@ -1072,9 +1145,9 @@ where
             };
         }
 
-        // Emit text content from worker completion responses so the live
-        // transcript can show the model's reasoning between tool calls.
-        if self.process_type == ProcessType::Worker {
+        // Emit branch and worker text so live process transcripts include the
+        // model's reasoning between tool calls. Channel text uses streaming events.
+        if matches!(self.process_type, ProcessType::Branch | ProcessType::Worker) {
             let text: String = response
                 .choice
                 .iter()
@@ -1093,12 +1166,10 @@ where
                 .collect::<Vec<_>>()
                 .join("\n\n");
 
-            if !text.is_empty()
-                && let ProcessId::Worker(worker_id) = &self.process_id
-            {
-                let event = ProcessEvent::WorkerText {
+            if !text.is_empty() {
+                let event = ProcessEvent::ProcessText {
                     agent_id: self.agent_id.clone(),
-                    worker_id: *worker_id,
+                    process_id: self.process_id.clone(),
                     channel_id: self.channel_id.clone(),
                     text,
                 };
@@ -1207,8 +1278,8 @@ where
             guard.remove(_internal_call_id);
         }
         // Loop guard: check for repetitive tool calling before execution.
-        // Runs for all process types. Block → Skip (message becomes tool
-        // result), CircuitBreak → Terminate.
+        // Runs for all process types. Block becomes a tool result the model can
+        // recover from without terminating the process.
         if let Ok(mut guard) = self.loop_guard.lock() {
             match guard.check(tool_name, args) {
                 LoopGuardVerdict::Allow => {}
@@ -1219,14 +1290,6 @@ where
                         "loop guard blocked tool call"
                     );
                     return ToolCallHookAction::Skip { reason };
-                }
-                LoopGuardVerdict::CircuitBreak(reason) => {
-                    tracing::warn!(
-                        process_id = %self.process_id,
-                        tool_name = %tool_name,
-                        "loop guard circuit-breaking agent loop"
-                    );
-                    return ToolCallHookAction::Terminate { reason };
                 }
             }
         }
@@ -1391,6 +1454,25 @@ where
             };
         }
 
+        // An autonomy finish request closes admission for new delegated work.
+        // The channel remains alive to consume existing worker completions, but
+        // the model does not need another turn after recording its summary.
+        if !is_tool_error && tool_name == "autonomy_complete" {
+            return HookAction::Terminate {
+                reason: "spacebot_autonomy_finish_requested".into(),
+            };
+        }
+
+        if !is_tool_error
+            && tool_name == "spawn_worker"
+            && let Some(delegation) = &self.branch_delegation
+            && delegation.delegation().await.is_some()
+        {
+            return HookAction::Terminate {
+                reason: "spacebot_branch_delegated".into(),
+            };
+        }
+
         // A successful tool call proves the worker is still productive.
         // Reset the consecutive nudge counter so a brief narration blip
         // after many tool calls doesn't exhaust the retry budget.
@@ -1412,6 +1494,11 @@ where
         {
             self.outcome_signaled
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            if self.terminate_on_outcome {
+                return HookAction::Terminate {
+                    reason: Self::WORKER_OUTCOME_RECORDED_REASON.into(),
+                };
+            }
         }
 
         // Channel turns should end immediately after a successful reply or skip
@@ -1611,7 +1698,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outcome_signal_allows_text_only_completion() {
+    async fn outcome_signal_allows_text_only_completion_when_not_terminal() {
         let hook = make_hook().with_tool_nudge_policy(ToolNudgePolicy::Enabled);
         let prompt = prompt_message();
         hook.reset_tool_nudge_state();
@@ -1660,6 +1747,29 @@ mod tests {
             matches!(response, HookAction::Continue),
             "Expected text-only to pass through after outcome signal"
         );
+    }
+
+    #[tokio::test]
+    async fn one_shot_worker_outcome_terminates_the_prompt_loop() {
+        let hook = make_hook()
+            .with_tool_nudge_policy(ToolNudgePolicy::Enabled)
+            .with_terminate_on_outcome(true);
+        let action = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
+            &hook,
+            "set_status",
+            None,
+            "internal_1",
+            "{\"status\":\"finished\",\"kind\":\"outcome\"}",
+            "{\"success\":true,\"worker_id\":1,\"status\":\"finished\",\"kind\":\"outcome\"}",
+        )
+        .await;
+
+        assert!(matches!(
+            action,
+            HookAction::Terminate { ref reason }
+                if reason == SpacebotHook::WORKER_OUTCOME_RECORDED_REASON
+        ));
+        assert!(hook.outcome_signaled());
     }
 
     #[tokio::test]

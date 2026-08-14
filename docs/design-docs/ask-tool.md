@@ -38,7 +38,7 @@ We go non-blocking. Spacebot turns are cheap and the click already arrives as an
 
 The tradeoff is that the model must re-orient when the answer comes in. Enrichment (below) closes most of that gap: the answer message carries the original question text, so the model doesn't need the asking turn in recent context to interpret it.
 
-One consequence worth stating: there is no "Other (type your answer)" option, because the chat input is always available. The user can tap a button or just type — both are normal inbound paths. The prompt guidance tells the model that typed replies to a pending question are possible and that its own question is visible in the transcript.
+One consequence worth stating: there is no "Other (type your answer)" option, because the chat input is always available. A typed reply remains a normal inbound message: it does not resolve or correlate a pending question automatically. The model can interpret it from the transcript, but only a matching interaction resolves the stored question.
 
 ## The tool
 
@@ -104,7 +104,7 @@ Written when `ask` sends, resolved when an answer lands. Restart-safe by constru
 At the flattening point in `src/agent/channel.rs:2120-2131`, an `Interaction` whose `action_id` parses as `ask:{question_id}:{idx}`:
 
 1. Looks up the pending question. Miss or already-resolved → render as today's breadcrumb with an `(expired)` note, so late clicks don't false-resolve anything.
-2. Hit → mark resolved, and render for the LLM as:
+2. Hit → atomically mark resolved. Only the interaction that wins that update renders for the LLM as:
 
    ```
    {sender} answered "{question}": {label}

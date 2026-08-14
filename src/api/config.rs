@@ -49,20 +49,16 @@ pub struct ChronicleSection {
     pub context_token_budget: usize,
     pub expand_message_limit: i64,
     pub max_messages_per_checkpoint: i64,
+    pub rollup_threshold: usize,
+    pub rollup_batch: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug, utoipa::ToSchema)]
 pub struct CortexSection {
     pub tick_interval_secs: u64,
     pub maintenance_interval_secs: u64,
-    pub worker_timeout_secs: u64,
-    pub branch_timeout_secs: u64,
-    pub detached_worker_timeout_retry_limit: u8,
-    pub supervisor_kill_budget_per_tick: usize,
+    pub worker_wall_clock_timeout_secs: u64,
     pub circuit_breaker_threshold: u8,
-    pub bulletin_interval_secs: u64,
-    pub bulletin_max_words: usize,
-    pub bulletin_max_turns: usize,
     pub maintenance_decay_rate: f32,
     pub maintenance_prune_threshold: f32,
     pub maintenance_min_age_days: i64,
@@ -236,20 +232,16 @@ pub(super) struct ChronicleUpdate {
     context_token_budget: Option<usize>,
     expand_message_limit: Option<i64>,
     max_messages_per_checkpoint: Option<i64>,
+    rollup_threshold: Option<usize>,
+    rollup_batch: Option<usize>,
 }
 
 #[derive(Deserialize, Debug, utoipa::ToSchema)]
 pub(super) struct CortexUpdate {
     tick_interval_secs: Option<u64>,
     maintenance_interval_secs: Option<u64>,
-    worker_timeout_secs: Option<u64>,
-    branch_timeout_secs: Option<u64>,
-    detached_worker_timeout_retry_limit: Option<u8>,
-    supervisor_kill_budget_per_tick: Option<usize>,
+    worker_wall_clock_timeout_secs: Option<u64>,
     circuit_breaker_threshold: Option<u8>,
-    bulletin_interval_secs: Option<u64>,
-    bulletin_max_words: Option<usize>,
-    bulletin_max_turns: Option<usize>,
     maintenance_decay_rate: Option<f32>,
     maintenance_prune_threshold: Option<f32>,
     maintenance_min_age_days: Option<i64>,
@@ -398,19 +390,15 @@ pub(super) async fn get_agent_config(
                 context_token_budget: compaction.chronicle.context_token_budget,
                 expand_message_limit: compaction.chronicle.expand_message_limit,
                 max_messages_per_checkpoint: compaction.chronicle.max_messages_per_checkpoint,
+                rollup_threshold: compaction.chronicle.rollup_threshold,
+                rollup_batch: compaction.chronicle.rollup_batch,
             },
         },
         cortex: CortexSection {
             tick_interval_secs: cortex.tick_interval_secs,
             maintenance_interval_secs: cortex.maintenance_interval_secs,
-            worker_timeout_secs: cortex.worker_timeout_secs,
-            branch_timeout_secs: cortex.branch_timeout_secs,
-            detached_worker_timeout_retry_limit: cortex.detached_worker_timeout_retry_limit,
-            supervisor_kill_budget_per_tick: cortex.supervisor_kill_budget_per_tick,
+            worker_wall_clock_timeout_secs: cortex.worker_wall_clock_timeout_secs,
             circuit_breaker_threshold: cortex.circuit_breaker_threshold,
-            bulletin_interval_secs: cortex.bulletin_interval_secs,
-            bulletin_max_words: cortex.bulletin_max_words,
-            bulletin_max_turns: cortex.bulletin_max_turns,
             maintenance_decay_rate: cortex.maintenance_decay_rate,
             maintenance_prune_threshold: cortex.maintenance_prune_threshold,
             maintenance_min_age_days: cortex.maintenance_min_age_days,
@@ -801,6 +789,12 @@ fn update_compaction_table(
         if let Some(v) = chronicle.max_messages_per_checkpoint {
             chronicle_table["max_messages_per_checkpoint"] = toml_edit::value(v);
         }
+        if let Some(v) = chronicle.rollup_threshold {
+            chronicle_table["rollup_threshold"] = toml_edit::value(v as i64);
+        }
+        if let Some(v) = chronicle.rollup_batch {
+            chronicle_table["rollup_batch"] = toml_edit::value(v as i64);
+        }
     }
     Ok(())
 }
@@ -824,13 +818,6 @@ fn to_i64_from_u64(field: &'static str, value: u64) -> Result<i64, StatusCode> {
     })
 }
 
-fn to_i64_from_usize(field: &'static str, value: usize) -> Result<i64, StatusCode> {
-    i64::try_from(value).map_err(|_| {
-        tracing::warn!(field, value, "config value exceeds i64 range");
-        StatusCode::BAD_REQUEST
-    })
-}
-
 fn update_cortex_table(
     doc: &mut toml_edit::DocumentMut,
     agent_idx: usize,
@@ -841,31 +828,12 @@ fn update_cortex_table(
     if let Some(v) = cortex.tick_interval_secs {
         table["tick_interval_secs"] = toml_edit::value(to_i64_from_u64("tick_interval_secs", v)?);
     }
-    if let Some(v) = cortex.worker_timeout_secs {
-        table["worker_timeout_secs"] = toml_edit::value(to_i64_from_u64("worker_timeout_secs", v)?);
-    }
-    if let Some(v) = cortex.branch_timeout_secs {
-        table["branch_timeout_secs"] = toml_edit::value(to_i64_from_u64("branch_timeout_secs", v)?);
-    }
-    if let Some(v) = cortex.detached_worker_timeout_retry_limit {
-        table["detached_worker_timeout_retry_limit"] = toml_edit::value(i64::from(v));
-    }
-    if let Some(v) = cortex.supervisor_kill_budget_per_tick {
-        table["supervisor_kill_budget_per_tick"] =
-            toml_edit::value(to_i64_from_usize("supervisor_kill_budget_per_tick", v)?);
+    if let Some(v) = cortex.worker_wall_clock_timeout_secs {
+        table["worker_wall_clock_timeout_secs"] =
+            toml_edit::value(to_i64_from_u64("worker_wall_clock_timeout_secs", v)?);
     }
     if let Some(v) = cortex.circuit_breaker_threshold {
         table["circuit_breaker_threshold"] = toml_edit::value(i64::from(v));
-    }
-    if let Some(v) = cortex.bulletin_interval_secs {
-        table["bulletin_interval_secs"] =
-            toml_edit::value(to_i64_from_u64("bulletin_interval_secs", v)?);
-    }
-    if let Some(v) = cortex.bulletin_max_words {
-        table["bulletin_max_words"] = toml_edit::value(to_i64_from_usize("bulletin_max_words", v)?);
-    }
-    if let Some(v) = cortex.bulletin_max_turns {
-        table["bulletin_max_turns"] = toml_edit::value(to_i64_from_usize("bulletin_max_turns", v)?);
     }
     if let Some(v) = cortex.maintenance_interval_secs {
         if v == 0 {
@@ -1357,45 +1325,16 @@ id = "main"
         let update = CortexUpdate {
             tick_interval_secs: None,
             maintenance_interval_secs: None,
-            worker_timeout_secs: None,
-            branch_timeout_secs: None,
-            detached_worker_timeout_retry_limit: None,
-            supervisor_kill_budget_per_tick: Some(usize::MAX),
+            worker_wall_clock_timeout_secs: Some(u64::MAX),
             circuit_breaker_threshold: None,
-            bulletin_interval_secs: None,
-            bulletin_max_words: None,
-            bulletin_max_turns: None,
             maintenance_decay_rate: None,
             maintenance_prune_threshold: None,
             maintenance_min_age_days: None,
             maintenance_merge_similarity_threshold: None,
         };
 
-        let result = update_cortex_table(&mut doc, agent_idx, &update);
-        if (usize::MAX as u128) > (i64::MAX as u128) {
-            assert_eq!(result, Err(StatusCode::BAD_REQUEST));
-        } else {
-            assert!(result.is_ok());
-        }
-
-        let overflow_u64_update = CortexUpdate {
-            tick_interval_secs: Some(u64::MAX),
-            maintenance_interval_secs: None,
-            worker_timeout_secs: None,
-            branch_timeout_secs: None,
-            detached_worker_timeout_retry_limit: None,
-            supervisor_kill_budget_per_tick: None,
-            circuit_breaker_threshold: None,
-            bulletin_interval_secs: None,
-            bulletin_max_words: None,
-            bulletin_max_turns: None,
-            maintenance_decay_rate: None,
-            maintenance_prune_threshold: None,
-            maintenance_min_age_days: None,
-            maintenance_merge_similarity_threshold: None,
-        };
         assert_eq!(
-            update_cortex_table(&mut doc, agent_idx, &overflow_u64_update),
+            update_cortex_table(&mut doc, agent_idx, &update),
             Err(StatusCode::BAD_REQUEST)
         );
     }
@@ -1415,14 +1354,8 @@ id = "main"
         let invalid_decay = CortexUpdate {
             tick_interval_secs: None,
             maintenance_interval_secs: None,
-            worker_timeout_secs: None,
-            branch_timeout_secs: None,
-            detached_worker_timeout_retry_limit: None,
-            supervisor_kill_budget_per_tick: None,
+            worker_wall_clock_timeout_secs: None,
             circuit_breaker_threshold: None,
-            bulletin_interval_secs: None,
-            bulletin_max_words: None,
-            bulletin_max_turns: None,
             maintenance_decay_rate: Some(1.1),
             maintenance_prune_threshold: None,
             maintenance_min_age_days: None,
@@ -1436,14 +1369,8 @@ id = "main"
         let invalid_min_age = CortexUpdate {
             tick_interval_secs: None,
             maintenance_interval_secs: None,
-            worker_timeout_secs: None,
-            branch_timeout_secs: None,
-            detached_worker_timeout_retry_limit: None,
-            supervisor_kill_budget_per_tick: None,
+            worker_wall_clock_timeout_secs: None,
             circuit_breaker_threshold: None,
-            bulletin_interval_secs: None,
-            bulletin_max_words: None,
-            bulletin_max_turns: None,
             maintenance_decay_rate: None,
             maintenance_prune_threshold: None,
             maintenance_min_age_days: Some(-1),
@@ -1457,14 +1384,8 @@ id = "main"
         let invalid_interval = CortexUpdate {
             tick_interval_secs: None,
             maintenance_interval_secs: Some(0),
-            worker_timeout_secs: None,
-            branch_timeout_secs: None,
-            detached_worker_timeout_retry_limit: None,
-            supervisor_kill_budget_per_tick: None,
+            worker_wall_clock_timeout_secs: None,
             circuit_breaker_threshold: None,
-            bulletin_interval_secs: None,
-            bulletin_max_words: None,
-            bulletin_max_turns: None,
             maintenance_decay_rate: None,
             maintenance_prune_threshold: None,
             maintenance_min_age_days: None,
@@ -1490,14 +1411,8 @@ id = "main"
         let update = CortexUpdate {
             tick_interval_secs: Some(45),
             maintenance_interval_secs: Some(3_600),
-            worker_timeout_secs: Some(321),
-            branch_timeout_secs: Some(12),
-            detached_worker_timeout_retry_limit: Some(3),
-            supervisor_kill_budget_per_tick: Some(12),
+            worker_wall_clock_timeout_secs: Some(321),
             circuit_breaker_threshold: Some(6),
-            bulletin_interval_secs: Some(120),
-            bulletin_max_words: Some(4000),
-            bulletin_max_turns: Some(5),
             maintenance_decay_rate: Some(0.16),
             maintenance_prune_threshold: Some(0.17),
             maintenance_min_age_days: Some(15),
@@ -1521,19 +1436,10 @@ id = "main"
             cortex["maintenance_interval_secs"].as_integer(),
             Some(3_600)
         );
-        assert_eq!(cortex["worker_timeout_secs"].as_integer(), Some(321));
-        assert_eq!(cortex["branch_timeout_secs"].as_integer(), Some(12));
         assert_eq!(
-            cortex["detached_worker_timeout_retry_limit"].as_integer(),
-            Some(3)
+            cortex["worker_wall_clock_timeout_secs"].as_integer(),
+            Some(321)
         );
-        assert_eq!(
-            cortex["supervisor_kill_budget_per_tick"].as_integer(),
-            Some(12)
-        );
-        assert_eq!(cortex["bulletin_interval_secs"].as_integer(), Some(120));
-        assert_eq!(cortex["bulletin_max_words"].as_integer(), Some(4000));
-        assert_eq!(cortex["bulletin_max_turns"].as_integer(), Some(5));
         assert!((cortex["maintenance_decay_rate"].as_float().unwrap_or(0.0) - 0.16).abs() < 1e-6);
         assert!(
             (cortex["maintenance_prune_threshold"]
@@ -1569,14 +1475,8 @@ id = "main"
         let initial = CortexUpdate {
             tick_interval_secs: Some(45),
             maintenance_interval_secs: None,
-            worker_timeout_secs: None,
-            branch_timeout_secs: None,
-            detached_worker_timeout_retry_limit: None,
-            supervisor_kill_budget_per_tick: None,
+            worker_wall_clock_timeout_secs: None,
             circuit_breaker_threshold: None,
-            bulletin_interval_secs: None,
-            bulletin_max_words: None,
-            bulletin_max_turns: None,
             maintenance_decay_rate: None,
             maintenance_prune_threshold: None,
             maintenance_min_age_days: None,
@@ -1588,14 +1488,8 @@ id = "main"
         let second = CortexUpdate {
             tick_interval_secs: Some(60),
             maintenance_interval_secs: Some(4_800),
-            worker_timeout_secs: None,
-            branch_timeout_secs: None,
-            detached_worker_timeout_retry_limit: None,
-            supervisor_kill_budget_per_tick: None,
+            worker_wall_clock_timeout_secs: None,
             circuit_breaker_threshold: None,
-            bulletin_interval_secs: None,
-            bulletin_max_words: None,
-            bulletin_max_turns: None,
             maintenance_decay_rate: Some(0.2),
             maintenance_prune_threshold: None,
             maintenance_min_age_days: None,
@@ -1628,7 +1522,7 @@ id = "main"
                 .abs()
                 < 1e-6
         );
-        assert!(cortex.get("worker_timeout_secs").is_none());
+        assert!(cortex.get("worker_wall_clock_timeout_secs").is_none());
         assert!(cortex.get("maintenance_prune_threshold").is_none());
     }
 }

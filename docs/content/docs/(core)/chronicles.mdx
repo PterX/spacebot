@@ -1,0 +1,55 @@
+---
+title: Chronicles
+description: Durable, navigable session history for long-running conversations.
+---
+
+# Chronicles
+
+Chronicles preserve a long-running conversation as a durable record. Instead of repeatedly rewriting one rolling summary, Spacebot cuts append-only checkpoints over contiguous transcript ranges.
+
+Each checkpoint summarizes the messages since the previous checkpoint. It is persisted with the range it covers, so the session remains traceable after restarts and compaction.
+
+## Checkpoints
+
+A checkpoint records a summary and its position in the transcript. Checkpoints cover the transcript without gaps or overlap. They are immutable once committed.
+
+The channel sees a bounded chronicle section in its prompt. Recent checkpoints render in full. Older checkpoints collapse as needed to fit the configured budget. When enough older checkpoints accumulate, Spacebot writes a rollup that summarizes a batch while retaining provenance back to every included checkpoint and transcript range.
+
+## Navigation
+
+The agent can navigate its own history through chronicle operations:
+
+- **List** checkpoints as a session table of contents.
+- **Open** a checkpoint summary when a past decision matters.
+- **Expand** a raw transcript range through a branch when the summary does not provide enough detail.
+
+Expansion is deliberately delegated to a branch. The branch reads the requested source range and returns only the conclusion the channel needs.
+
+## Portal
+
+Portal shows chronicle checkpoints in the conversation timeline. This gives the operator the same durable landmarks that guide the channel and its workers.
+
+The instance history endpoint, `GET /api/chronicle?limit=20`, returns recent level-zero checkpoints across agents and the latest daily brief for each agent. Each checkpoint includes its agent, channel, title, summary, message count, coverage window, and creation time.
+
+## Worker Delegation
+
+When a worker needs conversation context, Spacebot uses the relevant current history. For an old or large session, that becomes the bounded chronicle view rather than an unbounded transcript. The worker has enough intent and prior decisions to act without inheriting the entire session.
+
+## Enabling Chronicle Mode
+
+```toml
+[defaults.compaction]
+mode = "chronicle"
+
+[defaults.compaction.chronicle]
+interval_messages = 40
+interval_token_fraction = 0.12
+recent_window_hours = 24
+max_recent = 8
+max_older = 12
+context_token_budget = 2000
+rollup_threshold = 12
+rollup_batch = 8
+```
+
+See [Compaction](/docs/compaction) for thresholds, emergency behavior, and the complete tuning reference.

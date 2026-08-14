@@ -269,6 +269,33 @@ impl ChronicleStore {
         Ok(CommitOutcome::Busy)
     }
 
+    /// Commit a higher-level checkpoint and atomically link the level below it.
+    /// The caller supplies the exact unrolled source rows it summarized; if a
+    /// concurrent rollup claimed any of them, this returns `Superseded` and the
+    /// caller discards its result.
+    pub async fn commit_rollup(
+        &self,
+        new: NewCheckpoint,
+        source_ids: &[String],
+    ) -> Result<CommitOutcome> {
+        const MAX_BUSY_RETRIES: u32 = 4;
+        const BASE_BUSY_DELAY_MS: u64 = 25;
+
+        for attempt in 0..=MAX_BUSY_RETRIES {
+            match self.try_commit_rollup(&new, source_ids).await {
+                Ok(outcome) => return Ok(outcome),
+                Err(error) if is_busy(&error) && attempt < MAX_BUSY_RETRIES => {
+                    let delay = BASE_BUSY_DELAY_MS * 2u64.pow(attempt);
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+                Err(error) if is_busy(&error) => return Ok(CommitOutcome::Busy),
+                Err(error) => return Err(anyhow::anyhow!(error).into()),
+            }
+        }
+
+        Ok(CommitOutcome::Busy)
+    }
+
     async fn try_commit(
         &self,
         new: &NewCheckpoint,
@@ -290,6 +317,73 @@ impl ChronicleStore {
         }
 
         outcome
+    }
+
+    async fn try_commit_rollup(
+        &self,
+        new: &NewCheckpoint,
+        source_ids: &[String],
+    ) -> std::result::Result<CommitOutcome, sqlx::Error> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await?;
+
+        let sources = sqlx::query(
+            "SELECT id FROM channel_chronicle_checkpoints \
+             WHERE channel_id = ? AND level = ? AND rolled_up_into IS NULL \
+             ORDER BY seq ASC LIMIT ?",
+        )
+        .bind(&new.channel_id)
+        .bind(new.level - 1)
+        .bind(source_ids.len() as i64)
+        .fetch_all(&mut *connection)
+        .await?;
+        let current_ids: Vec<String> = sources
+            .iter()
+            .filter_map(|row| row.try_get("id").ok())
+            .collect();
+        if current_ids != source_ids {
+            sqlx::query("ROLLBACK").execute(&mut *connection).await.ok();
+            return Ok(CommitOutcome::Superseded {
+                expected: source_ids.len() as i64,
+                found: current_ids.len() as i64,
+            });
+        }
+
+        let outcome = self.commit_in_transaction(new, &mut connection).await?;
+        let checkpoint = match outcome {
+            CommitOutcome::Committed(checkpoint) => checkpoint,
+            outcome => {
+                sqlx::query("ROLLBACK").execute(&mut *connection).await.ok();
+                return Ok(outcome);
+            }
+        };
+
+        let changed = sqlx::query(
+            "UPDATE channel_chronicle_checkpoints SET rolled_up_into = ? \
+             WHERE channel_id = ? AND level = ? AND rolled_up_into IS NULL \
+               AND seq >= ? AND seq <= ?",
+        )
+        .bind(&checkpoint.id)
+        .bind(&new.channel_id)
+        .bind(new.level - 1)
+        .bind(new.rolls_up_from_seq)
+        .bind(new.rolls_up_to_seq)
+        .execute(&mut *connection)
+        .await?
+        .rows_affected();
+
+        if changed != source_ids.len() as u64 {
+            sqlx::query("ROLLBACK").execute(&mut *connection).await.ok();
+            return Ok(CommitOutcome::Superseded {
+                expected: source_ids.len() as i64,
+                found: changed as i64,
+            });
+        }
+
+        sqlx::query("COMMIT").execute(&mut *connection).await?;
+        Ok(CommitOutcome::Committed(checkpoint))
     }
 
     async fn commit_in_transaction(
@@ -425,6 +519,52 @@ impl ChronicleStore {
         Ok(checkpoints_from_rows(rows))
     }
 
+    /// Oldest level-0 checkpoints not yet represented by a rollup.
+    pub async fn list_unrolled(
+        &self,
+        channel_id: &str,
+        level: i64,
+        limit: i64,
+    ) -> Result<Vec<ChronicleCheckpoint>> {
+        let rows = sqlx::query(
+            "SELECT * FROM channel_chronicle_checkpoints \
+             WHERE channel_id = ? AND level = ? AND rolled_up_into IS NULL \
+             ORDER BY seq ASC LIMIT ?",
+        )
+        .bind(channel_id)
+        .bind(level)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+        Ok(checkpoints_from_rows(rows))
+    }
+
+    /// The compact chronicle representation for prompt rendering: level-1
+    /// rollups plus level-0 checkpoints not yet absorbed by a rollup.
+    pub async fn list_renderable(
+        &self,
+        channel_id: &str,
+        limit: i64,
+    ) -> Result<Vec<ChronicleCheckpoint>> {
+        let rows = sqlx::query(
+            "SELECT * FROM ( \
+                 SELECT * FROM channel_chronicle_checkpoints \
+                 WHERE channel_id = ? \
+                   AND (level = 1 OR (level = 0 AND rolled_up_into IS NULL)) \
+                 ORDER BY covers_to_seq DESC LIMIT ? \
+             ) ORDER BY covers_from_seq ASC",
+        )
+        .bind(channel_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+        Ok(checkpoints_from_rows(rows))
+    }
+
     /// Checkpoints at a level whose coverage ends at or after `since`, oldest
     /// first. Used to select the recent window for the prompt.
     pub async fn list_since(
@@ -445,6 +585,72 @@ impl ChronicleStore {
         .bind(channel_id)
         .bind(level)
         .bind(sql_timestamp(since))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+        Ok(checkpoints_from_rows(rows))
+    }
+
+    /// The newest level-0 checkpoint whose timestamp window covers `at`, or
+    /// `None` when no checkpoint covers that instant. This is the range-join
+    /// key from memories (by `created_at`) back to the chronicle span that
+    /// produced them (1.7).
+    pub async fn covering_checkpoint(
+        &self,
+        channel_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<ChronicleCheckpoint>> {
+        // Coverage bounds are stored as `sql_timestamp` TEXT, so the probe
+        // must be bound in the same shape and compared under `datetime()` —
+        // a raw DateTime bind encodes as RFC 3339 and never compares equal.
+        let row = sqlx::query(
+            r#"
+            SELECT * FROM channel_chronicle_checkpoints
+            WHERE channel_id = ? AND level = 0
+              AND datetime(covers_from_at) <= datetime(?)
+              AND datetime(covers_to_at) >= datetime(?)
+            ORDER BY seq DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(channel_id)
+        .bind(sql_timestamp(at))
+        .bind(sql_timestamp(at))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+        Ok(match row {
+            Some(row) => checkpoint_from_row(&row).ok(),
+            None => None,
+        })
+    }
+
+    /// Every level-0 checkpoint across all channels, oldest first. Used for
+    /// the one-time chronicle embedding backfill (1.7).
+    pub async fn list_level_zero_all(&self) -> Result<Vec<ChronicleCheckpoint>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM channel_chronicle_checkpoints
+            WHERE level = 0
+            ORDER BY seq ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+        Ok(checkpoints_from_rows(rows))
+    }
+
+    /// Most recently committed level-0 checkpoints across all channels.
+    pub async fn list_level_zero_recent(&self, limit: i64) -> Result<Vec<ChronicleCheckpoint>> {
+        let rows = sqlx::query(
+            "SELECT * FROM channel_chronicle_checkpoints \
+             WHERE level = 0 ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
         .bind(limit)
         .fetch_all(&self.pool)
         .await
@@ -555,6 +761,26 @@ impl ChronicleStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(|error| anyhow::anyhow!(error))?;
+
+        Ok(row.as_ref().and_then(|row| match checkpoint_from_row(row) {
+            Ok(checkpoint) => Some(checkpoint),
+            Err(error) => {
+                tracing::warn!(%error, "skipping undecodable chronicle checkpoint row");
+                None
+            }
+        }))
+    }
+
+    /// A single checkpoint by id alone. Checkpoint ids are global (UUIDs), so
+    /// a provenance reference recorded from one channel resolves even when the
+    /// referencing row now lives under a different channel (cross-channel
+    /// merges).
+    pub async fn checkpoint_by_id(&self, id: &str) -> Result<Option<ChronicleCheckpoint>> {
+        let row = sqlx::query("SELECT * FROM channel_chronicle_checkpoints WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
 
         Ok(row.as_ref().and_then(|row| match checkpoint_from_row(row) {
             Ok(checkpoint) => Some(checkpoint),
@@ -914,6 +1140,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rollup_commits_and_links_exact_source_checkpoints() {
+        let store = setup().await;
+        let mut boundary = 0;
+        let mut sources = Vec::new();
+        for index in 1..=3 {
+            let CommitOutcome::Committed(checkpoint) = store
+                .commit(new_checkpoint("ch", boundary, index * 10, 10))
+                .await
+                .expect("commit")
+            else {
+                panic!("source checkpoint should commit")
+            };
+            boundary = checkpoint.covers_to_seq;
+            sources.push(checkpoint);
+        }
+
+        let first = sources.first().expect("sources are present");
+        let last = sources.last().expect("sources are present");
+        let source_ids: Vec<String> = sources
+            .iter()
+            .map(|checkpoint| checkpoint.id.clone())
+            .collect();
+        let mut rollup = new_checkpoint("ch", first.covers_from_seq, last.covers_to_seq, 30);
+        rollup.level = 1;
+        rollup.kind = CheckpointKind::Rollup;
+        rollup.rolls_up_from_seq = Some(first.seq);
+        rollup.rolls_up_to_seq = Some(last.seq);
+
+        let CommitOutcome::Committed(rollup) = store
+            .commit_rollup(rollup, &source_ids)
+            .await
+            .expect("rollup commit")
+        else {
+            panic!("rollup should commit")
+        };
+
+        assert_eq!(rollup.level, 1);
+        assert_eq!(rollup.kind, CheckpointKind::Rollup);
+        assert_eq!(rollup.rolls_up_from_seq, Some(first.seq));
+        assert_eq!(rollup.rolls_up_to_seq, Some(last.seq));
+
+        let unrolled = store.list_unrolled("ch", 0, 10).await.expect("list");
+        assert!(
+            unrolled.is_empty(),
+            "the sources are no longer rollup candidates"
+        );
+        for source in sources {
+            let stored = store
+                .get_by_id("ch", &source.id)
+                .await
+                .expect("lookup")
+                .expect("source exists");
+            assert_eq!(stored.rolled_up_into.as_deref(), Some(rollup.id.as_str()));
+        }
+    }
+
+    #[tokio::test]
+    async fn rollup_rejects_stale_source_selection() {
+        let store = setup().await;
+        let CommitOutcome::Committed(source) = store
+            .commit(new_checkpoint("ch", 0, 10, 10))
+            .await
+            .expect("source commit")
+        else {
+            panic!("source checkpoint should commit")
+        };
+        let mut rollup = new_checkpoint("ch", 0, 10, 10);
+        rollup.level = 1;
+        rollup.kind = CheckpointKind::Rollup;
+        rollup.rolls_up_from_seq = Some(source.seq);
+        rollup.rolls_up_to_seq = Some(source.seq);
+
+        let outcome = store
+            .commit_rollup(rollup, &["missing".to_string()])
+            .await
+            .expect("rollup attempt");
+        assert!(matches!(outcome, CommitOutcome::Superseded { .. }));
+
+        let stored = store
+            .get_by_id("ch", &source.id)
+            .await
+            .expect("lookup")
+            .expect("source exists");
+        assert!(stored.rolled_up_into.is_none());
+    }
+
+    #[tokio::test]
     async fn stale_cut_is_superseded_and_writes_nothing() {
         let store = setup().await;
         let CommitOutcome::Committed(first) = store
@@ -1139,6 +1452,158 @@ mod tests {
             ids,
             vec!["m4", "m5", "m6"],
             "the newest three, still in chronological order"
+        );
+    }
+
+    fn covering_checkpoint_fixture(
+        channel: &str,
+        from_seq: i64,
+        to_seq: i64,
+        from_at: DateTime<Utc>,
+        to_at: DateTime<Utc>,
+    ) -> NewCheckpoint {
+        let mut checkpoint = new_checkpoint(channel, from_seq, to_seq, to_seq - from_seq);
+        checkpoint.covers_from_at = from_at;
+        checkpoint.covers_to_at = to_at;
+        checkpoint
+    }
+
+    fn utc(hour: u32, minute: u32, second: u32) -> DateTime<Utc> {
+        use chrono::TimeZone as _;
+        Utc.with_ymd_and_hms(2026, 8, 1, hour, minute, second)
+            .unwrap()
+    }
+
+    /// A probe strictly inside a same-day window must resolve. This is the
+    /// case a raw DateTime bind broke: RFC 3339 text sorts after the stored
+    /// `sql_timestamp` shape for any same-day instant.
+    #[tokio::test]
+    async fn covering_checkpoint_matches_inside_a_same_day_window() {
+        let store = setup().await;
+        let CommitOutcome::Committed(checkpoint) = store
+            .commit(covering_checkpoint_fixture(
+                "ch",
+                0,
+                10,
+                utc(10, 0, 0),
+                utc(12, 0, 0),
+            ))
+            .await
+            .expect("commit")
+        else {
+            panic!("expected commit")
+        };
+
+        let found = store
+            .covering_checkpoint("ch", utc(11, 0, 0))
+            .await
+            .expect("query")
+            .expect("a probe inside the window must resolve");
+        assert_eq!(found.id, checkpoint.id);
+    }
+
+    /// The window is inclusive at both ends.
+    #[tokio::test]
+    async fn covering_checkpoint_includes_both_boundaries() {
+        let store = setup().await;
+        let CommitOutcome::Committed(checkpoint) = store
+            .commit(covering_checkpoint_fixture(
+                "ch",
+                0,
+                10,
+                utc(10, 0, 0),
+                utc(12, 0, 0),
+            ))
+            .await
+            .expect("commit")
+        else {
+            panic!("expected commit")
+        };
+
+        for probe in [utc(10, 0, 0), utc(12, 0, 0)] {
+            let found = store
+                .covering_checkpoint("ch", probe)
+                .await
+                .expect("query")
+                .expect("boundary instants are covered");
+            assert_eq!(found.id, checkpoint.id);
+        }
+
+        assert!(
+            store
+                .covering_checkpoint("ch", utc(12, 0, 1))
+                .await
+                .expect("query")
+                .is_none(),
+            "an instant past the window must not resolve"
+        );
+    }
+
+    /// Contiguous windows share their boundary instant; the newest checkpoint
+    /// (highest seq) wins the tie.
+    #[tokio::test]
+    async fn covering_checkpoint_prefers_the_newest_on_a_shared_boundary() {
+        let store = setup().await;
+        let CommitOutcome::Committed(first) = store
+            .commit(covering_checkpoint_fixture(
+                "ch",
+                0,
+                10,
+                utc(10, 0, 0),
+                utc(12, 0, 0),
+            ))
+            .await
+            .expect("commit")
+        else {
+            panic!("expected commit")
+        };
+        let CommitOutcome::Committed(second) = store
+            .commit(covering_checkpoint_fixture(
+                "ch",
+                first.covers_to_seq,
+                20,
+                utc(12, 0, 0),
+                utc(14, 0, 0),
+            ))
+            .await
+            .expect("commit")
+        else {
+            panic!("expected commit")
+        };
+
+        let found = store
+            .covering_checkpoint("ch", utc(12, 0, 0))
+            .await
+            .expect("query")
+            .expect("the shared boundary is covered");
+        assert_eq!(found.id, second.id, "the newest covering checkpoint wins");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_by_id_resolves_without_a_channel() {
+        let store = setup().await;
+        let CommitOutcome::Committed(checkpoint) = store
+            .commit(new_checkpoint("ch", 0, 10, 10))
+            .await
+            .expect("commit")
+        else {
+            panic!("expected commit")
+        };
+
+        let found = store
+            .checkpoint_by_id(&checkpoint.id)
+            .await
+            .expect("query")
+            .expect("the checkpoint resolves by id alone");
+        assert_eq!(found.channel_id, "ch");
+        assert_eq!(found.seq, checkpoint.seq);
+
+        assert!(
+            store
+                .checkpoint_by_id("no-such-id")
+                .await
+                .expect("query")
+                .is_none()
         );
     }
 

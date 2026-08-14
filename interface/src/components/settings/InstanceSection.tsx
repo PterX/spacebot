@@ -1,8 +1,33 @@
 import {useState, useEffect} from "react";
-import {useMutation, useQueryClient} from "@tanstack/react-query";
-import {api} from "@/api/client";
+import {useQuery, useMutation, useQueryClient} from "@tanstack/react-query";
+import {api, type StatusResponse} from "@/api/client";
 import {Button, Input} from "@spacedrive/primitives";
 import type {GlobalSettingsSectionProps} from "./types";
+
+function formatUptime(seconds: number): string {
+	if (seconds < 60) return `${seconds}s`;
+	const days = Math.floor(seconds / 86_400);
+	const hours = Math.floor((seconds % 86_400) / 3_600);
+	const minutes = Math.floor((seconds % 3_600) / 60);
+	const parts: string[] = [];
+	if (days > 0) parts.push(`${days}d`);
+	if (hours > 0) parts.push(`${hours}h`);
+	parts.push(`${minutes}m`);
+	return parts.join(" ");
+}
+
+function InfoRow({label, value, mono}: {label: string; value: string; mono?: boolean}) {
+	return (
+		<div className="flex items-baseline justify-between gap-4">
+			<dt className="text-sm text-ink-dull">{label}</dt>
+			<dd
+				className={`text-right text-sm text-ink ${mono ? "font-mono tabular-nums" : ""}`}
+			>
+				{value}
+			</dd>
+		</div>
+	);
+}
 
 export function InstanceSection({settings, isLoading}: GlobalSettingsSectionProps) {
 	const queryClient = useQueryClient();
@@ -13,6 +38,12 @@ export function InstanceSection({settings, isLoading}: GlobalSettingsSectionProp
 		text: string;
 		type: "success" | "error";
 	} | null>(null);
+
+	const {data: status} = useQuery<StatusResponse>({
+		queryKey: ["instance-status"],
+		queryFn: api.status,
+		refetchInterval: 60_000,
+	});
 
 	useEffect(() => {
 		if (settings) {
@@ -57,6 +88,23 @@ export function InstanceSection({settings, isLoading}: GlobalSettingsSectionProp
 				</div>
 			) : (
 				<div className="flex flex-col gap-4">
+					<div className="rounded-lg border border-app-line bg-app-box p-4">
+						<span className="text-sm font-medium text-ink">Instance</span>
+						<dl className="mt-3 flex flex-col gap-2">
+							<InfoRow label="Version" value={status?.version ?? "—"} mono />
+							<InfoRow
+								label="Uptime"
+								value={status ? formatUptime(status.uptime_seconds) : "—"}
+								mono
+							/>
+							<InfoRow
+								label="Process ID"
+								value={status ? String(status.pid) : "—"}
+								mono
+							/>
+						</dl>
+					</div>
+
 					<div className="rounded-lg border border-app-line bg-app-box p-4">
 						<label className="block">
 							<span className="text-sm font-medium text-ink">

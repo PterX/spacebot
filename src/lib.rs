@@ -180,11 +180,29 @@ pub struct ChronicleCheckpointPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProcessEvent {
+    /// A system-originated message was accepted by a channel outside the
+    /// adapter relay, such as an autonomy briefing.
+    ChannelSystemMessage {
+        agent_id: AgentId,
+        channel_id: ChannelId,
+        text: String,
+    },
+    /// A channel-local assistant record produced without adapter delivery,
+    /// such as an autonomy run's terminal summary.
+    ChannelAssistantMessage {
+        agent_id: AgentId,
+        channel_id: ChannelId,
+        text: String,
+    },
     BranchStarted {
         agent_id: AgentId,
         branch_id: BranchId,
         channel_id: ChannelId,
         description: String,
+        input: String,
+        profile: String,
+        model: String,
+        max_turns: usize,
         reply_to_message_id: Option<String>,
     },
     BranchResult {
@@ -192,6 +210,9 @@ pub enum ProcessEvent {
         branch_id: BranchId,
         channel_id: ChannelId,
         conclusion: String,
+        status: String,
+        transcript: Option<Vec<u8>>,
+        tool_calls: i64,
     },
     WorkerStarted {
         agent_id: AgentId,
@@ -225,6 +246,10 @@ pub enum ProcessEvent {
         result: String,
         notify: bool,
         success: bool,
+        outcome_kind: crate::conversation::WorkerOutcomeKind,
+        outcome_version: i64,
+        transcript_version: i64,
+        terminal_owner: Option<crate::conversation::WorkerTerminalOwner>,
     },
     ToolStarted {
         agent_id: AgentId,
@@ -254,6 +279,16 @@ pub enum ProcessEvent {
         agent_id: AgentId,
         channel_id: ChannelId,
         threshold_reached: f32,
+    },
+    CompactionStarted {
+        agent_id: AgentId,
+        channel_id: ChannelId,
+        kind: String,
+    },
+    CompactionCompleted {
+        agent_id: AgentId,
+        channel_id: ChannelId,
+        success: bool,
     },
     /// A session chronicle checkpoint was committed for a channel.
     ///
@@ -336,6 +371,16 @@ pub enum ProcessEvent {
         text_delta: String,
         aggregated_text: String,
     },
+    /// Streaming reasoning/thinking delta for a channel turn. Mirrors
+    /// [`TextDelta`](ProcessEvent::TextDelta) but carries model reasoning
+    /// (thinking) content, which is not user-facing text.
+    ReasoningDelta {
+        agent_id: AgentId,
+        process_id: ProcessId,
+        channel_id: Option<ChannelId>,
+        reasoning_delta: String,
+        aggregated_reasoning: String,
+    },
     /// A cortex chat auto-triggered turn completed (e.g. after a worker delivered
     /// its result). The frontend appends this message to the cortex chat panel.
     CortexChatUpdate {
@@ -344,11 +389,11 @@ pub enum ProcessEvent {
         content: String,
         tool_calls_json: Option<String>,
     },
-    /// A worker emitted text content (model reasoning between tool calls).
+    /// A branch or worker emitted text content between tool calls.
     /// Sent once per completion response, containing the full text for that turn.
-    WorkerText {
+    ProcessText {
         agent_id: AgentId,
-        worker_id: WorkerId,
+        process_id: ProcessId,
         channel_id: Option<ChannelId>,
         text: String,
     },
@@ -507,10 +552,10 @@ pub struct AgentDeps {
     pub api_state: Option<Arc<api::ApiState>>,
     /// Instance-wide wiki store.
     pub wiki_store: Option<Arc<wiki::WikiStore>>,
-    /// Wake channel for dormant-mode dispatch. When set, tools / cron
-    /// fire wakes by sending a target `AgentId`; the wake manager looks
-    /// up the receiver and runs `cortex::wake_one` for it. `None` in
-    /// test contexts and during config preview where no manager runs.
+    /// Wake channel for autonomy dispatch. When set, tools / cron fire wakes
+    /// by sending a target `AgentId`; the wake manager looks up the receiver
+    /// and checks whether an autonomy run is due. `None` in test contexts and
+    /// during config preview where no manager runs.
     pub wake_tx: Option<agent::wake::WakeSender>,
 }
 

@@ -1,0 +1,38 @@
+---
+title: Commands
+description: Typed cross-platform commands with explicit authority rules.
+---
+
+# Commands
+
+Spacebot handles built-in commands before normal LLM processing. The command set is shared across supported messaging adapters, with platform-specific rendering where necessary.
+
+## Commands
+
+| Command | Access | Behavior |
+| --- | --- | --- |
+| `/help` | Everyone | List commands available in the current chat. |
+| `/whoami` | Everyone | Show whether the sender has authority in this chat. |
+| `/status` | Everyone | Show the current mode, models, and binding state. |
+| `/agent-id` | Everyone | Show the runtime agent ID. |
+| `/tasks` | Everyone | Request a ready-task list. |
+| `/today` | Everyone | Request an in-progress and ready-task snapshot. |
+| `/digest` | Everyone | Request a one-shot digest for the current day. |
+| `/active` | Authority | Set normal response mode. |
+| `/mention-only` | Authority | Reply only when mentioned, replied to, or commanded. |
+| `/quiet` or `/observe` | Authority | Keep context without replying. |
+| `/sethome` | Authority | Set the current chat as the agent's home channel. |
+| `/pause [reason]` | Authority | Stop new work from starting. |
+| `/pause off` | Authority | Resume new work. |
+
+Commands that request task information are sent through the agent after classification. Control commands are applied atomically and do not need an LLM turn.
+
+## Authority
+
+Authority is configured per binding or adapter. Binding-level authority lists take precedence over adapter defaults. Everyone can use conversational and read-only commands. Only authority members can alter response mode, pause state, or the home channel.
+
+Run `/whoami` before using a control command to see the access available in the current chat.
+
+## Response Modes
+
+`/active`, `/mention-only`, and `/quiet` update the channel setting and survive restarts. See [Configuring Channels](/docs/configuring-channels) for the detailed response-mode behavior.

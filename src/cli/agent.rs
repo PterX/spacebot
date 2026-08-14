@@ -435,6 +435,14 @@ fn config_rows(config: AgentConfigResponse) -> Vec<Vec<String>> {
         "compaction.chronicle.max_messages_per_checkpoint",
         chronicle.max_messages_per_checkpoint.to_string(),
     );
+    push(
+        "compaction.chronicle.rollup_threshold",
+        chronicle.rollup_threshold.to_string(),
+    );
+    push(
+        "compaction.chronicle.rollup_batch",
+        chronicle.rollup_batch.to_string(),
+    );
 
     push(
         "cortex.tick_interval_secs",
@@ -445,39 +453,12 @@ fn config_rows(config: AgentConfigResponse) -> Vec<Vec<String>> {
         config.cortex.maintenance_interval_secs.to_string(),
     );
     push(
-        "cortex.worker_timeout_secs",
-        config.cortex.worker_timeout_secs.to_string(),
-    );
-    push(
-        "cortex.branch_timeout_secs",
-        config.cortex.branch_timeout_secs.to_string(),
-    );
-    push(
-        "cortex.detached_worker_timeout_retry_limit",
-        config
-            .cortex
-            .detached_worker_timeout_retry_limit
-            .to_string(),
-    );
-    push(
-        "cortex.supervisor_kill_budget_per_tick",
-        config.cortex.supervisor_kill_budget_per_tick.to_string(),
+        "cortex.worker_wall_clock_timeout_secs",
+        config.cortex.worker_wall_clock_timeout_secs.to_string(),
     );
     push(
         "cortex.circuit_breaker_threshold",
         config.cortex.circuit_breaker_threshold.to_string(),
-    );
-    push(
-        "cortex.bulletin_interval_secs",
-        config.cortex.bulletin_interval_secs.to_string(),
-    );
-    push(
-        "cortex.bulletin_max_words",
-        config.cortex.bulletin_max_words.to_string(),
-    );
-    push(
-        "cortex.bulletin_max_turns",
-        config.cortex.bulletin_max_turns.to_string(),
     );
     push(
         "cortex.maintenance_decay_rate",

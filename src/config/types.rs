@@ -672,6 +672,10 @@ pub struct DefaultsConfig {
     pub home_channel: Option<String>,
     /// Projects workspace management defaults.
     pub projects: ProjectsConfig,
+    /// Cap on an individual HUMAN.md profile rendered into org context
+    /// (chars). Renders in full with a loud >100% utilization header past
+    /// the cap; truncates at a section boundary only past 2x.
+    pub human_profile_cap: usize,
 }
 
 impl std::fmt::Debug for DefaultsConfig {
@@ -801,6 +805,10 @@ pub struct ChronicleConfig {
     pub expand_message_limit: i64,
     /// Raw messages a single checkpoint summarization may read.
     pub max_messages_per_checkpoint: i64,
+    /// Number of unrolled level-0 checkpoints that trigger a level-1 rollup.
+    pub rollup_threshold: usize,
+    /// Oldest unrolled level-0 checkpoints included in one rollup.
+    pub rollup_batch: usize,
 }
 
 impl Default for ChronicleConfig {
@@ -814,6 +822,8 @@ impl Default for ChronicleConfig {
             context_token_budget: 2000,
             expand_message_limit: 100,
             max_messages_per_checkpoint: 400,
+            rollup_threshold: 12,
+            rollup_batch: 8,
         }
     }
 }
@@ -1197,27 +1207,17 @@ pub struct CortexConfig {
     /// active vs dormant trade-off.
     pub mode: CortexMode,
     pub tick_interval_secs: u64,
-    /// Supervisor idle-kill bound: max seconds since `last_activity_at`
-    /// before the cortex supervisor terminates a stuck worker.
-    pub worker_timeout_secs: u64,
     /// Wall-clock budget for an entire `Worker::run` invocation. Distinct
-    /// from `worker_timeout_secs` (which is idle-shaped). Catches the
-    /// slow-drift case where a worker stays "active" but never completes.
+    /// Catches the slow-drift case where a worker stays active but never completes.
     pub worker_wall_clock_timeout_secs: u64,
     /// Per-agent default for cron job timeouts. `None` falls back to the
     /// system default (`crate::cron::scheduler::DEFAULT_CRON_TIMEOUT_SECS`).
     /// A per-job `timeout_secs` always wins over this default.
     pub cron_default_timeout_secs: Option<u64>,
-    pub branch_timeout_secs: u64,
-    pub detached_worker_timeout_retry_limit: u8,
-    pub supervisor_kill_budget_per_tick: usize,
     pub circuit_breaker_threshold: u8,
     /// Interval in seconds between memory bulletin refreshes.
-    pub bulletin_interval_secs: u64,
     /// Target word count for the memory bulletin.
-    pub bulletin_max_words: usize,
     /// Max LLM turns for bulletin generation.
-    pub bulletin_max_turns: usize,
     /// Interval in seconds between memory maintenance passes.
     pub maintenance_interval_secs: u64,
     /// Per-day decay applied to memory importance during maintenance.
@@ -1236,10 +1236,15 @@ pub struct CortexConfig {
     pub association_updates_threshold: f32,
     /// Max associations to create per pass (rate limit).
     pub association_max_per_pass: usize,
-    /// Knowledge synthesis max words (replaces bulletin_max_words for Layer 5).
-    pub knowledge_synthesis_max_words: usize,
-    /// Debounce seconds after last memory change before regenerating knowledge synthesis.
-    pub knowledge_synthesis_debounce_secs: u64,
+    /// Max words for the deterministic memory-store render in the channel
+    /// knowledge-context slot (replaces the retired LLM knowledge synthesis).
+    pub memory_render_max_words: usize,
+    /// Per-partition memory cap for write-time consolidation. When a
+    /// partition (memory type) exceeds this, saves surface consolidation
+    /// debt advising the branch to merge near-duplicates.
+    pub consolidation_partition_cap: usize,
+    /// Similarity threshold for near-duplicate detection at save time.
+    pub consolidation_near_duplicate_threshold: f32,
 }
 
 impl Default for CortexConfig {
@@ -1247,17 +1252,10 @@ impl Default for CortexConfig {
         Self {
             mode: CortexMode::Active,
             tick_interval_secs: 30,
-            worker_timeout_secs: 600,
             worker_wall_clock_timeout_secs:
                 crate::agent::worker::DEFAULT_WORKER_WALL_CLOCK_TIMEOUT_SECS,
             cron_default_timeout_secs: None,
-            branch_timeout_secs: 600,
-            detached_worker_timeout_retry_limit: 2,
-            supervisor_kill_budget_per_tick: 8,
             circuit_breaker_threshold: 3,
-            bulletin_interval_secs: 3600,
-            bulletin_max_words: 1500,
-            bulletin_max_turns: 15,
             maintenance_interval_secs: 3600,
             maintenance_decay_rate: 0.05,
             maintenance_prune_threshold: 0.1,
@@ -1267,8 +1265,9 @@ impl Default for CortexConfig {
             association_similarity_threshold: 0.85,
             association_updates_threshold: 0.95,
             association_max_per_pass: 100,
-            knowledge_synthesis_max_words: 500,
-            knowledge_synthesis_debounce_secs: 60,
+            memory_render_max_words: 500,
+            consolidation_partition_cap: 200,
+            consolidation_near_duplicate_threshold: 0.95,
         }
     }
 }
@@ -1538,7 +1537,7 @@ pub struct WarmupStatus {
     pub embedding_ready: bool,
     pub last_refresh_unix_ms: Option<i64>,
     pub last_error: Option<String>,
-    pub bulletin_age_secs: Option<u64>,
+    pub refresh_age_secs: Option<u64>,
 }
 
 impl Default for WarmupStatus {
@@ -1548,7 +1547,7 @@ impl Default for WarmupStatus {
             embedding_ready: false,
             last_refresh_unix_ms: None,
             last_error: None,
-            bulletin_age_secs: None,
+            refresh_age_secs: None,
         }
     }
 }
@@ -1558,8 +1557,7 @@ impl Default for WarmupStatus {
 pub enum WorkReadinessReason {
     StateNotWarm,
     EmbeddingNotReady,
-    BulletinMissing,
-    BulletinStale,
+    WarmupNeverCompleted,
 }
 
 impl WorkReadinessReason {
@@ -1567,8 +1565,7 @@ impl WorkReadinessReason {
         match self {
             Self::StateNotWarm => "state_not_warm",
             Self::EmbeddingNotReady => "embedding_not_ready",
-            Self::BulletinMissing => "bulletin_missing",
-            Self::BulletinStale => "bulletin_stale",
+            Self::WarmupNeverCompleted => "warmup_never_completed",
         }
     }
 }
@@ -1580,7 +1577,7 @@ pub struct WorkReadiness {
     pub reason: Option<WorkReadinessReason>,
     pub warmup_state: WarmupState,
     pub embedding_ready: bool,
-    pub bulletin_age_secs: Option<u64>,
+    pub refresh_age_secs: Option<u64>,
     pub stale_after_secs: u64,
 }
 
@@ -1590,7 +1587,7 @@ pub(super) fn evaluate_work_readiness(
     now_unix_ms: i64,
 ) -> WorkReadiness {
     let stale_after_secs = warmup_config.refresh_secs.max(1).saturating_mul(2).max(60);
-    let bulletin_age_secs = status
+    let refresh_age_secs = status
         .last_refresh_unix_ms
         .map(|refresh_ms| {
             if now_unix_ms > refresh_ms {
@@ -1599,16 +1596,16 @@ pub(super) fn evaluate_work_readiness(
                 0
             }
         })
-        .or(status.bulletin_age_secs);
+        .or(status.refresh_age_secs);
 
-    // Knowledge synthesis is change-driven, not timer-driven. Staleness
-    // is no longer a readiness concern — only "never generated" matters.
+    // Staleness is not a readiness concern — only "no warmup pass has ever
+    // completed" gates dispatch.
     let reason = if status.state != WarmupState::Warm {
         Some(WorkReadinessReason::StateNotWarm)
     } else if warmup_config.eager_embedding_load && !status.embedding_ready {
         Some(WorkReadinessReason::EmbeddingNotReady)
-    } else if bulletin_age_secs.is_none() {
-        Some(WorkReadinessReason::BulletinMissing)
+    } else if refresh_age_secs.is_none() {
+        Some(WorkReadinessReason::WarmupNeverCompleted)
     } else {
         None
     };
@@ -1618,7 +1615,7 @@ pub(super) fn evaluate_work_readiness(
         reason,
         warmup_state: status.state,
         embedding_ready: status.embedding_ready,
-        bulletin_age_secs,
+        refresh_age_secs,
         stale_after_secs,
     }
 }
@@ -1732,6 +1729,8 @@ pub struct ResolvedAgentConfig {
     pub sandbox: crate::sandbox::SandboxConfig,
     /// Projects workspace management settings.
     pub projects: ProjectsConfig,
+    /// Cap on an individual HUMAN.md profile rendered into org context.
+    pub human_profile_cap: usize,
     /// Number of messages to fetch from the platform when a new channel is created.
     pub history_backfill_count: usize,
     pub cron: Vec<CronDef>,
@@ -1771,6 +1770,7 @@ impl Default for DefaultsConfig {
             opencode: OpenCodeConfig::default(),
             worker_log_mode: crate::settings::WorkerLogMode::default(),
             home_channel: None,
+            human_profile_cap: 4_000,
             projects: ProjectsConfig::default(),
         }
     }
@@ -1798,6 +1798,7 @@ impl AgentConfig {
             role: self.role.clone(),
             gradient_start: self.gradient_start.clone(),
             gradient_end: self.gradient_end.clone(),
+            human_profile_cap: defaults.human_profile_cap,
             workspace: self
                 .workspace
                 .clone()
@@ -1895,6 +1896,22 @@ impl ResolvedAgentConfig {
     /// Path to the saved attachments directory for persisted channel files.
     pub fn saved_dir(&self) -> PathBuf {
         self.workspace.join("saved")
+    }
+
+    /// Path to durable prose the agent and user author.
+    pub fn notes_dir(&self) -> PathBuf {
+        self.workspace.join("notes")
+    }
+
+    /// Path to reference material gathered from outside the instance.
+    pub fn research_dir(&self) -> PathBuf {
+        self.workspace.join("research")
+    }
+
+    /// Path to superseded workspace material, distinct from `archives_dir`
+    /// at the agent root which holds conversation archives.
+    pub fn workspace_archive_dir(&self) -> PathBuf {
+        self.workspace.join("archive")
     }
 }
 

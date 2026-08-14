@@ -44,6 +44,14 @@ pub struct OpenCodeWorker {
     pub sqlite_pool: Option<sqlx::SqlitePool>,
     /// Pre-populated session state for resumed workers (set by `resume_interactive`).
     pub resuming_session: Option<ResumeSession>,
+    pub transcript_snapshot: crate::agent::worker::WorkerTranscriptSnapshot,
+    pub cancellation_session: Arc<Mutex<Option<OpenCodeCancellationSession>>>,
+}
+
+#[derive(Clone)]
+pub struct OpenCodeCancellationSession {
+    pub server: Arc<Mutex<crate::opencode::server::OpenCodeServer>>,
+    pub session_id: String,
 }
 
 /// Accumulated state from SSE event processing.
@@ -109,6 +117,8 @@ impl OpenCodeWorker {
             secrets_store: None,
             sqlite_pool: None,
             resuming_session: None,
+            transcript_snapshot: crate::agent::worker::new_worker_transcript_snapshot(),
+            cancellation_session: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -149,6 +159,14 @@ impl OpenCodeWorker {
     pub fn with_sqlite_pool(mut self, pool: sqlx::SqlitePool) -> Self {
         self.sqlite_pool = Some(pool);
         self
+    }
+
+    pub fn transcript_snapshot(&self) -> crate::agent::worker::WorkerTranscriptSnapshot {
+        self.transcript_snapshot.clone()
+    }
+
+    pub fn cancellation_session(&self) -> Arc<Mutex<Option<OpenCodeCancellationSession>>> {
+        self.cancellation_session.clone()
     }
 
     /// Create a resumed interactive OpenCode worker for an idle session.
@@ -349,6 +367,11 @@ impl OpenCodeWorker {
                     "OpenCode session created"
                 );
 
+                *self.cancellation_session.lock().await = Some(OpenCodeCancellationSession {
+                    server: server.clone(),
+                    session_id: session_id.clone(),
+                });
+
                 // Subscribe to SSE events before sending the prompt
                 let event_response = {
                     let guard = server.lock().await;
@@ -382,6 +405,13 @@ impl OpenCodeWorker {
                 (server, session_id, event_state, result_text)
             };
 
+        if resuming {
+            *self.cancellation_session.lock().await = Some(OpenCodeCancellationSession {
+                server: server.clone(),
+                session_id: session_id.clone(),
+            });
+        }
+
         // Interactive follow-up loop
         if let Some(mut input_rx) = self.input_rx.take() {
             if resuming {
@@ -389,6 +419,11 @@ impl OpenCodeWorker {
                 // (it was already relayed before the restart). Persist the recovered
                 // transcript so a second crash doesn't lose it.
                 self.persist_transcript_snapshot(&event_state).await;
+                self.persist_lifecycle_transition(
+                    crate::conversation::WorkerLifecycle::Running,
+                    crate::conversation::WorkerLifecycle::WaitingForInput,
+                )
+                .await;
                 self.send_status("resumed — waiting for follow-up");
                 self.send_idle();
             } else {
@@ -403,11 +438,21 @@ impl OpenCodeWorker {
                 });
 
                 self.persist_transcript_snapshot(&event_state).await;
+                self.persist_lifecycle_transition(
+                    crate::conversation::WorkerLifecycle::Running,
+                    crate::conversation::WorkerLifecycle::WaitingForInput,
+                )
+                .await;
                 self.send_status("waiting for follow-up");
                 self.send_idle();
             }
 
             while let Some(follow_up) = input_rx.recv().await {
+                self.persist_lifecycle_transition(
+                    crate::conversation::WorkerLifecycle::WaitingForInput,
+                    crate::conversation::WorkerLifecycle::Running,
+                )
+                .await;
                 self.send_status("processing follow-up");
 
                 // Subscribe to fresh events for the follow-up
@@ -452,6 +497,11 @@ impl OpenCodeWorker {
                             });
                         }
                         self.persist_transcript_snapshot(&event_state).await;
+                        self.persist_lifecycle_transition(
+                            crate::conversation::WorkerLifecycle::Running,
+                            crate::conversation::WorkerLifecycle::WaitingForInput,
+                        )
+                        .await;
                         self.send_status("waiting for follow-up");
                         self.send_idle();
                     }
@@ -509,6 +559,8 @@ impl OpenCodeWorker {
 
         // Prefer API-fetched result text, fall back to SSE last_text
         let final_result_text = api_result_text.unwrap_or(result_text);
+
+        self.update_transcript_snapshot(&transcript, event_state.tool_calls);
 
         tracing::info!(
             worker_id = %self.id,
@@ -906,17 +958,68 @@ impl OpenCodeWorker {
 
         let blob = crate::conversation::worker_transcript::serialize_steps(&steps);
         let tool_calls = event_state.tool_calls;
-        let worker_id = self.id.to_string();
+        self.update_transcript_snapshot(&steps, tool_calls);
 
-        if let Err(error) =
-            sqlx::query("UPDATE worker_runs SET transcript = ?, tool_calls = ? WHERE id = ?")
-                .bind(&blob)
-                .bind(tool_calls)
-                .bind(&worker_id)
-                .execute(pool)
-                .await
+        let logger = crate::conversation::ProcessRunLogger::new(pool.clone());
+        let lifecycle = match logger.read_worker_lifecycle(self.id).await {
+            Ok(Some(lifecycle)) => lifecycle,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(%error, worker_id = %self.id, "failed to read OpenCode worker lifecycle");
+                return;
+            }
+        };
+        if matches!(
+            lifecycle,
+            crate::conversation::WorkerLifecycle::Running
+                | crate::conversation::WorkerLifecycle::WaitingForInput
+        ) && let Err(error) = logger
+            .checkpoint_worker_transcript(self.id, lifecycle, &blob, tool_calls)
+            .await
         {
-            tracing::warn!(%error, worker_id, "failed to persist transcript snapshot");
+            tracing::warn!(%error, worker_id = %self.id, "failed to persist transcript snapshot");
+        }
+    }
+
+    fn update_transcript_snapshot(
+        &self,
+        steps: &[crate::conversation::worker_transcript::TranscriptStep],
+        tool_calls: i64,
+    ) {
+        if steps.is_empty() {
+            return;
+        }
+        let transcript = crate::conversation::worker_transcript::serialize_steps(steps);
+        if let Ok(mut snapshot) = self.transcript_snapshot.write() {
+            *snapshot = Some(crate::agent::worker::WorkerTranscriptPayload {
+                transcript,
+                tool_calls,
+            });
+        }
+    }
+
+    async fn persist_lifecycle_transition(
+        &self,
+        expected: crate::conversation::WorkerLifecycle,
+        target: crate::conversation::WorkerLifecycle,
+    ) {
+        let Some(pool) = &self.sqlite_pool else {
+            return;
+        };
+        let logger = crate::conversation::ProcessRunLogger::new(pool.clone());
+        match logger.transition_worker(self.id, expected, target).await {
+            Ok(crate::conversation::WorkerTransitionResult::Applied { .. }) => {}
+            Ok(crate::conversation::WorkerTransitionResult::Conflict { current })
+                if current == target || current.is_terminal() => {}
+            Ok(crate::conversation::WorkerTransitionResult::Conflict { current }) => {
+                tracing::debug!(worker_id = %self.id, lifecycle = current.as_str(), target = target.as_str(), "OpenCode worker lifecycle transition conflicted");
+            }
+            Ok(crate::conversation::WorkerTransitionResult::NotFound) => {
+                tracing::warn!(worker_id = %self.id, "OpenCode worker lifecycle row was not found");
+            }
+            Err(error) => {
+                tracing::warn!(%error, worker_id = %self.id, "failed to persist OpenCode worker lifecycle transition");
+            }
         }
     }
 }

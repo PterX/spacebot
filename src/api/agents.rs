@@ -34,12 +34,10 @@ pub(super) struct AgentOverviewResponse {
     memory_total: i64,
     channel_count: usize,
     cron_jobs: Vec<CronJobInfo>,
-    last_bulletin_at: Option<String>,
     recent_cortex_events: Vec<crate::agent::cortex::CortexEvent>,
     memory_daily: Vec<DayCount>,
     activity_daily: Vec<ActivityDayCount>,
     activity_heatmap: Vec<HeatmapCell>,
-    latest_bulletin: Option<String>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -91,7 +89,6 @@ struct AgentSummary {
     cron_job_count: usize,
     activity_sparkline: Vec<i64>,
     last_activity_at: Option<String>,
-    last_bulletin_at: Option<String>,
     profile: Option<crate::agent::cortex::AgentProfile>,
 }
 
@@ -204,11 +201,11 @@ fn hydrate_warmup_status(
 ) -> crate::config::WarmupStatus {
     let mut status = runtime_config.warmup_status.load().as_ref().clone();
     let now_ms = chrono::Utc::now().timestamp_millis();
-    status.bulletin_age_secs = compute_bulletin_age_secs(status.last_refresh_unix_ms, now_ms);
+    status.refresh_age_secs = compute_refresh_age_secs(status.last_refresh_unix_ms, now_ms);
     status
 }
 
-fn compute_bulletin_age_secs(last_refresh_unix_ms: Option<i64>, now_unix_ms: i64) -> Option<u64> {
+fn compute_refresh_age_secs(last_refresh_unix_ms: Option<i64>, now_unix_ms: i64) -> Option<u64> {
     last_refresh_unix_ms.map(|refresh_ms| {
         if now_unix_ms > refresh_ms {
             ((now_unix_ms - refresh_ms) / 1000) as u64
@@ -813,6 +810,10 @@ pub async fn create_agent_internal(
         &agent_config.archives_dir,
         &agent_config.ingest_dir(),
         &agent_config.logs_dir(),
+        &agent_config.saved_dir(),
+        &agent_config.notes_dir(),
+        &agent_config.research_dir(),
+        &agent_config.workspace_archive_dir(),
     ] {
         std::fs::create_dir_all(dir).map_err(|error| {
             tracing::error!(%error, dir = %dir.display(), "failed to create agent directory");
@@ -858,11 +859,27 @@ pub async fn create_agent_internal(
         tracing::warn!(%error, agent_id = %agent_id, "failed to create FTS index");
     }
 
-    let memory_search = std::sync::Arc::new(crate::memory::MemorySearch::new(
-        memory_store,
-        embedding_table,
-        embedding_model,
-    ));
+    let memory_search = std::sync::Arc::new(
+        crate::memory::MemorySearch::new(memory_store, embedding_table, embedding_model)
+            .with_chronicle_table(
+                crate::memory::ChronicleEmbeddingTable::open_or_create(&db.lance)
+                    .await
+                    .map_err(|error| {
+                        tracing::error!(
+                            %error,
+                            agent_id = %agent_id,
+                            "failed to init chronicle embeddings"
+                        );
+                        format!("failed to init chronicle embeddings: {error}")
+                    })?,
+            ),
+    );
+    if let Err(error) = memory_search
+        .backfill_chronicle_embeddings(&db.sqlite)
+        .await
+    {
+        tracing::warn!(%error, agent_id = %agent_id, "chronicle embedding backfill failed");
+    }
     let task_store = state
         .task_store
         .load()
@@ -1130,10 +1147,6 @@ pub async fn create_agent_internal(
     let _cortex_loop = crate::agent::cortex::spawn_cortex_loop(deps.clone(), cortex_logger.clone());
     let _association_loop =
         crate::agent::cortex::spawn_association_loop(deps.clone(), cortex_logger);
-    crate::agent::cortex::spawn_ready_task_loop(
-        deps.clone(),
-        make_cortex_logger(db.sqlite.clone()),
-    );
 
     let ingestion_config = **runtime_config.ingestion.load();
     if ingestion_config.enabled {
@@ -1619,23 +1632,10 @@ pub(super) async fn agent_overview(
         .collect();
 
     let cortex_logger = CortexLogger::new(pool.clone());
-    let bulletin_events = cortex_logger
-        .load_events(1, 0, Some("bulletin_generated"))
-        .await
-        .unwrap_or_default();
-    let last_bulletin_at = bulletin_events.first().map(|e| e.created_at.clone());
-
     let recent_cortex_events = cortex_logger
         .load_events(5, 0, None)
         .await
         .unwrap_or_default();
-
-    let latest_bulletin = bulletin_events.first().and_then(|e| {
-        e.details.as_ref().and_then(|d| {
-            d.get("bulletin_text")
-                .and_then(|v| v.as_str().map(|s| s.to_string()))
-        })
-    });
 
     let memory_daily_rows = sqlx::query(
         "SELECT date(created_at) as date, COUNT(*) as count FROM memories WHERE forgotten = 0 AND created_at > date('now', '-30 days') GROUP BY date ORDER BY date",
@@ -1720,12 +1720,10 @@ pub(super) async fn agent_overview(
         memory_total,
         channel_count,
         cron_jobs,
-        last_bulletin_at,
         recent_cortex_events,
         memory_daily,
         activity_daily,
         activity_heatmap,
-        latest_bulletin,
     }))
 }
 
@@ -1758,7 +1756,6 @@ pub(super) async fn instance_overview(
                 cron_job_count: 0,
                 activity_sparkline: vec![0; 14],
                 last_activity_at: None,
-                last_bulletin_at: None,
                 profile: None,
             });
             continue;
@@ -1809,13 +1806,6 @@ pub(super) async fn instance_overview(
             activity_sparkline.push(*activity_map.get(&date).unwrap_or(&0));
         }
 
-        let cortex_logger = CortexLogger::new(pool.clone());
-        let bulletin_events = cortex_logger
-            .load_events(1, 0, Some("bulletin_generated"))
-            .await
-            .unwrap_or_default();
-        let last_bulletin_at = bulletin_events.first().map(|e| e.created_at.clone());
-
         let profile = crate::agent::cortex::load_profile(pool, &agent_id).await;
 
         agents.push(AgentSummary {
@@ -1825,7 +1815,6 @@ pub(super) async fn instance_overview(
             cron_job_count: cron_job_count as usize,
             activity_sparkline,
             last_activity_at,
-            last_bulletin_at,
             profile,
         });
     }
@@ -1955,7 +1944,7 @@ pub(super) async fn update_identity(
 #[cfg(test)]
 mod tests {
     use super::{
-        ApiState, WarmupQuery, WarmupTriggerRequest, compute_bulletin_age_secs, get_warmup_status,
+        ApiState, WarmupQuery, WarmupTriggerRequest, compute_refresh_age_secs, get_warmup_status,
         resolve_warmup_agent_ids, trigger_warmup,
     };
     use crate::config::{Config, RuntimeConfig, WarmupState, WarmupStatus};
@@ -2002,19 +1991,19 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_bulletin_age_secs_none_stays_none() {
-        assert_eq!(compute_bulletin_age_secs(None, 1_000), None);
+    fn test_compute_refresh_age_secs_none_stays_none() {
+        assert_eq!(compute_refresh_age_secs(None, 1_000), None);
     }
 
     #[test]
-    fn test_compute_bulletin_age_secs_rounds_down_to_seconds() {
-        let age = compute_bulletin_age_secs(Some(1_000), 4_999);
+    fn test_compute_refresh_age_secs_rounds_down_to_seconds() {
+        let age = compute_refresh_age_secs(Some(1_000), 4_999);
         assert_eq!(age, Some(3));
     }
 
     #[test]
-    fn test_compute_bulletin_age_secs_future_timestamp_clamps_to_zero() {
-        let age = compute_bulletin_age_secs(Some(10_000), 9_000);
+    fn test_compute_refresh_age_secs_future_timestamp_clamps_to_zero() {
+        let age = compute_refresh_age_secs(Some(10_000), 9_000);
         assert_eq!(age, Some(0));
     }
 
@@ -2029,7 +2018,7 @@ mod tests {
             state: WarmupState::Warm,
             embedding_ready: true,
             last_refresh_unix_ms: Some(refresh_ms),
-            bulletin_age_secs: None,
+            refresh_age_secs: None,
             last_error: None,
         }));
         let zeta_config = test_runtime_config(tempdir.path());
@@ -2051,7 +2040,7 @@ mod tests {
         assert!(
             response.statuses[0]
                 .status
-                .bulletin_age_secs
+                .refresh_age_secs
                 .expect("missing bulletin age")
                 >= 3
         );

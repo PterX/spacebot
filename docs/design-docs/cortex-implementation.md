@@ -1,6 +1,6 @@
 # Cortex Implementation Plan
 
-The cortex is designed to be the system's self-awareness — supervising processes, maintaining memory coherence, and generating the memory bulletin. Phase 1 plumbing, Phase 2 health supervision, and Phase 3 maintenance are now live; consolidation remains.
+The cortex observes the system, maintains memory coherence, and generates the memory bulletin. Phase 1 plumbing, Phase 2 health observation, and Phase 3 maintenance are live. Consolidation remains.
 
 This doc covers the path from "bulletin generator" to "full system supervisor."
 
@@ -21,7 +21,7 @@ This doc covers the path from "bulletin generator" to "full system supervisor."
 
 **Wired through config:**
 - `tick_interval_secs` and `bulletin_interval_secs` are read by the running cortex loop and hot-reload during runtime.
-- Phase 2 knobs are active and hot-reloaded: `worker_timeout_secs`, `branch_timeout_secs`, `detached_worker_timeout_retry_limit`, `supervisor_kill_budget_per_tick`, and `circuit_breaker_threshold`.
+- Phase 2 knobs are active and hot-reloaded: `worker_wall_clock_timeout_secs` and `circuit_breaker_threshold`.
 
 **Referenced in prompts but don't exist:**
 - `memory_consolidate` tool
@@ -68,52 +68,7 @@ Get the cortex running as a persistent process that observes the event bus and t
 
 ## Phase 2: System Health (Implemented)
 
-The supervisor role is now active and still fully programmatic (no LLM loop for health decisions).
-
-### Control plane
-
-- `ProcessControlRegistry` provides cancellation routing for:
-  - live channel workers/branches through weak `ChannelControlHandle`s
-  - detached ready-task workers through registered `DetachedWorkerControl` entries
-- Channel cancel convergence now uses reason-aware methods that emit terminal synthetic events:
-  - worker cancel emits one `WorkerComplete` payload (`result`, `notify`, `success`)
-  - branch cancel removes branch status, logs terminal run, emits one synthetic `BranchResult`
-
-### Detached worker single-winner lifecycle
-
-Detached ready-task workers use a lifecycle state machine:
-
-```text
-0 active -> 1 completing -> 3 terminal
-0 active -> 2 killing    -> 3 terminal
-```
-
-- Completion path must win `CAS(0 -> 1)` before terminal side-effects.
-- Supervisor kill path must win `CAS(0 -> 2)` (or observe prior `2`) before timeout side-effects.
-- Losing path performs no terminal writes/events.
-
-### Timeout retry and quarantine policy
-
-On detached timeout kill, a single task update writes both status and metadata:
-
-- `supervisor_timeout_count` increments each timeout.
-- `supervisor_timeout_exhausted` flips to `true` once the retry limit is exceeded.
-- If count is `<= detached_worker_timeout_retry_limit`: task returns to `ready` and clears `worker_id`.
-- If count is `> detached_worker_timeout_retry_limit`: task moves to `backlog` and clears `worker_id`.
-
-### Lag-aware health tick
-
-Per tick, cortex maintains runtime maps for workers, branches, branch latency, and breaker state.
-
-- If control receiver lag occurred since the prior tick, kill enforcement is skipped for that tick only.
-- `health_check` logs include `kill_skipped_due_to_lag=true` when skipped.
-- Lag flag is cleared at tick end so enforcement resumes next interval.
-
-### Kill budget and ordering
-
-- Overdue workers/branches are selected in deterministic oldest-first order.
-- Cancellation attempts are capped by `supervisor_kill_budget_per_tick` each tick.
-- Remaining overdue items roll to subsequent ticks.
+The cortex observes system health without cancelling channel-owned workers or branches. Workers enforce their configured wall-clock deadline. Channels, workflows, explicit user actions, and shutdown retain their own cancellation behavior.
 
 ### Observe-only circuit breaker
 

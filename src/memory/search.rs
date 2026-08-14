@@ -2,10 +2,18 @@
 
 use crate::error::Result;
 use crate::memory::types::{Memory, MemorySearchResult, MemoryType, RelationType};
-use crate::memory::{EmbeddingModel, EmbeddingTable, MemoryStore};
+use crate::memory::{
+    ChronicleEmbeddingTable, ChronicleHit, EmbeddingModel, EmbeddingTable, MemoryStore,
+};
 
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Minimum cosine similarity for a chronicle checkpoint hit to count as a
+/// result. Memory results go through RRF and carry their own `min_score`;
+/// chronicle hits are raw nearest neighbours, so without a floor every query
+/// returns *something* no matter how unrelated.
+const CHRONICLE_MIN_SIMILARITY: f32 = 0.3;
 
 /// Which search strategy to use.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -38,6 +46,11 @@ pub struct MemorySearch {
     store: Arc<MemoryStore>,
     embedding_table: EmbeddingTable,
     embedding_model: Arc<EmbeddingModel>,
+    /// Shared write-time consolidation state (debt + partition locks).
+    consolidation: Arc<crate::memory::consolidation::ConsolidationState>,
+    /// Chronicle checkpoint embeddings (level-0 spans). Optional: absent in
+    /// tests and minimal harnesses until wired via `with_chronicle_table`.
+    chronicle_table: Option<ChronicleEmbeddingTable>,
 }
 
 impl Clone for MemorySearch {
@@ -46,6 +59,8 @@ impl Clone for MemorySearch {
             store: Arc::clone(&self.store),
             embedding_table: self.embedding_table.clone(),
             embedding_model: Arc::clone(&self.embedding_model),
+            consolidation: Arc::clone(&self.consolidation),
+            chronicle_table: self.chronicle_table.clone(),
         }
     }
 }
@@ -69,7 +84,94 @@ impl MemorySearch {
             store,
             embedding_table,
             embedding_model,
+            consolidation: Arc::new(crate::memory::consolidation::ConsolidationState::default()),
+            chronicle_table: None,
         }
+    }
+
+    /// Attach the chronicle embedding table for unified labeled search and
+    /// checkpoint provenance (1.7).
+    pub fn with_chronicle_table(mut self, table: ChronicleEmbeddingTable) -> Self {
+        self.chronicle_table = Some(table);
+        self
+    }
+
+    /// Embed a level-0 checkpoint into the chronicle table (idempotent by id).
+    /// Level-1+ rollups are skipped — the spine is level-0 spans.
+    pub async fn embed_chronicle_checkpoint(
+        &self,
+        checkpoint: &crate::conversation::chronicle::ChronicleCheckpoint,
+    ) -> Result<()> {
+        let Some(table) = &self.chronicle_table else {
+            return Ok(());
+        };
+        if checkpoint.level != 0 {
+            return Ok(());
+        }
+        let text = format!("{} — {}", checkpoint.title, checkpoint.summary);
+        let embedding = self.embedding_model.embed_one(&text).await?;
+        table
+            .store(
+                &checkpoint.id,
+                &checkpoint.title,
+                &checkpoint.channel_id,
+                checkpoint.seq,
+                &text,
+                &embedding,
+            )
+            .await
+    }
+
+    /// One-time backfill: embed every level-0 checkpoint that lacks a row.
+    /// Level-0 rows only, per the chronicle spine contract. Returns how many
+    /// checkpoints were embedded.
+    pub async fn backfill_chronicle_embeddings(&self, pool: &sqlx::SqlitePool) -> Result<usize> {
+        let Some(table) = &self.chronicle_table else {
+            return Ok(0);
+        };
+        let store = crate::conversation::chronicle::ChronicleStore::new(pool.clone());
+        let checkpoints = store.list_level_zero_all().await?;
+        let mut embedded = 0;
+        let mut skipped = 0;
+        for checkpoint in checkpoints {
+            if table.has(&checkpoint.id).await? {
+                skipped += 1;
+                continue;
+            }
+            self.embed_chronicle_checkpoint(&checkpoint).await?;
+            embedded += 1;
+        }
+        tracing::info!(embedded, skipped, "chronicle embedding backfill complete");
+        Ok(embedded)
+    }
+
+    /// Unified labeled search: memory results (with checkpoint range-join
+    /// provenance) plus chronicle checkpoint hits, when the chronicle table
+    /// is wired. Checkpoint hits are labeled by title + seq. Queryless modes
+    /// (recent/important/typed) return no checkpoint hits — embedding an
+    /// empty string would surface arbitrary nearest neighbours.
+    pub async fn search_with_chronicle(
+        &self,
+        query: &str,
+        config: &SearchConfig,
+        checkpoint_limit: usize,
+    ) -> Result<(Vec<MemorySearchResult>, Vec<ChronicleHit>)> {
+        let memories = self.search(query, config).await?;
+        let mut checkpoints = Vec::new();
+        if let Some(table) = &self.chronicle_table
+            && !query.trim().is_empty()
+        {
+            match self.embedding_model.embed_one(query).await {
+                Ok(embedding) => {
+                    checkpoints = table.vector_search(&embedding, checkpoint_limit).await?;
+                    checkpoints.retain(|hit| hit.similarity >= CHRONICLE_MIN_SIMILARITY);
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "chronicle search embedding failed");
+                }
+            }
+        }
+        Ok((memories, checkpoints))
     }
 
     /// Get a reference to the memory store.
@@ -92,6 +194,12 @@ impl MemorySearch {
         &self.embedding_model
     }
 
+    /// The shared write-time consolidation state (debt + partition locks).
+    /// Clones of `MemorySearch` share one instance.
+    pub fn consolidation(&self) -> &Arc<crate::memory::consolidation::ConsolidationState> {
+        &self.consolidation
+    }
+
     /// Unified search entry point. Dispatches to the appropriate strategy
     /// based on `config.mode`.
     pub async fn search(
@@ -99,12 +207,29 @@ impl MemorySearch {
         query: &str,
         config: &SearchConfig,
     ) -> Result<Vec<MemorySearchResult>> {
-        let results = match config.mode {
+        let mut results = match config.mode {
             SearchMode::Hybrid => self.hybrid_search(query, config).await,
             SearchMode::Recent => self.metadata_search(SearchSort::Recent, config).await,
             SearchMode::Important => self.metadata_search(SearchSort::Importance, config).await,
             SearchMode::Typed => self.metadata_search(config.sort_by, config).await,
         }?;
+
+        // Chronicle range join (1.7): annotate each result with the level-0
+        // checkpoint whose span produced this memory, when the memory has a
+        // channel and a covering checkpoint exists.
+        let chronicle =
+            crate::conversation::chronicle::ChronicleStore::new(self.store.pool().clone());
+        for result in &mut results {
+            if let Some(channel_id) = &result.memory.channel_id {
+                let at = result.memory.created_at;
+                if let Ok(Some(checkpoint)) = chronicle.covering_checkpoint(channel_id, at).await {
+                    result.checkpoint = Some(crate::memory::types::CheckpointRef {
+                        title: checkpoint.title,
+                        seq: checkpoint.seq,
+                    });
+                }
+            }
+        }
 
         #[cfg(feature = "metrics")]
         {
@@ -151,6 +276,7 @@ impl MemorySearch {
                     memory,
                     score,
                     rank: rank + 1,
+                    checkpoint: None,
                 }
             })
             .collect();
@@ -258,6 +384,7 @@ impl MemorySearch {
                 memory: scored.memory,
                 score: scored.score as f32,
                 rank: rank + 1,
+                checkpoint: None,
             })
             .filter(|r| r.score >= config.min_score)
             .take(config.max_results_per_source)
@@ -501,6 +628,7 @@ mod tests {
                 memory: Memory::new(format!("mem {i}"), MemoryType::Fact),
                 score: 1.0 - (i as f32 * 0.1),
                 rank: i + 1,
+                checkpoint: None,
             })
             .collect();
 

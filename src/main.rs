@@ -1347,7 +1347,7 @@ async fn run(
                         agent.config.screenshot_dir(),
                         agent.config.logs_dir(),
                         snapshot_store,
-                        Some(api_state.live_worker_transcripts.clone()),
+                        Some(api_state.live_process_transcripts.clone()),
                         resolved_settings,
                         None, // no cron outcome for normal channels
                         None, // no autonomy run for normal channels
@@ -1745,7 +1745,7 @@ async fn run(
                         agent.config.screenshot_dir(),
                         agent.config.logs_dir(),
                         snapshot_store,
-                        Some(api_state.live_worker_transcripts.clone()),
+                        Some(api_state.live_process_transcripts.clone()),
                         resolved_settings,
                         None, // no cron outcome for normal channels
                         None, // no autonomy run for normal channels
@@ -1906,6 +1906,7 @@ async fn run(
                         sender_name,
                         sender_id: message.sender_id.clone(),
                         text: message.content.to_string(),
+                        system: false,
                         attachments: inbound_attachments,
                     }).ok();
 
@@ -2250,11 +2251,8 @@ async fn initialize_agents(
             .collect(),
     );
 
-    // Wake-dispatch infrastructure for dormant-mode agents. Always spawned
-    // so active-mode agents can also participate (cron / message wake hooks
-    // are mode-agnostic — `cortex::wake_one` is a no-op contention with the
-    // active loop's pickup, harmless either way). The registry lives on
-    // `api_state` so runtime agent-create / agent-delete paths can keep it
+    // Wake-dispatch infrastructure for autonomy channels. The registry lives
+    // on `api_state` so runtime agent-create / agent-delete paths can keep it
     // in sync without going through main.
     let wake_registry = api_state.wake_registry.clone();
     let wake_tx = spacebot::agent::wake::spawn_wake_manager(wake_registry.clone());
@@ -2300,6 +2298,14 @@ async fn initialize_agents(
                 agent_config.saved_dir().display()
             )
         })?;
+        for dir in [
+            agent_config.notes_dir(),
+            agent_config.research_dir(),
+            agent_config.workspace_archive_dir(),
+        ] {
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("failed to create workspace dir: {}", dir.display()))?;
+        }
 
         // Per-agent database connections
         let db = spacebot::db::Db::connect(&agent_config.data_dir)
@@ -2375,11 +2381,56 @@ async fn initialize_agents(
             tracing::warn!(%error, agent = %agent_config.id, "failed to create FTS index");
         }
 
-        let memory_search = Arc::new(spacebot::memory::MemorySearch::new(
+        // Chronicle embeddings are optional: a table that cannot be opened
+        // disables session search for this run instead of aborting startup.
+        let chronicle_table =
+            match spacebot::memory::ChronicleEmbeddingTable::open_or_create(&db.lance).await {
+                Ok(table) => {
+                    if let Err(error) = table.ensure_fts_index().await {
+                        tracing::warn!(
+                            %error,
+                            agent = %agent_config.id,
+                            "failed to create chronicle FTS index"
+                        );
+                    }
+                    Some(table)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        agent = %agent_config.id,
+                        "failed to init chronicle embeddings; session search disabled this run"
+                    );
+                    None
+                }
+            };
+
+        let mut memory_search = spacebot::memory::MemorySearch::new(
             memory_store,
             embedding_table,
             embedding_model.clone(),
-        ));
+        );
+        if let Some(table) = chronicle_table {
+            memory_search = memory_search.with_chronicle_table(table);
+        }
+        let memory_search = Arc::new(memory_search);
+
+        // One-time backfill of level-0 checkpoint embeddings (1.7), off the
+        // boot path — the table serves vector search while it fills.
+        {
+            let memory_search = Arc::clone(&memory_search);
+            let pool = db.sqlite.clone();
+            let agent = agent_config.id.clone();
+            tokio::spawn(async move {
+                if let Err(error) = memory_search.backfill_chronicle_embeddings(&pool).await {
+                    tracing::warn!(%error, %agent, "chronicle embedding backfill failed");
+                }
+            });
+        }
+
+        // Seed anchor memories for configured org humans (3.1a). Idempotent —
+        // humans with an existing anchor are left alone.
+        spacebot::tools::memory_save::seed_org_human_anchors(&memory_search, &config.humans).await;
 
         // Working memory event log (temporal situational awareness).
         let working_memory_timezone = {
@@ -2674,7 +2725,7 @@ async fn initialize_agents(
                     agent_id = %agent_id,
                     state = ?status.state,
                     embedding_ready = status.embedding_ready,
-                    bulletin_age_secs = ?status.bulletin_age_secs,
+                    refresh_age_secs = ?status.refresh_age_secs,
                     last_error = ?status.last_error,
                     "startup warmup pass finished"
                 );
@@ -3295,14 +3346,6 @@ async fn initialize_agents(
             spacebot::agent::cortex::spawn_association_loop(agent.deps.clone(), cortex_logger);
         cortex_handles.push(association_handle);
         tracing::info!(agent_id = %agent_id, "cortex association loop started");
-
-        let ready_task_handle = spacebot::agent::cortex::spawn_ready_task_loop(
-            agent.deps.clone(),
-            spacebot::agent::cortex::CortexLogger::new(agent.db.sqlite.clone())
-                .with_notifications(global_notification_store.clone(), agent_id.to_string()),
-        );
-        cortex_handles.push(ready_task_handle);
-        tracing::info!(agent_id = %agent_id, "cortex ready-task loop started");
     }
 
     // Spawn the instance-wide memory janitor when configured. Required for

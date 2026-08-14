@@ -19,6 +19,9 @@ pub struct Memory {
     /// Soft-delete flag. Forgotten memories are excluded from search and recall
     /// but remain in the database.
     pub forgotten: bool,
+    /// Chronicle checkpoint whose span this memory superseded (set by write-
+    /// time consolidation). Provenance for supersede-with-provenance (1.7).
+    pub supersedes_checkpoint_id: Option<String>,
 }
 
 impl Memory {
@@ -40,6 +43,7 @@ impl Memory {
             source: None,
             channel_id: None,
             forgotten: false,
+            supersedes_checkpoint_id: None,
         }
     }
 
@@ -84,6 +88,7 @@ impl MemoryType {
             MemoryType::Observation => 0.3,
             MemoryType::Goal => 0.9,
             MemoryType::Todo => 0.8,
+            MemoryType::Human => 0.85,
         }
     }
 }
@@ -108,6 +113,10 @@ pub enum MemoryType {
     Goal,
     /// An actionable task or reminder.
     Todo,
+    /// A curated anchor for a specific human — who they are, how they
+    /// prefer to work, what they care about. One anchor per human,
+    /// mapped via `human_identities` and merged by reflection (3.1a).
+    Human,
 }
 
 impl MemoryType {
@@ -121,7 +130,38 @@ impl MemoryType {
         MemoryType::Observation,
         MemoryType::Goal,
         MemoryType::Todo,
+        MemoryType::Human,
     ];
+
+    /// Parse a memory type from its lowercase label, matching `Display`.
+    pub fn from_label(label: &str) -> Option<MemoryType> {
+        Self::ALL.iter().copied().find(|t| t.to_string() == label)
+    }
+
+    /// Per-value guidance rendered into tool schemas — the taxonomy lives
+    /// on the enum so every tool derives the same wording and a new
+    /// variant cannot ship without its description.
+    pub fn schema_description(&self) -> &'static str {
+        match self {
+            MemoryType::Fact => "What you know to be true. Grounds your responses.",
+            MemoryType::Preference => "How the user likes things done. Shapes your approach.",
+            MemoryType::Decision => "Commitments that were made. Constrains future choices.",
+            MemoryType::Identity => {
+                "Stable facts about who the user or the agent is. Shapes self-understanding."
+            }
+            MemoryType::Event => {
+                "Something that happened at a point in time. Adds situational context."
+            }
+            MemoryType::Observation => {
+                "Patterns noticed about how things work. System-level awareness."
+            }
+            MemoryType::Goal => "What the user or you are working toward. Drives proactive action.",
+            MemoryType::Todo => "Concrete tasks to complete. Creates accountability.",
+            MemoryType::Human => {
+                "A curated anchor for a specific human — who they are, how they prefer to work. Requires human_id; saves merge into the existing anchor for that human."
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for MemoryType {
@@ -135,6 +175,7 @@ impl std::fmt::Display for MemoryType {
             MemoryType::Observation => write!(f, "observation"),
             MemoryType::Goal => write!(f, "goal"),
             MemoryType::Todo => write!(f, "todo"),
+            MemoryType::Human => write!(f, "human"),
         }
     }
 }
@@ -205,12 +246,24 @@ impl std::fmt::Display for RelationType {
     }
 }
 
+/// Chronicle checkpoint reference surfaced on search results: which
+/// checkpoint's span produced this memory (range join, 1.7).
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct CheckpointRef {
+    pub title: String,
+    pub seq: i64,
+}
+
 /// Search result combining memory with relevance score.
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct MemorySearchResult {
     pub memory: Memory,
     pub score: f32,
     pub rank: usize,
+    /// The chronicle checkpoint whose span this memory came from, when the
+    /// memory has a channel and a covering checkpoint exists (range join).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<CheckpointRef>,
 }
 
 /// Input for memory creation.

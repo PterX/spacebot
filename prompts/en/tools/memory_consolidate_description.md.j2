@@ -1,0 +1,16 @@
+Consolidate memory near-duplicates for one partition (memory type) in a single atomic batch.
+
+Use this when a `memory_save` result includes a `consolidation` block. Each op
+absorbs one memory into a survivor:
+
+- `survivor_id` — the memory that stays (typically the older, higher-importance one, or the one with the most associations)
+- `absorbed_id` — the memory being merged into the survivor and deleted
+- `merged_content` — the combined, de-duplicated statement (superseding outdated wording from the absorbed memory)
+
+The survivor's embedding is re-computed from `merged_content`, associations
+are rewired to the survivor, and the absorbed memory is deleted. The batch is
+serialized per partition and succeeds or fails as a unit; the partition's
+consolidation debt is cleared on success.
+
+Run at most ONE batch per partition per pass — never loop. When the batch
+succeeds, continue with your original work.
