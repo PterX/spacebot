@@ -99,6 +99,23 @@ impl PromptBlock {
     }
 }
 
+/// A prompt assembled outside the template engine has no map, which is a
+/// smaller claim than a wrong one — the text still renders whole.
+impl From<String> for SegmentedPrompt {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            blocks: Vec::new(),
+        }
+    }
+}
+
+impl From<&str> for SegmentedPrompt {
+    fn from(text: &str) -> Self {
+        Self::from(text.to_string())
+    }
+}
+
 impl SegmentedPrompt {
     /// Adopt a version of this prompt with text appended, recording the
     /// appended region as a block of its own.
@@ -129,11 +146,12 @@ impl SegmentedPrompt {
         let tokens = estimate_tokens(suffix);
         let end = replacement.len();
 
+        let (layer, stability, source) = classify(id);
         self.blocks.push(PromptBlock {
             id: id.to_string(),
-            layer: BlockLayer::Contract,
-            stability: BlockStability::Epoch,
-            source: BlockSource::Config,
+            layer,
+            stability,
+            source,
             start,
             end,
             chars,
@@ -149,6 +167,19 @@ pub struct SegmentedPrompt {
     /// The prompt exactly as it will be sent.
     pub text: String,
     pub blocks: Vec<PromptBlock>,
+}
+
+impl SegmentedPrompt {
+    /// Append a named section, separated by a blank line.
+    ///
+    /// Empty sections are skipped rather than recorded as zero-width blocks.
+    pub fn append_section(&mut self, id: &str, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let separator = if self.text.is_empty() { "" } else { "\n\n" };
+        self.adopt_appended(format!("{}{separator}{text}", self.text), id);
+    }
 }
 
 /// Classify a template variable. Unknown names are reported so a new prompt
@@ -176,6 +207,8 @@ fn classify(name: &str) -> (BlockLayer, BlockStability, BlockSource) {
         "active_goals" => (Runtime, Volatile, Store),
         "conversation_context" => (Runtime, Epoch, LiveState),
         "status_text" => (Runtime, Volatile, LiveState),
+        "tool_use_enforcement" => (Contract, Epoch, Config),
+        "required_skills" => (Capabilities, Epoch, Config),
         _ => (Runtime, Volatile, LiveState),
     }
 }

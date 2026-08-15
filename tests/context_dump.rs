@@ -379,7 +379,8 @@ async fn dump_branch_context() {
     let workspace_dir = rc.workspace_dir.to_string_lossy();
     let branch_prompt = prompt_engine
         .render_branch_prompt(&instance_dir, &workspace_dir, false)
-        .expect("failed to render branch prompt");
+        .expect("failed to render branch prompt")
+        .text;
     print_section("BRANCH SYSTEM PROMPT", &branch_prompt);
     print_stats("System prompt", &branch_prompt);
 
@@ -459,7 +460,8 @@ async fn dump_worker_context() {
             false,
             None,
         )
-        .expect("failed to render worker prompt");
+        .expect("failed to render worker prompt")
+        .text;
     print_section("WORKER SYSTEM PROMPT", &worker_prompt);
     print_stats("System prompt", &worker_prompt);
     let brave_search_key = (**rc.brave_search_key.load()).clone();
@@ -616,7 +618,8 @@ async fn dump_all_contexts() {
     // ── Branch ──
     let branch_prompt = prompt_engine
         .render_branch_prompt(&instance_dir, &workspace_dir, false)
-        .expect("failed to render branch prompt");
+        .expect("failed to render branch prompt")
+        .text;
     let run_logger = spacebot::conversation::ProcessRunLogger::new(deps.sqlite_pool.clone());
     let branch_tool_server = spacebot::tools::create_branch_tool_server(
         None,
@@ -665,7 +668,8 @@ async fn dump_all_contexts() {
             false,
             None,
         )
-        .expect("failed to render worker prompt");
+        .expect("failed to render worker prompt")
+        .text;
     let brave_search_key = (**rc.brave_search_key.load()).clone();
     let worker_tool_server = spacebot::tools::create_worker_tool_server(
         deps.agent_id.clone(),

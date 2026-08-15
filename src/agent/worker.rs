@@ -264,7 +264,7 @@ pub struct Worker {
     pub deps: AgentDeps,
     pub hook: SpacebotHook,
     /// System prompt loaded from prompts/WORKER.md.
-    pub system_prompt: String,
+    pub system_prompt: crate::prompts::SegmentedPrompt,
     /// Input channel for interactive workers (follow-up loop).
     pub input_rx: Option<mpsc::Receiver<String>>,
     /// Context injection channel. Unlike `input_rx` (which drives the
@@ -313,7 +313,7 @@ impl Worker {
     fn build(
         channel_id: Option<ChannelId>,
         task: impl Into<String>,
-        system_prompt: impl Into<String>,
+        system_prompt: impl Into<crate::prompts::SegmentedPrompt>,
         deps: AgentDeps,
         browser_config: BrowserConfig,
         screenshot_dir: PathBuf,
@@ -386,7 +386,7 @@ impl Worker {
     pub fn new(
         channel_id: Option<ChannelId>,
         task: impl Into<String>,
-        system_prompt: impl Into<String>,
+        system_prompt: impl Into<crate::prompts::SegmentedPrompt>,
         deps: AgentDeps,
         browser_config: BrowserConfig,
         screenshot_dir: PathBuf,
@@ -423,7 +423,7 @@ impl Worker {
     pub fn new_interactive(
         channel_id: Option<ChannelId>,
         task: impl Into<String>,
-        system_prompt: impl Into<String>,
+        system_prompt: impl Into<crate::prompts::SegmentedPrompt>,
         deps: AgentDeps,
         browser_config: BrowserConfig,
         screenshot_dir: PathBuf,
@@ -464,7 +464,7 @@ impl Worker {
         existing_id: WorkerId,
         channel_id: Option<ChannelId>,
         task: impl Into<String>,
-        system_prompt: impl Into<String>,
+        system_prompt: impl Into<crate::prompts::SegmentedPrompt>,
         deps: AgentDeps,
         browser_config: BrowserConfig,
         screenshot_dir: PathBuf,
@@ -662,12 +662,12 @@ impl Worker {
                         input: Some(self.task.clone()),
                         parent: self.channel_id.as_ref().map(|id| format!("channel:{id}")),
                     }),
-                    blocks: Vec::new(),
+                    blocks: self.system_prompt.blocks.clone(),
                 },
             );
 
         let agent = AgentBuilder::new(model)
-            .preamble(&self.system_prompt)
+            .preamble(&self.system_prompt.text)
             .default_max_turns(TURNS_PER_SEGMENT)
             .tool_server_handle(worker_tool_server)
             .build();

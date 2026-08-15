@@ -191,34 +191,35 @@ pub async fn spawn_branch_from_state(
     let model_name = routing.resolve(ProcessType::Branch, None).to_string();
     let tool_use_enforcement = rc.tool_use_enforcement.load();
     let wiki_enabled = state.deps.wiki_store.is_some();
-    let system_prompt = prompt_engine
+    let mut system_prompt = prompt_engine
         .render_branch_prompt(
             &rc.instance_dir.display().to_string(),
             &rc.workspace_dir.display().to_string(),
             wiki_enabled,
         )
-        .and_then(|prompt| {
-            let skills_prompt = rc.skills.load().render_branch_skills(&prompt_engine)?;
-            Ok(if skills_prompt.is_empty() {
-                prompt
-            } else {
-                format!("{prompt}\n\n{skills_prompt}")
-            })
-        })
-        .and_then(|prompt| {
-            prompt_engine.maybe_append_tool_use_enforcement(
-                prompt,
+        .map_err(|e| AgentError::Other(anyhow::anyhow!("{e}")))?;
+    let skills_prompt = rc
+        .skills
+        .load()
+        .render_branch_skills(&prompt_engine)
+        .map_err(|e| AgentError::Other(anyhow::anyhow!("{e}")))?;
+    system_prompt.append_section("skills_prompt", &skills_prompt);
+    system_prompt.adopt_appended(
+        prompt_engine
+            .maybe_append_tool_use_enforcement(
+                system_prompt.text.clone(),
                 tool_use_enforcement.as_ref(),
                 &model_name,
             )
-        })
-        .map_err(|e| AgentError::Other(anyhow::anyhow!("{e}")))?;
+            .map_err(|e| AgentError::Other(anyhow::anyhow!("{e}")))?,
+        "tool_use_enforcement",
+    );
 
     spawn_branch(
         state,
         &description,
         &description,
-        &system_prompt,
+        system_prompt,
         &description,
         "branch",
         BranchSpawnOptions {
@@ -274,7 +275,7 @@ pub(crate) async fn spawn_memory_persistence_branch(
         state,
         "memory persistence",
         &prompt,
-        &system_prompt,
+        system_prompt.into(),
         if skill_reflection {
             "persisting memories and reflecting on skills..."
         } else {
@@ -339,7 +340,7 @@ async fn spawn_branch(
     state: &ChannelState,
     description: &str,
     prompt: &str,
-    system_prompt: &str,
+    system_prompt: crate::prompts::SegmentedPrompt,
     status_label: &str,
     dispatch_type: &'static str,
     branch_options: BranchSpawnOptions,
@@ -791,14 +792,11 @@ async fn spawn_worker_inner(
     // Append skills listing to worker system prompt. Suggested skills are
     // flagged so the worker knows the channel's intent, but it can read any
     // skill it decides is relevant via the read_skill tool.
-    let mut system_prompt = match skills.render_worker_skills(suggested_skills, &prompt_engine) {
-        Ok(skills_prompt) if !skills_prompt.is_empty() => {
-            format!("{worker_system_prompt}\n\n{skills_prompt}")
-        }
-        Ok(_) => worker_system_prompt,
+    let mut system_prompt = worker_system_prompt;
+    match skills.render_worker_skills(suggested_skills, &prompt_engine) {
+        Ok(skills_prompt) => system_prompt.append_section("skills_prompt", &skills_prompt),
         Err(error) => {
             tracing::warn!(%error, "failed to render worker skills listing, spawning without skills context");
-            worker_system_prompt
         }
     };
 
@@ -806,19 +804,21 @@ async fn spawn_worker_inner(
     // not an entry in the index the worker may or may not read. Unresolvable
     // names were rejected at task creation and at spawn.
     if let Some(required_block) = skills.render_required_skills(required_skills) {
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str(&required_block);
+        system_prompt.append_section("required_skills", &required_block);
     }
 
     // Append tool-use enforcement after skills so it's the last instruction
     // in the preamble ("last instruction wins").
-    let mut system_prompt = prompt_engine
-        .maybe_append_tool_use_enforcement(
-            system_prompt,
-            tool_use_enforcement.as_ref(),
-            &model_name,
-        )
-        .map_err(|e| AgentError::Other(anyhow::anyhow!("{e}")))?;
+    system_prompt.adopt_appended(
+        prompt_engine
+            .maybe_append_tool_use_enforcement(
+                system_prompt.text.clone(),
+                tool_use_enforcement.as_ref(),
+                &model_name,
+            )
+            .map_err(|e| AgentError::Other(anyhow::anyhow!("{e}")))?,
+        "tool_use_enforcement",
+    );
 
     // Inject memory context based on worker_context settings
     if worker_context.memory.ambient_enabled() {
@@ -853,12 +853,13 @@ async fn spawn_worker_inner(
         .await
         {
             if let Some(memory_store) = memory_store {
-                system_prompt.push_str("\n\n");
-                system_prompt.push_str(&memory_store);
+                system_prompt.append_section("knowledge_synthesis", &memory_store);
             }
             if !working_memory.is_empty() {
-                system_prompt.push_str("\n\n## Recent Activity\n");
-                system_prompt.push_str(&working_memory);
+                system_prompt.append_section(
+                    "working_memory",
+                    &format!("## Recent Activity\n{working_memory}"),
+                );
             }
         }
     }
@@ -875,7 +876,7 @@ async fn spawn_worker_inner(
             // The preamble is fully rendered by now — skills and ambient
             // memory included — so the fork is budgeted against what the
             // worker's first call actually leaves for history.
-            let prompt_tokens = crate::agent::compactor::estimate_text_tokens(&system_prompt)
+            let prompt_tokens = crate::agent::compactor::estimate_text_tokens(&system_prompt.text)
                 + crate::agent::compactor::estimate_text_tokens(task);
             let removed = crate::agent::compactor::precompact_forked_history(
                 &mut history,
@@ -904,7 +905,7 @@ async fn spawn_worker_inner(
         let (worker, input_tx, inject_tx) = Worker::new_interactive(
             Some(state.channel_id.clone()),
             task,
-            &system_prompt,
+            system_prompt.clone(),
             state.deps.clone(),
             browser_config.clone(),
             state.screenshot_dir.clone(),
@@ -931,7 +932,7 @@ async fn spawn_worker_inner(
         let (worker, inject_tx) = Worker::new(
             Some(state.channel_id.clone()),
             task,
-            &system_prompt,
+            system_prompt,
             state.deps.clone(),
             browser_config,
             state.screenshot_dir.clone(),
@@ -1811,7 +1812,7 @@ pub async fn resume_idle_worker_into_state(
             let model_name = routing.resolve(ProcessType::Worker, None).to_string();
             let tool_use_enforcement = rc.tool_use_enforcement.load();
             let project_context = build_project_context(&state.deps, &prompt_engine).await;
-            let system_prompt = prompt_engine
+            let mut system_prompt = prompt_engine
                 .render_worker_prompt(
                     &rc.instance_dir.display().to_string(),
                     &rc.workspace_dir.display().to_string(),
@@ -1825,21 +1826,24 @@ pub async fn resume_idle_worker_into_state(
                     false, // resumed workers use original context; wiki not re-injected
                     project_context,
                 )
-                .and_then(|prompt| {
-                    prompt_engine.maybe_append_tool_use_enforcement(
-                        prompt,
+                .map_err(|error| format!("failed to render worker prompt: {error}"))?;
+            system_prompt.adopt_appended(
+                prompt_engine
+                    .maybe_append_tool_use_enforcement(
+                        system_prompt.text.clone(),
                         tool_use_enforcement.as_ref(),
                         &model_name,
                     )
-                })
-                .map_err(|error| format!("failed to render worker prompt: {error}"))?;
+                    .map_err(|error| format!("failed to render worker prompt: {error}"))?,
+                "tool_use_enforcement",
+            );
             let brave_search_key = (**rc.brave_search_key.load()).clone();
 
             let (worker, input_tx, inject_tx) = Worker::resume_interactive(
                 worker_id,
                 Some(state.channel_id.clone()),
                 &idle_worker.task,
-                &system_prompt,
+                system_prompt,
                 state.deps.clone(),
                 browser_config,
                 state.screenshot_dir.clone(),

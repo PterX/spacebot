@@ -26,7 +26,7 @@ pub struct RetriggerResult {
 #[derive(Debug, Default, Clone)]
 pub struct PromptInputs {
     text: Vec<(&'static str, Option<String>)>,
-    flags: Vec<(&'static str, bool)>,
+    inline: Vec<(&'static str, Value)>,
 }
 
 impl PromptInputs {
@@ -42,10 +42,12 @@ impl PromptInputs {
         self
     }
 
-    /// Add a boolean the template branches on. Flags gate prose rather than
-    /// contributing bytes, so they are never marked as blocks.
-    pub fn flag(mut self, name: &'static str, value: bool) -> Self {
-        self.flags.push((name, value));
+    /// Add a value the template weaves into its own prose — a path, a flag,
+    /// a list it iterates. These are never marked as blocks: a directory
+    /// inside a sentence belongs to the sentence, and marking it would litter
+    /// the map with fragments no reader is looking for.
+    pub fn inline(mut self, name: &'static str, value: impl Serialize) -> Self {
+        self.inline.push((name, Value::from_serialize(value)));
         self
     }
 
@@ -69,8 +71,8 @@ impl PromptInputs {
             };
             vars.insert((*name).to_string(), value);
         }
-        for (name, value) in &self.flags {
-            vars.insert((*name).to_string(), Value::from(*value));
+        for (name, value) in &self.inline {
+            vars.insert((*name).to_string(), value.clone());
         }
         Value::from_object(vars)
     }
@@ -121,7 +123,7 @@ impl ChannelPromptInputs {
             .text("active_goals", self.active_goals)
             .text("execution_mode", Some(self.execution_mode))
             .text("authority", Some(self.authority))
-            .flag("agent_links", self.agent_links)
+            .inline("agent_links", self.agent_links)
     }
 }
 
@@ -557,22 +559,21 @@ impl PromptEngine {
         status_text: Option<String>,
         wiki_enabled: bool,
         project_context: Option<String>,
-    ) -> Result<String> {
-        self.render(
+    ) -> Result<blocks::SegmentedPrompt> {
+        self.render_segmented(
             "worker",
-            context! {
-                instance_dir => instance_dir,
-                workspace_dir => workspace_dir,
-                sandbox_enabled => sandbox_enabled,
-                sandbox_containment_active => sandbox_containment_active,
-                sandbox_read_allowlist => sandbox_read_allowlist,
-                sandbox_write_allowlist => sandbox_write_allowlist,
-                tool_secret_names => tool_secret_names,
-                browser_persist_session => browser_persist_session,
-                status_text => status_text,
-                wiki_enabled => wiki_enabled,
-                project_context => project_context,
-            },
+            PromptInputs::new()
+                .text("status_text", status_text)
+                .text("project_context", project_context)
+                .inline("instance_dir", instance_dir)
+                .inline("workspace_dir", workspace_dir)
+                .inline("sandbox_enabled", sandbox_enabled)
+                .inline("sandbox_containment_active", sandbox_containment_active)
+                .inline("sandbox_read_allowlist", sandbox_read_allowlist)
+                .inline("sandbox_write_allowlist", sandbox_write_allowlist)
+                .inline("tool_secret_names", tool_secret_names)
+                .inline("browser_persist_session", browser_persist_session)
+                .inline("wiki_enabled", wiki_enabled),
         )
     }
 
@@ -582,14 +583,13 @@ impl PromptEngine {
         instance_dir: &str,
         workspace_dir: &str,
         wiki_enabled: bool,
-    ) -> Result<String> {
-        self.render(
+    ) -> Result<blocks::SegmentedPrompt> {
+        self.render_segmented(
             "branch",
-            context! {
-                instance_dir => instance_dir,
-                workspace_dir => workspace_dir,
-                wiki_enabled => wiki_enabled,
-            },
+            PromptInputs::new()
+                .inline("instance_dir", instance_dir)
+                .inline("workspace_dir", workspace_dir)
+                .inline("wiki_enabled", wiki_enabled),
         )
     }
 
@@ -1245,6 +1245,89 @@ mod tests {
             assert_eq!(
                 block.start, cursor,
                 "gap or overlap before block {}",
+                block.id
+            );
+            cursor = block.end;
+        }
+        assert_eq!(cursor, segmented.text.len(), "blocks must reach the end");
+    }
+
+    /// Worker prompts weave paths, flags and allowlists into their own
+    /// sentences. Those are inline inputs, not sections — marking them would
+    /// litter the map with fragments — so the map should hold the template's
+    /// prose plus the two real sections.
+    #[test]
+    fn worker_prompt_maps_sections_and_inlines_scalars() {
+        let engine = PromptEngine::new("en").expect("prompt engine should build");
+
+        let segmented = engine
+            .render_worker_prompt(
+                "/instance",
+                "/workspace",
+                true,
+                true,
+                vec!["/workspace".to_string()],
+                vec!["/workspace/out".to_string()],
+                &["OPENAI_API_KEY".to_string()],
+                false,
+                Some("No active processes.".to_string()),
+                false,
+                Some("## Active Projects\n\n- spacebot".to_string()),
+            )
+            .expect("worker prompt should render");
+
+        let ids: Vec<&str> = segmented
+            .blocks
+            .iter()
+            .map(|block| block.id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&"status_text"),
+            "sections must be mapped: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"project_context"),
+            "sections must be mapped: {ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|id| id.contains("workspace_dir")),
+            "a path woven into a sentence is prose, not a block: {ids:?}"
+        );
+
+        // The scalars still reach the template.
+        assert!(segmented.text.contains("/workspace"));
+        assert!(segmented.text.contains("/workspace/out"));
+
+        assert_tiles(&segmented);
+    }
+
+    #[test]
+    fn appended_sections_extend_the_map() {
+        let engine = PromptEngine::new("en").expect("prompt engine should build");
+        let mut segmented = engine
+            .render_branch_prompt("/instance", "/workspace", false)
+            .expect("branch prompt should render");
+
+        let before = segmented.blocks.len();
+        segmented.append_section("skills_prompt", "## Available Skills\n\n- deploy");
+        segmented.append_section("tool_use_enforcement", "Always call a tool.");
+        // An empty section is skipped rather than recorded as a zero-width block.
+        segmented.append_section("required_skills", "");
+
+        assert_eq!(segmented.blocks.len(), before + 2);
+        assert!(segmented.text.ends_with("Always call a tool."));
+        assert_tiles(&segmented);
+    }
+
+    /// Blocks must account for every byte, in order, with no gaps or overlaps.
+    fn assert_tiles(segmented: &crate::prompts::SegmentedPrompt) {
+        let mut cursor = 0usize;
+        for block in &segmented.blocks {
+            assert_eq!(block.start, cursor, "gap or overlap at block {}", block.id);
+            assert_eq!(
+                segmented.text[block.start..block.end].chars().count(),
+                block.chars,
+                "block {} reports the wrong character count",
                 block.id
             );
             cursor = block.end;
