@@ -103,12 +103,22 @@ impl SpawnWorkerTool {
         // Refuse a second run on a task something is already working. The
         // delegation check elsewhere is per-channel, so without this two
         // channels can spawn on the same task without either noticing.
-        if let Ok(Some(live)) = deps.task_store.live_task_attempt(number).await {
-            return Err(SpawnWorkerError(format!(
-                "task #{number} is already being worked by worker {} (attempt #{}, started {}). \
-                 Wait for it, or cancel it before spawning again.",
-                live.worker_id, live.attempt, live.started_at
-            )));
+        // An unreadable history cannot establish that the task is free, so a
+        // lookup failure blocks the spawn rather than falling through it.
+        match deps.task_store.live_task_attempt(number).await {
+            Ok(Some(live)) => {
+                return Err(SpawnWorkerError(format!(
+                    "task #{number} is already being worked by worker {} (attempt #{}, started {}). \
+                     Wait for it, or cancel it before spawning again.",
+                    live.worker_id, live.attempt, live.started_at
+                )));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(SpawnWorkerError(format!(
+                    "failed to check whether task #{number} is already being worked: {error}"
+                )));
+            }
         }
 
         let project = match &task.project_id {
@@ -703,6 +713,12 @@ impl SpawnWorkerTool {
 
             // The pointer above names only the run executing now. This is the
             // history: what has been tried on this task and how it ended.
+            //
+            // Unlike the binding above this one is not fire-and-forget. The
+            // live-attempt index rejects a second open run on the same task, so
+            // a failure here means another spawn claimed the task between the
+            // guard and this insert. An unrecorded worker is invisible to the
+            // guard and to the board, so it is stopped instead of left running.
             if let Err(error) = self
                 .state
                 .deps
@@ -725,6 +741,21 @@ impl SpawnWorkerTool {
                     %worker_id,
                     "failed to record the task attempt"
                 );
+                if let Err(cancel_error) = self
+                    .state
+                    .cancel_worker_with_reason(worker_id, "task attempt could not be recorded")
+                    .await
+                {
+                    tracing::warn!(
+                        %cancel_error,
+                        %worker_id,
+                        "failed to cancel a worker with no recorded attempt"
+                    );
+                }
+                return Err(SpawnWorkerError(format!(
+                    "task #{} could not record this attempt, so worker {worker_id} was cancelled: {error}",
+                    plan.task_number
+                )));
             }
         }
 

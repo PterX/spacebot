@@ -1448,7 +1448,7 @@ impl TaskStore {
         task_from_row(updated)
     }
 
-    /// Delete a task with its comments and revisions.
+    /// Delete a task with its comments, revisions and run history.
     ///
     /// The child rows are removed explicitly rather than through the foreign
     /// key, which only cascades when `PRAGMA foreign_keys` is on.
@@ -1473,7 +1473,12 @@ impl TaskStore {
             return Ok(false);
         };
 
-        for table in ["task_comments", "task_revisions", "task_dependencies"] {
+        for table in [
+            "task_comments",
+            "task_revisions",
+            "task_dependencies",
+            "task_worker_runs",
+        ] {
             sqlx::query(&format!("DELETE FROM {table} WHERE task_id = ?"))
                 .bind(&task_id)
                 .execute(&mut *tx)
@@ -1845,6 +1850,14 @@ pub(crate) async fn setup_test_store() -> TaskStore {
     .execute(&pool)
     .await
     .expect("task_worker_runs should be created");
+
+    sqlx::query(
+        "CREATE UNIQUE INDEX task_worker_runs_live ON task_worker_runs(task_id) \
+         WHERE ended_at IS NULL",
+    )
+    .execute(&pool)
+    .await
+    .expect("live attempt index should be created");
 
     sqlx::query("INSERT INTO task_number_seq (id, next_number) VALUES (1, 1)")
         .execute(&pool)

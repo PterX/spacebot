@@ -32,5 +32,9 @@ CREATE TABLE task_worker_runs (
 CREATE INDEX task_worker_runs_task ON task_worker_runs(task_id, attempt DESC);
 CREATE INDEX task_worker_runs_worker ON task_worker_runs(worker_id);
 
--- Resolving "is this task already being worked on" must not scan the table.
-CREATE INDEX task_worker_runs_live ON task_worker_runs(task_id, ended_at);
+-- One live run per task, enforced rather than checked. The spawn guard reads
+-- this before creating a worker, so two channels can both find the task free
+-- and both spawn; the index is what settles that race. It also answers "is this
+-- task already being worked on" without scanning the table.
+CREATE UNIQUE INDEX task_worker_runs_live ON task_worker_runs(task_id)
+WHERE ended_at IS NULL;

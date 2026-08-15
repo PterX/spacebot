@@ -219,7 +219,18 @@ impl TaskStore {
         .bind(&input.channel_id)
         .execute(&mut *tx)
         .await
-        .context("failed to record task attempt")?;
+        .map_err(|error| {
+            // The live-attempt index is what settles two spawns racing on the
+            // same task, so a unique violation here is a lost race rather than
+            // a storage fault, and the caller has to be able to tell them apart.
+            if matches!(&error, sqlx::Error::Database(db) if db.is_unique_violation()) {
+                anyhow::anyhow!(
+                    "task #{task_number} already has a live attempt — another spawn claimed it first"
+                )
+            } else {
+                anyhow::Error::new(error).context("failed to record task attempt")
+            }
+        })?;
 
         let row = sqlx::query(&format!("{ATTEMPT_COLUMNS} WHERE id = ?"))
             .bind(&id)
@@ -577,6 +588,88 @@ mod tests {
                 .expect("lookup should succeed")
                 .is_none()
         );
+    }
+
+    /// The spawn guard reads before it writes, so two channels can both find a
+    /// task free. Storage is what settles it: the second worker is refused, and
+    /// the task opens again once the first run ends.
+    #[tokio::test]
+    async fn only_one_run_can_be_live_on_a_task() {
+        let (store, number) = store_with_task().await;
+
+        store
+            .start_task_attempt(number, start("worker-1"))
+            .await
+            .expect("start should succeed")
+            .expect("task exists");
+
+        let raced = store
+            .start_task_attempt(number, start("worker-2"))
+            .await
+            .expect_err("a second live run should be refused");
+        assert!(
+            raced.to_string().contains("already has a live attempt"),
+            "unexpected error: {raced}"
+        );
+        assert_eq!(
+            store
+                .list_task_attempts(number, 10)
+                .await
+                .expect("history should load")
+                .len(),
+            1
+        );
+
+        store
+            .finish_task_attempt("worker-1", TaskAttemptOutcome::Failed, None)
+            .await
+            .expect("finish should succeed");
+
+        let retry = store
+            .start_task_attempt(number, start("worker-2"))
+            .await
+            .expect("start should succeed")
+            .expect("task exists");
+        assert_eq!(retry.attempt, 2);
+    }
+
+    /// Attempts carry worker ids and outcome text, so they must not outlive the
+    /// task. Foreign-key enforcement is not guaranteed to be on, which is why
+    /// the delete is explicit.
+    #[tokio::test]
+    async fn deleting_a_task_deletes_its_attempts() {
+        let (store, number) = store_with_task().await;
+        store
+            .start_task_attempt(number, start("worker-1"))
+            .await
+            .expect("start should succeed")
+            .expect("task exists");
+        store
+            .finish_task_attempt("worker-1", TaskAttemptOutcome::Succeeded, Some("done"))
+            .await
+            .expect("finish should succeed");
+
+        // The condition the explicit delete exists for: with enforcement off,
+        // the cascade on the foreign key does nothing.
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(store.pool())
+            .await
+            .expect("pragma should apply");
+
+        assert!(store.delete(number).await.expect("delete should succeed"));
+
+        assert_eq!(
+            store
+                .task_number_for_worker("worker-1")
+                .await
+                .expect("lookup should succeed"),
+            None
+        );
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_worker_runs")
+            .fetch_one(store.pool())
+            .await
+            .expect("count should succeed");
+        assert_eq!(remaining, 0);
     }
 
     /// Re-binding the same worker must not invent a second attempt, so a
