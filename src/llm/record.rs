@@ -362,10 +362,10 @@ impl PromptRecordStore {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             // Directory names are `%Y-%m-%d`, which sorts lexicographically.
-            if name.as_ref() < cutoff_day.as_str() {
-                if let Err(error) = tokio::fs::remove_dir_all(entry.path()).await {
-                    tracing::warn!(day = %name, %error, "failed to sweep prompt records");
-                }
+            if name.as_ref() < cutoff_day.as_str()
+                && let Err(error) = tokio::fs::remove_dir_all(entry.path()).await
+            {
+                tracing::warn!(day = %name, %error, "failed to sweep prompt records");
             }
         }
 

@@ -208,7 +208,9 @@ async fn run_sample(
     let logger = ConversationLogger::new(deps.sqlite_pool.clone());
     for (role, text) in conversation {
         match *role {
-            "user" => logger.log_user_message(&channel_id, "user", "user-1", text, &HashMap::new()),
+            "user" => {
+                logger.log_user_message(&channel_id, "user", "user-1", text, &HashMap::new());
+            }
             "assistant" => logger.log_bot_message(&channel_id, text),
             _ => {}
         }
