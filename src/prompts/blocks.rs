@@ -209,6 +209,10 @@ fn classify(name: &str) -> (BlockLayer, BlockStability, BlockSource) {
         "status_text" => (Runtime, Volatile, LiveState),
         "tool_use_enforcement" => (Contract, Epoch, Config),
         "required_skills" => (Capabilities, Epoch, Config),
+        "agents_manifest" | "runtime_config_snapshot" => (Capabilities, Epoch, Config),
+        "changelog_highlights" => (Knowledge, Epoch, Config),
+        "channel_transcript" => (Working, Volatile, Store),
+        "task_state" | "active_workers" => (Runtime, Volatile, Store),
         _ => (Runtime, Volatile, LiveState),
     }
 }

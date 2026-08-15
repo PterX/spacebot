@@ -477,11 +477,15 @@ async fn process_chunk(
     let routing = deps.runtime_config.routing.load();
     let model_name = routing.resolve(ProcessType::Branch, None).to_string();
     let tool_use_enforcement = deps.runtime_config.tool_use_enforcement.load();
-    let ingestion_prompt = prompt_engine.maybe_append_tool_use_enforcement(
-        prompt_engine.render_static("ingestion")?,
-        tool_use_enforcement.as_ref(),
-        &model_name,
-    )?;
+    let mut ingestion_prompt = prompt_engine.render_static_segmented("ingestion")?;
+    ingestion_prompt.adopt_appended(
+        prompt_engine.maybe_append_tool_use_enforcement(
+            ingestion_prompt.text.clone(),
+            tool_use_enforcement.as_ref(),
+            &model_name,
+        )?,
+        "tool_use_enforcement",
+    );
     let model = SpacebotModel::make(&deps.llm_manager, &model_name)
         .with_context(&*deps.agent_id, "branch")
         .with_worker_type("ingestion")
@@ -499,7 +503,7 @@ async fn process_chunk(
                     kind: "ingestion".to_string(),
                     ..Default::default()
                 }),
-                blocks: Vec::new(),
+                blocks: ingestion_prompt.blocks.clone(),
             },
         );
 
@@ -532,7 +536,7 @@ async fn process_chunk(
     );
 
     let agent = AgentBuilder::new(model)
-        .preamble(&ingestion_prompt)
+        .preamble(&ingestion_prompt.text)
         .default_max_turns(10)
         .tool_server_handle(tool_server)
         .build();

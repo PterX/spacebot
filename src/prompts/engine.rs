@@ -515,13 +515,12 @@ impl PromptEngine {
         &self,
         skill_reflection: bool,
         reflection_worker_ids: &[String],
-    ) -> Result<String> {
-        self.render(
+    ) -> Result<blocks::SegmentedPrompt> {
+        self.render_segmented(
             "memory_persistence",
-            context! {
-                skill_reflection => skill_reflection,
-                reflection_worker_ids => reflection_worker_ids,
-            },
+            PromptInputs::new()
+                .inline("skill_reflection", skill_reflection)
+                .inline("reflection_worker_ids", reflection_worker_ids),
         )
     }
 
@@ -884,18 +883,17 @@ impl PromptEngine {
         runtime_config_snapshot: Option<String>,
         worker_capabilities: String,
         factory_enabled: bool,
-    ) -> Result<String> {
-        self.render(
+    ) -> Result<blocks::SegmentedPrompt> {
+        self.render_segmented(
             "cortex_chat",
-            context! {
-                identity_context => identity_context,
-                channel_transcript => channel_transcript,
-                agents_manifest => agents_manifest,
-                changelog_highlights => changelog_highlights,
-                runtime_config_snapshot => runtime_config_snapshot,
-                worker_capabilities => worker_capabilities,
-                factory_enabled => factory_enabled,
-            },
+            PromptInputs::new()
+                .text("identity_context", identity_context)
+                .text("channel_transcript", channel_transcript)
+                .text("agents_manifest", agents_manifest)
+                .text("changelog_highlights", changelog_highlights)
+                .text("runtime_config_snapshot", runtime_config_snapshot)
+                .text("worker_capabilities", Some(worker_capabilities))
+                .inline("factory_enabled", factory_enabled),
         )
     }
 
@@ -903,13 +901,23 @@ impl PromptEngine {
     ///
     /// The factory prompt instructs the LLM on how to create and configure new agents
     /// using preset archetypes, organizational memory, and user preferences.
-    pub fn render_factory_prompt(&self, identity_context: Option<String>) -> Result<String> {
-        self.render(
+    pub fn render_factory_prompt(
+        &self,
+        identity_context: Option<String>,
+    ) -> Result<blocks::SegmentedPrompt> {
+        self.render_segmented(
             "factory",
-            context! {
-                identity_context => identity_context,
-            },
+            PromptInputs::new().text("identity_context", identity_context),
         )
+    }
+
+    /// Render a prompt that takes no variables, mapped as one template block.
+    ///
+    /// The map is a single entry, which is the honest description: nothing was
+    /// injected. It still lets the inspector report the prompt as mapped rather
+    /// than as an unmapped wall of text.
+    pub fn render_static_segmented(&self, template_name: &str) -> Result<blocks::SegmentedPrompt> {
+        self.render_segmented(template_name, PromptInputs::new())
     }
 
     /// Render the org context fragment showing the agent's position in the hierarchy.
@@ -1301,6 +1309,25 @@ mod tests {
         assert_tiles(&segmented);
     }
 
+    /// A prompt with no injected values is one block covering all of it —
+    /// which is what the inspector should say, rather than reporting it as
+    /// unmapped.
+    #[test]
+    fn static_prompt_maps_to_a_single_template_block() {
+        let engine = PromptEngine::new("en").expect("prompt engine should build");
+        let segmented = engine
+            .render_static_segmented("compactor")
+            .expect("compactor prompt should render");
+
+        assert_eq!(segmented.blocks.len(), 1);
+        assert_eq!(segmented.blocks[0].id, "template:compactor");
+        assert_eq!(
+            segmented.text,
+            engine.render_static("compactor").expect("plain render"),
+        );
+        assert_tiles(&segmented);
+    }
+
     #[test]
     fn appended_sections_extend_the_map() {
         let engine = PromptEngine::new("en").expect("prompt engine should build");
@@ -1514,13 +1541,15 @@ mod tests {
 
         let plain = engine
             .render_memory_persistence_prompt(false, &[])
-            .expect("persistence prompt should render");
+            .expect("persistence prompt should render")
+            .text;
         assert!(plain.contains("memory persistence process"));
         assert!(!plain.contains("## Skill Reflection"));
 
         let reflecting = engine
             .render_memory_persistence_prompt(true, &[])
-            .expect("reflection prompt should render");
+            .expect("reflection prompt should render")
+            .text;
         assert!(reflecting.contains("## Skill Reflection"));
         assert!(reflecting.contains("never the incident"));
         assert!(reflecting.contains("Never persist"));
@@ -1529,7 +1558,8 @@ mod tests {
         let worker_ids = vec!["92ae6824-dd29-4f10-bdbe-8e33b4faa35d".to_string()];
         let with_workers = engine
             .render_memory_persistence_prompt(true, &worker_ids)
-            .expect("reflection prompt with workers should render");
+            .expect("reflection prompt with workers should render")
+            .text;
         assert!(with_workers.contains("92ae6824-dd29-4f10-bdbe-8e33b4faa35d"));
         assert!(with_workers.contains("worker_inspect"));
     }

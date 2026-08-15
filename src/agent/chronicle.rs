@@ -747,7 +747,7 @@ impl CutContext {
     ) -> (String, String, Option<String>) {
         let fallback_title = range_title(messages);
         let prompt_engine = self.deps.runtime_config.prompts.load();
-        let preamble = match prompt_engine.render_static("chronicle_checkpoint") {
+        let preamble = match prompt_engine.render_static_segmented("chronicle_checkpoint") {
             Ok(preamble) => preamble,
             Err(error) => {
                 tracing::error!(%error, "failed to render chronicle checkpoint prompt");
@@ -778,12 +778,12 @@ impl CutContext {
                         input: None,
                         parent: Some(format!("channel:{}", self.channel_id)),
                     }),
-                    blocks: Vec::new(),
+                    blocks: preamble.blocks.clone(),
                 },
             );
 
         let agent = AgentBuilder::new(model)
-            .preamble(&preamble)
+            .preamble(&preamble.text)
             .default_max_turns(1)
             .build();
 
@@ -849,7 +849,7 @@ impl RollupContext {
 
         let sources = &unrolled[..self.config.rollup_batch];
         let prompt_engine = self.deps.runtime_config.prompts.load();
-        let preamble = prompt_engine.render_static("chronicle_rollup")?;
+        let preamble = prompt_engine.render_static_segmented("chronicle_rollup")?;
         let routing = self.deps.runtime_config.routing.load();
         let model_name = self
             .model_override
@@ -873,11 +873,11 @@ impl RollupContext {
                         input: None,
                         parent: Some(format!("channel:{}", self.channel_id)),
                     }),
-                    blocks: Vec::new(),
+                    blocks: preamble.blocks.clone(),
                 },
             );
         let agent = AgentBuilder::new(model)
-            .preamble(&preamble)
+            .preamble(&preamble.text)
             .default_max_turns(1)
             .build();
         let hook = SpacebotHook::new(

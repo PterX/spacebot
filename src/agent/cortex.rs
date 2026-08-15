@@ -2137,7 +2137,7 @@ async fn generate_profile(deps: &AgentDeps, logger: &CortexLogger) {
     let started = Instant::now();
 
     let prompt_engine = deps.runtime_config.prompts.load();
-    let profile_prompt = match prompt_engine.render_static("cortex_profile") {
+    let profile_prompt = match prompt_engine.render_static_segmented("cortex_profile") {
         Ok(p) => p,
         Err(error) => {
             tracing::warn!(%error, "failed to render cortex_profile prompt");
@@ -2185,12 +2185,12 @@ async fn generate_profile(deps: &AgentDeps, logger: &CortexLogger) {
                     kind: "profile".to_string(),
                     ..Default::default()
                 }),
-                blocks: Vec::new(),
+                blocks: profile_prompt.blocks.clone(),
             },
         );
 
     let agent = AgentBuilder::new(model)
-        .preamble(&profile_prompt)
+        .preamble(&profile_prompt.text)
         .hook(CortexHook::new())
         .build();
 

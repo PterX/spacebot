@@ -257,16 +257,19 @@ pub(crate) async fn spawn_memory_persistence_branch(
             format!("{id} — {status}")
         })
         .collect();
-    let system_prompt = prompt_engine
+    let mut system_prompt = prompt_engine
         .render_memory_persistence_prompt(skill_reflection, &reflection_worker_ids)
-        .and_then(|prompt| {
-            prompt_engine.maybe_append_tool_use_enforcement(
-                prompt,
+        .map_err(|e| AgentError::Other(anyhow::anyhow!("{e}")))?;
+    system_prompt.adopt_appended(
+        prompt_engine
+            .maybe_append_tool_use_enforcement(
+                system_prompt.text.clone(),
                 tool_use_enforcement.as_ref(),
                 &model_name,
             )
-        })
-        .map_err(|e| AgentError::Other(anyhow::anyhow!("{e}")))?;
+            .map_err(|e| AgentError::Other(anyhow::anyhow!("{e}")))?,
+        "tool_use_enforcement",
+    );
     let prompt = prompt_engine
         .render_system_memory_persistence()
         .map_err(|e| AgentError::Other(anyhow::anyhow!("{e}")))?;
@@ -275,7 +278,7 @@ pub(crate) async fn spawn_memory_persistence_branch(
         state,
         "memory persistence",
         &prompt,
-        system_prompt.into(),
+        system_prompt,
         if skill_reflection {
             "persisting memories and reflecting on skills..."
         } else {
