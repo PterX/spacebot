@@ -706,7 +706,23 @@ impl CortexChatSession {
         let model_name = routing.resolve(ProcessType::Cortex, None).to_string();
         let model = SpacebotModel::make(&self.deps.llm_manager, &model_name)
             .with_context(self.deps.agent_id.as_ref(), "cortex")
-            .with_routing(routing.as_ref().clone());
+            .with_routing(routing.as_ref().clone())
+            .with_debug(
+                self.deps.prompt_records(),
+                crate::llm::record::DebugContext {
+                    process: Some(crate::llm::record::ProcessRef {
+                        kind: "cortex".to_string(),
+                        id: None,
+                        process_type: Some("cortex_chat".to_string()),
+                        channel_id: channel_context_id.map(str::to_string),
+                    }),
+                    trigger: Some(crate::llm::record::Trigger {
+                        kind: "cortex_chat".to_string(),
+                        ..Default::default()
+                    }),
+                    blocks: Vec::new(),
+                },
+            );
 
         let agent = AgentBuilder::new(model)
             .preamble(&system_prompt)

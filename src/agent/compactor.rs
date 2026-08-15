@@ -298,7 +298,25 @@ async fn run_compaction(
     };
     let model = SpacebotModel::make(&deps.llm_manager, &model_name)
         .with_context(&*deps.agent_id, "compactor")
-        .with_routing((**routing).clone());
+        .with_routing((**routing).clone())
+        .with_debug(
+            deps.prompt_records(),
+            crate::llm::record::DebugContext {
+                process: Some(crate::llm::record::ProcessRef {
+                    kind: "compactor".to_string(),
+                    id: Some(channel_id.to_string()),
+                    process_type: None,
+                    channel_id: Some(channel_id.to_string()),
+                }),
+                trigger: Some(crate::llm::record::Trigger {
+                    kind: "compaction".to_string(),
+                    message_id: None,
+                    input: Some(format!("{remove_count} messages")),
+                    parent: Some(format!("channel:{channel_id}")),
+                }),
+                blocks: Vec::new(),
+            },
+        );
 
     // Give the compaction worker memory_save so it can directly persist memories
     // No tool server — the compactor's sole job is producing a summary.

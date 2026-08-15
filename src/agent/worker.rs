@@ -646,7 +646,25 @@ impl Worker {
             .with_context(&*self.deps.agent_id, "worker")
             .with_worker_type("builtin")
             .with_routing((**routing).clone())
-            .with_accumulator(usage_accumulator.clone());
+            .with_accumulator(usage_accumulator.clone())
+            .with_debug(
+                self.deps.prompt_records(),
+                crate::llm::record::DebugContext {
+                    process: Some(crate::llm::record::ProcessRef {
+                        kind: "worker".to_string(),
+                        id: Some(self.id.to_string()),
+                        process_type: Some("builtin".to_string()),
+                        channel_id: self.channel_id.as_ref().map(|id| id.to_string()),
+                    }),
+                    trigger: Some(crate::llm::record::Trigger {
+                        kind: "spawn_worker".to_string(),
+                        message_id: None,
+                        input: Some(self.task.clone()),
+                        parent: self.channel_id.as_ref().map(|id| format!("channel:{id}")),
+                    }),
+                    blocks: Vec::new(),
+                },
+            );
 
         let agent = AgentBuilder::new(model)
             .preamble(&self.system_prompt)

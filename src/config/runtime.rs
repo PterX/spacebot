@@ -71,6 +71,8 @@ pub struct RuntimeConfig {
     pub skills_config: ArcSwap<crate::config::SkillsConfig>,
     /// Prompt snapshot store for debugging prompt construction.
     pub prompt_snapshots: ArcSwap<Option<Arc<crate::agent::prompt_snapshot::PromptSnapshotStore>>>,
+    /// Record store for captured LLM requests, set after agent initialization.
+    pub prompt_records: ArcSwap<Option<Arc<crate::llm::record::PromptRecordStore>>>,
     /// Secrets store for encrypted credential storage.
     pub secrets: ArcSwap<Option<Arc<crate::secrets::store::SecretsStore>>>,
     /// Sandbox configuration for process containment.
@@ -149,6 +151,7 @@ impl RuntimeConfig {
             skill_usage: ArcSwap::from_pointee(None),
             skills_config: ArcSwap::from_pointee(agent_config.skills),
             prompt_snapshots: ArcSwap::from_pointee(None),
+            prompt_records: ArcSwap::from_pointee(None),
             secrets: ArcSwap::from_pointee(None),
             sandbox: Arc::new(ArcSwap::from_pointee(agent_config.sandbox.clone())),
             projects: ArcSwap::from_pointee(agent_config.projects.clone()),

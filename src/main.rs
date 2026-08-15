@@ -2378,6 +2378,14 @@ async fn initialize_agents(
                 }
             };
 
+        // Per-agent record of every outgoing LLM request. Payloads land under
+        // the data directory; the index shares the agent database.
+        let prompt_record_store = Arc::new(spacebot::llm::PromptRecordStore::new(
+            &agent_config.data_dir,
+            db.sqlite.clone(),
+            settings_store.prompt_debug_capture(),
+        ));
+
         // Per-agent memory system
         let memory_store =
             spacebot::memory::MemoryStore::with_agent_id(db.sqlite.clone(), &agent_config.id);
@@ -2511,6 +2519,9 @@ async fn initialize_agents(
         runtime_config
             .prompt_snapshots
             .store(Arc::new(prompt_snapshot_store.clone()));
+        runtime_config
+            .prompt_records
+            .store(Arc::new(Some(prompt_record_store.clone())));
         if let Err(error) = settings_store.set_worker_log_mode(config.defaults.worker_log_mode) {
             tracing::warn!(%error, agent = %agent_config.id, "failed to set worker_log_mode from config");
         }
@@ -3359,6 +3370,10 @@ async fn initialize_agents(
         cortex_handles.push(association_handle);
         tracing::info!(agent_id = %agent_id, "cortex association loop started");
     }
+
+    cortex_handles.push(spacebot::agent::maintenance::spawn_prompt_record_sweeper(
+        wake_registry.clone(),
+    ));
 
     // Spawn the instance-wide memory janitor when configured. Required for
     // dormant-mode agents (their cortex loop never runs maintenance);

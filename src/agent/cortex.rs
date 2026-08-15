@@ -1830,7 +1830,23 @@ pub async fn maybe_synthesize_intraday_batch(
     let model = SpacebotModel::make(&deps.llm_manager, &model_name)
         .with_context(&*deps.agent_id, "cortex")
         .with_routing((**routing).clone())
-        .with_accumulator(usage_accumulator.clone());
+        .with_accumulator(usage_accumulator.clone())
+        .with_debug(
+            deps.prompt_records(),
+            crate::llm::record::DebugContext {
+                process: Some(crate::llm::record::ProcessRef {
+                    kind: "cortex".to_string(),
+                    id: None,
+                    process_type: Some("intraday_synthesis".to_string()),
+                    channel_id: None,
+                }),
+                trigger: Some(crate::llm::record::Trigger {
+                    kind: "intraday_synthesis".to_string(),
+                    ..Default::default()
+                }),
+                blocks: Vec::new(),
+            },
+        );
 
     let agent = AgentBuilder::new(model)
         .preamble("You are a concise narrative summarizer. Output only the summary paragraph, nothing else.")
@@ -1985,7 +2001,23 @@ pub async fn maybe_synthesize_daily_summary(
     let model = SpacebotModel::make(&deps.llm_manager, &model_name)
         .with_context(&*deps.agent_id, "cortex")
         .with_routing((**routing).clone())
-        .with_accumulator(usage_accumulator.clone());
+        .with_accumulator(usage_accumulator.clone())
+        .with_debug(
+            deps.prompt_records(),
+            crate::llm::record::DebugContext {
+                process: Some(crate::llm::record::ProcessRef {
+                    kind: "cortex".to_string(),
+                    id: None,
+                    process_type: Some("daily_summary".to_string()),
+                    channel_id: None,
+                }),
+                trigger: Some(crate::llm::record::Trigger {
+                    kind: "daily_summary".to_string(),
+                    ..Default::default()
+                }),
+                blocks: Vec::new(),
+            },
+        );
 
     let agent = AgentBuilder::new(model)
         .preamble("You are a daily activity summarizer. Output only the summary, nothing else.")
@@ -2139,7 +2171,23 @@ async fn generate_profile(deps: &AgentDeps, logger: &CortexLogger) {
     let model = SpacebotModel::make(&deps.llm_manager, &model_name)
         .with_context(&*deps.agent_id, "cortex")
         .with_routing((**routing).clone())
-        .with_accumulator(usage_accumulator.clone());
+        .with_accumulator(usage_accumulator.clone())
+        .with_debug(
+            deps.prompt_records(),
+            crate::llm::record::DebugContext {
+                process: Some(crate::llm::record::ProcessRef {
+                    kind: "cortex".to_string(),
+                    id: None,
+                    process_type: Some("profile".to_string()),
+                    channel_id: None,
+                }),
+                trigger: Some(crate::llm::record::Trigger {
+                    kind: "profile".to_string(),
+                    ..Default::default()
+                }),
+                blocks: Vec::new(),
+            },
+        );
 
     let agent = AgentBuilder::new(model)
         .preamble(&profile_prompt)

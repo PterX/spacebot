@@ -565,6 +565,11 @@ impl AgentDeps {
         self.runtime_config.settings.load().as_ref().clone()
     }
 
+    /// The prompt record store, once the runtime has wired it up.
+    pub fn prompt_records(&self) -> Option<Arc<llm::record::PromptRecordStore>> {
+        self.runtime_config.prompt_records.load().as_ref().clone()
+    }
+
     /// Why this agent is holding off on new work, or `None` when running
     /// normally. A pause with no stated reason yields an empty string.
     pub fn pause_reason(&self) -> Option<String> {

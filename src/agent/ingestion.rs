@@ -485,7 +485,23 @@ async fn process_chunk(
     let model = SpacebotModel::make(&deps.llm_manager, &model_name)
         .with_context(&*deps.agent_id, "branch")
         .with_worker_type("ingestion")
-        .with_routing((**routing).clone());
+        .with_routing((**routing).clone())
+        .with_debug(
+            deps.prompt_records(),
+            crate::llm::record::DebugContext {
+                process: Some(crate::llm::record::ProcessRef {
+                    kind: "ingestion".to_string(),
+                    id: None,
+                    process_type: Some("ingestion".to_string()),
+                    channel_id: None,
+                }),
+                trigger: Some(crate::llm::record::Trigger {
+                    kind: "ingestion".to_string(),
+                    ..Default::default()
+                }),
+                blocks: Vec::new(),
+            },
+        );
 
     let conversation_logger =
         crate::conversation::history::ConversationLogger::new(deps.sqlite_pool.clone());

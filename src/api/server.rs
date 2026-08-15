@@ -4,8 +4,8 @@ use super::state::ApiState;
 use super::{
     activity, agents, attachments, autonomy, bindings, channels, chronicle, config, cortex, cron,
     factory, goals, ingest, links, mcp, memories, messaging, models, notifications, opencode_proxy,
-    portal, projects, providers, secrets, settings, skills, ssh, system, tasks, tools, usage,
-    wakes, wiki, workers,
+    portal, projects, prompts, providers, secrets, settings, skills, ssh, system, tasks, tools,
+    usage, wakes, wiki, workers,
 };
 
 use axum::Json;
@@ -95,6 +95,13 @@ pub fn api_router() -> OpenApiRouter<Arc<ApiState>> {
         .routes(routes!(channels::list_prompt_snapshots))
         .routes(routes!(channels::get_prompt_snapshot))
         .routes(routes!(channels::cancel_process))
+        // Prompt record routes
+        .routes(routes!(prompts::list_prompt_requests))
+        .routes(routes!(prompts::get_prompt_request))
+        .routes(routes!(
+            prompts::get_prompt_debug_capture,
+            prompts::set_prompt_debug_capture
+        ))
         .routes(routes!(
             channels::get_channel_settings,
             channels::update_channel_settings

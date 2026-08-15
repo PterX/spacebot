@@ -127,7 +127,25 @@ impl Branch {
         let model = SpacebotModel::make(&self.deps.llm_manager, &model_name)
             .with_context(&*self.deps.agent_id, "branch")
             .with_routing((**routing).clone())
-            .with_accumulator(usage_accumulator.clone());
+            .with_accumulator(usage_accumulator.clone())
+            .with_debug(
+                self.deps.prompt_records(),
+                crate::llm::record::DebugContext {
+                    process: Some(crate::llm::record::ProcessRef {
+                        kind: "branch".to_string(),
+                        id: Some(self.id.to_string()),
+                        process_type: None,
+                        channel_id: Some(self.channel_id.to_string()),
+                    }),
+                    trigger: Some(crate::llm::record::Trigger {
+                        kind: "branch".to_string(),
+                        message_id: None,
+                        input: Some(self.description.clone()),
+                        parent: Some(format!("channel:{}", self.channel_id)),
+                    }),
+                    blocks: Vec::new(),
+                },
+            );
 
         let agent = AgentBuilder::new(model)
             .preamble(&self.system_prompt)

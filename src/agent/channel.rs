@@ -432,6 +432,16 @@ pub enum ChannelKind {
     Autonomy,
 }
 
+impl std::fmt::Display for ChannelKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::User => write!(f, "user"),
+            Self::Cron => write!(f, "cron"),
+            Self::Autonomy => write!(f, "autonomy"),
+        }
+    }
+}
+
 impl ChannelKind {
     /// System-initiated channels receive no further user messages after the
     /// initial prompt, so the event loop exits once all work settles.
@@ -2472,7 +2482,7 @@ impl Channel {
         // Build system prompt. Time and the coalesce hint ride on the user
         // message envelope below instead of the system prompt — the prompt
         // must stay byte-stable across turns for provider caches to hit.
-        let system_prompt = self.build_system_prompt().await?;
+        let system_prompt = self.build_system_prompt_segmented().await?;
 
         // Extract adapter from messages (prefer explicit message.adapter, fall back to stored source_adapter)
         // This preserves per-message adapter for Signal named instances (e.g., "signal:work")
@@ -2811,7 +2821,7 @@ impl Channel {
             }
         }
 
-        let system_prompt = self.build_system_prompt().await?;
+        let system_prompt = self.build_system_prompt_segmented().await?;
 
         {
             let mut reply_target = self.state.reply_target_message_id.write().await;
@@ -3439,7 +3449,7 @@ impl Channel {
     async fn run_agent_turn(
         &self,
         user_text: &str,
-        system_prompt: &str,
+        system_prompt: &crate::prompts::SegmentedPrompt,
         conversation_id: &str,
         attachment_content: Vec<UserContent>,
         is_retrigger: bool,
@@ -3560,10 +3570,38 @@ impl Channel {
         let model = SpacebotModel::make(&self.deps.llm_manager, model_name)
             .with_context(&*self.deps.agent_id, "channel")
             .with_routing((**routing).clone())
-            .with_accumulator(usage_accumulator.clone());
+            .with_accumulator(usage_accumulator.clone())
+            .with_debug(
+                self.deps.prompt_records(),
+                crate::llm::record::DebugContext {
+                    process: Some(crate::llm::record::ProcessRef {
+                        kind: "channel".to_string(),
+                        id: Some(self.id.to_string()),
+                        process_type: Some(self.state.kind.to_string()),
+                        channel_id: Some(self.id.to_string()),
+                    }),
+                    trigger: Some(crate::llm::record::Trigger {
+                        kind: if is_retrigger {
+                            "retrigger".to_string()
+                        } else {
+                            "user_message".to_string()
+                        },
+                        message_id: self
+                            .state
+                            .reply_target_message_id
+                            .read()
+                            .await
+                            .as_deref()
+                            .and_then(|id| id.parse().ok()),
+                        input: Some(user_text.to_string()),
+                        parent: None,
+                    }),
+                    blocks: system_prompt.blocks.clone(),
+                },
+            );
 
         let agent = AgentBuilder::new(model)
-            .preamble(system_prompt)
+            .preamble(&system_prompt.text)
             .default_max_turns(max_turns)
             .tool_server_handle(self.tool_server.clone())
             .build();
@@ -3625,7 +3663,7 @@ impl Channel {
         {
             let context_window = **self.deps.runtime_config.context_window.load();
             let estimated = crate::agent::chronicle::estimate_request_tokens(
-                crate::agent::compactor::estimate_text_tokens(system_prompt),
+                crate::agent::compactor::estimate_text_tokens(&system_prompt.text),
                 &history,
                 user_text,
                 context_window,
@@ -3642,7 +3680,7 @@ impl Channel {
         }
 
         // ── Prompt snapshot capture (fire-and-forget) ──
-        self.maybe_capture_snapshot(system_prompt, user_text, &history);
+        self.maybe_capture_snapshot(&system_prompt.text, user_text, &history);
 
         let mut result = self
             .hook

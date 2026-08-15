@@ -62,6 +62,8 @@ pub struct SpacebotModel {
     process_type: Option<String>,
     worker_type: Option<String>,
     usage_accumulator: Option<Arc<Mutex<crate::llm::usage::UsageAccumulator>>>,
+    record_store: Option<Arc<crate::llm::record::PromptRecordStore>>,
+    debug_context: Option<Arc<crate::llm::record::DebugContext>>,
 }
 
 impl SpacebotModel {
@@ -116,6 +118,167 @@ impl SpacebotModel {
         self
     }
 
+    /// Record this model's requests, labelled with the process that sent them.
+    ///
+    /// A process that does not call this still has its requests recorded if a
+    /// store is attached; it just cannot be linked back to the process, so
+    /// prefer attaching context wherever the sending process is known.
+    pub fn with_debug(
+        mut self,
+        store: Option<Arc<crate::llm::record::PromptRecordStore>>,
+        context: crate::llm::record::DebugContext,
+    ) -> Self {
+        self.record_store = store;
+        self.debug_context = Some(Arc::new(context));
+        self
+    }
+
+    /// The store to record into, when capture is on.
+    fn active_record_store(&self) -> Option<Arc<crate::llm::record::PromptRecordStore>> {
+        self.record_store
+            .as_ref()
+            .filter(|store| store.is_enabled())
+            .cloned()
+    }
+
+    /// Build a record for a request and hand it to the store.
+    ///
+    /// Saving is spawned rather than awaited: a debugging aid must never sit
+    /// in front of a turn, and must never fail one.
+    fn record_request(
+        &self,
+        request: &CompletionRequest,
+        started_at: chrono::DateTime<chrono::Utc>,
+        duration: std::time::Duration,
+        response: crate::llm::record::ResponseRef,
+        usage: crate::llm::record::UsageRef,
+    ) {
+        let Some(store) = self.active_record_store() else {
+            return;
+        };
+
+        let debug = self.debug_context.clone().unwrap_or_default();
+
+        let messages: Vec<&rig::message::Message> = request.chat_history.iter().collect();
+        let history_length = messages.len();
+        let messages = serde_json::to_value(&messages).unwrap_or(serde_json::Value::Null);
+
+        let tools = request
+            .tools
+            .iter()
+            .map(|tool| {
+                let schema = serde_json::to_value(&tool.parameters).unwrap_or_default();
+                crate::llm::record::ToolRef {
+                    chars: tool.name.chars().count()
+                        + tool.description.chars().count()
+                        + schema.to_string().chars().count(),
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    schema,
+                }
+            })
+            .collect();
+
+        let system = crate::llm::record::SystemRef {
+            text: request.preamble.clone().unwrap_or_default(),
+            // A block map built for a different prompt would mislabel bytes,
+            // so it is only carried when it describes this preamble.
+            blocks: match request.preamble.as_deref() {
+                Some(preamble) if block_map_fits(&debug.blocks, preamble) => debug.blocks.clone(),
+                _ => Vec::new(),
+            },
+        };
+
+        let record = crate::llm::record::PromptRecord {
+            request_id: uuid::Uuid::new_v4().simple().to_string(),
+            agent_id: self.agent_id.clone().unwrap_or_else(|| "unknown".into()),
+            process: debug
+                .process
+                .clone()
+                .unwrap_or_else(|| crate::llm::record::ProcessRef {
+                    kind: self
+                        .process_type
+                        .clone()
+                        .unwrap_or_else(|| "unknown".into()),
+                    id: None,
+                    process_type: self.worker_type.clone(),
+                    channel_id: None,
+                }),
+            trigger: debug.trigger.clone().unwrap_or_default(),
+            model: crate::llm::record::ModelRef {
+                name: self.full_model_name.clone(),
+                provider: self.provider.clone(),
+                max_tokens: request.max_tokens,
+                temperature: request.temperature,
+            },
+            started_at,
+            duration_ms: duration.as_millis() as u64,
+            system,
+            tools,
+            messages,
+            history_length,
+            response,
+            usage,
+        };
+
+        tokio::spawn(async move { store.save(&record).await });
+    }
+}
+
+/// Normalized usage for a record, priced with the same table as billing.
+impl SpacebotModel {
+    fn usage_ref(&self, body: &serde_json::Value) -> crate::llm::record::UsageRef {
+        let extended = if self.provider == "anthropic" {
+            crate::llm::usage::ExtendedUsage::from_anthropic_body(body)
+        } else {
+            crate::llm::usage::ExtendedUsage::from_openai_body(body)
+        };
+        crate::llm::record::UsageRef {
+            input_tokens: extended.input_tokens,
+            output_tokens: extended.output_tokens,
+            cached_read_tokens: extended.cache_read_tokens,
+            cached_write_tokens: extended.cache_write_tokens,
+            cost_usd: crate::llm::pricing::estimate_cost_extended(&self.full_model_name, &extended),
+        }
+    }
+}
+
+/// Split a model's reply into its text and the tools it asked for.
+fn response_ref_from_choice(
+    choice: &OneOrMany<AssistantContent>,
+) -> crate::llm::record::ResponseRef {
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+
+    for content in choice.iter() {
+        match content {
+            AssistantContent::Text(part) => text.push_str(&part.text),
+            AssistantContent::ToolCall(call) => tool_calls.push(call.function.name.clone()),
+            _ => {}
+        }
+    }
+
+    crate::llm::record::ResponseRef {
+        text: (!text.is_empty()).then_some(text),
+        tool_calls,
+        error: None,
+    }
+}
+
+/// True when a block map describes exactly the given preamble.
+///
+/// The map is produced when the prompt is assembled and the request is built
+/// later, so this guards against the two having drifted — a rendered prompt
+/// that was trimmed, wrapped, or replaced downstream would leave every byte
+/// range in the map pointing at the wrong content.
+fn block_map_fits(blocks: &[crate::prompts::PromptBlock], preamble: &str) -> bool {
+    match blocks.last() {
+        Some(last) => last.end == preamble.len(),
+        None => false,
+    }
+}
+
+impl SpacebotModel {
     async fn provider_config_for_current_model(&self) -> Result<ProviderConfig, CompletionError> {
         let provider_id = self
             .full_model_name
@@ -418,6 +581,8 @@ impl CompletionModel for SpacebotModel {
             process_type: None,
             worker_type: None,
             usage_accumulator: None,
+            record_store: None,
+            debug_context: None,
         }
     }
 
@@ -429,6 +594,16 @@ impl CompletionModel for SpacebotModel {
         let start = std::time::Instant::now();
 
         self.repair_request_history(&mut request)?;
+
+        // Captured before dispatch: the routing block below consumes the
+        // request, and a fallback may re-send it against a different model.
+        let capture = self.active_record_store().is_some().then(|| {
+            (
+                request.clone(),
+                chrono::Utc::now(),
+                std::time::Instant::now(),
+            )
+        });
 
         let result = async move {
             let Some(routing) = &self.routing else {
@@ -689,6 +864,23 @@ impl CompletionModel for SpacebotModel {
                 .add(extended, &self.full_model_name, &self.provider, cost);
         }
 
+        if let Some((request, started_at, clock)) = capture {
+            let (response, usage) = match &result {
+                Ok(response) => (
+                    response_ref_from_choice(&response.choice),
+                    self.usage_ref(&response.raw_response.body),
+                ),
+                Err(error) => (
+                    crate::llm::record::ResponseRef {
+                        error: Some(error.to_string()),
+                        ..Default::default()
+                    },
+                    crate::llm::record::UsageRef::default(),
+                ),
+            };
+            self.record_request(&request, started_at, clock.elapsed(), response, usage);
+        }
+
         result
     }
 
@@ -697,6 +889,20 @@ impl CompletionModel for SpacebotModel {
         mut request: CompletionRequest,
     ) -> Result<StreamingCompletionResponse<RawStreamingResponse>, CompletionError> {
         self.repair_request_history(&mut request)?;
+
+        // A streamed response is assembled by the caller as it arrives, so the
+        // record is written for the request alone and its response stays
+        // empty. The prompt is the part that cannot be recovered afterwards —
+        // what the model said is in the transcript either way.
+        if self.active_record_store().is_some() {
+            self.record_request(
+                &request,
+                chrono::Utc::now(),
+                std::time::Duration::ZERO,
+                crate::llm::record::ResponseRef::default(),
+                crate::llm::record::UsageRef::default(),
+            );
+        }
 
         let provider_config = self.provider_config_for_current_model().await?;
 

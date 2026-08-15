@@ -26,6 +26,7 @@ pub mod notifications;
 mod opencode_proxy;
 pub mod portal;
 pub mod projects;
+pub mod prompts;
 pub mod providers;
 pub mod secrets;
 mod server;
