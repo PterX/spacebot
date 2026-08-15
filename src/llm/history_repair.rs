@@ -155,16 +155,24 @@ fn bounded_result_text(result: &ToolResult) -> String {
             ToolResultContent::Text(value) => text.push_str(&value.text),
             ToolResultContent::Image(_) => text.push_str("[historical image result omitted]"),
         }
-        if text.chars().count() >= MAX_UNTRUSTED_RESULT_CHARS {
+        // A string shorter in bytes than the limit cannot exceed it in
+        // characters, so the count only runs once there is enough text to
+        // matter — a tool result can carry many items and be very long.
+        if text.len() >= MAX_UNTRUSTED_RESULT_CHARS
+            && text.chars().count() >= MAX_UNTRUSTED_RESULT_CHARS
+        {
             break;
         }
     }
 
-    let mut bounded: String = text.chars().take(MAX_UNTRUSTED_RESULT_CHARS).collect();
-    if text.chars().count() > MAX_UNTRUSTED_RESULT_CHARS {
-        bounded.push_str("…[truncated]");
+    match text.char_indices().nth(MAX_UNTRUSTED_RESULT_CHARS) {
+        Some((cut, _)) => {
+            let mut bounded = text[..cut].to_string();
+            bounded.push_str("…[truncated]");
+            bounded
+        }
+        None => text,
     }
-    bounded
 }
 
 /// Rewrite a result as delimited historical data.

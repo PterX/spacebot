@@ -221,6 +221,24 @@ impl SpacebotModel {
         true
     }
 
+    /// Record how a tool-history retry ended, for both request paths.
+    fn record_tool_history_recovery(&self, succeeded: bool) {
+        #[cfg(feature = "metrics")]
+        crate::telemetry::Metrics::global()
+            .tool_history_recovery_total
+            .with_label_values(&[
+                self.agent_id.as_deref().unwrap_or("unknown"),
+                if succeeded {
+                    "retry_success"
+                } else {
+                    "terminal_failure"
+                },
+            ])
+            .inc();
+        #[cfg(not(feature = "metrics"))]
+        let _ = succeeded;
+    }
+
     /// Direct call to the provider (no fallback logic).
     async fn attempt_completion(
         &self,
@@ -416,13 +434,16 @@ impl SpacebotModel {
     }
 
     /// Run a prepared request through routing, retries and the fallback chain.
+    ///
+    /// Borrows the request: `attempt_with_retries` clones per attempt, so only
+    /// the unrouted path below needs a copy of its own.
     async fn dispatch_completion(
         &self,
-        request: CompletionRequest,
+        request: &CompletionRequest,
     ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
         let Some(routing) = &self.routing else {
             // No routing config — just call the model directly, no fallback/retry
-            return self.attempt_completion(request).await;
+            return self.attempt_completion(request.clone()).await;
         };
 
         let cooldown = routing.rate_limit_cooldown_secs;
@@ -448,7 +469,7 @@ impl SpacebotModel {
             );
         } else {
             match self
-                .attempt_with_retries(&self.full_model_name, &request)
+                .attempt_with_retries(&self.full_model_name, request)
                 .await
             {
                 Ok(response) => return Ok(response),
@@ -505,7 +526,7 @@ impl SpacebotModel {
                 continue;
             }
 
-            match self.attempt_with_retries(fallback_name, &request).await {
+            match self.attempt_with_retries(fallback_name, request).await {
                 Ok(response) => {
                     tracing::info!(
                         original = %self.full_model_name,
@@ -588,7 +609,7 @@ impl CompletionModel for SpacebotModel {
 
         self.repair_request_history(&mut request)?;
 
-        let mut result = self.dispatch_completion(request.clone()).await;
+        let mut result = self.dispatch_completion(&request).await;
 
         // A mismatch that survives the pre-send repair is the other half of the
         // protocol: an assistant call nothing answers, which no result-side
@@ -598,20 +619,8 @@ impl CompletionModel for SpacebotModel {
             && routing::is_tool_history_mismatch_error(&error.to_string())
             && self.escalate_tool_history_repair(&mut request)
         {
-            result = self.dispatch_completion(request).await;
-
-            #[cfg(feature = "metrics")]
-            crate::telemetry::Metrics::global()
-                .tool_history_recovery_total
-                .with_label_values(&[
-                    self.agent_id.as_deref().unwrap_or("unknown"),
-                    if result.is_ok() {
-                        "retry_success"
-                    } else {
-                        "terminal_failure"
-                    },
-                ])
-                .inc();
+            result = self.dispatch_completion(&request).await;
+            self.record_tool_history_recovery(result.is_ok());
         }
 
         #[cfg(feature = "metrics")]
@@ -754,6 +763,30 @@ impl CompletionModel for SpacebotModel {
     ) -> Result<StreamingCompletionResponse<RawStreamingResponse>, CompletionError> {
         self.repair_request_history(&mut request)?;
 
+        let mut result = self.dispatch_stream(request.clone()).await;
+
+        // The channel agent streams, so it needs the same escalation as the
+        // non-streaming path. A provider rejects an assistant call nothing
+        // answers while opening the stream, before any token is yielded, so the
+        // repaired history can still be sent once more.
+        if let Err(ref error) = result
+            && routing::is_tool_history_mismatch_error(&error.to_string())
+            && self.escalate_tool_history_repair(&mut request)
+        {
+            result = self.dispatch_stream(request).await;
+            self.record_tool_history_recovery(result.is_ok());
+        }
+
+        result
+    }
+}
+
+impl SpacebotModel {
+    /// Open a stream against whichever provider the current model belongs to.
+    async fn dispatch_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<StreamingCompletionResponse<RawStreamingResponse>, CompletionError> {
         let provider_config = self.provider_config_for_current_model().await?;
 
         match provider_config.api_type {
