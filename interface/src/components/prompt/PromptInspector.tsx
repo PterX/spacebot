@@ -1,4 +1,11 @@
-import {useCallback, useEffect, useMemo, useRef, useState} from "react";
+import {
+	useCallback,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 import {useQuery} from "@tanstack/react-query";
 import {cx} from "class-variance-authority";
 import {Check, Copy, X} from "@phosphor-icons/react";
@@ -14,6 +21,8 @@ import {
 	LAYER_STYLES,
 	SOURCE_LABEL,
 	STABILITY_LABEL,
+	byteLength,
+	byteSlicer,
 	formatCost,
 	formatTokens,
 	isJoinery,
@@ -179,7 +188,7 @@ function InspectorHeader({
 			)}
 
 			{!captureEnabled && (
-				<span className="rounded-md bg-amber-500/10 px-2 py-1 text-tiny text-amber-300">
+				<span className="rounded-md bg-block-working/10 px-2 py-1 text-tiny text-block-working">
 					Capture off
 				</span>
 			)}
@@ -234,7 +243,7 @@ function Metric({
 	accent?: boolean;
 }) {
 	return (
-		<span className={accent ? "text-emerald-300" : "text-ink-dull"}>
+		<span className={accent ? "text-block-knowledge" : "text-ink-dull"}>
 			<span className="text-ink-faint">{label} </span>
 			{value}
 		</span>
@@ -376,22 +385,33 @@ type Row =
 
 function RecordView({record}: {record: PromptRecord}) {
 	const scrollRef = useRef<HTMLDivElement>(null);
+	const contentRef = useRef<HTMLDivElement>(null);
 	const rowRefs = useRef<Record<string, HTMLDivElement | null>>({});
 
 	const {text, blocks} = record.system;
 
-	const visibleBlocks = useMemo(
-		() => blocks.filter((block) => !isJoinery(block, text)),
-		[blocks, text],
-	);
-
-	const totalBytes = text.length || 1;
+	// Block ranges are byte offsets, so the prompt is sliced as bytes once and
+	// the results reused — see `byteSlicer`.
+	const {visibleBlocks, blockText, totalBytes} = useMemo(() => {
+		const slice = byteSlicer(text);
+		const sliced = blocks.map((block) => slice(block.start, block.end));
+		return {
+			visibleBlocks: blocks.filter((_, index) => !isJoinery(sliced[index]!)),
+			blockText: new Map(
+				blocks.map((block, index) => [
+					`${block.id}-${block.start}`,
+					sliced[index]!,
+				]),
+			),
+			totalBytes: byteLength(text) || 1,
+		};
+	}, [blocks, text]);
 
 	const rows = useMemo<Row[]>(() => {
 		const result: Row[] = visibleBlocks.map((block) => ({
 			kind: "block" as const,
 			block,
-			text: text.slice(block.start, block.end),
+			text: blockText.get(`${block.id}-${block.start}`) ?? "",
 			share: (block.end - block.start) / totalBytes,
 		}));
 
@@ -438,16 +458,27 @@ function RecordView({record}: {record: PromptRecord}) {
 		rowRefs.current[id]?.scrollIntoView({behavior: "smooth", block: "start"});
 	}, []);
 
+	const rowKeys = useMemo(
+		() =>
+			rows.map((row) =>
+				row.kind === "block" ? `${row.block.id}-${row.block.start}` : row.id,
+			),
+		[rows],
+	);
+
+	const segments = useDocumentMap(scrollRef, contentRef, rowKeys, rowRefs);
+
 	return (
 		<div className="flex min-w-0 flex-1">
 			<Minimap
-				blocks={visibleBlocks}
-				totalBytes={totalBytes}
+				rows={rows}
+				segments={segments}
 				scrollRef={scrollRef}
 				onJump={scrollTo}
 			/>
 
 			<div ref={scrollRef} className="min-w-0 flex-1 overflow-y-auto">
+				<div ref={contentRef}>
 				{rows.map((row) =>
 					row.kind === "block" ? (
 						<BlockSection
@@ -476,26 +507,81 @@ function RecordView({record}: {record: PromptRecord}) {
 						</SectionDivider>
 					),
 				)}
+				</div>
 			</div>
 		</div>
 	);
 }
 
 /**
- * A proportional map of the assembled prompt. Blocks tile it exactly, so the
- * bars add up to the whole prompt rather than approximating it.
+ * Measure where each section actually sits in the laid-out document.
+ *
+ * A block's share of the prompt's bytes is not its share of the rendered
+ * height — a 26-character block still costs a header row and padding — so a
+ * map drawn from byte shares drifts further from the scrollbar the further
+ * down it goes. Measuring the real layout is what keeps the two in step, and
+ * it lets the map cover the tool and message sections the prompt blocks do
+ * not describe.
+ */
+function useDocumentMap(
+	scrollRef: React.RefObject<HTMLDivElement | null>,
+	contentRef: React.RefObject<HTMLDivElement | null>,
+	rowKeys: string[],
+	rowRefs: React.RefObject<Record<string, HTMLDivElement | null>>,
+): Map<string, {top: number; height: number}> {
+	const [segments, setSegments] = useState<
+		Map<string, {top: number; height: number}>
+	>(new Map());
+
+	useLayoutEffect(() => {
+		const scroller = scrollRef.current;
+		const content = contentRef.current;
+		if (!scroller || !content) return;
+
+		const measure = () => {
+			const total = scroller.scrollHeight;
+			if (!total) return;
+			const origin = scroller.getBoundingClientRect().top - scroller.scrollTop;
+
+			const next = new Map<string, {top: number; height: number}>();
+			for (const key of rowKeys) {
+				const node = rowRefs.current[key];
+				if (!node) continue;
+				const rect = node.getBoundingClientRect();
+				next.set(key, {
+					top: (rect.top - origin) / total,
+					height: rect.height / total,
+				});
+			}
+			setSegments(next);
+		};
+
+		measure();
+		const observer = new ResizeObserver(measure);
+		observer.observe(content);
+		observer.observe(scroller);
+		return () => observer.disconnect();
+	}, [scrollRef, contentRef, rowKeys, rowRefs]);
+
+	return segments;
+}
+
+/**
+ * A scaled-down view of the document, drawn from measured layout rather than
+ * byte shares so it stays in step with the scrollbar at every depth.
  */
 function Minimap({
-	blocks,
-	totalBytes,
+	rows,
+	segments,
 	scrollRef,
 	onJump,
 }: {
-	blocks: PromptBlock[];
-	totalBytes: number;
+	rows: Row[];
+	segments: Map<string, {top: number; height: number}>;
 	scrollRef: React.RefObject<HTMLDivElement | null>;
 	onJump: (id: string) => void;
 }) {
+	const railRef = useRef<HTMLDivElement>(null);
 	const [viewport, setViewport] = useState<{top: number; height: number} | null>(
 		null,
 	);
@@ -526,43 +612,89 @@ function Minimap({
 		};
 	}, [scrollRef]);
 
-	// Without a block map there is nothing to map. The reading column still
-	// shows the prompt, so a rail of nothing would only mislead.
-	if (blocks.length === 0) return null;
+	/** Drag or click anywhere on the rail to scroll to that depth. */
+	const seek = useCallback(
+		(clientY: number) => {
+			const rail = railRef.current;
+			const scroller = scrollRef.current;
+			if (!rail || !scroller) return;
+			const rect = rail.getBoundingClientRect();
+			const fraction = (clientY - rect.top) / (rect.height || 1);
+			const target =
+				fraction * scroller.scrollHeight - scroller.clientHeight / 2;
+			scroller.scrollTo({top: Math.max(0, target)});
+		},
+		[scrollRef],
+	);
+
+	if (segments.size === 0) return null;
 
 	return (
-		<div className="relative w-11 flex-shrink-0 border-r border-app-line/40 bg-app-dark-box/50 py-2">
-			<div className="flex h-full min-h-0 flex-col gap-px px-2">
-				{blocks.map((block) => {
-					const share = (block.end - block.start) / totalBytes;
-					return (
-						<button
-							key={`${block.id}-${block.start}`}
-							type="button"
-							title={`${block.id} — ${block.chars.toLocaleString()} chars`}
-							onClick={() => onJump(`${block.id}-${block.start}`)}
-							style={{flexGrow: Math.max(share, 0.002), flexBasis: 0}}
-							className={cx(
-								"min-h-[2px] w-full rounded-[2px] opacity-70 transition-opacity hover:opacity-100",
-								LAYER_STYLES[block.layer].swatch,
-							)}
-						/>
-					);
-				})}
-			</div>
+		<div
+			ref={railRef}
+			className="relative w-11 flex-shrink-0 cursor-pointer border-r border-app-line/40 bg-app-dark-box/50"
+			onPointerDown={(event) => {
+				event.currentTarget.setPointerCapture(event.pointerId);
+				seek(event.clientY);
+			}}
+			onPointerMove={(event) => {
+				if (event.buttons === 1) seek(event.clientY);
+			}}
+		>
+			{rows.map((row) => {
+				const key =
+					row.kind === "block" ? `${row.block.id}-${row.block.start}` : row.id;
+				const segment = segments.get(key);
+				if (!segment) return null;
+				return (
+					<button
+						key={key}
+						type="button"
+						title={
+							row.kind === "block"
+								? `${row.block.id} — ${row.block.chars.toLocaleString()} chars`
+								: row.label
+						}
+						onClick={(event) => {
+							event.stopPropagation();
+							onJump(key);
+						}}
+						style={{
+							top: `${segment.top * 100}%`,
+							// A hairline off the bottom separates neighbours without
+							// moving any bar off the depth it maps to.
+							height: `max(2px, calc(${segment.height * 100}% - 1px))`,
+						}}
+						className={cx(
+							"absolute inset-x-2 rounded-[2px] opacity-70 transition-opacity hover:opacity-100",
+							row.kind === "block"
+								? LAYER_STYLES[row.block.layer].swatch
+								: SECTION_SWATCH[row.id] ?? "bg-ink-faint/40",
+						)}
+					/>
+				);
+			})}
 
 			{viewport && (
 				<div
-					className="pointer-events-none absolute inset-x-0 rounded-sm border border-ink/25 bg-ink/5"
+					className="pointer-events-none absolute inset-x-0 rounded-sm border border-ink/30 bg-ink/10"
 					style={{
 						top: `${viewport.top * 100}%`,
-						height: `${Math.max(viewport.height * 100, 2)}%`,
+						height: `${Math.max(viewport.height * 100, 1.5)}%`,
 					}}
 				/>
 			)}
 		</div>
 	);
 }
+
+/** Sections below the assembled prompt get their own marks on the map. */
+const SECTION_SWATCH: Record<string, string> = {
+	system: "bg-block-contract",
+	tools: "bg-block-tools",
+	messages: "bg-ink-faint/50",
+	response: "bg-accent",
+};
 
 function BlockSection({
 	row,
@@ -629,7 +761,7 @@ function ToolList({record}: {record: PromptRecord}) {
 			{record.tools.map((tool) => (
 				<div key={tool.name} className="px-4 py-2">
 					<div className="flex items-baseline gap-2">
-						<span className="font-mono text-tiny font-medium text-cyan-300">
+						<span className="font-mono text-tiny font-medium text-block-tools">
 							{tool.name}
 						</span>
 						<span className="ml-auto text-tiny text-ink-faint">
@@ -682,7 +814,7 @@ function ResponseView({record}: {record: PromptRecord}) {
 					{response.tool_calls.map((name, index) => (
 						<span
 							key={`${name}-${index}`}
-							className="rounded bg-blue-500/15 px-1.5 py-0.5 font-mono text-tiny text-blue-300"
+							className="rounded bg-block-capabilities/15 px-1.5 py-0.5 font-mono text-tiny text-block-capabilities"
 						>
 							{name}
 						</span>

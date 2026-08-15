@@ -1,9 +1,4 @@
-import type {
-	BlockLayer,
-	BlockSource,
-	BlockStability,
-	PromptBlock,
-} from "@/api/client";
+import type {BlockLayer, BlockSource, BlockStability} from "@/api/client";
 
 /**
  * One colour per composition layer, held constant across every process type
@@ -16,45 +11,45 @@ export const LAYER_STYLES: Record<
 > = {
 	identity: {
 		label: "Identity",
-		rule: "bg-violet-400",
-		swatch: "bg-violet-400",
-		text: "text-violet-300",
-		tint: "bg-violet-500/[0.06]",
+		rule: "bg-block-identity",
+		swatch: "bg-block-identity",
+		text: "text-block-identity",
+		tint: "bg-block-identity/[0.06]",
 	},
 	contract: {
 		label: "Contract",
-		rule: "bg-zinc-500",
-		swatch: "bg-zinc-500",
-		text: "text-zinc-300",
+		rule: "bg-block-contract",
+		swatch: "bg-block-contract",
+		text: "text-block-contract",
 		tint: "bg-transparent",
 	},
 	capabilities: {
 		label: "Capabilities",
-		rule: "bg-blue-400",
-		swatch: "bg-blue-400",
-		text: "text-blue-300",
-		tint: "bg-blue-500/[0.06]",
+		rule: "bg-block-capabilities",
+		swatch: "bg-block-capabilities",
+		text: "text-block-capabilities",
+		tint: "bg-block-capabilities/[0.06]",
 	},
 	knowledge: {
 		label: "Knowledge",
-		rule: "bg-emerald-400",
-		swatch: "bg-emerald-400",
-		text: "text-emerald-300",
-		tint: "bg-emerald-500/[0.06]",
+		rule: "bg-block-knowledge",
+		swatch: "bg-block-knowledge",
+		text: "text-block-knowledge",
+		tint: "bg-block-knowledge/[0.06]",
 	},
 	working: {
 		label: "Working",
-		rule: "bg-amber-400",
-		swatch: "bg-amber-400",
-		text: "text-amber-300",
-		tint: "bg-amber-500/[0.06]",
+		rule: "bg-block-working",
+		swatch: "bg-block-working",
+		text: "text-block-working",
+		tint: "bg-block-working/[0.06]",
 	},
 	runtime: {
 		label: "Runtime",
-		rule: "bg-rose-400",
-		swatch: "bg-rose-400",
-		text: "text-rose-300",
-		tint: "bg-rose-500/[0.06]",
+		rule: "bg-block-runtime",
+		swatch: "bg-block-runtime",
+		text: "text-block-runtime",
+		tint: "bg-block-runtime/[0.06]",
 	},
 };
 
@@ -83,12 +78,31 @@ export const SOURCE_LABEL: Record<BlockSource, string> = {
 };
 
 /**
+ * Slice a prompt by the byte offsets a block carries.
+ *
+ * Block ranges are byte offsets into the UTF-8 prompt, while a JavaScript
+ * string indexes UTF-16 code units. The two agree only until the first
+ * non-ASCII character, after which slicing the string directly drifts further
+ * wrong with every multi-byte character above it — so the bytes are sliced as
+ * bytes and decoded back.
+ */
+export function byteSlicer(text: string): (start: number, end: number) => string {
+	const bytes = new TextEncoder().encode(text);
+	const decoder = new TextDecoder();
+	return (start, end) => decoder.decode(bytes.subarray(start, end));
+}
+
+export function byteLength(text: string): number {
+	return new TextEncoder().encode(text).length;
+}
+
+/**
  * Template prose that is only whitespace exists to keep the block map tiling
  * the prompt exactly. It carries nothing to read, so the block list hides it
  * while the map still counts its bytes.
  */
-export function isJoinery(block: PromptBlock, text: string): boolean {
-	return text.slice(block.start, block.end).trim().length === 0;
+export function isJoinery(text: string): boolean {
+	return text.trim().length === 0;
 }
 
 export function formatTokens(tokens: number): string {
@@ -108,16 +122,16 @@ export function processKindStyle(kind: string): string {
 		case "channel":
 			return "bg-accent/15 text-accent";
 		case "branch":
-			return "bg-violet-500/15 text-violet-300";
+			return "bg-block-identity/15 text-block-identity";
 		case "worker":
-			return "bg-blue-500/15 text-blue-300";
+			return "bg-block-capabilities/15 text-block-capabilities";
 		case "compactor":
-			return "bg-cyan-500/15 text-cyan-300";
+			return "bg-block-tools/15 text-block-tools";
 		case "chronicle":
 		case "chronicle_rollup":
-			return "bg-teal-500/15 text-teal-300";
+			return "bg-block-knowledge/15 text-block-knowledge";
 		case "cortex":
-			return "bg-emerald-500/15 text-emerald-300";
+			return "bg-block-working/15 text-block-working";
 		default:
 			return "bg-app-hover text-ink-dull";
 	}
