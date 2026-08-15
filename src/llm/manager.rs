@@ -44,6 +44,67 @@ pub struct LlmManager {
     openai_oauth_credentials: RwLock<Option<OpenAiOAuthCredentials>>,
     /// Cached GitHub Copilot API token (exchanged from PAT, refreshed lazily).
     copilot_token: RwLock<Option<CopilotToken>>,
+    /// What each model's requests are allowed to grow to.
+    ///
+    /// Lives here because every `SpacebotModel` already shares this manager, so
+    /// a ceiling learned by one run applies to the next without threading it
+    /// through fifteen construction sites.
+    context_ceilings: ArcSwap<ContextCeilings>,
+}
+
+/// What a request is allowed to grow to, per model.
+///
+/// A published context window is not what a backend enforces: the same model
+/// answers to a different ceiling depending on which API it is reached through,
+/// and that ceiling moves without notice. `default` is the configured fallback;
+/// `learned` holds what a provider has demonstrated by refusing a request of
+/// known size.
+#[derive(Debug, Default, Clone)]
+pub struct ContextCeilings {
+    pub default: Option<usize>,
+    pub learned: HashMap<String, usize>,
+}
+
+impl ContextCeilings {
+    /// What this model's requests must fit inside, if anything is known.
+    ///
+    /// A refusal only ever tightens: it proves the ceiling sits below the size
+    /// refused and says nothing about whether the configured window was too
+    /// generous, so the smaller of the two is what a request has to fit.
+    pub fn ceiling_for(&self, full_model_name: &str) -> Option<usize> {
+        match (self.learned.get(full_model_name).copied(), self.default) {
+            (Some(learned), Some(default)) => Some(learned.min(default)),
+            (learned, default) => learned.or(default),
+        }
+    }
+
+    /// Fold a rejection of `estimated_tokens` into the ceilings.
+    ///
+    /// Returns `None` when nothing was learned: a rejection at or above what is
+    /// already known says nothing new, so only a smaller one tightens the
+    /// ceiling. Moving in one direction keeps a single unlucky large request
+    /// from undoing a limit that was correctly discovered.
+    pub fn with_overflow(&self, full_model_name: &str, estimated_tokens: usize) -> Option<Self> {
+        // Back off from the refused size rather than sitting on the boundary,
+        // since the estimate is approximate in both directions.
+        let ceiling = estimated_tokens.saturating_mul(9) / 10;
+        if ceiling == 0 {
+            return None;
+        }
+        if self
+            .ceiling_for(full_model_name)
+            .is_some_and(|known| known <= ceiling)
+        {
+            return None;
+        }
+
+        let mut learned = self.learned.clone();
+        learned.insert(full_model_name.to_string(), ceiling);
+        Some(Self {
+            default: self.default,
+            learned,
+        })
+    }
 }
 
 impl LlmManager {
@@ -62,6 +123,7 @@ impl LlmManager {
             anthropic_oauth_credentials: RwLock::new(None),
             openai_oauth_credentials: RwLock::new(None),
             copilot_token: RwLock::new(None),
+            context_ceilings: ArcSwap::from_pointee(ContextCeilings::default()),
         })
     }
 
@@ -142,7 +204,61 @@ impl LlmManager {
             anthropic_oauth_credentials: RwLock::new(anthropic_oauth_credentials),
             openai_oauth_credentials: RwLock::new(openai_oauth_credentials),
             copilot_token: RwLock::new(copilot_token),
+            context_ceilings: ArcSwap::from_pointee(ContextCeilings::default()),
         })
+    }
+
+    /// The configured fallback ceiling, applied to any model with nothing learned.
+    ///
+    /// Read-modify-write under `rcu`: a refusal recorded by a request in flight
+    /// must not be dropped by this write, and vice versa.
+    pub fn set_default_context_ceiling(&self, tokens: usize) {
+        self.context_ceilings.rcu(|current| ContextCeilings {
+            default: Some(tokens),
+            learned: current.learned.clone(),
+        });
+    }
+
+    /// What this model's requests must fit inside, if anything is known.
+    pub fn context_ceiling(&self, full_model_name: &str) -> Option<usize> {
+        self.context_ceilings.load().ceiling_for(full_model_name)
+    }
+
+    /// Record that a request of this size was refused for exceeding the window.
+    ///
+    /// The refusal is the only trustworthy measurement available: it proves the
+    /// ceiling sits below `estimated_tokens`. Following the lowest observed
+    /// refusal means a backend that silently tightens its limit is tracked
+    /// rather than fought.
+    /// Read-modify-write under `rcu`, so two models learning at once cannot
+    /// drop each other's ceiling and a stale copy cannot widen a tighter one.
+    /// The closure can run more than once, which is safe: `with_overflow` is a
+    /// pure function of the state it is handed.
+    pub fn note_context_overflow(&self, full_model_name: &str, estimated_tokens: usize) {
+        let mut learned: Option<usize> = None;
+        self.context_ceilings.rcu(|current| {
+            match current.with_overflow(full_model_name, estimated_tokens) {
+                Some(updated) => {
+                    learned = updated.ceiling_for(full_model_name);
+                    updated
+                }
+                None => {
+                    learned = None;
+                    (**current).clone()
+                }
+            }
+        });
+        let Some(ceiling) = learned else {
+            return;
+        };
+
+        tracing::warn!(
+            model = %full_model_name,
+            rejected_at = estimated_tokens,
+            ceiling,
+            "provider refused a request for exceeding its context window; \
+             lowering the ceiling for this model"
+        );
     }
 
     /// Atomically swap in new provider credentials.
@@ -480,5 +596,120 @@ impl LlmManager {
             .write()
             .await
             .retain(|_, limited_at| limited_at.elapsed().as_secs() < cooldown_secs);
+    }
+}
+
+#[cfg(test)]
+mod context_ceiling_tests {
+    use super::ContextCeilings;
+
+    #[test]
+    fn nothing_is_enforced_until_a_ceiling_is_known() {
+        let ceilings = ContextCeilings::default();
+        assert_eq!(ceilings.ceiling_for("openai-chatgpt/gpt-5.6-sol"), None);
+    }
+
+    #[test]
+    fn the_configured_default_applies_to_every_model() {
+        let ceilings = ContextCeilings {
+            default: Some(128_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            ceilings.ceiling_for("openai-chatgpt/gpt-5.6-sol"),
+            Some(128_000)
+        );
+        assert_eq!(ceilings.ceiling_for("anything/else"), Some(128_000));
+    }
+
+    /// The case that killed two workers: the backend enforced far less than the
+    /// model advertises, and the only way to find out was to be refused.
+    #[test]
+    fn a_refusal_teaches_the_ceiling_for_that_model_alone() {
+        let ceilings = ContextCeilings {
+            default: Some(1_050_000),
+            ..Default::default()
+        };
+
+        let learned = ceilings
+            .with_overflow("openai-chatgpt/gpt-5.6-sol", 257_963)
+            .expect("a refusal teaches something");
+
+        let ceiling = learned
+            .ceiling_for("openai-chatgpt/gpt-5.6-sol")
+            .expect("learned");
+        assert!(
+            ceiling < 257_963,
+            "the ceiling must sit below the size that was refused"
+        );
+        assert_eq!(ceiling, 232_166);
+
+        // Every other model keeps the configured default.
+        assert_eq!(
+            learned.ceiling_for("anthropic/claude-sonnet-4"),
+            Some(1_050_000)
+        );
+    }
+
+    /// A backend that tightens again must be followed down, and one that
+    /// happens to refuse a larger request must not undo what was learned.
+    #[test]
+    fn the_ceiling_only_ever_moves_down() {
+        let ceilings = ContextCeilings {
+            default: Some(400_000),
+            ..Default::default()
+        };
+
+        let first = ceilings.with_overflow("m", 300_000).expect("learned");
+        let learned = first.ceiling_for("m").expect("learned");
+
+        assert!(
+            first.with_overflow("m", 350_000).is_none(),
+            "a larger refusal says nothing new"
+        );
+
+        let tighter = first.with_overflow("m", 200_000).expect("tightened");
+        assert!(tighter.ceiling_for("m").expect("learned") < learned);
+    }
+
+    /// A refusal proves the ceiling sits below the size refused. It proves
+    /// nothing about a configured window being too small, so it must never
+    /// raise one — with the shipped default of 128,000, a refusal at 257,963
+    /// would otherwise learn 232,166 and start sending far more than the
+    /// operator asked for.
+    #[test]
+    fn a_refusal_cannot_raise_the_configured_ceiling() {
+        let ceilings = ContextCeilings {
+            default: Some(128_000),
+            ..Default::default()
+        };
+
+        assert!(
+            ceilings
+                .with_overflow("openai-chatgpt/gpt-5.6-sol", 257_963)
+                .is_none(),
+            "a refusal above the configured ceiling says nothing new"
+        );
+
+        // One below it still tightens, and stays tightened when the default is
+        // later raised.
+        let learned = ceilings.with_overflow("m", 100_000).expect("tightened");
+        assert_eq!(learned.ceiling_for("m"), Some(90_000));
+
+        let raised = ContextCeilings {
+            default: Some(1_050_000),
+            learned: learned.learned.clone(),
+        };
+        assert_eq!(raised.ceiling_for("m"), Some(90_000));
+        assert_eq!(raised.ceiling_for("untouched"), Some(1_050_000));
+    }
+
+    #[test]
+    fn a_nonsense_refusal_is_ignored() {
+        let ceilings = ContextCeilings {
+            default: Some(128_000),
+            ..Default::default()
+        };
+        assert!(ceilings.with_overflow("m", 0).is_none());
     }
 }

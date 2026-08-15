@@ -340,28 +340,30 @@ export function PortalTimeline({
 		refetchInterval: 2000,
 	});
 
-	const conversationWorkers = (workersQuery.data?.workers ?? []).filter(
-		(w) => w.channel_id === conversationId,
+	// The workers query is a page of the agent's most recent workers, not this
+	// conversation's full set, so it cannot decide which rows exist. It only
+	// enriches the rows the timeline already carries; `renderTimelineItem`
+	// falls back to `synthesizeWorker` for any worker outside the page.
+	const conversationWorkers = useMemo(
+		() =>
+			(workersQuery.data?.workers ?? []).filter(
+				(worker) => worker.channel_id === conversationId,
+			),
+		[workersQuery.data, conversationId],
 	);
-	const workerIds = new Set(conversationWorkers.map((w) => w.id));
-
-	const visibleItems = timeline.filter((item) => {
-		if (item.type !== "worker_run") return true;
-		return workerIds.has(item.id);
-	});
 
 	const rows: TimelineRow[] = useMemo(() => {
-		const list: TimelineRow[] = visibleItems.map((item) => ({
+		const list: TimelineRow[] = timeline.map((item) => ({
 			kind: "item",
 			item,
 		}));
-		if (conversationCreatedAt && visibleItems.length > 0) {
+		if (conversationCreatedAt && timeline.length > 0) {
 			list.unshift({kind: "conversation_start", createdAt: conversationCreatedAt});
 		}
 		if (isTyping) list.push({kind: "typing"});
 		list.push({kind: "spacer"});
 		return list;
-	}, [conversationCreatedAt, visibleItems, isTyping]);
+	}, [conversationCreatedAt, timeline, isTyping]);
 
 	useEffect(() => {
 		if (sendCount === 0) return;

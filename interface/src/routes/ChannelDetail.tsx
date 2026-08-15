@@ -468,6 +468,13 @@ export function ChannelDetail({
 	// paint, and the timeline keeps growing after the first render, so hold the
 	// bottom across a few frames each time. Once the reader scrolls up, their
 	// position is left alone.
+	//
+	// The channel counts as opened on the first pin, not after the frame loop
+	// finishes: rowCount changes on nearly every commit while history streams,
+	// and the cleanup cancels the pending frame each time, so a loop that only
+	// records itself at the end never gets there. Leaving it unrecorded holds
+	// `opening` true, which skips the distance check below and drags the reader
+	// back to the bottom on every update.
 	useEffect(() => {
 		if (rowCount === 0) return;
 		const opening = openedChannelRef.current !== channelId;
@@ -477,11 +484,10 @@ export function ChannelDetail({
 		let attempts = 0;
 		const pinToEnd = () => {
 			chatRef.current?.scrollToEnd({behavior: "auto"});
+			openedChannelRef.current = channelId;
 			attempts += 1;
 			if (attempts < 12) {
 				frame = requestAnimationFrame(pinToEnd);
-			} else {
-				openedChannelRef.current = channelId;
 			}
 		};
 		frame = requestAnimationFrame(pinToEnd);

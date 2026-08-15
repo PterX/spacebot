@@ -697,9 +697,26 @@ async fn render_task_state(
         }
 
         any = true;
+
+        // What has already been tried on these tasks, in one query. A run that
+        // cannot see prior attempts repeats failed work and never escalates.
+        let numbers: Vec<i64> = visible.iter().map(|task| task.task_number).collect();
+        let attempts = deps
+            .task_store
+            .prior_attempt_summaries(&numbers)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "failed to load task attempt history for the board");
+                std::collections::HashMap::new()
+            });
+
         output.push_str(&format!("### {label}\n"));
         for task in visible {
-            output.push_str(&render_task_line(&task, &deps.agent_id));
+            output.push_str(&render_task_line(
+                &task,
+                &deps.agent_id,
+                attempts.get(&task.task_number).map(String::as_str),
+            ));
         }
         output.push('\n');
     }
@@ -710,7 +727,7 @@ async fn render_task_state(
     Ok((output, any))
 }
 
-fn render_task_line(task: &Task, agent_id: &str) -> String {
+fn render_task_line(task: &Task, agent_id: &str, prior_attempts: Option<&str>) -> String {
     let ownership = match task.assigned_agent_id.as_deref() {
         Some(assigned) if assigned == agent_id => String::new(),
         Some(assigned) => format!(" (assigned to {assigned})"),
@@ -749,6 +766,10 @@ fn render_task_line(task: &Task, agent_id: &str) -> String {
     }
     if let Some(parent) = task.stack_parent() {
         line.push_str(&format!(" [stacks on #{parent}]"));
+    }
+    // What has already been tried, so a run does not repeat failed work.
+    if let Some(attempts) = prior_attempts {
+        line.push_str(&format!(" [{attempts}]"));
     }
     line.push('\n');
     line

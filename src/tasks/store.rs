@@ -488,6 +488,7 @@ pub struct UpdateTaskInput {
     pub repo_id: Patch<String>,
     pub worktree_mode: Patch<TaskWorktreeMode>,
     pub worktree_id: Patch<String>,
+    pub goal_id: Patch<String>,
     pub required_skills: Option<Vec<String>>,
     /// Attribution and optimistic-concurrency expectations for this mutation.
     pub context: TaskMutationContext,
@@ -846,6 +847,69 @@ impl TaskStore {
         Ok(Some(task))
     }
 
+    /// Bind tasks to the worktree already carrying their conventional name.
+    ///
+    /// A task provisioned before the binding was recorded has a `task-<number>`
+    /// worktree on disk and no `worktree_id`, so nothing connects the two and a
+    /// retry rediscovers the worktree by name every time. `candidates` is
+    /// `(worktree_name, worktree_id)`; the caller supplies them so this does
+    /// not reach into the project tables.
+    ///
+    /// The binding is inferred from the naming convention rather than observed
+    /// when the worktree was provisioned, and the revision it writes says so —
+    /// that is what keeps an inferred binding distinguishable from a real one.
+    /// Idempotent: a task that already has a binding is never revisited.
+    pub async fn backfill_worktree_bindings(
+        &self,
+        candidates: &[(String, String)],
+    ) -> Result<usize> {
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        let unbound: Vec<i64> = sqlx::query_scalar(
+            "SELECT task_number FROM tasks WHERE worktree_id IS NULL ORDER BY task_number",
+        )
+        .fetch_all(self.pool())
+        .await
+        .context("failed to list tasks without a worktree binding")?;
+
+        let mut bound = 0usize;
+        for task_number in unbound {
+            let name = format!("task-{task_number}");
+            let Some((_, worktree_id)) = candidates.iter().find(|(known, _)| *known == name) else {
+                continue;
+            };
+
+            let context = TaskMutationContext::new(
+                crate::tasks::TaskAuthorKind::System,
+                Some("migration".to_string()),
+                crate::tasks::TaskMutationSource::Migration,
+            )
+            .with_summary(Some(format!(
+                "Bound to the existing {name} worktree by name; inferred from the naming \
+                 convention, not observed when the worktree was provisioned"
+            )));
+
+            let updated = self
+                .update(
+                    task_number,
+                    UpdateTaskInput {
+                        worktree_id: Some(Some(worktree_id.clone())),
+                        context,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+
+            if updated.is_some() {
+                bound += 1;
+            }
+        }
+
+        Ok(bound)
+    }
+
     pub async fn update(&self, task_number: i64, input: UpdateTaskInput) -> Result<Option<Task>> {
         Ok(self
             .update_with_status_transition(task_number, input)
@@ -1056,6 +1120,7 @@ impl TaskStore {
             repo_id: Some(snapshot.repo_id),
             worktree_mode: Some(snapshot.worktree_mode),
             worktree_id: Some(snapshot.worktree_id),
+            goal_id: Some(snapshot.goal_id),
             required_skills: Some(snapshot.required_skills),
             context,
             ..Default::default()
@@ -1310,6 +1375,7 @@ impl TaskStore {
         let next_repo_id = patch(input.repo_id, current.repo_id);
         let next_worktree_mode = patch(input.worktree_mode, current.worktree_mode);
         let next_worktree_id = patch(input.worktree_id, current.worktree_id);
+        let next_goal_id = patch(input.goal_id, current.goal_id);
         let next_required_skills = input.required_skills.unwrap_or(current.required_skills);
         let required_skills_json = serde_json::to_string(&next_required_skills)
             .context("failed to serialize required skills")?;
@@ -1318,7 +1384,7 @@ impl TaskStore {
             "UPDATE tasks SET title = ?, description = ?, status = ?, priority = ?, \
              assigned_agent_id = ?, subtasks = ?, metadata = ?, \
              worker_type = ?, project_id = ?, repo_id = ?, worktree_mode = ?, \
-             worktree_id = ?, required_skills = ?, ",
+             worktree_id = ?, goal_id = ?, required_skills = ?, ",
         );
 
         if clear_worker {
@@ -1358,6 +1424,7 @@ impl TaskStore {
             .bind(&next_repo_id)
             .bind(next_worktree_mode.map(TaskWorktreeMode::as_str))
             .bind(&next_worktree_id)
+            .bind(&next_goal_id)
             .bind(&required_skills_json);
 
         if !clear_worker {
@@ -1381,7 +1448,7 @@ impl TaskStore {
         task_from_row(updated)
     }
 
-    /// Delete a task with its comments and revisions.
+    /// Delete a task with its comments, revisions and run history.
     ///
     /// The child rows are removed explicitly rather than through the foreign
     /// key, which only cascades when `PRAGMA foreign_keys` is on.
@@ -1406,7 +1473,12 @@ impl TaskStore {
             return Ok(false);
         };
 
-        for table in ["task_comments", "task_revisions", "task_dependencies"] {
+        for table in [
+            "task_comments",
+            "task_revisions",
+            "task_dependencies",
+            "task_worker_runs",
+        ] {
             sqlx::query(&format!("DELETE FROM {table} WHERE task_id = ?"))
                 .bind(&task_id)
                 .execute(&mut *tx)
@@ -1756,6 +1828,36 @@ pub(crate) async fn setup_test_store() -> TaskStore {
     .execute(&pool)
     .await
     .expect("task_revisions should be created");
+
+    sqlx::query(
+        "CREATE TABLE task_worker_runs (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            worker_id TEXT NOT NULL,
+            attempt INTEGER NOT NULL,
+            author_type TEXT NOT NULL DEFAULT 'system',
+            author_id TEXT,
+            agent_id TEXT,
+            channel_id TEXT,
+            started_at TIMESTAMP NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            outcome_kind TEXT,
+            outcome_summary TEXT,
+            ended_at TIMESTAMP,
+            UNIQUE (task_id, worker_id),
+            UNIQUE (task_id, attempt)
+        )",
+    )
+    .execute(&pool)
+    .await
+    .expect("task_worker_runs should be created");
+
+    sqlx::query(
+        "CREATE UNIQUE INDEX task_worker_runs_live ON task_worker_runs(task_id) \
+         WHERE ended_at IS NULL",
+    )
+    .execute(&pool)
+    .await
+    .expect("live attempt index should be created");
 
     sqlx::query("INSERT INTO task_number_seq (id, next_number) VALUES (1, 1)")
         .execute(&pool)

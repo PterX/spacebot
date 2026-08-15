@@ -1,5 +1,6 @@
 //! SpacebotModel: Custom CompletionModel implementation that routes through LlmManager.
 
+use crate::agent::compactor::{advance_past_stranded_tool_results, estimate_history_tokens};
 use crate::config::{ApiType, ProviderConfig};
 use crate::llm::manager::LlmManager;
 use crate::llm::routing::{
@@ -64,6 +65,53 @@ pub struct SpacebotModel {
     usage_accumulator: Option<Arc<Mutex<crate::llm::usage::UsageAccumulator>>>,
     record_store: Option<Arc<crate::llm::record::PromptRecordStore>>,
     debug_context: Option<Arc<crate::llm::record::DebugContext>>,
+}
+
+/// Share of the ceiling held back for the model's own response.
+const RESPONSE_RESERVE: f32 = 0.15;
+
+/// Tokens a request spends before any history: system prompt and tool schemas
+/// are charged to the same window.
+/// What the history has to fit inside, given the ceiling and the fixed cost of
+/// the system prompt and tool schemas.
+///
+/// The model needs room to answer, and the preamble and tool definitions are
+/// charged to the same window as the history. The ceiling is the size of a whole
+/// request, so subtracting the overhead here is the only place it is charged.
+fn context_budget(ceiling: usize, overhead: usize) -> usize {
+    let reserve = (ceiling as f32 * RESPONSE_RESERVE) as usize;
+    ceiling.saturating_sub(reserve).saturating_sub(overhead)
+}
+
+fn request_overhead_tokens(request: &CompletionRequest) -> usize {
+    let preamble = request.preamble.as_ref().map_or(0, |text| text.len());
+    let tools: usize = request
+        .tools
+        .iter()
+        .map(|tool| tool.name.len() + tool.description.len() + tool.parameters.to_string().len())
+        .sum();
+    (preamble + tools) / 4
+}
+
+/// Drop the oldest turns until the history fits `budget`, returning how many
+/// messages went.
+///
+/// Cuts a quarter at a time so a history barely over budget does not lose far
+/// more than it needs to, and aligns every cut so a tool result is never left
+/// without the call it answers. Returns 0 when no aligned cut can shrink it,
+/// which the caller reports rather than sending a request it knows will fail.
+fn trim_history_to_budget(history: &mut Vec<rig::message::Message>, budget: usize) -> usize {
+    let mut dropped = 0usize;
+    while estimate_history_tokens(history) > budget && history.len() > 2 {
+        let target = (history.len() / 4).max(1);
+        let cut = advance_past_stranded_tool_results(history, target, history.len() - 2);
+        if cut == 0 {
+            break;
+        }
+        history.drain(..cut);
+        dropped += cut;
+    }
+    dropped
 }
 
 impl SpacebotModel {
@@ -335,50 +383,212 @@ impl SpacebotModel {
         }
     }
 
-    /// Drop tool results this request cannot pair before it reaches a provider.
+    /// Rewrite tool results this request cannot pair before it reaches a
+    /// provider.
     ///
     /// A stranded result is rejected at the API boundary, so the model never
     /// runs and a retry of the same history fails the same way. Repairing here
     /// covers every caller regardless of which trim produced the history, and
-    /// the warning names what went so a cut that keeps stranding results is
+    /// the warning names what changed so a cut that keeps stranding results is
     /// still visible rather than silently absorbed.
-    ///
-    /// A history that repairs to nothing has no request left to send: the
-    /// provider requires at least one message, so this reports the empty
-    /// history rather than spending a call that is certain to be rejected.
     fn repair_request_history(
         &self,
         request: &mut CompletionRequest,
     ) -> Result<(), CompletionError> {
-        let Some((repaired, dropped)) =
+        let Some((repaired, report)) =
             crate::llm::history_repair::repair_orphaned_tool_results(&request.chat_history)
         else {
             return Ok(());
         };
 
         let Ok(chat_history) = OneOrMany::many(repaired) else {
-            tracing::error!(
-                model = %self.full_model_name,
-                dropped,
-                "request history is entirely unpaired tool results"
-            );
             return Err(CompletionError::RequestError(
-                format!("request history is {dropped} unpaired tool results and nothing else")
-                    .into(),
+                "request history repaired to no messages".into(),
             ));
         };
 
         tracing::warn!(
             model = %self.full_model_name,
-            dropped,
-            "dropped tool results with no matching call from request history"
+            orphan_results = report.orphan_results,
+            stale_results = report.stale_results,
+            duplicate_results = report.duplicate_results,
+            "rewrote unpairable tool results as historical text"
         );
+        #[cfg(feature = "metrics")]
+        crate::telemetry::Metrics::global()
+            .tool_history_recovery_total
+            .with_label_values(&[self.agent_id.as_deref().unwrap_or("unknown"), "repaired"])
+            .inc();
+
         request.chat_history = chat_history;
         Ok(())
     }
 
+    /// Trim a request until it fits the ceiling the provider actually enforces.
+    ///
+    /// Every history a request can be built from passes through here: the
+    /// worker's segments, rig's internal tool loop, branches, the cortex. That
+    /// matters because a budget checked anywhere else can be skipped by a loop
+    /// that does not yield. A worker reached 269k tokens against a 128k
+    /// compaction trigger without the trigger ever being evaluated, because the
+    /// whole run happened inside one segment and the check only ran between
+    /// segments. This is the point that cannot be bypassed.
+    ///
+    /// Cutting here is a backstop, not a replacement for compaction: it drops
+    /// the oldest turns outright, where compaction summarises them first. It
+    /// exists so a run degrades instead of dying.
+    /// Returns the size of the request as sent, which is what a refusal
+    /// measures: history plus the system prompt and tool schemas charged to the
+    /// same window. The response reserve is this side's policy and is not part
+    /// of what the provider receives, so it is not counted here.
+    fn enforce_context_ceiling(&self, request: &mut CompletionRequest) -> usize {
+        let overhead = request_overhead_tokens(request);
+        let history_tokens = |request: &CompletionRequest| {
+            estimate_history_tokens(&request.chat_history.iter().cloned().collect::<Vec<_>>())
+        };
+
+        let Some(ceiling) = self.llm_manager.context_ceiling(&self.full_model_name) else {
+            return history_tokens(request) + overhead;
+        };
+
+        let budget = context_budget(ceiling, overhead);
+        let before = history_tokens(request);
+        if budget == 0 {
+            tracing::warn!(
+                model = %self.full_model_name,
+                ceiling,
+                overhead,
+                "the system prompt and tool schemas alone fill the context ceiling; \
+                 sending unchanged so the provider decides"
+            );
+            return before + overhead;
+        }
+        if before <= budget {
+            return before + overhead;
+        }
+
+        let mut history: Vec<rig::message::Message> =
+            request.chat_history.iter().cloned().collect();
+        let dropped = trim_history_to_budget(&mut history, budget);
+
+        if dropped == 0 {
+            tracing::error!(
+                model = %self.full_model_name,
+                estimated = before,
+                budget,
+                "request exceeds the context ceiling and no aligned cut can shrink it"
+            );
+            return before + overhead;
+        }
+
+        let Ok(chat_history) = OneOrMany::many(history) else {
+            return before + overhead;
+        };
+
+        request.chat_history = chat_history;
+        let after = history_tokens(request);
+
+        // The trim runs out of room before the budget when only the two
+        // retained messages are left, and the request goes anyway: the ceiling
+        // is an estimate, and the provider is the one that decides.
+        if after > budget {
+            tracing::warn!(
+                model = %self.full_model_name,
+                ceiling,
+                estimated_after = after,
+                budget,
+                "trimmed as far as an aligned cut allows and the request still \
+                 exceeds the ceiling"
+            );
+        } else {
+            tracing::warn!(
+                model = %self.full_model_name,
+                ceiling,
+                estimated_before = before,
+                estimated_after = after,
+                dropped_messages = dropped,
+                "trimmed request history to fit the model's context ceiling"
+            );
+        }
+        after + overhead
+    }
+
+    /// Repair a history a provider has already rejected, for one retry.
+    ///
+    /// The pre-send pass pairs every result, so a mismatch that survives it is
+    /// the other half of the protocol: an assistant tool call nothing answers,
+    /// which Anthropic rejects and which no result-side repair can reach.
+    /// Returns `false` when nothing changed, so an identical request is never
+    /// sent twice.
+    fn escalate_tool_history_repair(&self, request: &mut CompletionRequest) -> bool {
+        let mut history: Vec<rig::message::Message> =
+            request.chat_history.iter().cloned().collect();
+        let report = crate::llm::history_repair::drop_unanswered_tool_calls(&mut history);
+
+        if !report.changed() {
+            return false;
+        }
+
+        let Ok(chat_history) = OneOrMany::many(history) else {
+            return false;
+        };
+
+        tracing::warn!(
+            model = %self.full_model_name,
+            unanswered_calls = report.unanswered_calls,
+            "dropped unanswered tool calls after a provider rejected the history"
+        );
+        request.chat_history = chat_history;
+        true
+    }
+
+    /// Record how a tool-history retry ended, for both request paths.
+    fn record_tool_history_recovery(&self, succeeded: bool) {
+        #[cfg(feature = "metrics")]
+        crate::telemetry::Metrics::global()
+            .tool_history_recovery_total
+            .with_label_values(&[
+                self.agent_id.as_deref().unwrap_or("unknown"),
+                if succeeded {
+                    "retry_success"
+                } else {
+                    "terminal_failure"
+                },
+            ])
+            .inc();
+        #[cfg(not(feature = "metrics"))]
+        let _ = succeeded;
+    }
+
     /// Direct call to the provider (no fallback logic).
+    ///
+    /// The ceiling is enforced here rather than once at the top of `completion`
+    /// because this is where the model that receives the request is known. A
+    /// fallback attempt builds its own `SpacebotModel`, so trimming higher up
+    /// would size one model's request against another model's limit and record
+    /// its refusal against the wrong name.
     async fn attempt_completion(
+        &self,
+        mut request: CompletionRequest,
+    ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
+        let sent_tokens = self.enforce_context_ceiling(&mut request);
+        let result = self.call_provider(request).await;
+
+        // A rejection is the only trustworthy measurement of where the ceiling
+        // sits: the published window and the one the backend enforces are
+        // routinely different, and the difference moves without notice.
+        if let Err(ref error) = result
+            && routing::is_context_overflow_error(&error.to_string())
+        {
+            self.llm_manager
+                .note_context_overflow(&self.full_model_name, sent_tokens);
+        }
+
+        result
+    }
+
+    /// Send a prepared request to whichever provider this model belongs to.
+    async fn call_provider(
         &self,
         request: CompletionRequest,
     ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
@@ -570,6 +780,139 @@ impl SpacebotModel {
             was_rate_limit,
         ))
     }
+
+    /// Run a prepared request through routing, retries and the fallback chain.
+    ///
+    /// Borrows the request: `attempt_with_retries` clones per attempt, so only
+    /// the unrouted path below needs a copy of its own.
+    async fn dispatch_completion(
+        &self,
+        request: &CompletionRequest,
+    ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
+        let Some(routing) = &self.routing else {
+            // No routing config — just call the model directly, no fallback/retry
+            return self.attempt_completion(request.clone()).await;
+        };
+
+        let cooldown = routing.rate_limit_cooldown_secs;
+        let mut fallbacks: Vec<String> = routing.get_fallbacks(&self.full_model_name).to_vec();
+        // Set when the configured model id was rejected outright and the
+        // fallbacks were derived from the provider's default routing table.
+        let mut provider_recovery = false;
+        let mut last_error: Option<CompletionError> = None;
+
+        // Try the primary model (with retries) unless it's in rate-limit cooldown
+        // and we have fallbacks to try instead.
+        let primary_rate_limited = self
+            .llm_manager
+            .is_rate_limited(&self.full_model_name, cooldown)
+            .await;
+
+        let skip_primary = primary_rate_limited && !fallbacks.is_empty();
+
+        if skip_primary {
+            tracing::debug!(
+                model = %self.full_model_name,
+                "primary model in rate-limit cooldown, skipping to fallbacks"
+            );
+        } else {
+            match self
+                .attempt_with_retries(&self.full_model_name, request)
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err((error, was_rate_limit)) => {
+                    if was_rate_limit {
+                        self.llm_manager
+                            .record_rate_limit(&self.full_model_name)
+                            .await;
+                    }
+                    // A rejected model id (stale default, typo, no access) never
+                    // recovers on its own — try the provider's default models
+                    // when no explicit chain is configured.
+                    if fallbacks.is_empty() && routing::is_model_not_found_error(&error.to_string())
+                    {
+                        fallbacks = routing::default_model_candidates(&self.provider)
+                            .into_iter()
+                            .filter(|candidate| candidate != &self.full_model_name)
+                            .collect();
+                        provider_recovery = !fallbacks.is_empty();
+                        if provider_recovery {
+                            tracing::warn!(
+                                model = %self.full_model_name,
+                                candidates = ?fallbacks,
+                                "provider rejected configured model, trying its default models"
+                            );
+                        }
+                    }
+                    if fallbacks.is_empty() {
+                        // No fallbacks — this is the final error
+                        return Err(error);
+                    }
+                    if !provider_recovery {
+                        tracing::warn!(
+                            model = %self.full_model_name,
+                            "primary model exhausted retries, trying fallbacks"
+                        );
+                    }
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        // Try fallback chain, each with their own retry loop
+        for (index, fallback_name) in fallbacks.iter().take(MAX_FALLBACK_ATTEMPTS).enumerate() {
+            if self
+                .llm_manager
+                .is_rate_limited(fallback_name, cooldown)
+                .await
+            {
+                tracing::debug!(
+                    fallback = %fallback_name,
+                    "fallback model in cooldown, skipping"
+                );
+                continue;
+            }
+
+            match self.attempt_with_retries(fallback_name, request).await {
+                Ok(response) => {
+                    tracing::info!(
+                        original = %self.full_model_name,
+                        fallback = %fallback_name,
+                        attempt = index + 1,
+                        "fallback model succeeded"
+                    );
+                    return Ok(response);
+                }
+                Err((error, was_rate_limit)) => {
+                    if was_rate_limit {
+                        self.llm_manager.record_rate_limit(fallback_name).await;
+                    }
+                    tracing::warn!(
+                        fallback = %fallback_name,
+                        "fallback model exhausted retries, continuing chain"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        let final_error = last_error.unwrap_or_else(|| {
+            CompletionError::ProviderError("all models in fallback chain failed".into())
+        });
+        if provider_recovery && routing::is_model_not_found_error(&final_error.to_string()) {
+            return Err(CompletionError::ProviderError(format!(
+                "provider '{}' rejected the configured model '{}' and every default \
+                 candidate ({}). Spacebot's built-in model ids for this provider appear \
+                 to be stale — pick a working model in Settings → Model Routing and \
+                 please report this as a bug.",
+                self.provider,
+                self.full_model_name,
+                fallbacks.join(", ")
+            )));
+        }
+        Err(final_error)
+    }
 }
 
 impl CompletionModel for SpacebotModel {
@@ -616,143 +959,27 @@ impl CompletionModel for SpacebotModel {
 
         self.repair_request_history(&mut request)?;
 
-        // Captured before dispatch: the routing block below consumes the
-        // request, and a fallback may re-send it against a different model.
-        let capture = self.active_record_store().is_some().then(|| {
-            (
-                request.clone(),
-                chrono::Utc::now(),
-                std::time::Instant::now(),
-            )
-        });
+        // Only the clock is taken up front. The request is recorded after the
+        // escalation below, which may rewrite and re-send it — the record has
+        // to describe the request that produced the response it is paired with.
+        let capture_started = self
+            .active_record_store()
+            .is_some()
+            .then(|| (chrono::Utc::now(), std::time::Instant::now()));
 
-        let result = async move {
-            let Some(routing) = &self.routing else {
-                // No routing config — just call the model directly, no fallback/retry
-                return self.attempt_completion(request).await;
-            };
+        let mut result = self.dispatch_completion(&request).await;
 
-            let cooldown = routing.rate_limit_cooldown_secs;
-            let mut fallbacks: Vec<String> = routing.get_fallbacks(&self.full_model_name).to_vec();
-            // Set when the configured model id was rejected outright and the
-            // fallbacks were derived from the provider's default routing table.
-            let mut provider_recovery = false;
-            let mut last_error: Option<CompletionError> = None;
-
-            // Try the primary model (with retries) unless it's in rate-limit cooldown
-            // and we have fallbacks to try instead.
-            let primary_rate_limited = self
-                .llm_manager
-                .is_rate_limited(&self.full_model_name, cooldown)
-                .await;
-
-            let skip_primary = primary_rate_limited && !fallbacks.is_empty();
-
-            if skip_primary {
-                tracing::debug!(
-                    model = %self.full_model_name,
-                    "primary model in rate-limit cooldown, skipping to fallbacks"
-                );
-            } else {
-                match self
-                    .attempt_with_retries(&self.full_model_name, &request)
-                    .await
-                {
-                    Ok(response) => return Ok(response),
-                    Err((error, was_rate_limit)) => {
-                        if was_rate_limit {
-                            self.llm_manager
-                                .record_rate_limit(&self.full_model_name)
-                                .await;
-                        }
-                        // A rejected model id (stale default, typo, no access) never
-                        // recovers on its own — try the provider's default models
-                        // when no explicit chain is configured.
-                        if fallbacks.is_empty()
-                            && routing::is_model_not_found_error(&error.to_string())
-                        {
-                            fallbacks = routing::default_model_candidates(&self.provider)
-                                .into_iter()
-                                .filter(|candidate| candidate != &self.full_model_name)
-                                .collect();
-                            provider_recovery = !fallbacks.is_empty();
-                            if provider_recovery {
-                                tracing::warn!(
-                                    model = %self.full_model_name,
-                                    candidates = ?fallbacks,
-                                    "provider rejected configured model, trying its default models"
-                                );
-                            }
-                        }
-                        if fallbacks.is_empty() {
-                            // No fallbacks — this is the final error
-                            return Err(error);
-                        }
-                        if !provider_recovery {
-                            tracing::warn!(
-                                model = %self.full_model_name,
-                                "primary model exhausted retries, trying fallbacks"
-                            );
-                        }
-                        last_error = Some(error);
-                    }
-                }
-            }
-
-            // Try fallback chain, each with their own retry loop
-            for (index, fallback_name) in fallbacks.iter().take(MAX_FALLBACK_ATTEMPTS).enumerate() {
-                if self
-                    .llm_manager
-                    .is_rate_limited(fallback_name, cooldown)
-                    .await
-                {
-                    tracing::debug!(
-                        fallback = %fallback_name,
-                        "fallback model in cooldown, skipping"
-                    );
-                    continue;
-                }
-
-                match self.attempt_with_retries(fallback_name, &request).await {
-                    Ok(response) => {
-                        tracing::info!(
-                            original = %self.full_model_name,
-                            fallback = %fallback_name,
-                            attempt = index + 1,
-                            "fallback model succeeded"
-                        );
-                        return Ok(response);
-                    }
-                    Err((error, was_rate_limit)) => {
-                        if was_rate_limit {
-                            self.llm_manager.record_rate_limit(fallback_name).await;
-                        }
-                        tracing::warn!(
-                            fallback = %fallback_name,
-                            "fallback model exhausted retries, continuing chain"
-                        );
-                        last_error = Some(error);
-                    }
-                }
-            }
-
-            let final_error = last_error.unwrap_or_else(|| {
-                CompletionError::ProviderError("all models in fallback chain failed".into())
-            });
-            if provider_recovery && routing::is_model_not_found_error(&final_error.to_string()) {
-                return Err(CompletionError::ProviderError(format!(
-                    "provider '{}' rejected the configured model '{}' and every default \
-                     candidate ({}). Spacebot's built-in model ids for this provider appear \
-                     to be stale — pick a working model in Settings → Model Routing and \
-                     please report this as a bug.",
-                    self.provider,
-                    self.full_model_name,
-                    fallbacks.join(", ")
-                )));
-            }
-            Err(final_error)
+        // A mismatch that survives the pre-send repair is the other half of the
+        // protocol: an assistant call nothing answers, which no result-side
+        // repair can reach. Retry once, and only when the history changed, so
+        // an identical request is never sent twice.
+        if let Err(ref error) = result
+            && routing::is_tool_history_mismatch_error(&error.to_string())
+            && self.escalate_tool_history_repair(&mut request)
+        {
+            result = self.dispatch_completion(&request).await;
+            self.record_tool_history_recovery(result.is_ok());
         }
-        .await;
 
         #[cfg(feature = "metrics")]
         {
@@ -885,7 +1112,7 @@ impl CompletionModel for SpacebotModel {
                 .add(extended, &self.full_model_name, &self.provider, cost);
         }
 
-        if let Some((request, started_at, clock)) = capture {
+        if let Some((started_at, clock)) = capture_started {
             let (response, usage) = match &result {
                 Ok(response) => (
                     response_ref_from_choice(&response.choice),
@@ -910,21 +1137,66 @@ impl CompletionModel for SpacebotModel {
         mut request: CompletionRequest,
     ) -> Result<StreamingCompletionResponse<RawStreamingResponse>, CompletionError> {
         self.repair_request_history(&mut request)?;
+        // Streaming has no fallback chain, so this model is the one that
+        // receives the request and the one a refusal belongs to.
+        let sent_tokens = self.enforce_context_ceiling(&mut request);
+
+        let capture_started = self
+            .active_record_store()
+            .is_some()
+            .then(|| (chrono::Utc::now(), std::time::Instant::now()));
+
+        let mut result = self.dispatch_stream(request.clone()).await;
+
+        // The channel agent streams, so it needs the same escalation as the
+        // non-streaming path. A provider rejects an assistant call nothing
+        // answers while opening the stream, before any token is yielded, so the
+        // repaired history can still be sent once more.
+        if let Err(ref error) = result
+            && routing::is_tool_history_mismatch_error(&error.to_string())
+            && self.escalate_tool_history_repair(&mut request)
+        {
+            result = self.dispatch_stream(request.clone()).await;
+            self.record_tool_history_recovery(result.is_ok());
+        }
 
         // A streamed response is assembled by the caller as it arrives, so the
-        // record is written for the request alone and its response stays
-        // empty. The prompt is the part that cannot be recovered afterwards —
-        // what the model said is in the transcript either way.
-        if self.active_record_store().is_some() {
+        // record carries the request alone and an empty response. The prompt is
+        // the half that cannot be recovered afterwards — what the model said
+        // ends up in the transcript either way. A stream that fails to open
+        // never yields anything, so that error is worth keeping.
+        if let Some((started_at, clock)) = capture_started {
             self.record_request(
                 &request,
-                chrono::Utc::now(),
-                std::time::Duration::ZERO,
-                crate::llm::record::ResponseRef::default(),
+                started_at,
+                clock.elapsed(),
+                crate::llm::record::ResponseRef {
+                    error: result.as_ref().err().map(ToString::to_string),
+                    ..Default::default()
+                },
                 crate::llm::record::UsageRef::default(),
             );
         }
 
+        // The refusal lands while the stream is opening, so it is measurable
+        // here for the same reason it is on the non-streaming path.
+        if let Err(ref error) = result
+            && routing::is_context_overflow_error(&error.to_string())
+        {
+            self.llm_manager
+                .note_context_overflow(&self.full_model_name, sent_tokens);
+        }
+
+        result
+    }
+}
+
+impl SpacebotModel {
+    /// Open a stream against whichever provider the current model belongs to.
+    async fn dispatch_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<StreamingCompletionResponse<RawStreamingResponse>, CompletionError> {
         let provider_config = self.provider_config_for_current_model().await?;
 
         match provider_config.api_type {
@@ -5235,5 +5507,133 @@ mod tests {
         let msg = format_api_error(status, &body);
         assert!(msg.contains("Google"));
         assert!(msg.contains("invalid schema"));
+    }
+}
+
+#[cfg(test)]
+mod context_trim_tests {
+    use super::{context_budget, trim_history_to_budget};
+    use crate::agent::compactor::estimate_history_tokens;
+    use crate::llm::manager::ContextCeilings;
+    use rig::message::{AssistantContent, Message, UserContent};
+
+    /// A refusal measures the whole request, so the system prompt and tool
+    /// schemas are already inside what is learned. Recording the history alone
+    /// meant the overhead was charged twice — once by the estimate that was
+    /// never counted, once by the budget — and the usable window shrank on
+    /// every refusal.
+    #[test]
+    fn the_learned_ceiling_and_the_budget_charge_overhead_once() {
+        let overhead = 20_000;
+        let history = 240_000;
+
+        let learn = |size: usize| {
+            ContextCeilings::default()
+                .with_overflow("m", size)
+                .expect("a refusal teaches something")
+                .ceiling_for("m")
+                .expect("learned")
+        };
+
+        let from_whole_request = context_budget(learn(history + overhead), overhead);
+        let from_history_alone = context_budget(learn(history), overhead);
+
+        assert!(
+            from_whole_request > from_history_alone,
+            "measuring only the history gives back a smaller window every time"
+        );
+        // The next request still has to be smaller than the one that was refused.
+        assert!(from_whole_request + overhead < history + overhead);
+    }
+
+    /// Overhead alone can fill the window, and there is nothing to trim then.
+    #[test]
+    fn a_budget_cannot_go_below_zero() {
+        assert_eq!(context_budget(10_000, 50_000), 0);
+    }
+
+    fn assistant_tool_call(id: &str) -> Message {
+        Message::Assistant {
+            id: None,
+            content: rig::OneOrMany::one(AssistantContent::tool_call(
+                id,
+                "shell",
+                serde_json::json!({"command": "cat -n src/agent/worker.rs"}),
+            )),
+        }
+    }
+
+    fn tool_result(id: &str, bytes: usize) -> Message {
+        Message::User {
+            content: rig::OneOrMany::one(UserContent::ToolResult(rig::message::ToolResult {
+                id: id.to_string(),
+                call_id: None,
+                content: rig::OneOrMany::one(rig::message::ToolResultContent::text(
+                    "x".repeat(bytes),
+                )),
+            })),
+        }
+    }
+
+    /// The shape that killed both workers: turns of parallel shell calls, each
+    /// result at the 50,000-byte cap, run until the history is twice the window.
+    fn overflowing_history() -> Vec<Message> {
+        let mut history = vec![Message::from("audit the worker backends")];
+        for turn in 0..8 {
+            for call in 0..4 {
+                let id = format!("call_{turn}_{call}");
+                history.push(assistant_tool_call(&id));
+                history.push(tool_result(&id, 50_000));
+            }
+        }
+        history
+    }
+
+    #[test]
+    fn a_history_already_under_budget_is_left_alone() {
+        let mut history = vec![Message::from("hello")];
+        assert_eq!(trim_history_to_budget(&mut history, 100_000), 0);
+        assert_eq!(history.len(), 1);
+    }
+
+    /// The guarantee the whole change exists for: whatever the loop built, what
+    /// leaves fits.
+    #[test]
+    fn an_overflowing_history_is_brought_under_budget() {
+        let mut history = overflowing_history();
+        let before = estimate_history_tokens(&history);
+        assert!(
+            before > 250_000,
+            "fixture should reproduce the real overflow, got {before}"
+        );
+
+        let dropped = trim_history_to_budget(&mut history, 200_000);
+
+        assert!(dropped > 0);
+        let after = estimate_history_tokens(&history);
+        assert!(after <= 200_000, "history must fit the budget, got {after}");
+        assert!(!history.is_empty());
+    }
+
+    /// A tighter ceiling has to cut harder, not give up.
+    #[test]
+    fn a_small_budget_still_produces_a_sendable_history() {
+        let mut history = overflowing_history();
+        trim_history_to_budget(&mut history, 30_000);
+
+        assert!(estimate_history_tokens(&history) <= 30_000);
+        assert!(!history.is_empty());
+    }
+
+    /// Trimming must not stand a result up without the call it answers.
+    #[test]
+    fn the_retained_head_is_never_a_stranded_result() {
+        let mut history = overflowing_history();
+        trim_history_to_budget(&mut history, 120_000);
+
+        assert!(
+            !crate::agent::compactor::opens_with_tool_result(&history[0]),
+            "the retained history must not open on a tool result"
+        );
     }
 }

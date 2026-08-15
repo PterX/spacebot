@@ -76,6 +76,13 @@ impl std::fmt::Display for TaskAuthorKind {
     }
 }
 
+impl Default for TaskAuthorKind {
+    /// Unattributed writes are Spacebot's own.
+    fn default() -> Self {
+        Self::System
+    }
+}
+
 /// Which surface a task mutation arrived through. Recorded per revision so
 /// history reads as a sequence of decisions with their origin intact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -947,6 +954,197 @@ mod tests {
 
         assert_eq!(restored.task.project_id, None);
         assert_eq!(restored.task.metadata, serde_json::json!({}));
+    }
+
+    /// The backfill reconnects a task to the `task-<number>` worktree that was
+    /// provisioned for it before the binding was recorded.
+    #[tokio::test]
+    async fn worktree_backfill_binds_by_the_conventional_name() {
+        let (store, number) = store_with_task().await;
+        let candidates = vec![
+            (format!("task-{number}"), "wt-for-this-task".to_string()),
+            ("task-9999".to_string(), "wt-for-another-task".to_string()),
+        ];
+
+        let bound = store
+            .backfill_worktree_bindings(&candidates)
+            .await
+            .expect("backfill should succeed");
+
+        assert_eq!(bound, 1);
+        let task = store
+            .get_by_number(number)
+            .await
+            .expect("load should succeed")
+            .expect("task should exist");
+        assert_eq!(task.worktree_id.as_deref(), Some("wt-for-this-task"));
+
+        // The revision records that the binding was inferred rather than
+        // observed, which is what keeps the two kinds distinguishable.
+        let history = store
+            .list_revisions(number, 10)
+            .await
+            .expect("history should load");
+        let latest = history.first().expect("a revision was appended");
+        assert!(
+            latest
+                .edit_summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("inferred")),
+            "the backfill revision should say the binding was inferred"
+        );
+    }
+
+    /// Running it twice must not append a second revision, and a task that
+    /// already has a binding is never touched.
+    #[tokio::test]
+    async fn worktree_backfill_is_idempotent_and_skips_bound_tasks() {
+        let (store, number) = store_with_task().await;
+        let candidates = vec![(format!("task-{number}"), "wt-1".to_string())];
+
+        assert_eq!(
+            store
+                .backfill_worktree_bindings(&candidates)
+                .await
+                .expect("first pass"),
+            1
+        );
+        let after_first = store
+            .list_revisions(number, 10)
+            .await
+            .expect("history should load")
+            .len();
+
+        assert_eq!(
+            store
+                .backfill_worktree_bindings(&candidates)
+                .await
+                .expect("second pass"),
+            0,
+            "a bound task must not be revisited"
+        );
+        assert_eq!(
+            store
+                .list_revisions(number, 10)
+                .await
+                .expect("history should load")
+                .len(),
+            after_first,
+            "the second pass must not append a revision"
+        );
+
+        // A rename must not steal the binding the task already holds.
+        let renamed = vec![(format!("task-{number}"), "wt-2".to_string())];
+        assert_eq!(
+            store
+                .backfill_worktree_bindings(&renamed)
+                .await
+                .expect("third pass"),
+            0
+        );
+        let task = store
+            .get_by_number(number)
+            .await
+            .expect("load should succeed")
+            .expect("task should exist");
+        assert_eq!(task.worktree_id.as_deref(), Some("wt-1"));
+    }
+
+    /// A task with no matching worktree is left alone rather than guessed at.
+    #[tokio::test]
+    async fn worktree_backfill_ignores_tasks_with_no_matching_worktree() {
+        let (store, number) = store_with_task().await;
+
+        let bound = store
+            .backfill_worktree_bindings(&[("task-4242".to_string(), "wt-x".to_string())])
+            .await
+            .expect("backfill should succeed");
+
+        assert_eq!(bound, 0);
+        let task = store
+            .get_by_number(number)
+            .await
+            .expect("load should succeed")
+            .expect("task should exist");
+        assert_eq!(task.worktree_id, None);
+    }
+
+    /// `goal_id` is in the snapshot and `changes` diffs it, so a restore that
+    /// left the current goal in place would report success while producing a
+    /// task that does not match the revision it claims to have restored.
+    #[tokio::test]
+    async fn restore_reinstates_the_goal_it_recorded() {
+        let (store, number) = store_with_task().await;
+
+        store
+            .update_with_status_transition(
+                number,
+                UpdateTaskInput {
+                    goal_id: Some(Some("goal-original".to_string())),
+                    context: user_context("Attach the original goal"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update should succeed");
+
+        let moved = store
+            .update_with_status_transition(
+                number,
+                UpdateTaskInput {
+                    goal_id: Some(Some("goal-moved".to_string())),
+                    context: user_context("Move to another goal"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update should succeed")
+            .expect("task should exist");
+        assert_eq!(moved.task.goal_id.as_deref(), Some("goal-moved"));
+
+        let restored = store
+            .restore_revision(number, 2, user_context("Back to the original goal"))
+            .await
+            .expect("restore should succeed");
+
+        assert_eq!(restored.task.goal_id.as_deref(), Some("goal-original"));
+
+        // The revision the restore appended must match what it restored, or a
+        // diff against it still reports a goal change.
+        let diff = store
+            .diff_revisions(number, 2, None)
+            .await
+            .expect("diff should compute");
+        assert!(
+            !diff.changes.iter().any(|change| change.field == "goal_id"),
+            "the restored revision should agree with revision 2 on goal_id"
+        );
+    }
+
+    /// A restore back to a revision that predates any goal must clear it,
+    /// matching how the other patch fields behave.
+    #[tokio::test]
+    async fn restore_clears_a_goal_the_target_revision_did_not_have() {
+        let (store, number) = store_with_task().await;
+
+        store
+            .update_with_status_transition(
+                number,
+                UpdateTaskInput {
+                    goal_id: Some(Some("goal-1".to_string())),
+                    context: user_context("Attach a goal"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update should succeed");
+
+        let restored = store
+            .restore_revision(number, 1, user_context("Back to the start"))
+            .await
+            .expect("restore should succeed");
+
+        assert_eq!(restored.task.goal_id, None);
     }
 
     #[tokio::test]

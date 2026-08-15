@@ -100,6 +100,27 @@ impl SpawnWorkerTool {
             }
         }
 
+        // Refuse a second run on a task something is already working. The
+        // delegation check elsewhere is per-channel, so without this two
+        // channels can spawn on the same task without either noticing.
+        // An unreadable history cannot establish that the task is free, so a
+        // lookup failure blocks the spawn rather than falling through it.
+        match deps.task_store.live_task_attempt(number).await {
+            Ok(Some(live)) => {
+                return Err(SpawnWorkerError(format!(
+                    "task #{number} is already being worked by worker {} (attempt #{}, started {}). \
+                     Wait for it, or cancel it before spawning again.",
+                    live.worker_id, live.attempt, live.started_at
+                )));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(SpawnWorkerError(format!(
+                    "failed to check whether task #{number} is already being worked: {error}"
+                )));
+            }
+        }
+
         let project = match &task.project_id {
             Some(project_id) => Some(
                 deps.project_store
@@ -174,13 +195,30 @@ impl SpawnWorkerTool {
                 let worktree_name = format!("task-{number}");
 
                 // Reuse the worktree from an earlier spawn attempt instead of
-                // failing on the existing path.
-                let existing = deps
-                    .project_store
-                    .list_worktrees(&project.id)
-                    .await
-                    .ok()
-                    .and_then(|worktrees| worktrees.into_iter().find(|w| w.name == worktree_name));
+                // failing on the existing path. The binding the task carries is
+                // authoritative; the `task-<number>` name is the compatibility
+                // key for tasks provisioned before that binding was recorded.
+                let bound = match plan.worktree_id.as_deref() {
+                    Some(worktree_id) => deps
+                        .project_store
+                        .get_worktree(worktree_id)
+                        .await
+                        .ok()
+                        .flatten(),
+                    None => None,
+                };
+
+                let existing = match bound {
+                    Some(worktree) => Some(worktree),
+                    None => deps
+                        .project_store
+                        .list_worktrees(&project.id)
+                        .await
+                        .ok()
+                        .and_then(|worktrees| {
+                            worktrees.into_iter().find(|w| w.name == worktree_name)
+                        }),
+                };
 
                 match existing {
                     Some(worktree) => {
@@ -656,6 +694,10 @@ impl SpawnWorkerTool {
                     crate::tasks::UpdateTaskInput {
                         worker_id: Some(worker_id.to_string()),
                         status: status_change,
+                        // Record the worktree this run resolved to, so a retry
+                        // reuses it instead of rediscovering it by name and a
+                        // task's working directory is visible on the board.
+                        worktree_id: plan.worktree_id.clone().map(Some),
                         ..Default::default()
                     },
                 )
@@ -667,6 +709,53 @@ impl SpawnWorkerTool {
                     %worker_id,
                     "failed to bind spawned worker to task"
                 );
+            }
+
+            // The pointer above names only the run executing now. This is the
+            // history: what has been tried on this task and how it ended.
+            //
+            // Unlike the binding above this one is not fire-and-forget. The
+            // live-attempt index rejects a second open run on the same task, so
+            // a failure here means another spawn claimed the task between the
+            // guard and this insert. An unrecorded worker is invisible to the
+            // guard and to the board, so it is stopped instead of left running.
+            if let Err(error) = self
+                .state
+                .deps
+                .task_store
+                .start_task_attempt(
+                    plan.task_number,
+                    crate::tasks::StartTaskAttempt {
+                        worker_id: worker_id.to_string(),
+                        author_type: crate::tasks::TaskAuthorKind::Agent,
+                        author_id: Some(self.state.deps.agent_id.to_string()),
+                        agent_id: Some(self.state.deps.agent_id.to_string()),
+                        channel_id: Some(self.state.channel_id.to_string()),
+                    },
+                )
+                .await
+            {
+                tracing::warn!(
+                    %error,
+                    task_number = plan.task_number,
+                    %worker_id,
+                    "failed to record the task attempt"
+                );
+                if let Err(cancel_error) = self
+                    .state
+                    .cancel_worker_with_reason(worker_id, "task attempt could not be recorded")
+                    .await
+                {
+                    tracing::warn!(
+                        %cancel_error,
+                        %worker_id,
+                        "failed to cancel a worker with no recorded attempt"
+                    );
+                }
+                return Err(SpawnWorkerError(format!(
+                    "task #{} could not record this attempt, so worker {worker_id} was cancelled: {error}",
+                    plan.task_number
+                )));
             }
         }
 
@@ -1030,6 +1119,7 @@ impl Tool for DetachedSpawnWorkerTool {
             None,
             None,
             secrets_store,
+            Some(self.deps.task_store.clone()),
             "builtin",
             worker.run().instrument(worker_span),
         );
