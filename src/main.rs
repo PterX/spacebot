@@ -2134,6 +2134,12 @@ async fn run(
                         {
                             Ok(new_llm) => {
                                 let new_llm_manager = Arc::new(new_llm);
+                                // Ceilings live on the manager, so the
+                                // replacement starts with none and every agent
+                                // built after setup would send unbounded.
+                                new_llm_manager.set_default_context_ceiling(
+                                    new_config.defaults.context_window,
+                                );
                                 api_state.set_llm_manager(new_llm_manager.clone()).await;
                                 // Update agent_humans from the reloaded config
                                 // before initialize_agents so agents see the

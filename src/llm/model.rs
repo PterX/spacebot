@@ -70,6 +70,17 @@ const RESPONSE_RESERVE: f32 = 0.15;
 
 /// Tokens a request spends before any history: system prompt and tool schemas
 /// are charged to the same window.
+/// What the history has to fit inside, given the ceiling and the fixed cost of
+/// the system prompt and tool schemas.
+///
+/// The model needs room to answer, and the preamble and tool definitions are
+/// charged to the same window as the history. The ceiling is the size of a whole
+/// request, so subtracting the overhead here is the only place it is charged.
+fn context_budget(ceiling: usize, overhead: usize) -> usize {
+    let reserve = (ceiling as f32 * RESPONSE_RESERVE) as usize;
+    ceiling.saturating_sub(reserve).saturating_sub(overhead)
+}
+
 fn request_overhead_tokens(request: &CompletionRequest) -> usize {
     let preamble = request.preamble.as_ref().map_or(0, |text| text.len());
     let tools: usize = request
@@ -242,28 +253,38 @@ impl SpacebotModel {
     /// Cutting here is a backstop, not a replacement for compaction: it drops
     /// the oldest turns outright, where compaction summarises them first. It
     /// exists so a run degrades instead of dying.
-    fn enforce_context_ceiling(&self, request: &mut CompletionRequest) {
-        let Some(ceiling) = self.llm_manager.context_ceiling(&self.full_model_name) else {
-            return;
+    /// Returns the size of the request as sent, which is what a refusal
+    /// measures: history plus the system prompt and tool schemas charged to the
+    /// same window. The response reserve is this side's policy and is not part
+    /// of what the provider receives, so it is not counted here.
+    fn enforce_context_ceiling(&self, request: &mut CompletionRequest) -> usize {
+        let overhead = request_overhead_tokens(request);
+        let history_tokens = |request: &CompletionRequest| {
+            estimate_history_tokens(&request.chat_history.iter().cloned().collect::<Vec<_>>())
         };
 
-        // The model needs room to answer, and the system prompt and tool
-        // schemas are charged to the same window as the history.
-        let reserve = (ceiling as f32 * RESPONSE_RESERVE) as usize;
-        let budget = ceiling
-            .saturating_sub(reserve)
-            .saturating_sub(request_overhead_tokens(request));
+        let Some(ceiling) = self.llm_manager.context_ceiling(&self.full_model_name) else {
+            return history_tokens(request) + overhead;
+        };
+
+        let budget = context_budget(ceiling, overhead);
+        let before = history_tokens(request);
         if budget == 0 {
-            return;
+            tracing::warn!(
+                model = %self.full_model_name,
+                ceiling,
+                overhead,
+                "the system prompt and tool schemas alone fill the context ceiling; \
+                 sending unchanged so the provider decides"
+            );
+            return before + overhead;
+        }
+        if before <= budget {
+            return before + overhead;
         }
 
         let mut history: Vec<rig::message::Message> =
             request.chat_history.iter().cloned().collect();
-        let before = estimate_history_tokens(&history);
-        if before <= budget {
-            return;
-        }
-
         let dropped = trim_history_to_budget(&mut history, budget);
 
         if dropped == 0 {
@@ -273,24 +294,39 @@ impl SpacebotModel {
                 budget,
                 "request exceeds the context ceiling and no aligned cut can shrink it"
             );
-            return;
+            return before + overhead;
         }
 
         let Ok(chat_history) = OneOrMany::many(history) else {
-            return;
+            return before + overhead;
         };
 
-        tracing::warn!(
-            model = %self.full_model_name,
-            ceiling,
-            estimated_before = before,
-            estimated_after = estimate_history_tokens(
-                &chat_history.iter().cloned().collect::<Vec<_>>()
-            ),
-            dropped_messages = dropped,
-            "trimmed request history to fit the model's context ceiling"
-        );
         request.chat_history = chat_history;
+        let after = history_tokens(request);
+
+        // The trim runs out of room before the budget when only the two
+        // retained messages are left, and the request goes anyway: the ceiling
+        // is an estimate, and the provider is the one that decides.
+        if after > budget {
+            tracing::warn!(
+                model = %self.full_model_name,
+                ceiling,
+                estimated_after = after,
+                budget,
+                "trimmed as far as an aligned cut allows and the request still \
+                 exceeds the ceiling"
+            );
+        } else {
+            tracing::warn!(
+                model = %self.full_model_name,
+                ceiling,
+                estimated_before = before,
+                estimated_after = after,
+                dropped_messages = dropped,
+                "trimmed request history to fit the model's context ceiling"
+            );
+        }
+        after + overhead
     }
 
     /// Repair a history a provider has already rejected, for one retry.
@@ -341,7 +377,34 @@ impl SpacebotModel {
     }
 
     /// Direct call to the provider (no fallback logic).
+    ///
+    /// The ceiling is enforced here rather than once at the top of `completion`
+    /// because this is where the model that receives the request is known. A
+    /// fallback attempt builds its own `SpacebotModel`, so trimming higher up
+    /// would size one model's request against another model's limit and record
+    /// its refusal against the wrong name.
     async fn attempt_completion(
+        &self,
+        mut request: CompletionRequest,
+    ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
+        let sent_tokens = self.enforce_context_ceiling(&mut request);
+        let result = self.call_provider(request).await;
+
+        // A rejection is the only trustworthy measurement of where the ceiling
+        // sits: the published window and the one the backend enforces are
+        // routinely different, and the difference moves without notice.
+        if let Err(ref error) = result
+            && routing::is_context_overflow_error(&error.to_string())
+        {
+            self.llm_manager
+                .note_context_overflow(&self.full_model_name, sent_tokens);
+        }
+
+        result
+    }
+
+    /// Send a prepared request to whichever provider this model belongs to.
+    async fn call_provider(
         &self,
         request: CompletionRequest,
     ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
@@ -709,9 +772,6 @@ impl CompletionModel for SpacebotModel {
         let start = std::time::Instant::now();
 
         self.repair_request_history(&mut request)?;
-        self.enforce_context_ceiling(&mut request);
-        let sent_tokens =
-            estimate_history_tokens(&request.chat_history.iter().cloned().collect::<Vec<_>>());
 
         let mut result = self.dispatch_completion(&request).await;
 
@@ -858,16 +918,6 @@ impl CompletionModel for SpacebotModel {
                 .add(extended, &self.full_model_name, &self.provider, cost);
         }
 
-        // A rejection is the only trustworthy measurement of where the ceiling
-        // sits: the published window and the one the backend enforces are
-        // routinely different, and the difference moves without notice.
-        if let Err(ref error) = result
-            && routing::is_context_overflow_error(&error.to_string())
-        {
-            self.llm_manager
-                .note_context_overflow(&self.full_model_name, sent_tokens);
-        }
-
         result
     }
 
@@ -876,7 +926,9 @@ impl CompletionModel for SpacebotModel {
         mut request: CompletionRequest,
     ) -> Result<StreamingCompletionResponse<RawStreamingResponse>, CompletionError> {
         self.repair_request_history(&mut request)?;
-        self.enforce_context_ceiling(&mut request);
+        // Streaming has no fallback chain, so this model is the one that
+        // receives the request and the one a refusal belongs to.
+        let sent_tokens = self.enforce_context_ceiling(&mut request);
 
         let mut result = self.dispatch_stream(request.clone()).await;
 
@@ -890,6 +942,15 @@ impl CompletionModel for SpacebotModel {
         {
             result = self.dispatch_stream(request).await;
             self.record_tool_history_recovery(result.is_ok());
+        }
+
+        // The refusal lands while the stream is opening, so it is measurable
+        // here for the same reason it is on the non-streaming path.
+        if let Err(ref error) = result
+            && routing::is_context_overflow_error(&error.to_string())
+        {
+            self.llm_manager
+                .note_context_overflow(&self.full_model_name, sent_tokens);
         }
 
         result
@@ -5144,9 +5205,45 @@ mod tests {
 
 #[cfg(test)]
 mod context_trim_tests {
-    use super::trim_history_to_budget;
+    use super::{context_budget, trim_history_to_budget};
     use crate::agent::compactor::estimate_history_tokens;
+    use crate::llm::manager::ContextCeilings;
     use rig::message::{AssistantContent, Message, UserContent};
+
+    /// A refusal measures the whole request, so the system prompt and tool
+    /// schemas are already inside what is learned. Recording the history alone
+    /// meant the overhead was charged twice — once by the estimate that was
+    /// never counted, once by the budget — and the usable window shrank on
+    /// every refusal.
+    #[test]
+    fn the_learned_ceiling_and_the_budget_charge_overhead_once() {
+        let overhead = 20_000;
+        let history = 240_000;
+
+        let learn = |size: usize| {
+            ContextCeilings::default()
+                .with_overflow("m", size)
+                .expect("a refusal teaches something")
+                .ceiling_for("m")
+                .expect("learned")
+        };
+
+        let from_whole_request = context_budget(learn(history + overhead), overhead);
+        let from_history_alone = context_budget(learn(history), overhead);
+
+        assert!(
+            from_whole_request > from_history_alone,
+            "measuring only the history gives back a smaller window every time"
+        );
+        // The next request still has to be smaller than the one that was refused.
+        assert!(from_whole_request + overhead < history + overhead);
+    }
+
+    /// Overhead alone can fill the window, and there is nothing to trim then.
+    #[test]
+    fn a_budget_cannot_go_below_zero() {
+        assert_eq!(context_budget(10_000, 50_000), 0);
+    }
 
     fn assistant_tool_call(id: &str) -> Message {
         Message::Assistant {
