@@ -1081,6 +1081,13 @@ async fn run(
         .with_context(|| "failed to initialize LLM manager")?,
     );
 
+    // The hard ceiling every request is trimmed to fit. Compaction aims at the
+    // same number, but it only runs where a loop yields; this is enforced on
+    // the request itself, so a loop that never yields cannot exceed it. Raising
+    // `context_window` raises both — set it to what the backend actually
+    // enforces, which is not always what the model advertises.
+    llm_manager.set_default_context_ceiling(config.defaults.context_window);
+
     // Shared embedding model (stateless, agent-agnostic)
     let embedding_cache_dir = config.instance_dir.join("embedding_cache");
     let embedding_model = Arc::new(
@@ -2127,6 +2134,12 @@ async fn run(
                         {
                             Ok(new_llm) => {
                                 let new_llm_manager = Arc::new(new_llm);
+                                // Ceilings live on the manager, so the
+                                // replacement starts with none and every agent
+                                // built after setup would send unbounded.
+                                new_llm_manager.set_default_context_ceiling(
+                                    new_config.defaults.context_window,
+                                );
                                 api_state.set_llm_manager(new_llm_manager.clone()).await;
                                 // Update agent_humans from the reloaded config
                                 // before initialize_agents so agents see the

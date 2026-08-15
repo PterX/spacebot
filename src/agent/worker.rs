@@ -725,16 +725,19 @@ impl Worker {
                 self.segments_run
                     .store(segments_run, std::sync::atomic::Ordering::Relaxed);
 
-                // Pre-prompt maintenance: dedup stale tool results and check
-                // context usage *before* each LLM call, not just at segment
-                // boundaries. Fast models can accumulate large tool results
-                // within a single segment and exceed the context window before
-                // we ever reach a checkpoint.
-                if segments_run > 1 {
-                    dedup_tool_results(&mut history);
-                    self.maybe_compact_history(&mut compacted_history, &mut history)
-                        .await;
-                }
+                // Dedup stale tool results and check context usage before
+                // handing control to the tool loop. This runs on the first
+                // segment too: a run that finishes inside one segment would
+                // otherwise never be checked at all, which is how a worker
+                // reached 269k tokens against a 128k trigger.
+                //
+                // It is still only a per-segment check — the loop inside a
+                // segment can add tens of thousands of tokens per turn without
+                // yielding — so the request-level ceiling in `SpacebotModel` is
+                // what actually guarantees the window is respected.
+                dedup_tool_results(&mut history);
+                self.maybe_compact_history(&mut compacted_history, &mut history)
+                    .await;
 
                 match self
                     .hook
