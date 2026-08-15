@@ -16,7 +16,6 @@ import {
 } from "@/hooks/useChannelLiveState";
 import {useLiveContext} from "@/hooks/useLiveContext";
 import {Markdown} from "@/components/Markdown";
-import {PromptInspectModal} from "@/components/PromptInspectModal";
 import {PromptInspector} from "@/components/prompt/PromptInspector";
 import {
 	ProcessCard,
@@ -424,7 +423,6 @@ export function ChannelDetail({
   const hasActivity =
     activeWorkerCount > 0 || activeBranchCount > 0 || compaction !== null;
   const [inspectOpen, setInspectOpen] = useState(false);
-  const [legacyInspectOpen, setLegacyInspectOpen] = useState(false);
   const [inspectMessageId, setInspectMessageId] = useState<string | null>(null);
   const [selection, setSelection] = useState<ProcessSelection | null>(null);
   const { liveTranscripts } = useLiveContext();
@@ -577,9 +575,6 @@ export function ChannelDetail({
                 <DropdownMenuItem onSelect={() => setInspectOpen(true)}>
                   Inspect prompt
                 </DropdownMenuItem>
-                <DropdownMenuItem onSelect={() => setLegacyInspectOpen(true)}>
-                  Live prompt preview
-                </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenuRoot>
           </div>
@@ -701,11 +696,6 @@ export function ChannelDetail({
         />
       )}
 
-      <PromptInspectModal
-        open={legacyInspectOpen}
-        onOpenChange={setLegacyInspectOpen}
-        channelId={channelId}
-      />
     </div>
   );
 }

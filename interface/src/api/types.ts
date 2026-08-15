@@ -56,9 +56,6 @@ export type CancelProcessRequest =
 export type CancelProcessResponse =
   components["schemas"]["CancelProcessResponse"];
 
-// Prompt inspection
-export type PromptCaptureBody = components["schemas"]["PromptCaptureBody"];
-
 // Archive
 export type SetChannelArchiveRequest =
   components["schemas"]["SetChannelArchiveRequest"];

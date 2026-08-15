@@ -258,7 +258,6 @@ async fn dump_channel_context() {
         std::path::PathBuf::from("/tmp/screenshots"),
         std::path::PathBuf::from("/tmp/logs"),
         None,
-        None,
         spacebot::conversation::settings::ResolvedConversationSettings::default(),
         None,
         None,
@@ -302,7 +301,6 @@ async fn dump_channel_context() {
         screenshot_dir: std::path::PathBuf::from("/tmp/screenshots"),
         logs_dir: std::path::PathBuf::from("/tmp/logs"),
         reply_target_message_id: Arc::new(tokio::sync::RwLock::new(None)),
-        prompt_snapshot_store: None,
         live_process_transcripts: Arc::new(tokio::sync::RwLock::new(
             std::collections::HashMap::new(),
         )),
@@ -566,7 +564,6 @@ async fn dump_all_contexts() {
         screenshot_dir: std::path::PathBuf::from("/tmp/screenshots"),
         logs_dir: std::path::PathBuf::from("/tmp/logs"),
         reply_target_message_id: Arc::new(tokio::sync::RwLock::new(None)),
-        prompt_snapshot_store: None,
         live_process_transcripts: Arc::new(tokio::sync::RwLock::new(
             std::collections::HashMap::new(),
         )),

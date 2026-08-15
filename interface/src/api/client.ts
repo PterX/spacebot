@@ -498,45 +498,6 @@ export interface PromptHistoryBlock {
 	reasoning?: string[];
 }
 
-export interface PromptInspectResponse {
-	channel_id: string;
-	system_prompt: string;
-	total_chars: number;
-	history_length: number;
-	history: PromptHistoryMessage[];
-	capture_enabled: boolean;
-	/** Present when the channel is not active */
-	error?: string;
-	message?: string;
-}
-
-export interface PromptSnapshotSummary {
-	timestamp_ms: number;
-	user_message: string;
-	system_prompt_chars: number;
-	history_length: number;
-}
-
-export interface PromptSnapshotListResponse {
-	channel_id: string;
-	snapshots: PromptSnapshotSummary[];
-}
-
-export interface PromptSnapshot {
-	channel_id: string;
-	timestamp_ms: number;
-	user_message: string;
-	system_prompt: string;
-	system_prompt_chars: number;
-	history: PromptHistoryMessage[];
-	history_length: number;
-}
-
-export interface PromptCaptureResponse {
-	channel_id: string;
-	capture_enabled: boolean;
-}
-
 // --- Prompt records (the inspector) ---
 
 /** Composition layer a block belongs to. Drives its colour in the inspector. */
@@ -1993,8 +1954,6 @@ export const api = {
 		return fetchJson<Types.MessagesResponse>(`/channels/messages?${params}`);
 	},
 	channelStatus: () => fetchJson<ChannelStatusResponse>("/channels/status"),
-	inspectPrompt: (channelId: string) =>
-		fetchJson<PromptInspectResponse>(`/channels/prompt/inspect?channel_id=${encodeURIComponent(channelId)}`),
 	listPromptRequests: (
 		params: {
 			agentId?: string;
@@ -2038,23 +1997,6 @@ export const api = {
 		if (!response.ok) throw new Error(`API error: ${response.status}`);
 		return response.json() as Promise<PromptDebugCaptureSettings>;
 	},
-	setPromptCapture: async (channelId: string, enabled: boolean) => {
-		const response = await fetch(`${getApiBase()}/channels/prompt/capture`, {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ channel_id: channelId, enabled }),
-		});
-		if (!response.ok) throw new Error(`API error: ${response.status}`);
-		return response.json() as Promise<PromptCaptureResponse>;
-	},
-	listPromptSnapshots: (channelId: string, limit = 50) =>
-		fetchJson<PromptSnapshotListResponse>(
-			`/channels/prompt/snapshots?channel_id=${encodeURIComponent(channelId)}&limit=${limit}`,
-		),
-	getPromptSnapshot: (channelId: string, timestampMs: number) =>
-		fetchJson<PromptSnapshot>(
-			`/channels/prompt/snapshots/get?channel_id=${encodeURIComponent(channelId)}&timestamp_ms=${timestampMs}`,
-		),
 	workersList: (agentId: string, params: { limit?: number; offset?: number; status?: string } = {}) => {
 		const search = new URLSearchParams({ agent_id: agentId });
 		if (params.limit) search.set("limit", String(params.limit));

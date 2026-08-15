@@ -90,10 +90,6 @@ pub fn api_router() -> OpenApiRouter<Arc<ApiState>> {
         .routes(routes!(channels::set_channel_archive))
         .routes(routes!(channels::channel_messages))
         .routes(routes!(channels::channel_status))
-        .routes(routes!(channels::inspect_prompt))
-        .routes(routes!(channels::set_prompt_capture))
-        .routes(routes!(channels::list_prompt_snapshots))
-        .routes(routes!(channels::get_prompt_snapshot))
         .routes(routes!(channels::cancel_process))
         // Prompt record routes
         .routes(routes!(prompts::list_prompt_requests))

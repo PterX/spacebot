@@ -11,7 +11,6 @@ const SETTINGS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("settin
 
 /// Default key for worker log mode setting.
 pub const WORKER_LOG_MODE_KEY: &str = "worker_log_mode";
-const PROMPT_CAPTURE_PREFIX: &str = "prompt_capture:";
 /// Whether every outgoing LLM request is recorded for inspection.
 const PROMPT_DEBUG_CAPTURE_KEY: &str = "prompt_debug_capture";
 /// Days of captured requests to keep before the sweeper drops them.
@@ -284,18 +283,6 @@ impl SettingsStore {
     /// Set how many days of captured requests to keep.
     pub fn set_prompt_debug_retention_days(&self, days: i64) -> Result<()> {
         self.set_raw(PROMPT_DEBUG_RETENTION_KEY, &days.to_string())
-    }
-
-    /// Check whether prompt capture is enabled for a specific channel.
-    pub fn prompt_capture_enabled(&self, channel_id: &str) -> bool {
-        let key = format!("{PROMPT_CAPTURE_PREFIX}{channel_id}");
-        matches!(self.get_raw(&key), Ok(v) if v == "true")
-    }
-
-    /// Enable or disable prompt capture for a specific channel.
-    pub fn set_prompt_capture(&self, channel_id: &str, enabled: bool) -> Result<()> {
-        let key = format!("{PROMPT_CAPTURE_PREFIX}{channel_id}");
-        self.set_raw(&key, if enabled { "true" } else { "false" })
     }
 
     /// The instance's home channel, or `None` when unset.

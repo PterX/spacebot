@@ -504,7 +504,6 @@ pub struct ChannelState {
     pub screenshot_dir: std::path::PathBuf,
     pub logs_dir: std::path::PathBuf,
     /// Prompt snapshot store for debugging prompt construction.
-    pub prompt_snapshot_store: Option<Arc<crate::agent::prompt_snapshot::PromptSnapshotStore>>,
     /// Shared live transcript cache for running workers. When a worker is
     /// cancelled via `handle.abort()`, we drain its accumulated transcript
     /// steps from this cache and persist them to the DB so that cancelled
@@ -1193,7 +1192,6 @@ impl Channel {
         event_rx: broadcast::Receiver<ProcessEvent>,
         screenshot_dir: std::path::PathBuf,
         logs_dir: std::path::PathBuf,
-        prompt_snapshot_store: Option<Arc<crate::agent::prompt_snapshot::PromptSnapshotStore>>,
         live_process_transcripts: Option<LiveProcessTranscripts>,
         resolved_settings: ResolvedConversationSettings,
         cron_outcome: Option<crate::cron::CronOutcome>,
@@ -1258,7 +1256,6 @@ impl Channel {
             channel_store: channel_store.clone(),
             screenshot_dir,
             logs_dir,
-            prompt_snapshot_store,
             live_process_transcripts: live_process_transcripts
                 .unwrap_or_else(|| Arc::new(RwLock::new(HashMap::new()))),
             worker_context_settings: Arc::new(RwLock::new(
@@ -3683,9 +3680,6 @@ impl Channel {
             }
         }
 
-        // ── Prompt snapshot capture (fire-and-forget) ──
-        self.maybe_capture_snapshot(&system_prompt.text, user_text, &history);
-
         let mut result = self
             .hook
             .prompt_once_streaming(&agent, &mut history, user_text, max_turns)
@@ -4767,72 +4761,6 @@ impl Channel {
                 );
             }
         }
-    }
-
-    /// If prompt capture is enabled for this channel, snapshot the current
-    /// system prompt sections and conversation history. The save is
-    /// fire-and-forget so it never blocks the agentic loop.
-    fn maybe_capture_snapshot(
-        &self,
-        system_prompt: &str,
-        user_message: &str,
-        history: &[rig::message::Message],
-    ) {
-        // 1. Check if we have a snapshot store.
-        let snapshot_store = match self.state.prompt_snapshot_store.as_ref() {
-            Some(store) => store.clone(),
-            None => return,
-        };
-
-        // 2. Check if capture is enabled via settings.
-        let rc = &self.deps.runtime_config;
-        let capture_enabled = rc
-            .settings
-            .load()
-            .as_ref()
-            .as_ref()
-            .map(|settings| settings.prompt_capture_enabled(&self.id))
-            .unwrap_or(false);
-        if !capture_enabled {
-            return;
-        }
-
-        // 3. Serialize history and build the snapshot.
-        let history_json = match serde_json::to_value(history) {
-            Ok(value) => value,
-            Err(error) => {
-                tracing::warn!(
-                    channel_id = %self.id,
-                    %error,
-                    "failed to serialize prompt history; skipping snapshot capture"
-                );
-                return;
-            }
-        };
-        let history_length = history.len();
-        let system_prompt_chars = system_prompt.chars().count();
-
-        let snapshot = crate::agent::prompt_snapshot::PromptSnapshot {
-            channel_id: self.id.to_string(),
-            timestamp_ms: chrono::Utc::now().timestamp_millis(),
-            user_message: user_message.to_string(),
-            system_prompt: system_prompt.to_string(),
-            system_prompt_chars,
-            history: history_json,
-            history_length,
-        };
-
-        // 5. Fire-and-forget save.
-        let channel_id = self.id.clone();
-        tokio::spawn(async move {
-            if let Err(error) = snapshot_store.save(&snapshot) {
-                tracing::warn!(
-                    channel_id = %channel_id,
-                    %error,
-                    "failed to save prompt snapshot"
-                );
-            }
-        });
     }
 }
 

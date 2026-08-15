@@ -1291,14 +1291,6 @@ async fn run(
                     let event_rx = agent.deps.event_tx.subscribe();
                     let channel_id: spacebot::ChannelId = Arc::from(conversation_id.as_str());
 
-                    let snapshot_store = agent
-                        .deps
-                        .runtime_config
-                        .prompt_snapshots
-                        .load()
-                        .as_ref()
-                        .clone();
-
                     // Load per-conversation settings (idle worker resume).
                     // Try portal store first, then channel_settings for platform channels.
                     let resolved_settings = {
@@ -1358,7 +1350,6 @@ async fn run(
                         event_rx,
                         agent.config.screenshot_dir(),
                         agent.config.logs_dir(),
-                        snapshot_store,
                         Some(api_state.live_process_transcripts.clone()),
                         resolved_settings,
                         None, // no cron outcome for normal channels
@@ -1670,13 +1661,6 @@ async fn run(
 
                     let channel_id: spacebot::ChannelId = Arc::from(conversation_id.as_str());
 
-                    let snapshot_store = agent
-                        .deps
-                        .runtime_config
-                        .prompt_snapshots
-                        .load()
-                        .as_ref()
-                        .clone();
 
                     // Load per-conversation settings.
                     // Resolution: per-channel DB override > binding defaults > agent defaults > system defaults
@@ -1756,7 +1740,6 @@ async fn run(
                         event_rx,
                         agent.config.screenshot_dir(),
                         agent.config.logs_dir(),
-                        snapshot_store,
                         Some(api_state.live_process_transcripts.clone()),
                         resolved_settings,
                         None, // no cron outcome for normal channels
@@ -2361,23 +2344,6 @@ async fn initialize_agents(
             })?,
         );
 
-        // Per-agent prompt snapshot store (separate redb, easy to delete).
-        // Non-fatal: a corrupt/unwritable DB disables snapshotting for this agent.
-        let snapshot_path = agent_config.data_dir.join("prompt_snapshots.redb");
-        let prompt_snapshot_store =
-            match spacebot::agent::prompt_snapshot::PromptSnapshotStore::new(&snapshot_path) {
-                Ok(store) => Some(Arc::new(store)),
-                Err(error) => {
-                    tracing::warn!(
-                        agent_id = %agent_config.id,
-                        path = %snapshot_path.display(),
-                        %error,
-                        "failed to initialize prompt snapshot store; prompt snapshots disabled"
-                    );
-                    None
-                }
-            };
-
         // Per-agent record of every outgoing LLM request. Payloads land under
         // the data directory; the index shares the agent database.
         let prompt_record_store = Arc::new(spacebot::llm::PromptRecordStore::new(
@@ -2516,9 +2482,6 @@ async fn initialize_agents(
                 tracing::warn!(%error, agent = %agent_config.id, "failed to seed skill usage rows");
             }
         }
-        runtime_config
-            .prompt_snapshots
-            .store(Arc::new(prompt_snapshot_store.clone()));
         runtime_config
             .prompt_records
             .store(Arc::new(Some(prompt_record_store.clone())));

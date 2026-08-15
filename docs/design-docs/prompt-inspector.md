@@ -1,5 +1,7 @@
 # Prompt Inspector
 
+> Implemented. The "What Exists" section below describes the state this was designed against, not the state today — the snapshot store, the per-channel capture toggle and the live `inspect_prompt` render it names are all gone.
+
 Every request Spacebot sends to a model is recorded, decomposed into named blocks, and openable from the UI. Any channel turn, branch, worker, compaction, chronicle, or cortex run can be inspected as the exact byte stream the model received, with a map of what each block was, where it came from, and what it cost.
 
 The harness is the prompt. Today four of the five process types are black boxes.
