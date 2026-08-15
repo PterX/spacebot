@@ -11,7 +11,12 @@ const SETTINGS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("settin
 
 /// Default key for worker log mode setting.
 pub const WORKER_LOG_MODE_KEY: &str = "worker_log_mode";
-const PROMPT_CAPTURE_PREFIX: &str = "prompt_capture:";
+/// Whether every outgoing LLM request is recorded for inspection.
+const PROMPT_DEBUG_CAPTURE_KEY: &str = "prompt_debug_capture";
+/// Days of captured requests to keep before the sweeper drops them.
+const PROMPT_DEBUG_RETENTION_KEY: &str = "prompt_debug_retention_days";
+/// Retention used when nothing has been configured.
+pub const DEFAULT_PROMPT_RETENTION_DAYS: i64 = 7;
 /// Canonical `adapter:target` string for the instance's home channel.
 pub const HOME_CHANNEL_KEY: &str = "home_channel";
 /// Whether the stored home channel was set deliberately.
@@ -251,16 +256,54 @@ impl SettingsStore {
         self.set_raw(WORKER_LOG_MODE_KEY, &mode.to_string())
     }
 
-    /// Check whether prompt capture is enabled for a specific channel.
-    pub fn prompt_capture_enabled(&self, channel_id: &str) -> bool {
-        let key = format!("{PROMPT_CAPTURE_PREFIX}{channel_id}");
-        matches!(self.get_raw(&key), Ok(v) if v == "true")
+    /// Whether every outgoing LLM request is recorded for inspection.
+    ///
+    /// An unreadable store reports "off" so capture never starts by accident,
+    /// but the read failure is logged — folding it into the default silently
+    /// makes a broken store look like a deliberate setting.
+    pub fn prompt_debug_capture(&self) -> bool {
+        match self.get_optional(PROMPT_DEBUG_CAPTURE_KEY) {
+            Ok(value) => value.as_deref() == Some("true"),
+            Err(error) => {
+                tracing::warn!(%error, "failed to read prompt capture setting; treating as off");
+                false
+            }
+        }
     }
 
-    /// Enable or disable prompt capture for a specific channel.
-    pub fn set_prompt_capture(&self, channel_id: &str, enabled: bool) -> Result<()> {
-        let key = format!("{PROMPT_CAPTURE_PREFIX}{channel_id}");
-        self.set_raw(&key, if enabled { "true" } else { "false" })
+    /// Turn request recording on or off for the whole instance.
+    pub fn set_prompt_debug_capture(&self, enabled: bool) -> Result<()> {
+        self.set_raw(
+            PROMPT_DEBUG_CAPTURE_KEY,
+            if enabled { "true" } else { "false" },
+        )
+    }
+
+    /// Days of captured requests to keep. Unset or unparseable reads as the
+    /// default rather than as "keep forever", because the payloads are large
+    /// and an unbounded directory is the failure mode worth avoiding.
+    pub fn prompt_debug_retention_days(&self) -> i64 {
+        let stored = match self.get_optional(PROMPT_DEBUG_RETENTION_KEY) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    default_days = DEFAULT_PROMPT_RETENTION_DAYS,
+                    "failed to read prompt retention setting; using the default"
+                );
+                None
+            }
+        };
+
+        stored
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|days| *days > 0)
+            .unwrap_or(DEFAULT_PROMPT_RETENTION_DAYS)
+    }
+
+    /// Set how many days of captured requests to keep.
+    pub fn set_prompt_debug_retention_days(&self, days: i64) -> Result<()> {
+        self.set_raw(PROMPT_DEBUG_RETENTION_KEY, &days.to_string())
     }
 
     /// The instance's home channel, or `None` when unset.

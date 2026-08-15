@@ -222,32 +222,21 @@ fn build_channel_system_prompt(rc: &spacebot::config::RuntimeConfig) -> String {
     let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
 
     prompt_engine
-        .render_channel_prompt_with_links(
-            empty_to_none(identity_context),
-            None,
-            empty_to_none(skills_prompt),
+        .render_channel_prompt(spacebot::prompts::ChannelPromptInputs {
+            identity_context: empty_to_none(identity_context),
+            skills_prompt: empty_to_none(skills_prompt),
             worker_capabilities,
             conversation_context,
-            None,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            prompt_engine
+            execution_mode: prompt_engine
                 .render_static("fragments/execution_standard")
                 .unwrap_or_default(),
-            prompt_engine
+            authority: prompt_engine
                 .render_static("fragments/authority")
                 .unwrap_or_default(),
-        )
+            ..Default::default()
+        })
         .expect("failed to render channel prompt")
+        .text
 }
 
 // ─── Channel Context ─────────────────────────────────────────────────────────
@@ -268,7 +257,6 @@ async fn dump_channel_context() {
         deps.event_tx.subscribe(),
         std::path::PathBuf::from("/tmp/screenshots"),
         std::path::PathBuf::from("/tmp/logs"),
-        None,
         None,
         spacebot::conversation::settings::ResolvedConversationSettings::default(),
         None,
@@ -313,7 +301,6 @@ async fn dump_channel_context() {
         screenshot_dir: std::path::PathBuf::from("/tmp/screenshots"),
         logs_dir: std::path::PathBuf::from("/tmp/logs"),
         reply_target_message_id: Arc::new(tokio::sync::RwLock::new(None)),
-        prompt_snapshot_store: None,
         live_process_transcripts: Arc::new(tokio::sync::RwLock::new(
             std::collections::HashMap::new(),
         )),
@@ -390,7 +377,8 @@ async fn dump_branch_context() {
     let workspace_dir = rc.workspace_dir.to_string_lossy();
     let branch_prompt = prompt_engine
         .render_branch_prompt(&instance_dir, &workspace_dir, false)
-        .expect("failed to render branch prompt");
+        .expect("failed to render branch prompt")
+        .text;
     print_section("BRANCH SYSTEM PROMPT", &branch_prompt);
     print_stats("System prompt", &branch_prompt);
 
@@ -470,7 +458,8 @@ async fn dump_worker_context() {
             false,
             None,
         )
-        .expect("failed to render worker prompt");
+        .expect("failed to render worker prompt")
+        .text;
     print_section("WORKER SYSTEM PROMPT", &worker_prompt);
     print_stats("System prompt", &worker_prompt);
     let brave_search_key = (**rc.brave_search_key.load()).clone();
@@ -575,7 +564,6 @@ async fn dump_all_contexts() {
         screenshot_dir: std::path::PathBuf::from("/tmp/screenshots"),
         logs_dir: std::path::PathBuf::from("/tmp/logs"),
         reply_target_message_id: Arc::new(tokio::sync::RwLock::new(None)),
-        prompt_snapshot_store: None,
         live_process_transcripts: Arc::new(tokio::sync::RwLock::new(
             std::collections::HashMap::new(),
         )),
@@ -627,7 +615,8 @@ async fn dump_all_contexts() {
     // ── Branch ──
     let branch_prompt = prompt_engine
         .render_branch_prompt(&instance_dir, &workspace_dir, false)
-        .expect("failed to render branch prompt");
+        .expect("failed to render branch prompt")
+        .text;
     let run_logger = spacebot::conversation::ProcessRunLogger::new(deps.sqlite_pool.clone());
     let branch_tool_server = spacebot::tools::create_branch_tool_server(
         None,
@@ -676,7 +665,8 @@ async fn dump_all_contexts() {
             false,
             None,
         )
-        .expect("failed to render worker prompt");
+        .expect("failed to render worker prompt")
+        .text;
     let brave_search_key = (**rc.brave_search_key.load()).clone();
     let worker_tool_server = spacebot::tools::create_worker_tool_server(
         deps.agent_id.clone(),

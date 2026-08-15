@@ -432,6 +432,16 @@ pub enum ChannelKind {
     Autonomy,
 }
 
+impl std::fmt::Display for ChannelKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::User => write!(f, "user"),
+            Self::Cron => write!(f, "cron"),
+            Self::Autonomy => write!(f, "autonomy"),
+        }
+    }
+}
+
 impl ChannelKind {
     /// System-initiated channels receive no further user messages after the
     /// initial prompt, so the event loop exits once all work settles.
@@ -494,7 +504,6 @@ pub struct ChannelState {
     pub screenshot_dir: std::path::PathBuf,
     pub logs_dir: std::path::PathBuf,
     /// Prompt snapshot store for debugging prompt construction.
-    pub prompt_snapshot_store: Option<Arc<crate::agent::prompt_snapshot::PromptSnapshotStore>>,
     /// Shared live transcript cache for running workers. When a worker is
     /// cancelled via `handle.abort()`, we drain its accumulated transcript
     /// steps from this cache and persist them to the DB so that cancelled
@@ -1031,6 +1040,9 @@ pub struct Channel {
     /// The inbound message currently being processed. Used to pair outbound
     /// responses with the correct platform routing metadata (e.g. Slack thread_ts).
     current_inbound: Option<InboundMessage>,
+    /// Conversation message id the current turn is answering, so a captured
+    /// request can be traced back to the message that caused it.
+    current_message_id: Option<String>,
     /// Conversation ID from the first message (for synthetic re-trigger messages).
     pub conversation_id: Option<String>,
     /// Adapter source captured from the first non-system message.
@@ -1180,7 +1192,6 @@ impl Channel {
         event_rx: broadcast::Receiver<ProcessEvent>,
         screenshot_dir: std::path::PathBuf,
         logs_dir: std::path::PathBuf,
-        prompt_snapshot_store: Option<Arc<crate::agent::prompt_snapshot::PromptSnapshotStore>>,
         live_process_transcripts: Option<LiveProcessTranscripts>,
         resolved_settings: ResolvedConversationSettings,
         cron_outcome: Option<crate::cron::CronOutcome>,
@@ -1245,7 +1256,6 @@ impl Channel {
             channel_store: channel_store.clone(),
             screenshot_dir,
             logs_dir,
-            prompt_snapshot_store,
             live_process_transcripts: live_process_transcripts
                 .unwrap_or_else(|| Arc::new(RwLock::new(HashMap::new()))),
             worker_context_settings: Arc::new(RwLock::new(
@@ -1301,6 +1311,7 @@ impl Channel {
             response_tx,
             self_tx,
             current_inbound: None,
+            current_message_id: None,
             conversation_id: None,
             source_adapter: None,
             conversation_context: None,
@@ -1649,14 +1660,17 @@ impl Channel {
         });
     }
 
+    /// Persist an inbound user message and return the id it was stored under.
+    ///
+    /// System messages are not persisted, so they have no id to return.
     fn persist_inbound_user_message(
         &self,
         message: &InboundMessage,
         raw_text: &str,
         saved_attachments: Option<&[channel_attachments::SavedAttachmentMeta]>,
-    ) {
+    ) -> Option<String> {
         if message.source == "system" {
-            return;
+            return None;
         }
         let sender_name = participant_display_name(message);
 
@@ -1671,7 +1685,7 @@ impl Channel {
             message.metadata.clone()
         };
 
-        self.state.conversation_logger.log_user_message(
+        let message_id = self.state.conversation_logger.log_user_message(
             &self.state.channel_id,
             &sender_name,
             &message.sender_id,
@@ -1681,6 +1695,7 @@ impl Channel {
         self.state
             .channel_store
             .upsert(&message.conversation_id, &metadata);
+        Some(message_id)
     }
 
     fn suppress_plaintext_fallback(&self) -> bool {
@@ -2345,13 +2360,14 @@ impl Channel {
                 };
 
                 if message.source != "autonomy" {
-                    self.state.conversation_logger.log_user_message(
-                        &self.state.channel_id,
-                        &sender_name,
-                        &message.sender_id,
-                        &raw_text,
-                        &metadata,
-                    );
+                    self.current_message_id =
+                        Some(self.state.conversation_logger.log_user_message(
+                            &self.state.channel_id,
+                            &sender_name,
+                            &message.sender_id,
+                            &raw_text,
+                            &metadata,
+                        ));
                 }
                 self.state
                     .channel_store
@@ -2472,7 +2488,7 @@ impl Channel {
         // Build system prompt. Time and the coalesce hint ride on the user
         // message envelope below instead of the system prompt — the prompt
         // must stay byte-stable across turns for provider caches to hit.
-        let system_prompt = self.build_system_prompt().await?;
+        let system_prompt = self.build_system_prompt_segmented().await?;
 
         // Extract adapter from messages (prefer explicit message.adapter, fall back to stored source_adapter)
         // This preserves per-message adapter for Signal named instances (e.g., "signal:work")
@@ -2649,7 +2665,8 @@ impl Channel {
             .as_ref()
             .map(|data| data.iter().map(|(meta, _)| meta.clone()).collect());
 
-        self.persist_inbound_user_message(&message, &raw_text, saved_metas.as_deref());
+        self.current_message_id =
+            self.persist_inbound_user_message(&message, &raw_text, saved_metas.as_deref());
         self.track_participant_from_message(&message).await;
 
         // Slash-command dispatch. Control commands execute deterministically
@@ -2811,7 +2828,7 @@ impl Channel {
             }
         }
 
-        let system_prompt = self.build_system_prompt().await?;
+        let system_prompt = self.build_system_prompt_segmented().await?;
 
         {
             let mut reply_target = self.state.reply_target_message_id.write().await;
@@ -3319,6 +3336,14 @@ impl Channel {
     /// exact byte stream the channel sends, so behavioral fixtures can gate
     /// on it without duplicating the composition.
     pub async fn build_system_prompt(&self) -> crate::error::Result<String> {
+        Ok(self.build_system_prompt_segmented().await?.text)
+    }
+
+    /// Build the channel's system prompt along with the map of the blocks it
+    /// is assembled from.
+    pub async fn build_system_prompt_segmented(
+        &self,
+    ) -> crate::error::Result<crate::prompts::SegmentedPrompt> {
         let rc = &self.deps.runtime_config;
         let prompt_engine = rc.prompts.load();
 
@@ -3369,7 +3394,14 @@ impl Channel {
         let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
         let non_empty_option = |value: Option<String>| value.filter(|text| !text.is_empty());
         let routing = rc.routing.load();
-        let model_name = routing.resolve(ProcessType::Channel, None).to_string();
+        // Enforcement is model-specific, so it has to be rendered for the model
+        // the turn will actually use — a conversation override, when set, not
+        // the routing default.
+        let model_name = self
+            .resolved_settings
+            .resolve_model("channel")
+            .unwrap_or_else(|| routing.resolve(ProcessType::Channel, None))
+            .to_string();
         let tool_use_enforcement = rc.tool_use_enforcement.load();
         let direct_mode = self.resolved_settings.delegation == DelegationMode::Direct;
         let execution_mode = if direct_mode {
@@ -3385,37 +3417,42 @@ impl Channel {
             .render_static("fragments/authority")
             .unwrap_or_default();
 
-        let system_prompt = prompt_engine.render_channel_prompt_with_links(
-            empty_to_none(identity_context),
-            non_empty_option(knowledge_synthesis_text),
-            empty_to_none(skills_prompt),
-            worker_capabilities,
-            self.conversation_context.clone(),
-            empty_to_none(status_text),
-            available_channels,
-            self.send_agent_message_tool.is_some(),
-            org_context,
-            adapter_prompt,
-            project_context,
-            self.backfill_transcript.clone(),
-            self.render_session_chronicle().await,
-            empty_to_none(working_memory),
-            empty_to_none(channel_activity_map),
-            empty_to_none(participant_context),
-            active_goals,
-            execution_mode,
-            authority,
-        )?;
+        let mut segmented =
+            prompt_engine.render_channel_prompt(crate::prompts::ChannelPromptInputs {
+                identity_context: empty_to_none(identity_context),
+                knowledge_synthesis: non_empty_option(knowledge_synthesis_text),
+                skills_prompt: empty_to_none(skills_prompt),
+                worker_capabilities,
+                conversation_context: self.conversation_context.clone(),
+                status_text: empty_to_none(status_text),
+                available_channels,
+                agent_links: self.send_agent_message_tool.is_some(),
+                org_context,
+                adapter_prompt,
+                project_context,
+                backfill_transcript: self.backfill_transcript.clone(),
+                session_chronicle: self.render_session_chronicle().await,
+                working_memory: empty_to_none(working_memory),
+                channel_activity_map: empty_to_none(channel_activity_map),
+                participant_context: empty_to_none(participant_context),
+                active_goals,
+                execution_mode,
+                authority,
+            })?;
 
-        let system_prompt = prompt_engine.maybe_append_tool_use_enforcement(
-            system_prompt,
-            tool_use_enforcement.as_ref(),
-            &model_name,
-        )?;
-        self.chronicler.fence().record_prompt_tokens(
-            crate::agent::compactor::estimate_text_tokens(&system_prompt),
+        segmented.adopt_appended(
+            prompt_engine.maybe_append_tool_use_enforcement(
+                segmented.text.clone(),
+                tool_use_enforcement.as_ref(),
+                &model_name,
+            )?,
+            "tool_use_enforcement",
         );
-        Ok(system_prompt)
+
+        self.chronicler.fence().record_prompt_tokens(
+            crate::agent::compactor::estimate_text_tokens(&segmented.text),
+        );
+        Ok(segmented)
     }
 
     /// Register per-turn tools, run the LLM agentic loop, and clean up.
@@ -3426,7 +3463,7 @@ impl Channel {
     async fn run_agent_turn(
         &self,
         user_text: &str,
-        system_prompt: &str,
+        system_prompt: &crate::prompts::SegmentedPrompt,
         conversation_id: &str,
         attachment_content: Vec<UserContent>,
         is_retrigger: bool,
@@ -3547,10 +3584,32 @@ impl Channel {
         let model = SpacebotModel::make(&self.deps.llm_manager, model_name)
             .with_context(&*self.deps.agent_id, "channel")
             .with_routing((**routing).clone())
-            .with_accumulator(usage_accumulator.clone());
+            .with_accumulator(usage_accumulator.clone())
+            .with_debug(
+                self.deps.prompt_records(),
+                crate::llm::record::DebugContext {
+                    process: Some(crate::llm::record::ProcessRef {
+                        kind: "channel".to_string(),
+                        id: Some(self.id.to_string()),
+                        process_type: Some(self.state.kind.to_string()),
+                        channel_id: Some(self.id.to_string()),
+                    }),
+                    trigger: Some(crate::llm::record::Trigger {
+                        kind: if is_retrigger {
+                            "retrigger".to_string()
+                        } else {
+                            "user_message".to_string()
+                        },
+                        message_id: self.current_message_id.clone(),
+                        input: Some(user_text.to_string()),
+                        parent: None,
+                    }),
+                    blocks: system_prompt.blocks.clone(),
+                },
+            );
 
         let agent = AgentBuilder::new(model)
-            .preamble(system_prompt)
+            .preamble(&system_prompt.text)
             .default_max_turns(max_turns)
             .tool_server_handle(self.tool_server.clone())
             .build();
@@ -3612,7 +3671,7 @@ impl Channel {
         {
             let context_window = **self.deps.runtime_config.context_window.load();
             let estimated = crate::agent::chronicle::estimate_request_tokens(
-                crate::agent::compactor::estimate_text_tokens(system_prompt),
+                crate::agent::compactor::estimate_text_tokens(&system_prompt.text),
                 &history,
                 user_text,
                 context_window,
@@ -3627,9 +3686,6 @@ impl Channel {
                 );
             }
         }
-
-        // ── Prompt snapshot capture (fire-and-forget) ──
-        self.maybe_capture_snapshot(system_prompt, user_text, &history);
 
         let mut result = self
             .hook
@@ -4712,72 +4768,6 @@ impl Channel {
                 );
             }
         }
-    }
-
-    /// If prompt capture is enabled for this channel, snapshot the current
-    /// system prompt sections and conversation history. The save is
-    /// fire-and-forget so it never blocks the agentic loop.
-    fn maybe_capture_snapshot(
-        &self,
-        system_prompt: &str,
-        user_message: &str,
-        history: &[rig::message::Message],
-    ) {
-        // 1. Check if we have a snapshot store.
-        let snapshot_store = match self.state.prompt_snapshot_store.as_ref() {
-            Some(store) => store.clone(),
-            None => return,
-        };
-
-        // 2. Check if capture is enabled via settings.
-        let rc = &self.deps.runtime_config;
-        let capture_enabled = rc
-            .settings
-            .load()
-            .as_ref()
-            .as_ref()
-            .map(|settings| settings.prompt_capture_enabled(&self.id))
-            .unwrap_or(false);
-        if !capture_enabled {
-            return;
-        }
-
-        // 3. Serialize history and build the snapshot.
-        let history_json = match serde_json::to_value(history) {
-            Ok(value) => value,
-            Err(error) => {
-                tracing::warn!(
-                    channel_id = %self.id,
-                    %error,
-                    "failed to serialize prompt history; skipping snapshot capture"
-                );
-                return;
-            }
-        };
-        let history_length = history.len();
-        let system_prompt_chars = system_prompt.chars().count();
-
-        let snapshot = crate::agent::prompt_snapshot::PromptSnapshot {
-            channel_id: self.id.to_string(),
-            timestamp_ms: chrono::Utc::now().timestamp_millis(),
-            user_message: user_message.to_string(),
-            system_prompt: system_prompt.to_string(),
-            system_prompt_chars,
-            history: history_json,
-            history_length,
-        };
-
-        // 5. Fire-and-forget save.
-        let channel_id = self.id.clone();
-        tokio::spawn(async move {
-            if let Err(error) = snapshot_store.save(&snapshot) {
-                tracing::warn!(
-                    channel_id = %channel_id,
-                    %error,
-                    "failed to save prompt snapshot"
-                );
-            }
-        });
     }
 }
 

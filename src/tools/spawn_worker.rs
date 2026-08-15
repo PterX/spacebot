@@ -1014,7 +1014,7 @@ impl Tool for DetachedSpawnWorkerTool {
         let tool_use_enforcement = rc.tool_use_enforcement.load();
         let project_context =
             crate::agent::channel_dispatch::build_project_context(&self.deps, &prompt_engine).await;
-        let worker_system_prompt = prompt_engine
+        let mut worker_system_prompt = prompt_engine
             .render_worker_prompt(
                 &rc.instance_dir.display().to_string(),
                 &rc.workspace_dir.display().to_string(),
@@ -1028,16 +1028,21 @@ impl Tool for DetachedSpawnWorkerTool {
                 self.deps.wiki_store.is_some(),
                 project_context,
             )
-            .and_then(|prompt| {
-                prompt_engine.maybe_append_tool_use_enforcement(
-                    prompt,
-                    tool_use_enforcement.as_ref(),
-                    &model_name,
-                )
-            })
             .map_err(|error| {
                 SpawnWorkerError(format!("failed to render worker prompt: {error}"))
             })?;
+        worker_system_prompt.adopt_appended(
+            prompt_engine
+                .maybe_append_tool_use_enforcement(
+                    worker_system_prompt.text.clone(),
+                    tool_use_enforcement.as_ref(),
+                    &model_name,
+                )
+                .map_err(|error| {
+                    SpawnWorkerError(format!("failed to render worker prompt: {error}"))
+                })?,
+            "tool_use_enforcement",
+        );
 
         let brave_search_key = (**rc.brave_search_key.load()).clone();
 

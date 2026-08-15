@@ -146,7 +146,7 @@ impl Compactor {
         let prompt_engine = deps.runtime_config.prompts.load();
         // The compactor is a toolless agent (summary-only), so tool-use
         // enforcement is skipped — there are no tools to enforce.
-        let compactor_prompt = match prompt_engine.render_static("compactor") {
+        let compactor_prompt = match prompt_engine.render_static_segmented("compactor") {
             Ok(prompt) => prompt,
             Err(error) => {
                 tracing::error!(%error, "failed to render compactor prompt");
@@ -264,7 +264,7 @@ struct CompactionGuard {
 #[tracing::instrument(skip(deps, compactor_prompt, history, guard), fields(agent_id = %deps.agent_id))]
 async fn run_compaction(
     deps: &AgentDeps,
-    compactor_prompt: &str,
+    compactor_prompt: &crate::prompts::SegmentedPrompt,
     history: &Arc<RwLock<Vec<Message>>>,
     channel_id: &ChannelId,
     fraction: f32,
@@ -298,13 +298,31 @@ async fn run_compaction(
     };
     let model = SpacebotModel::make(&deps.llm_manager, &model_name)
         .with_context(&*deps.agent_id, "compactor")
-        .with_routing((**routing).clone());
+        .with_routing((**routing).clone())
+        .with_debug(
+            deps.prompt_records(),
+            crate::llm::record::DebugContext {
+                process: Some(crate::llm::record::ProcessRef {
+                    kind: "compactor".to_string(),
+                    id: Some(channel_id.to_string()),
+                    process_type: None,
+                    channel_id: Some(channel_id.to_string()),
+                }),
+                trigger: Some(crate::llm::record::Trigger {
+                    kind: "compaction".to_string(),
+                    message_id: None,
+                    input: Some(format!("{remove_count} messages")),
+                    parent: Some(format!("channel:{channel_id}")),
+                }),
+                blocks: compactor_prompt.blocks.clone(),
+            },
+        );
 
     // Give the compaction worker memory_save so it can directly persist memories
     // No tool server — the compactor's sole job is producing a summary.
     // Memory extraction is handled by persistence branches (Phase 5a).
     let agent = AgentBuilder::new(model)
-        .preamble(compactor_prompt)
+        .preamble(&compactor_prompt.text)
         .default_max_turns(1)
         .build();
 

@@ -26,7 +26,7 @@ pub struct Branch {
     pub deps: AgentDeps,
     pub hook: SpacebotHook,
     /// System prompt loaded from prompts/BRANCH.md.
-    pub system_prompt: String,
+    pub system_prompt: crate::prompts::SegmentedPrompt,
     /// Clone of the channel's history at fork time (Rig message format).
     pub history: Vec<rig::message::Message>,
     /// Isolated ToolServer with memory_save + memory_recall.
@@ -55,7 +55,7 @@ impl Branch {
         channel_id: ChannelId,
         description: impl Into<String>,
         deps: AgentDeps,
-        system_prompt: impl Into<String>,
+        system_prompt: impl Into<crate::prompts::SegmentedPrompt>,
         history: Vec<rig::message::Message>,
         tool_server: ToolServerHandle,
         execution_config: BranchExecutionConfig,
@@ -127,10 +127,28 @@ impl Branch {
         let model = SpacebotModel::make(&self.deps.llm_manager, &model_name)
             .with_context(&*self.deps.agent_id, "branch")
             .with_routing((**routing).clone())
-            .with_accumulator(usage_accumulator.clone());
+            .with_accumulator(usage_accumulator.clone())
+            .with_debug(
+                self.deps.prompt_records(),
+                crate::llm::record::DebugContext {
+                    process: Some(crate::llm::record::ProcessRef {
+                        kind: "branch".to_string(),
+                        id: Some(self.id.to_string()),
+                        process_type: None,
+                        channel_id: Some(self.channel_id.to_string()),
+                    }),
+                    trigger: Some(crate::llm::record::Trigger {
+                        kind: "branch".to_string(),
+                        message_id: None,
+                        input: Some(self.description.clone()),
+                        parent: Some(format!("channel:{}", self.channel_id)),
+                    }),
+                    blocks: self.system_prompt.blocks.clone(),
+                },
+            );
 
         let agent = AgentBuilder::new(model)
-            .preamble(&self.system_prompt)
+            .preamble(&self.system_prompt.text)
             .default_max_turns(self.max_turns)
             .tool_server_handle(self.tool_server.clone())
             .build();
@@ -366,7 +384,7 @@ impl Branch {
     /// half of the messages at a time until it fits.
     fn maybe_compact_history(&mut self, prompt: &str) {
         let context_window = **self.deps.runtime_config.context_window.load();
-        let prompt_tokens = crate::agent::compactor::estimate_text_tokens(&self.system_prompt)
+        let prompt_tokens = crate::agent::compactor::estimate_text_tokens(&self.system_prompt.text)
             + crate::agent::compactor::estimate_text_tokens(prompt);
         let removed = crate::agent::compactor::precompact_forked_history(
             &mut self.history,

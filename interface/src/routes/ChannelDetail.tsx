@@ -16,7 +16,7 @@ import {
 } from "@/hooks/useChannelLiveState";
 import {useLiveContext} from "@/hooks/useLiveContext";
 import {Markdown} from "@/components/Markdown";
-import {PromptInspectModal} from "@/components/PromptInspectModal";
+import {PromptInspector} from "@/components/prompt/PromptInspector";
 import {
 	ProcessCard,
 	ProcessDetail,
@@ -25,9 +25,15 @@ import {
 	type ProcessSelection,
 } from "@/components/processes/ProcessRunView";
 import {formatTimestamp, platformIcon, platformColor} from "@/lib/format";
-import {Button} from "@spacedrive/primitives";
+import {
+	Button,
+	DropdownMenuContent,
+	DropdownMenuItem,
+	DropdownMenuRoot,
+	DropdownMenuTrigger,
+} from "@spacedrive/primitives";
 import {ChatMessageList, type ChatMessageListHandle} from "@spacedrive/ai";
-import {Code} from "@phosphor-icons/react";
+import {DotsThree} from "@phosphor-icons/react";
 
 interface ChannelDetailProps {
   agentId: string;
@@ -188,6 +194,45 @@ function CheckpointItem({ item }: { item: TimelineCheckpoint }) {
   );
 }
 
+/**
+ * Per-message actions, revealed on hover. Prompt assembly changes between
+ * turns, so the useful question is what this turn looked like, not what the
+ * channel looks like now.
+ */
+function MessageActions({
+  messageId,
+  onInspect,
+}: {
+  messageId: string;
+  onInspect: () => void;
+}) {
+  return (
+    <DropdownMenuRoot>
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          aria-label="Message actions"
+          className="absolute right-1.5 top-1.5 rounded-md p-1 text-ink-faint opacity-0 transition-opacity hover:bg-app-hover hover:text-ink focus:opacity-100 group-hover:opacity-100"
+        >
+          <DotsThree className="size-4" weight="bold" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        <DropdownMenuItem onSelect={onInspect}>
+          Inspect prompt at this turn
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          onSelect={() =>
+            navigator.clipboard?.writeText(messageId).catch(console.warn)
+          }
+        >
+          Copy message id
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenuRoot>
+  );
+}
+
 function TimelineEntry({
   item,
   liveWorkers,
@@ -195,6 +240,7 @@ function TimelineEntry({
   channelId,
   selection,
   onSelect,
+  onInspectMessage,
 }: {
   item: TimelineItem;
   liveWorkers: Record<string, ActiveWorker>;
@@ -202,12 +248,13 @@ function TimelineEntry({
   channelId: string;
   selection: ProcessSelection | null;
   onSelect: (selection: ProcessSelection) => void;
+  onInspectMessage: (messageId: string) => void;
 }) {
   switch (item.type) {
     case "message":
       return (
         <div
-          className={`flex gap-3 rounded-md px-3 py-2 ${
+          className={`group relative flex gap-3 rounded-md px-3 py-2 ${
             item.role === "user" ? "bg-app-dark-box/30" : item.role === "system" ? "border border-app-line/40 bg-app-box/30" : ""
           }`}
         >
@@ -234,6 +281,10 @@ function TimelineEntry({
               <Markdown>{item.content}</Markdown>
             </div>
           </div>
+          <MessageActions
+            messageId={item.id}
+            onInspect={() => onInspectMessage(item.id)}
+          />
         </div>
       );
     case "branch_run": {
@@ -374,6 +425,7 @@ export function ChannelDetail({
   const hasActivity =
     activeWorkerCount > 0 || activeBranchCount > 0 || compaction !== null;
   const [inspectOpen, setInspectOpen] = useState(false);
+  const [inspectMessageId, setInspectMessageId] = useState<string | null>(null);
   const [selection, setSelection] = useState<ProcessSelection | null>(null);
   const { liveTranscripts } = useLiveContext();
   const selectedFallback = useMemo(
@@ -516,15 +568,23 @@ export function ChannelDetail({
                 <span className="ml-1 text-tiny text-ink-faint">typing</span>
               </div>
             )}
-            <Button
-              aria-label="Inspect prompt"
-              onClick={() => setInspectOpen(true)}
-              variant="bare"
-              size="icon"
-              title="Inspect prompt"
-            >
-              <Code className="h-4 w-4" />
-            </Button>
+            <DropdownMenuRoot>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  aria-label="Channel actions"
+                  variant="bare"
+                  size="icon"
+                  title="Channel actions"
+                >
+                  <DotsThree className="h-4 w-4" weight="bold" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onSelect={() => setInspectOpen(true)}>
+                  Inspect prompt
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenuRoot>
           </div>
         </div>
 
@@ -606,6 +666,7 @@ export function ChannelDetail({
 											channelId={channelId}
 											selection={selection}
 											onSelect={setSelection}
+											onInspectMessage={setInspectMessageId}
 										/>
 									</div>
 								);
@@ -627,11 +688,22 @@ export function ChannelDetail({
         </aside>
       )}
 
-      <PromptInspectModal
+      <PromptInspector
         open={inspectOpen}
         onOpenChange={setInspectOpen}
-        channelId={channelId}
+        agentId={agentId}
+        scope={{kind: "channel", channelId}}
       />
+
+      {inspectMessageId && (
+        <PromptInspector
+          open
+          onOpenChange={(open) => !open && setInspectMessageId(null)}
+          agentId={agentId}
+          scope={{kind: "message", messageId: inspectMessageId}}
+        />
+      )}
+
     </div>
   );
 }

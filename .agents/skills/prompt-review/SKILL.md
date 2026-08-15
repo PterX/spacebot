@@ -133,7 +133,7 @@ Each agent's live data lives on disk at `~/.spacebot/agents/{agent_id}/`. This i
         │   ├── spacebot.db              # SQLite — conversations, memory graph, cron, tasks
         │   ├── config.redb              # redb — agent-level key-value config
         │   ├── settings.redb            # redb — agent-level settings
-        │   ├── prompt_snapshots.redb    # redb — captured prompt snapshots for debugging
+        │   ├── prompts/                 # captured LLM requests, one JSON file per request
         │   ├── lancedb/                 # LanceDB — vector embeddings + full-text index
         │   │   └── memory_embeddings.lance/
         │   ├── logs/                    # Worker execution logs

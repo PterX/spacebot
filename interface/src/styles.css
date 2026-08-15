@@ -33,6 +33,22 @@
 	--font-sans: "IBM Plex Sans", system-ui, sans-serif;
 }
 
+/* Prompt inspector palette.
+   The SpaceUI token theme defines semantic colours only, so Tailwind's
+   default scale (violet, blue, emerald, …) generates no utilities in this
+   build — reaching for it renders transparent. One colour per prompt
+   composition layer, declared here so the inspector reads the same way
+   whichever process it is opened on. */
+@theme {
+	--color-block-identity: #a78bfa;
+	--color-block-contract: #94a3b8;
+	--color-block-capabilities: #60a5fa;
+	--color-block-knowledge: #34d399;
+	--color-block-working: #fbbf24;
+	--color-block-runtime: #fb7185;
+	--color-block-tools: #22d3ee;
+}
+
 /* Custom utilities */
 @utility no-scrollbar {
 	-ms-overflow-style: none;

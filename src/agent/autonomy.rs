@@ -342,7 +342,6 @@ pub async fn run_autonomy_channel(
         event_rx,
         screenshot_dir,
         logs_dir,
-        None, // autonomy channels don't capture prompt snapshots
         None, // autonomy channels don't share live transcript cache
         resolved_settings,
         None, // no cron outcome — delivery is not a concept here

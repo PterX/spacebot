@@ -264,7 +264,7 @@ pub struct Worker {
     pub deps: AgentDeps,
     pub hook: SpacebotHook,
     /// System prompt loaded from prompts/WORKER.md.
-    pub system_prompt: String,
+    pub system_prompt: crate::prompts::SegmentedPrompt,
     /// Input channel for interactive workers (follow-up loop).
     pub input_rx: Option<mpsc::Receiver<String>>,
     /// Context injection channel. Unlike `input_rx` (which drives the
@@ -313,7 +313,7 @@ impl Worker {
     fn build(
         channel_id: Option<ChannelId>,
         task: impl Into<String>,
-        system_prompt: impl Into<String>,
+        system_prompt: impl Into<crate::prompts::SegmentedPrompt>,
         deps: AgentDeps,
         browser_config: BrowserConfig,
         screenshot_dir: PathBuf,
@@ -386,7 +386,7 @@ impl Worker {
     pub fn new(
         channel_id: Option<ChannelId>,
         task: impl Into<String>,
-        system_prompt: impl Into<String>,
+        system_prompt: impl Into<crate::prompts::SegmentedPrompt>,
         deps: AgentDeps,
         browser_config: BrowserConfig,
         screenshot_dir: PathBuf,
@@ -423,7 +423,7 @@ impl Worker {
     pub fn new_interactive(
         channel_id: Option<ChannelId>,
         task: impl Into<String>,
-        system_prompt: impl Into<String>,
+        system_prompt: impl Into<crate::prompts::SegmentedPrompt>,
         deps: AgentDeps,
         browser_config: BrowserConfig,
         screenshot_dir: PathBuf,
@@ -464,7 +464,7 @@ impl Worker {
         existing_id: WorkerId,
         channel_id: Option<ChannelId>,
         task: impl Into<String>,
-        system_prompt: impl Into<String>,
+        system_prompt: impl Into<crate::prompts::SegmentedPrompt>,
         deps: AgentDeps,
         browser_config: BrowserConfig,
         screenshot_dir: PathBuf,
@@ -646,10 +646,28 @@ impl Worker {
             .with_context(&*self.deps.agent_id, "worker")
             .with_worker_type("builtin")
             .with_routing((**routing).clone())
-            .with_accumulator(usage_accumulator.clone());
+            .with_accumulator(usage_accumulator.clone())
+            .with_debug(
+                self.deps.prompt_records(),
+                crate::llm::record::DebugContext {
+                    process: Some(crate::llm::record::ProcessRef {
+                        kind: "worker".to_string(),
+                        id: Some(self.id.to_string()),
+                        process_type: Some("builtin".to_string()),
+                        channel_id: self.channel_id.as_ref().map(|id| id.to_string()),
+                    }),
+                    trigger: Some(crate::llm::record::Trigger {
+                        kind: "spawn_worker".to_string(),
+                        message_id: None,
+                        input: Some(self.task.clone()),
+                        parent: self.channel_id.as_ref().map(|id| format!("channel:{id}")),
+                    }),
+                    blocks: self.system_prompt.blocks.clone(),
+                },
+            );
 
         let agent = AgentBuilder::new(model)
-            .preamble(&self.system_prompt)
+            .preamble(&self.system_prompt.text)
             .default_max_turns(TURNS_PER_SEGMENT)
             .tool_server_handle(worker_tool_server)
             .build();

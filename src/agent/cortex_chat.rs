@@ -706,10 +706,26 @@ impl CortexChatSession {
         let model_name = routing.resolve(ProcessType::Cortex, None).to_string();
         let model = SpacebotModel::make(&self.deps.llm_manager, &model_name)
             .with_context(self.deps.agent_id.as_ref(), "cortex")
-            .with_routing(routing.as_ref().clone());
+            .with_routing(routing.as_ref().clone())
+            .with_debug(
+                self.deps.prompt_records(),
+                crate::llm::record::DebugContext {
+                    process: Some(crate::llm::record::ProcessRef {
+                        kind: "cortex".to_string(),
+                        id: None,
+                        process_type: Some("cortex_chat".to_string()),
+                        channel_id: channel_context_id.map(str::to_string),
+                    }),
+                    trigger: Some(crate::llm::record::Trigger {
+                        kind: "cortex_chat".to_string(),
+                        ..Default::default()
+                    }),
+                    blocks: system_prompt.blocks.clone(),
+                },
+            );
 
         let agent = AgentBuilder::new(model)
-            .preamble(&system_prompt)
+            .preamble(&system_prompt.text)
             .default_max_turns(50)
             .tool_server_handle(self.tool_server.clone())
             .build();
@@ -813,7 +829,7 @@ impl CortexChatSession {
     async fn build_system_prompt(
         &self,
         channel_context_id: Option<&str>,
-    ) -> crate::error::Result<String> {
+    ) -> crate::error::Result<crate::prompts::SegmentedPrompt> {
         let runtime_config = &self.deps.runtime_config;
         let prompt_engine = runtime_config.prompts.load();
 
@@ -855,7 +871,7 @@ impl CortexChatSession {
         let model_name = routing.resolve(ProcessType::Cortex, None).to_string();
         let tool_use_enforcement = runtime_config.tool_use_enforcement.load();
 
-        let system_prompt = prompt_engine.render_cortex_chat_prompt(
+        let mut system_prompt = prompt_engine.render_cortex_chat_prompt(
             empty_to_none(identity_context),
             channel_transcript,
             empty_to_none(agents_manifest),
@@ -865,11 +881,15 @@ impl CortexChatSession {
             self.factory_enabled,
         )?;
 
-        prompt_engine.maybe_append_tool_use_enforcement(
-            system_prompt,
-            tool_use_enforcement.as_ref(),
-            &model_name,
-        )
+        system_prompt.adopt_appended(
+            prompt_engine.maybe_append_tool_use_enforcement(
+                system_prompt.text.clone(),
+                tool_use_enforcement.as_ref(),
+                &model_name,
+            )?,
+            "tool_use_enforcement",
+        );
+        Ok(system_prompt)
     }
 
     /// Load the last 50 messages from a channel as a formatted transcript.

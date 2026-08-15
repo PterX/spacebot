@@ -1298,7 +1298,6 @@ async fn run_cron_job(
         event_rx,
         context.screenshot_dir.clone(),
         context.logs_dir.clone(),
-        None, // cron channels don't capture prompt snapshots
         None, // cron channels don't share live transcript cache
         crate::conversation::settings::ResolvedConversationSettings::default(),
         Some(cron_outcome.clone()),

@@ -532,43 +532,124 @@ export interface PromptHistoryBlock {
 	reasoning?: string[];
 }
 
-export interface PromptInspectResponse {
-	channel_id: string;
-	system_prompt: string;
-	total_chars: number;
+// --- Prompt records (the inspector) ---
+
+/** Composition layer a block belongs to. Drives its colour in the inspector. */
+export type BlockLayer =
+	| "identity"
+	| "contract"
+	| "capabilities"
+	| "knowledge"
+	| "working"
+	| "runtime";
+
+/** How often a block's bytes are expected to change. */
+export type BlockStability = "static" | "epoch" | "volatile";
+
+export type BlockSource =
+	| "template"
+	| "file"
+	| "store"
+	| "synthesis"
+	| "live_state"
+	| "config";
+
+export interface PromptBlock {
+	id: string;
+	layer: BlockLayer;
+	stability: BlockStability;
+	source: BlockSource;
+	/** Byte offsets into the system prompt. Blocks tile it exactly. */
+	start: number;
+	end: number;
+	chars: number;
+	tokens: number;
+}
+
+export interface PromptRequestSummary {
+	request_id: string;
+	process_kind: string;
+	process_id: string | null;
+	process_type: string | null;
+	channel_id: string | null;
+	message_id: string | null;
+	trigger: string | null;
+	model: string;
+	provider: string;
+	started_at: string;
+	duration_ms: number | null;
+	system_chars: number;
 	history_length: number;
-	history: PromptHistoryMessage[];
+	tool_count: number;
+	input_tokens: number | null;
+	output_tokens: number | null;
+	cached_tokens: number | null;
+	status: string;
+}
+
+export interface PromptRequestListResponse {
 	capture_enabled: boolean;
-	/** Present when the channel is not active */
-	error?: string;
-	message?: string;
+	requests: PromptRequestSummary[];
 }
 
-export interface PromptSnapshotSummary {
-	timestamp_ms: number;
-	user_message: string;
-	system_prompt_chars: number;
+export interface PromptToolRef {
+	name: string;
+	description: string;
+	schema: unknown;
+	chars: number;
+}
+
+export interface PromptRecord {
+	request_id: string;
+	agent_id: string;
+	process: {
+		kind: string;
+		id: string | null;
+		process_type: string | null;
+		channel_id: string | null;
+	};
+	trigger: {
+		kind: string;
+		message_id: string | null;
+		input: string | null;
+		parent: string | null;
+	};
+	model: {
+		name: string;
+		provider: string;
+		max_tokens: number | null;
+		temperature: number | null;
+	};
+	started_at: string;
+	duration_ms: number;
+	system: {
+		text: string;
+		blocks: PromptBlock[];
+	};
+	tools: PromptToolRef[];
+	/**
+	 * Serialized rig messages. The recorder falls back to JSON null when a
+	 * history fails to serialize, so a stored payload can carry null here.
+	 */
+	messages: PromptHistoryMessage[] | null;
 	history_length: number;
+	response: {
+		text: string | null;
+		tool_calls: string[];
+		error: string | null;
+	};
+	usage: {
+		input_tokens: number;
+		output_tokens: number;
+		cached_read_tokens: number;
+		cached_write_tokens: number;
+		cost_usd: number;
+	};
 }
 
-export interface PromptSnapshotListResponse {
-	channel_id: string;
-	snapshots: PromptSnapshotSummary[];
-}
-
-export interface PromptSnapshot {
-	channel_id: string;
-	timestamp_ms: number;
-	user_message: string;
-	system_prompt: string;
-	system_prompt_chars: number;
-	history: PromptHistoryMessage[];
-	history_length: number;
-}
-
-export interface PromptCaptureResponse {
-	channel_id: string;
-	capture_enabled: boolean;
+export interface PromptDebugCaptureSettings {
+	enabled: boolean;
+	retention_days: number;
 }
 
 // --- Memory helper types (extended beyond schema) ---
@@ -1943,25 +2024,49 @@ export const api = {
 		return fetchJson<Types.MessagesResponse>(`/channels/messages?${params}`);
 	},
 	channelStatus: () => fetchJson<ChannelStatusResponse>("/channels/status"),
-	inspectPrompt: (channelId: string) =>
-		fetchJson<PromptInspectResponse>(`/channels/prompt/inspect?channel_id=${encodeURIComponent(channelId)}`),
-	setPromptCapture: async (channelId: string, enabled: boolean) => {
-		const response = await apiFetch(`${getApiBase()}/channels/prompt/capture`, {
+	listPromptRequests: (
+		params: {
+			agentId?: string;
+			channelId?: string;
+			processId?: string;
+			messageId?: string;
+			limit?: number;
+		} = {},
+	) => {
+		const search = new URLSearchParams();
+		if (params.agentId) search.set("agent_id", params.agentId);
+		if (params.channelId) search.set("channel_id", params.channelId);
+		if (params.processId) search.set("process_id", params.processId);
+		if (params.messageId) search.set("message_id", params.messageId);
+		if (params.limit) search.set("limit", String(params.limit));
+		return fetchJson<PromptRequestListResponse>(`/prompts?${search}`);
+	},
+	getPromptRequest: (requestId: string, agentId?: string) => {
+		const search = new URLSearchParams({ request_id: requestId });
+		if (agentId) search.set("agent_id", agentId);
+		return fetchJson<PromptRecord>(`/prompts/get?${search}`);
+	},
+	getPromptDebugCapture: (agentId?: string) => {
+		const search = new URLSearchParams();
+		if (agentId) search.set("agent_id", agentId);
+		return fetchJson<PromptDebugCaptureSettings>(`/prompts/capture?${search}`);
+	},
+	setPromptDebugCapture: async (
+		enabled: boolean,
+		options: { agentId?: string; retentionDays?: number } = {},
+	) => {
+		const response = await apiFetch(`${getApiBase()}/prompts/capture`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ channel_id: channelId, enabled }),
+			body: JSON.stringify({
+				enabled,
+				agent_id: options.agentId,
+				retention_days: options.retentionDays,
+			}),
 		});
 		if (!response.ok) throw new Error(`API error: ${response.status}`);
-		return response.json() as Promise<PromptCaptureResponse>;
+		return response.json() as Promise<PromptDebugCaptureSettings>;
 	},
-	listPromptSnapshots: (channelId: string, limit = 50) =>
-		fetchJson<PromptSnapshotListResponse>(
-			`/channels/prompt/snapshots?channel_id=${encodeURIComponent(channelId)}&limit=${limit}`,
-		),
-	getPromptSnapshot: (channelId: string, timestampMs: number) =>
-		fetchJson<PromptSnapshot>(
-			`/channels/prompt/snapshots/get?channel_id=${encodeURIComponent(channelId)}&timestamp_ms=${timestampMs}`,
-		),
 	workersList: (agentId: string, params: { limit?: number; offset?: number; status?: string } = {}) => {
 		const search = new URLSearchParams({ agent_id: agentId });
 		if (params.limit) search.set("limit", String(params.limit));

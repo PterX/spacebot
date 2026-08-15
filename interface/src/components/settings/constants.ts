@@ -50,6 +50,12 @@ export const SECTIONS = [
 		description: "Worker execution logging",
 	},
 	{
+		id: "prompt-debug" as const,
+		label: "Prompt Capture",
+		group: "system" as const,
+		description: "Record LLM requests for the prompt inspector",
+	},
+	{
 		id: "updates" as const,
 		label: "Updates",
 		group: "system" as const,

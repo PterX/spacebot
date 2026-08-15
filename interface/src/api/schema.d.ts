@@ -1130,79 +1130,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/channels/prompt/capture": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Enable or disable prompt capture for a specific channel. */
-        post: operations["set_prompt_capture"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/channels/prompt/inspect": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Render the full prompt that the LLM would see on the next turn for a
-         *     given channel. Returns the rendered system prompt and conversation
-         *     history — useful for debugging prompt construction, coalescing,
-         *     status block content, and context window usage.
-         */
-        get: operations["inspect_prompt"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/channels/prompt/snapshots": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** List prompt snapshots for a channel (newest first). */
-        get: operations["list_prompt_snapshots"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/channels/prompt/snapshots/get": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Retrieve a specific prompt snapshot. */
-        get: operations["get_prompt_snapshot"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/channels/status": {
         parameters: {
             query?: never;
@@ -1980,6 +1907,61 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/prompts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List captured requests, newest first. */
+        get: operations["list_prompt_requests"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/prompts/capture": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read the instance-wide capture setting. */
+        get: operations["get_prompt_debug_capture"];
+        put?: never;
+        /** Turn request capture on or off for the whole instance. */
+        post: operations["set_prompt_debug_capture"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/prompts/get": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Fetch one captured request in full: system prompt, block map, tool
+         *     definitions, message history, response and usage.
+         */
+        get: operations["get_prompt_request"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/providers": {
         parameters: {
             query?: never;
@@ -2553,6 +2535,27 @@ export interface paths {
         put?: never;
         /** `POST /tasks/{number}/assign` — reassign a task to a different agent. */
         post: operations["assign_task"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/tasks/{number}/attempts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /tasks/{number}/attempts` — the worker runs attempted against a task.
+         * @description `tasks.worker_id` names only the run executing right now; this is the
+         *     history that says what has already been tried and how it ended.
+         */
+        get: operations["list_task_attempts"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -3261,6 +3264,20 @@ export interface components {
         CancelProcessResponse: {
             message: string;
             success: boolean;
+        };
+        CaptureBody: {
+            agent_id?: string | null;
+            enabled: boolean;
+            /**
+             * Format: int64
+             * @description Days of records to keep. Omitted leaves the current retention alone.
+             */
+            retention_days?: number | null;
+        };
+        CaptureSettings: {
+            enabled: boolean;
+            /** Format: int64 */
+            retention_days: number;
         };
         ChannelResponse: {
             agent_id: string;
@@ -4519,10 +4536,6 @@ export interface components {
             use_worktrees?: boolean | null;
             worktree_name_template?: string | null;
         };
-        PromptCaptureBody: {
-            channel_id: string;
-            enabled: boolean;
-        };
         ProviderConfigResponse: {
             api_version?: string | null;
             base_url?: string | null;
@@ -4896,6 +4909,36 @@ export interface components {
             message: string;
             success: boolean;
         };
+        /** @description One worker run recorded against a task. */
+        TaskAttempt: {
+            agent_id?: string | null;
+            /**
+             * Format: int64
+             * @description 1 for the first run on this task.
+             */
+            attempt: number;
+            author_id?: string | null;
+            author_type: components["schemas"]["TaskAuthorKind"];
+            channel_id?: string | null;
+            ended_at?: string | null;
+            id: string;
+            outcome?: null | components["schemas"]["TaskAttemptOutcome"];
+            outcome_summary?: string | null;
+            started_at: string;
+            task_id: string;
+            worker_id: string;
+        };
+        TaskAttemptListResponse: {
+            /** @description Worker runs attempted against this task, newest first. */
+            attempts: components["schemas"]["TaskAttempt"][];
+            /** @description One line summarising what has been tried, as prompt context renders it. */
+            summary?: string | null;
+        };
+        /**
+         * @description How a worker run ended, from the task's point of view.
+         * @enum {string}
+         */
+        TaskAttemptOutcome: "succeeded" | "partial" | "blocked" | "failed" | "cancelled" | "timed_out" | "interrupted";
         /**
          * @description Who performed a task mutation or wrote a comment.
          * @enum {string}
@@ -8589,155 +8632,6 @@ export interface operations {
             };
         };
     };
-    set_prompt_capture: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["PromptCaptureBody"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Agent or settings not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Internal server error */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    inspect_prompt: {
-        parameters: {
-            query: {
-                /** @description Channel ID to inspect */
-                channel_id: string;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Channel not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Internal server error */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    list_prompt_snapshots: {
-        parameters: {
-            query: {
-                /** @description Channel ID to list snapshots for */
-                channel_id: string;
-                /** @description Maximum number of snapshots to return (default: 50) */
-                limit: number;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Snapshot store not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Internal server error */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    get_prompt_snapshot: {
-        parameters: {
-            query: {
-                /** @description Channel ID the snapshot belongs to */
-                channel_id: string;
-                /** @description Snapshot timestamp in milliseconds */
-                timestamp_ms: number;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Snapshot or store not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Internal server error */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
     channel_status: {
         parameters: {
             query?: never;
@@ -10548,6 +10442,151 @@ export interface operations {
             };
         };
     };
+    list_prompt_requests: {
+        parameters: {
+            query?: {
+                agent_id?: string | null;
+                /** @description Restrict to one channel's requests. */
+                channel_id?: string | null;
+                /** @description Restrict to one branch or worker's requests. */
+                process_id?: string | null;
+                /** @description Every request produced by one conversation message. */
+                message_id?: string | null;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No record store for this agent */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_prompt_debug_capture: {
+        parameters: {
+            query?: {
+                /** @description Agent to read */
+                agent_id?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CaptureSettings"];
+                };
+            };
+            /** @description Agent not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    set_prompt_debug_capture: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CaptureBody"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CaptureSettings"];
+                };
+            };
+            /** @description Agent not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_prompt_request: {
+        parameters: {
+            query: {
+                agent_id?: string | null;
+                /** @description Full request id, or any unambiguous prefix of one. */
+                request_id: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No such request */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Ambiguous request id prefix */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     get_providers: {
         parameters: {
             query?: never;
@@ -11882,6 +11921,46 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    list_task_attempts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Task number */
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskAttemptListResponse"];
+                };
+            };
+            /** @description Task not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskErrorBody"];
+                };
+            };
+            /** @description Task store not initialized */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskErrorBody"];
+                };
             };
         };
     };

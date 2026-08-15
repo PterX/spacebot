@@ -747,7 +747,7 @@ impl CutContext {
     ) -> (String, String, Option<String>) {
         let fallback_title = range_title(messages);
         let prompt_engine = self.deps.runtime_config.prompts.load();
-        let preamble = match prompt_engine.render_static("chronicle_checkpoint") {
+        let preamble = match prompt_engine.render_static_segmented("chronicle_checkpoint") {
             Ok(preamble) => preamble,
             Err(error) => {
                 tracing::error!(%error, "failed to render chronicle checkpoint prompt");
@@ -762,10 +762,28 @@ impl CutContext {
         };
         let model = SpacebotModel::make(&self.deps.llm_manager, &model_name)
             .with_context(&*self.deps.agent_id, "chronicle")
-            .with_routing((**routing).clone());
+            .with_routing((**routing).clone())
+            .with_debug(
+                self.deps.prompt_records(),
+                crate::llm::record::DebugContext {
+                    process: Some(crate::llm::record::ProcessRef {
+                        kind: "chronicle".to_string(),
+                        id: Some(self.channel_id.to_string()),
+                        process_type: None,
+                        channel_id: Some(self.channel_id.to_string()),
+                    }),
+                    trigger: Some(crate::llm::record::Trigger {
+                        kind: "chronicle".to_string(),
+                        message_id: None,
+                        input: None,
+                        parent: Some(format!("channel:{}", self.channel_id)),
+                    }),
+                    blocks: preamble.blocks.clone(),
+                },
+            );
 
         let agent = AgentBuilder::new(model)
-            .preamble(&preamble)
+            .preamble(&preamble.text)
             .default_max_turns(1)
             .build();
 
@@ -831,7 +849,7 @@ impl RollupContext {
 
         let sources = &unrolled[..self.config.rollup_batch];
         let prompt_engine = self.deps.runtime_config.prompts.load();
-        let preamble = prompt_engine.render_static("chronicle_rollup")?;
+        let preamble = prompt_engine.render_static_segmented("chronicle_rollup")?;
         let routing = self.deps.runtime_config.routing.load();
         let model_name = self
             .model_override
@@ -839,9 +857,27 @@ impl RollupContext {
             .unwrap_or_else(|| routing.resolve(ProcessType::Compactor, None).to_string());
         let model = SpacebotModel::make(&self.deps.llm_manager, &model_name)
             .with_context(&*self.deps.agent_id, "chronicle_rollup")
-            .with_routing((**routing).clone());
+            .with_routing((**routing).clone())
+            .with_debug(
+                self.deps.prompt_records(),
+                crate::llm::record::DebugContext {
+                    process: Some(crate::llm::record::ProcessRef {
+                        kind: "chronicle_rollup".to_string(),
+                        id: Some(self.channel_id.to_string()),
+                        process_type: None,
+                        channel_id: Some(self.channel_id.to_string()),
+                    }),
+                    trigger: Some(crate::llm::record::Trigger {
+                        kind: "chronicle_rollup".to_string(),
+                        message_id: None,
+                        input: None,
+                        parent: Some(format!("channel:{}", self.channel_id)),
+                    }),
+                    blocks: preamble.blocks.clone(),
+                },
+            );
         let agent = AgentBuilder::new(model)
-            .preamble(&preamble)
+            .preamble(&preamble.text)
             .default_max_turns(1)
             .build();
         let hook = SpacebotHook::new(

@@ -25,6 +25,7 @@ mod model;
 mod notification;
 mod output;
 mod project;
+mod prompt;
 mod provider;
 mod secrets;
 mod skill;
@@ -131,6 +132,9 @@ pub enum Command {
     Usage(usage::UsageArgs),
     /// Show daily activity
     Activity(activity::ActivityArgs),
+    /// Inspect captured LLM requests
+    #[command(subcommand)]
+    Prompt(prompt::PromptCommand),
     /// Check for and apply updates
     #[command(subcommand)]
     Update(update::UpdateCommand),
@@ -195,6 +199,7 @@ pub fn dispatch(command: Command, ctx: Context) -> anyhow::Result<()> {
             Command::Notification(cmd) => notification::run(&ctx, cmd).await,
             Command::Usage(args) => usage::run(&ctx, args).await,
             Command::Activity(args) => activity::run(&ctx, args).await,
+            Command::Prompt(cmd) => prompt::run(&ctx, cmd).await,
             Command::Update(cmd) => update::run(&ctx, cmd).await,
             Command::Skill(cmd) => skill::run(&ctx, cmd).await,
             Command::Auth(cmd) => auth::run(&ctx, cmd).await,
