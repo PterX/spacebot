@@ -3319,6 +3319,14 @@ impl Channel {
     /// exact byte stream the channel sends, so behavioral fixtures can gate
     /// on it without duplicating the composition.
     pub async fn build_system_prompt(&self) -> crate::error::Result<String> {
+        Ok(self.build_system_prompt_segmented().await?.text)
+    }
+
+    /// Build the channel's system prompt along with the map of the blocks it
+    /// is assembled from.
+    pub async fn build_system_prompt_segmented(
+        &self,
+    ) -> crate::error::Result<crate::prompts::SegmentedPrompt> {
         let rc = &self.deps.runtime_config;
         let prompt_engine = rc.prompts.load();
 
@@ -3385,37 +3393,42 @@ impl Channel {
             .render_static("fragments/authority")
             .unwrap_or_default();
 
-        let system_prompt = prompt_engine.render_channel_prompt_with_links(
-            empty_to_none(identity_context),
-            non_empty_option(knowledge_synthesis_text),
-            empty_to_none(skills_prompt),
-            worker_capabilities,
-            self.conversation_context.clone(),
-            empty_to_none(status_text),
-            available_channels,
-            self.send_agent_message_tool.is_some(),
-            org_context,
-            adapter_prompt,
-            project_context,
-            self.backfill_transcript.clone(),
-            self.render_session_chronicle().await,
-            empty_to_none(working_memory),
-            empty_to_none(channel_activity_map),
-            empty_to_none(participant_context),
-            active_goals,
-            execution_mode,
-            authority,
-        )?;
+        let mut segmented =
+            prompt_engine.render_channel_prompt(crate::prompts::ChannelPromptInputs {
+                identity_context: empty_to_none(identity_context),
+                knowledge_synthesis: non_empty_option(knowledge_synthesis_text),
+                skills_prompt: empty_to_none(skills_prompt),
+                worker_capabilities,
+                conversation_context: self.conversation_context.clone(),
+                status_text: empty_to_none(status_text),
+                available_channels,
+                agent_links: self.send_agent_message_tool.is_some(),
+                org_context,
+                adapter_prompt,
+                project_context,
+                backfill_transcript: self.backfill_transcript.clone(),
+                session_chronicle: self.render_session_chronicle().await,
+                working_memory: empty_to_none(working_memory),
+                channel_activity_map: empty_to_none(channel_activity_map),
+                participant_context: empty_to_none(participant_context),
+                active_goals,
+                execution_mode,
+                authority,
+            })?;
 
-        let system_prompt = prompt_engine.maybe_append_tool_use_enforcement(
-            system_prompt,
-            tool_use_enforcement.as_ref(),
-            &model_name,
-        )?;
-        self.chronicler.fence().record_prompt_tokens(
-            crate::agent::compactor::estimate_text_tokens(&system_prompt),
+        segmented.adopt_appended(
+            prompt_engine.maybe_append_tool_use_enforcement(
+                segmented.text.clone(),
+                tool_use_enforcement.as_ref(),
+                &model_name,
+            )?,
+            "tool_use_enforcement",
         );
-        Ok(system_prompt)
+
+        self.chronicler.fence().record_prompt_tokens(
+            crate::agent::compactor::estimate_text_tokens(&segmented.text),
+        );
+        Ok(segmented)
     }
 
     /// Register per-turn tools, run the LLM agentic loop, and clean up.

@@ -1,4 +1,5 @@
 use crate::error::Result;
+use crate::prompts::blocks;
 use anyhow::Context;
 use minijinja::{Environment, Value, context};
 use serde::Serialize;
@@ -16,6 +17,112 @@ pub struct RetriggerResult {
     pub success: bool,
     /// The result/conclusion text from the process.
     pub result: String,
+}
+
+/// Named values for a template render.
+///
+/// Holds the inputs in one place so the plain render and the sentinel-marked
+/// render are built from the same values rather than assembled twice.
+#[derive(Debug, Default, Clone)]
+pub struct PromptInputs {
+    text: Vec<(&'static str, Option<String>)>,
+    flags: Vec<(&'static str, bool)>,
+}
+
+impl PromptInputs {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add an optional value. `None` and `Some("")` are both absent, which is
+    /// what the templates' `{%- if %}` guards already test for.
+    pub fn text(mut self, name: &'static str, value: Option<String>) -> Self {
+        self.text
+            .push((name, value.filter(|value| !value.is_empty())));
+        self
+    }
+
+    /// Add a boolean the template branches on. Flags gate prose rather than
+    /// contributing bytes, so they are never marked as blocks.
+    pub fn flag(mut self, name: &'static str, value: bool) -> Self {
+        self.flags.push((name, value));
+        self
+    }
+
+    /// The first input that cannot be safely marked, if any.
+    fn colliding_value(&self) -> Option<&'static str> {
+        self.text.iter().find_map(|(name, value)| {
+            value
+                .as_deref()
+                .is_some_and(blocks::collides_with_sentinels)
+                .then_some(*name)
+        })
+    }
+
+    fn context(&self, instrument: bool) -> Value {
+        let mut vars: HashMap<String, Value> = HashMap::new();
+        for (name, value) in &self.text {
+            let value = match value {
+                Some(value) if instrument => Value::from(blocks::mark(name, value)),
+                Some(value) => Value::from(value.clone()),
+                None => Value::UNDEFINED,
+            };
+            vars.insert((*name).to_string(), value);
+        }
+        for (name, value) in &self.flags {
+            vars.insert((*name).to_string(), Value::from(*value));
+        }
+        Value::from_object(vars)
+    }
+}
+
+/// Inputs to the channel system prompt, one field per template variable.
+#[derive(Debug, Default, Clone)]
+pub struct ChannelPromptInputs {
+    pub identity_context: Option<String>,
+    pub knowledge_synthesis: Option<String>,
+    pub skills_prompt: Option<String>,
+    pub worker_capabilities: String,
+    pub conversation_context: Option<String>,
+    pub status_text: Option<String>,
+    pub available_channels: Option<String>,
+    pub agent_links: bool,
+    pub org_context: Option<String>,
+    pub adapter_prompt: Option<String>,
+    pub project_context: Option<String>,
+    pub backfill_transcript: Option<String>,
+    pub session_chronicle: Option<String>,
+    pub working_memory: Option<String>,
+    pub channel_activity_map: Option<String>,
+    pub participant_context: Option<String>,
+    pub active_goals: Option<String>,
+    pub execution_mode: String,
+    pub authority: String,
+}
+
+impl ChannelPromptInputs {
+    fn into_inputs(self) -> PromptInputs {
+        PromptInputs::new()
+            .text("identity_context", self.identity_context)
+            .text("knowledge_synthesis", self.knowledge_synthesis)
+            .text("skills_prompt", self.skills_prompt)
+            .text("worker_capabilities", Some(self.worker_capabilities))
+            .text("conversation_context", self.conversation_context)
+            .text("status_text", self.status_text)
+            .text("available_channels", self.available_channels)
+            .text("org_context", self.org_context)
+            .text("adapter_prompt", self.adapter_prompt)
+            .text("project_context", self.project_context)
+            .text("backfill_transcript", self.backfill_transcript)
+            .text("session_chronicle", self.session_chronicle)
+            .text("working_memory", self.working_memory)
+            .text("channel_activity_map", self.channel_activity_map)
+            .text("participant_context", self.participant_context)
+            .text("active_goals", self.active_goals)
+            .text("execution_mode", Some(self.execution_mode))
+            .text("authority", Some(self.authority))
+            .flag("agent_links", self.agent_links)
+    }
 }
 
 /// Template engine for rendering system prompts with dynamic variables.
@@ -252,6 +359,38 @@ impl PromptEngine {
     /// let rendered = engine.render("channel", ctx)?;
     /// # Ok::<(), anyhow::Error>(())
     /// ```
+    /// Render a template from named inputs and map the result into blocks.
+    ///
+    /// The render is always instrumented: every injected value is wrapped in
+    /// sentinels, and the returned text is that render with the sentinels
+    /// stripped. There is deliberately no second, uninstrumented path — the
+    /// bytes described by the block map are the only bytes this produces, so
+    /// the map cannot describe a prompt that was never sent.
+    ///
+    /// The one exception is a value that already contains a sentinel
+    /// character, which would make the split ambiguous. That renders plainly
+    /// with an empty map rather than risk editing the value.
+    pub fn render_segmented(
+        &self,
+        template_name: &str,
+        inputs: PromptInputs,
+    ) -> Result<blocks::SegmentedPrompt> {
+        if let Some(colliding) = inputs.colliding_value() {
+            tracing::warn!(
+                template = template_name,
+                input = colliding,
+                "prompt input contains a block sentinel; rendering without a block map"
+            );
+            return Ok(blocks::SegmentedPrompt {
+                text: self.render(template_name, inputs.context(false))?,
+                blocks: Vec::new(),
+            });
+        }
+
+        let instrumented = self.render(template_name, inputs.context(true))?;
+        Ok(blocks::segment(&instrumented, template_name))
+    }
+
     pub fn render(&self, template_name: &str, context: Value) -> Result<String> {
         let template = self
             .env
@@ -823,52 +962,12 @@ impl PromptEngine {
 
     /// Render the channel system prompt with all dynamic components including org context.
     #[allow(clippy::too_many_arguments)]
-    pub fn render_channel_prompt_with_links(
+    /// Render the channel system prompt along with its block map.
+    pub fn render_channel_prompt(
         &self,
-        identity_context: Option<String>,
-        knowledge_synthesis: Option<String>,
-        skills_prompt: Option<String>,
-        worker_capabilities: String,
-        conversation_context: Option<String>,
-        status_text: Option<String>,
-        available_channels: Option<String>,
-        agent_links: bool,
-        org_context: Option<String>,
-        adapter_prompt: Option<String>,
-        project_context: Option<String>,
-        backfill_transcript: Option<String>,
-        session_chronicle: Option<String>,
-        working_memory: Option<String>,
-        channel_activity_map: Option<String>,
-        participant_context: Option<String>,
-        active_goals: Option<String>,
-        execution_mode: String,
-        authority: String,
-    ) -> Result<String> {
-        self.render(
-            "channel",
-            context! {
-                identity_context => identity_context,
-                skills_prompt => skills_prompt,
-                worker_capabilities => worker_capabilities,
-                conversation_context => conversation_context,
-                status_text => status_text,
-                available_channels => available_channels,
-                agent_links => agent_links,
-                org_context => org_context,
-                adapter_prompt => adapter_prompt,
-                project_context => project_context,
-                backfill_transcript => backfill_transcript,
-                session_chronicle => session_chronicle,
-                working_memory => working_memory,
-                channel_activity_map => channel_activity_map,
-                participant_context => participant_context,
-                active_goals => active_goals,
-                knowledge_synthesis => knowledge_synthesis,
-                execution_mode => execution_mode,
-                authority => authority,
-            },
-        )
+        inputs: ChannelPromptInputs,
+    ) -> Result<blocks::SegmentedPrompt> {
+        self.render_segmented("channel", inputs.into_inputs())
     }
 
     /// Get the configured language code.
@@ -1072,8 +1171,112 @@ pub struct ProjectWorktreeContext {
 
 #[cfg(test)]
 mod tests {
-    use super::PromptEngine;
+    use super::{ChannelPromptInputs, PromptEngine};
     use crate::config::ToolUseEnforcement;
+
+    /// A channel prompt with only the always-present fragments filled in.
+    fn base_inputs(engine: &PromptEngine) -> ChannelPromptInputs {
+        ChannelPromptInputs {
+            execution_mode: engine
+                .render_static("fragments/execution_standard")
+                .unwrap_or_default(),
+            authority: engine
+                .render_static("fragments/authority")
+                .unwrap_or_default(),
+            ..ChannelPromptInputs::default()
+        }
+    }
+
+    /// The block map must describe the prompt that would have been sent
+    /// without instrumentation. If this ever fails, every byte range and token
+    /// count in the inspector is describing a prompt the model never saw.
+    #[test]
+    fn segmented_render_matches_plain_render_byte_for_byte() {
+        let engine = PromptEngine::new("en").expect("prompt engine should build");
+
+        let filled = || ChannelPromptInputs {
+            identity_context: Some("# Orion\n\nI work for Jamie.".to_string()),
+            knowledge_synthesis: Some("## Memory Store\n\nScope: global".to_string()),
+            skills_prompt: Some("## Available Skills\n\n- deploy".to_string()),
+            worker_capabilities: "## Worker Types\n\nBuiltin only.".to_string(),
+            conversation_context: Some("Platform: telegram".to_string()),
+            status_text: Some("No active processes.".to_string()),
+            available_channels: Some("## Available Channels\n\n- ops".to_string()),
+            agent_links: true,
+            org_context: Some("## Organization\n\nFlat.".to_string()),
+            adapter_prompt: Some("Keep replies short.".to_string()),
+            project_context: Some("## Active Projects\n\n- spacebot".to_string()),
+            backfill_transcript: Some("[]".to_string()),
+            session_chronicle: Some("## Chronicle\n\nEarlier today.".to_string()),
+            working_memory: Some("## Working Memory\n\nNothing yet.".to_string()),
+            channel_activity_map: Some("## Channel Activity\n\nQuiet.".to_string()),
+            participant_context: Some("## Participants\n\nJamie.".to_string()),
+            active_goals: Some("## Goals\n\nShip it.".to_string()),
+            ..base_inputs(&engine)
+        };
+
+        let plain = engine
+            .render("channel", filled().into_inputs().context(false))
+            .expect("plain render");
+        let segmented = engine
+            .render_channel_prompt(filled())
+            .expect("segmented render");
+
+        assert_eq!(
+            segmented.text, plain,
+            "stripping the sentinels must reproduce the uninstrumented render"
+        );
+
+        // Every mapped range must address exactly the bytes it claims.
+        for block in &segmented.blocks {
+            assert!(
+                block.end <= segmented.text.len(),
+                "block {} runs past the prompt",
+                block.id
+            );
+            assert!(segmented.text.is_char_boundary(block.start));
+            assert!(segmented.text.is_char_boundary(block.end));
+        }
+
+        // Blocks must tile the prompt in order without gaps or overlaps, so a
+        // reader scrolling the raw text is never inside an unlabelled region.
+        let mut cursor = 0usize;
+        for block in &segmented.blocks {
+            assert_eq!(
+                block.start, cursor,
+                "gap or overlap before block {}",
+                block.id
+            );
+            cursor = block.end;
+        }
+        assert_eq!(cursor, segmented.text.len(), "blocks must reach the end");
+    }
+
+    #[test]
+    fn absent_inputs_produce_no_blocks() {
+        let engine = PromptEngine::new("en").expect("prompt engine should build");
+        let segmented = engine
+            .render_channel_prompt(ChannelPromptInputs {
+                worker_capabilities: "## Worker Types\n\nBuiltin only.".to_string(),
+                ..base_inputs(&engine)
+            })
+            .expect("segmented render");
+
+        assert!(
+            !segmented
+                .blocks
+                .iter()
+                .any(|block| block.id == "status_text"),
+            "an absent input must not appear in the block map"
+        );
+        assert!(
+            segmented
+                .blocks
+                .iter()
+                .any(|block| block.id == "worker_capabilities"),
+            "a present input must appear in the block map"
+        );
+    }
 
     #[test]
     fn cap_human_description_renders_small_docs_in_full() {
@@ -1176,32 +1379,13 @@ mod tests {
         let engine = PromptEngine::new("en").expect("prompt engine should build");
         let render = |agent_links: bool| {
             engine
-                .render_channel_prompt_with_links(
-                    None,
-                    Some("## Memory Store\n\nScope: global".to_string()),
-                    None,
-                    String::new(),
-                    None,
-                    None,
-                    None,
+                .render_channel_prompt(ChannelPromptInputs {
+                    knowledge_synthesis: Some("## Memory Store\n\nScope: global".to_string()),
                     agent_links,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    engine
-                        .render_static("fragments/execution_standard")
-                        .unwrap_or_default(),
-                    engine
-                        .render_static("fragments/authority")
-                        .unwrap_or_default(),
-                )
+                    ..base_inputs(&engine)
+                })
                 .expect("channel prompt should render")
+                .text
         };
 
         let unlinked = render(false);
@@ -1221,32 +1405,12 @@ mod tests {
         let engine = PromptEngine::new("en").expect("prompt engine should build");
         let render = |chronicle: Option<String>| {
             engine
-                .render_channel_prompt_with_links(
-                    None,
-                    None,
-                    None,
-                    String::new(),
-                    None,
-                    None,
-                    None,
-                    false,
-                    None,
-                    None,
-                    None,
-                    None,
-                    chronicle,
-                    None,
-                    None,
-                    None,
-                    None,
-                    engine
-                        .render_static("fragments/execution_standard")
-                        .unwrap_or_default(),
-                    engine
-                        .render_static("fragments/authority")
-                        .unwrap_or_default(),
-                )
+                .render_channel_prompt(ChannelPromptInputs {
+                    session_chronicle: chronicle,
+                    ..base_inputs(&engine)
+                })
                 .expect("channel prompt should render")
+                .text
         };
 
         let without = render(None);

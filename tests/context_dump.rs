@@ -222,32 +222,21 @@ fn build_channel_system_prompt(rc: &spacebot::config::RuntimeConfig) -> String {
     let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
 
     prompt_engine
-        .render_channel_prompt_with_links(
-            empty_to_none(identity_context),
-            None,
-            empty_to_none(skills_prompt),
+        .render_channel_prompt(spacebot::prompts::ChannelPromptInputs {
+            identity_context: empty_to_none(identity_context),
+            skills_prompt: empty_to_none(skills_prompt),
             worker_capabilities,
             conversation_context,
-            None,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            prompt_engine
+            execution_mode: prompt_engine
                 .render_static("fragments/execution_standard")
                 .unwrap_or_default(),
-            prompt_engine
+            authority: prompt_engine
                 .render_static("fragments/authority")
                 .unwrap_or_default(),
-        )
+            ..Default::default()
+        })
         .expect("failed to render channel prompt")
+        .text
 }
 
 // ─── Channel Context ─────────────────────────────────────────────────────────

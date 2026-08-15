@@ -844,28 +844,29 @@ pub(super) async fn inspect_prompt(
 
     // ── Render the full system prompt ──
     let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
-    let system_prompt = prompt_engine
-        .render_channel_prompt_with_links(
-            empty_to_none(identity_context),
-            empty_to_none(knowledge_synthesis.to_string()),
-            empty_to_none(skills_prompt),
+    let segmented = prompt_engine
+        .render_channel_prompt(crate::prompts::ChannelPromptInputs {
+            identity_context: empty_to_none(identity_context),
+            knowledge_synthesis: empty_to_none(knowledge_synthesis.to_string()),
+            skills_prompt: empty_to_none(skills_prompt),
             worker_capabilities,
             conversation_context,
-            empty_to_none(status_text),
+            status_text: empty_to_none(status_text),
             available_channels,
             agent_links,
             org_context,
             adapter_prompt,
             project_context,
-            None, // backfill_transcript — only set during channel initialization
+            // backfill_transcript is only set during channel initialization.
+            backfill_transcript: None,
             session_chronicle,
-            empty_to_none(working_memory),
-            empty_to_none(channel_activity_map),
-            empty_to_none(participant_context),
-            empty_to_none(active_goals),
-            {
-                // Render the execution fragment for the channel's actual
-                // delegation mode so inspection shows the prompt it sends.
+            working_memory: empty_to_none(working_memory),
+            channel_activity_map: empty_to_none(channel_activity_map),
+            participant_context: empty_to_none(participant_context),
+            active_goals: empty_to_none(active_goals),
+            // Render the execution fragment for the channel's actual
+            // delegation mode so inspection shows the prompt it sends.
+            execution_mode: {
                 let fragment = if channel_state.model_overrides.delegation
                     == crate::conversation::settings::DelegationMode::Direct
                 {
@@ -875,13 +876,18 @@ pub(super) async fn inspect_prompt(
                 };
                 prompt_engine.render_static(fragment).unwrap_or_default()
             },
-            prompt_engine
+            authority: prompt_engine
                 .render_static("fragments/authority")
                 .unwrap_or_default(),
-        )
-        .unwrap_or_default();
+        })
+        .unwrap_or_else(|_| crate::prompts::SegmentedPrompt {
+            text: String::new(),
+            blocks: Vec::new(),
+        });
 
-    let total_chars = system_prompt.chars().count();
+    let total_chars = segmented.text.chars().count();
+    let system_prompt = segmented.text;
+    let blocks = segmented.blocks;
 
     // ── History ──
     let history = channel_state.history.read().await;
@@ -903,6 +909,7 @@ pub(super) async fn inspect_prompt(
     let response = serde_json::json!({
         "channel_id": query.channel_id,
         "system_prompt": system_prompt,
+        "blocks": blocks,
         "total_chars": total_chars,
         "history_length": history.len(),
         "history": history_json,
