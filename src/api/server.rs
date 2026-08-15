@@ -163,6 +163,7 @@ pub fn api_router() -> OpenApiRouter<Arc<ApiState>> {
             tasks::list_task_comments,
             tasks::create_task_comment
         ))
+        .routes(routes!(tasks::list_task_attempts))
         .routes(routes!(tasks::list_task_revisions))
         .routes(routes!(tasks::diff_task_revisions))
         .routes(routes!(tasks::get_task_revision))

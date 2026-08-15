@@ -188,44 +188,43 @@ impl SpacebotModel {
         }
     }
 
-    /// Drop tool results this request cannot pair before it reaches a provider.
+    /// Rewrite tool results this request cannot pair before it reaches a
+    /// provider.
     ///
     /// A stranded result is rejected at the API boundary, so the model never
     /// runs and a retry of the same history fails the same way. Repairing here
     /// covers every caller regardless of which trim produced the history, and
-    /// the warning names what went so a cut that keeps stranding results is
+    /// the warning names what changed so a cut that keeps stranding results is
     /// still visible rather than silently absorbed.
-    ///
-    /// A history that repairs to nothing has no request left to send: the
-    /// provider requires at least one message, so this reports the empty
-    /// history rather than spending a call that is certain to be rejected.
     fn repair_request_history(
         &self,
         request: &mut CompletionRequest,
     ) -> Result<(), CompletionError> {
-        let Some((repaired, dropped)) =
+        let Some((repaired, report)) =
             crate::llm::history_repair::repair_orphaned_tool_results(&request.chat_history)
         else {
             return Ok(());
         };
 
         let Ok(chat_history) = OneOrMany::many(repaired) else {
-            tracing::error!(
-                model = %self.full_model_name,
-                dropped,
-                "request history is entirely unpaired tool results"
-            );
             return Err(CompletionError::RequestError(
-                format!("request history is {dropped} unpaired tool results and nothing else")
-                    .into(),
+                "request history repaired to no messages".into(),
             ));
         };
 
         tracing::warn!(
             model = %self.full_model_name,
-            dropped,
-            "dropped tool results with no matching call from request history"
+            orphan_results = report.orphan_results,
+            stale_results = report.stale_results,
+            duplicate_results = report.duplicate_results,
+            "rewrote unpairable tool results as historical text"
         );
+        #[cfg(feature = "metrics")]
+        crate::telemetry::Metrics::global()
+            .tool_history_recovery_total
+            .with_label_values(&[self.agent_id.as_deref().unwrap_or("unknown"), "repaired"])
+            .inc();
+
         request.chat_history = chat_history;
         Ok(())
     }
@@ -292,6 +291,53 @@ impl SpacebotModel {
             "trimmed request history to fit the model's context ceiling"
         );
         request.chat_history = chat_history;
+    }
+
+    /// Repair a history a provider has already rejected, for one retry.
+    ///
+    /// The pre-send pass pairs every result, so a mismatch that survives it is
+    /// the other half of the protocol: an assistant tool call nothing answers,
+    /// which Anthropic rejects and which no result-side repair can reach.
+    /// Returns `false` when nothing changed, so an identical request is never
+    /// sent twice.
+    fn escalate_tool_history_repair(&self, request: &mut CompletionRequest) -> bool {
+        let mut history: Vec<rig::message::Message> =
+            request.chat_history.iter().cloned().collect();
+        let report = crate::llm::history_repair::drop_unanswered_tool_calls(&mut history);
+
+        if !report.changed() {
+            return false;
+        }
+
+        let Ok(chat_history) = OneOrMany::many(history) else {
+            return false;
+        };
+
+        tracing::warn!(
+            model = %self.full_model_name,
+            unanswered_calls = report.unanswered_calls,
+            "dropped unanswered tool calls after a provider rejected the history"
+        );
+        request.chat_history = chat_history;
+        true
+    }
+
+    /// Record how a tool-history retry ended, for both request paths.
+    fn record_tool_history_recovery(&self, succeeded: bool) {
+        #[cfg(feature = "metrics")]
+        crate::telemetry::Metrics::global()
+            .tool_history_recovery_total
+            .with_label_values(&[
+                self.agent_id.as_deref().unwrap_or("unknown"),
+                if succeeded {
+                    "retry_success"
+                } else {
+                    "terminal_failure"
+                },
+            ])
+            .inc();
+        #[cfg(not(feature = "metrics"))]
+        let _ = succeeded;
     }
 
     /// Direct call to the provider (no fallback logic).
@@ -487,6 +533,139 @@ impl SpacebotModel {
             was_rate_limit,
         ))
     }
+
+    /// Run a prepared request through routing, retries and the fallback chain.
+    ///
+    /// Borrows the request: `attempt_with_retries` clones per attempt, so only
+    /// the unrouted path below needs a copy of its own.
+    async fn dispatch_completion(
+        &self,
+        request: &CompletionRequest,
+    ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
+        let Some(routing) = &self.routing else {
+            // No routing config — just call the model directly, no fallback/retry
+            return self.attempt_completion(request.clone()).await;
+        };
+
+        let cooldown = routing.rate_limit_cooldown_secs;
+        let mut fallbacks: Vec<String> = routing.get_fallbacks(&self.full_model_name).to_vec();
+        // Set when the configured model id was rejected outright and the
+        // fallbacks were derived from the provider's default routing table.
+        let mut provider_recovery = false;
+        let mut last_error: Option<CompletionError> = None;
+
+        // Try the primary model (with retries) unless it's in rate-limit cooldown
+        // and we have fallbacks to try instead.
+        let primary_rate_limited = self
+            .llm_manager
+            .is_rate_limited(&self.full_model_name, cooldown)
+            .await;
+
+        let skip_primary = primary_rate_limited && !fallbacks.is_empty();
+
+        if skip_primary {
+            tracing::debug!(
+                model = %self.full_model_name,
+                "primary model in rate-limit cooldown, skipping to fallbacks"
+            );
+        } else {
+            match self
+                .attempt_with_retries(&self.full_model_name, request)
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err((error, was_rate_limit)) => {
+                    if was_rate_limit {
+                        self.llm_manager
+                            .record_rate_limit(&self.full_model_name)
+                            .await;
+                    }
+                    // A rejected model id (stale default, typo, no access) never
+                    // recovers on its own — try the provider's default models
+                    // when no explicit chain is configured.
+                    if fallbacks.is_empty() && routing::is_model_not_found_error(&error.to_string())
+                    {
+                        fallbacks = routing::default_model_candidates(&self.provider)
+                            .into_iter()
+                            .filter(|candidate| candidate != &self.full_model_name)
+                            .collect();
+                        provider_recovery = !fallbacks.is_empty();
+                        if provider_recovery {
+                            tracing::warn!(
+                                model = %self.full_model_name,
+                                candidates = ?fallbacks,
+                                "provider rejected configured model, trying its default models"
+                            );
+                        }
+                    }
+                    if fallbacks.is_empty() {
+                        // No fallbacks — this is the final error
+                        return Err(error);
+                    }
+                    if !provider_recovery {
+                        tracing::warn!(
+                            model = %self.full_model_name,
+                            "primary model exhausted retries, trying fallbacks"
+                        );
+                    }
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        // Try fallback chain, each with their own retry loop
+        for (index, fallback_name) in fallbacks.iter().take(MAX_FALLBACK_ATTEMPTS).enumerate() {
+            if self
+                .llm_manager
+                .is_rate_limited(fallback_name, cooldown)
+                .await
+            {
+                tracing::debug!(
+                    fallback = %fallback_name,
+                    "fallback model in cooldown, skipping"
+                );
+                continue;
+            }
+
+            match self.attempt_with_retries(fallback_name, request).await {
+                Ok(response) => {
+                    tracing::info!(
+                        original = %self.full_model_name,
+                        fallback = %fallback_name,
+                        attempt = index + 1,
+                        "fallback model succeeded"
+                    );
+                    return Ok(response);
+                }
+                Err((error, was_rate_limit)) => {
+                    if was_rate_limit {
+                        self.llm_manager.record_rate_limit(fallback_name).await;
+                    }
+                    tracing::warn!(
+                        fallback = %fallback_name,
+                        "fallback model exhausted retries, continuing chain"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        let final_error = last_error.unwrap_or_else(|| {
+            CompletionError::ProviderError("all models in fallback chain failed".into())
+        });
+        if provider_recovery && routing::is_model_not_found_error(&final_error.to_string()) {
+            return Err(CompletionError::ProviderError(format!(
+                "provider '{}' rejected the configured model '{}' and every default \
+                 candidate ({}). Spacebot's built-in model ids for this provider appear \
+                 to be stale — pick a working model in Settings → Model Routing and \
+                 please report this as a bug.",
+                self.provider,
+                self.full_model_name,
+                fallbacks.join(", ")
+            )));
+        }
+        Err(final_error)
+    }
 }
 
 impl CompletionModel for SpacebotModel {
@@ -534,133 +713,19 @@ impl CompletionModel for SpacebotModel {
         let sent_tokens =
             estimate_history_tokens(&request.chat_history.iter().cloned().collect::<Vec<_>>());
 
-        let result = async move {
-            let Some(routing) = &self.routing else {
-                // No routing config — just call the model directly, no fallback/retry
-                return self.attempt_completion(request).await;
-            };
+        let mut result = self.dispatch_completion(&request).await;
 
-            let cooldown = routing.rate_limit_cooldown_secs;
-            let mut fallbacks: Vec<String> = routing.get_fallbacks(&self.full_model_name).to_vec();
-            // Set when the configured model id was rejected outright and the
-            // fallbacks were derived from the provider's default routing table.
-            let mut provider_recovery = false;
-            let mut last_error: Option<CompletionError> = None;
-
-            // Try the primary model (with retries) unless it's in rate-limit cooldown
-            // and we have fallbacks to try instead.
-            let primary_rate_limited = self
-                .llm_manager
-                .is_rate_limited(&self.full_model_name, cooldown)
-                .await;
-
-            let skip_primary = primary_rate_limited && !fallbacks.is_empty();
-
-            if skip_primary {
-                tracing::debug!(
-                    model = %self.full_model_name,
-                    "primary model in rate-limit cooldown, skipping to fallbacks"
-                );
-            } else {
-                match self
-                    .attempt_with_retries(&self.full_model_name, &request)
-                    .await
-                {
-                    Ok(response) => return Ok(response),
-                    Err((error, was_rate_limit)) => {
-                        if was_rate_limit {
-                            self.llm_manager
-                                .record_rate_limit(&self.full_model_name)
-                                .await;
-                        }
-                        // A rejected model id (stale default, typo, no access) never
-                        // recovers on its own — try the provider's default models
-                        // when no explicit chain is configured.
-                        if fallbacks.is_empty()
-                            && routing::is_model_not_found_error(&error.to_string())
-                        {
-                            fallbacks = routing::default_model_candidates(&self.provider)
-                                .into_iter()
-                                .filter(|candidate| candidate != &self.full_model_name)
-                                .collect();
-                            provider_recovery = !fallbacks.is_empty();
-                            if provider_recovery {
-                                tracing::warn!(
-                                    model = %self.full_model_name,
-                                    candidates = ?fallbacks,
-                                    "provider rejected configured model, trying its default models"
-                                );
-                            }
-                        }
-                        if fallbacks.is_empty() {
-                            // No fallbacks — this is the final error
-                            return Err(error);
-                        }
-                        if !provider_recovery {
-                            tracing::warn!(
-                                model = %self.full_model_name,
-                                "primary model exhausted retries, trying fallbacks"
-                            );
-                        }
-                        last_error = Some(error);
-                    }
-                }
-            }
-
-            // Try fallback chain, each with their own retry loop
-            for (index, fallback_name) in fallbacks.iter().take(MAX_FALLBACK_ATTEMPTS).enumerate() {
-                if self
-                    .llm_manager
-                    .is_rate_limited(fallback_name, cooldown)
-                    .await
-                {
-                    tracing::debug!(
-                        fallback = %fallback_name,
-                        "fallback model in cooldown, skipping"
-                    );
-                    continue;
-                }
-
-                match self.attempt_with_retries(fallback_name, &request).await {
-                    Ok(response) => {
-                        tracing::info!(
-                            original = %self.full_model_name,
-                            fallback = %fallback_name,
-                            attempt = index + 1,
-                            "fallback model succeeded"
-                        );
-                        return Ok(response);
-                    }
-                    Err((error, was_rate_limit)) => {
-                        if was_rate_limit {
-                            self.llm_manager.record_rate_limit(fallback_name).await;
-                        }
-                        tracing::warn!(
-                            fallback = %fallback_name,
-                            "fallback model exhausted retries, continuing chain"
-                        );
-                        last_error = Some(error);
-                    }
-                }
-            }
-
-            let final_error = last_error.unwrap_or_else(|| {
-                CompletionError::ProviderError("all models in fallback chain failed".into())
-            });
-            if provider_recovery && routing::is_model_not_found_error(&final_error.to_string()) {
-                return Err(CompletionError::ProviderError(format!(
-                    "provider '{}' rejected the configured model '{}' and every default \
-                     candidate ({}). Spacebot's built-in model ids for this provider appear \
-                     to be stale — pick a working model in Settings → Model Routing and \
-                     please report this as a bug.",
-                    self.provider,
-                    self.full_model_name,
-                    fallbacks.join(", ")
-                )));
-            }
-            Err(final_error)
+        // A mismatch that survives the pre-send repair is the other half of the
+        // protocol: an assistant call nothing answers, which no result-side
+        // repair can reach. Retry once, and only when the history changed, so
+        // an identical request is never sent twice.
+        if let Err(ref error) = result
+            && routing::is_tool_history_mismatch_error(&error.to_string())
+            && self.escalate_tool_history_repair(&mut request)
+        {
+            result = self.dispatch_completion(&request).await;
+            self.record_tool_history_recovery(result.is_ok());
         }
-        .await;
 
         #[cfg(feature = "metrics")]
         {
@@ -813,6 +878,30 @@ impl CompletionModel for SpacebotModel {
         self.repair_request_history(&mut request)?;
         self.enforce_context_ceiling(&mut request);
 
+        let mut result = self.dispatch_stream(request.clone()).await;
+
+        // The channel agent streams, so it needs the same escalation as the
+        // non-streaming path. A provider rejects an assistant call nothing
+        // answers while opening the stream, before any token is yielded, so the
+        // repaired history can still be sent once more.
+        if let Err(ref error) = result
+            && routing::is_tool_history_mismatch_error(&error.to_string())
+            && self.escalate_tool_history_repair(&mut request)
+        {
+            result = self.dispatch_stream(request).await;
+            self.record_tool_history_recovery(result.is_ok());
+        }
+
+        result
+    }
+}
+
+impl SpacebotModel {
+    /// Open a stream against whichever provider the current model belongs to.
+    async fn dispatch_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<StreamingCompletionResponse<RawStreamingResponse>, CompletionError> {
         let provider_config = self.provider_config_for_current_model().await?;
 
         match provider_config.api_type {
