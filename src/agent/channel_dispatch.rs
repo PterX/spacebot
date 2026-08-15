@@ -129,6 +129,8 @@ fn classify_worker_completion(
     }
 }
 
+/// How a run ended, as a task's attempt history records it.
+///
 fn completion_flags(kind: WorkerCompletionKind) -> (bool, bool) {
     let notify = true;
     let success = matches!(
@@ -988,6 +990,7 @@ async fn spawn_worker_inner(
         None,
         None,
         secrets_store,
+        Some(state.deps.task_store.clone()),
         "builtin",
         worker.run().instrument(worker_span),
     );
@@ -1222,6 +1225,7 @@ async fn spawn_opencode_worker_inner(
         Some(opencode_cancellation),
         Some(directory_claim),
         oc_secrets_store,
+        Some(state.deps.task_store.clone()),
         "opencode",
         async move {
             let result = worker.run().await.map_err(SpacebotError::from);
@@ -1294,6 +1298,8 @@ pub(crate) fn spawn_worker_task<F>(
     >,
     opencode_directory_claim: Option<crate::opencode::server::OpenCodeDirectoryClaim>,
     secrets_store: Option<Arc<crate::secrets::store::SecretsStore>>,
+    // Present when the run should be recorded against a task's history.
+    task_store: Option<Arc<crate::tasks::TaskStore>>,
     #[cfg_attr(not(feature = "metrics"), allow(unused_variables))] worker_type: &'static str,
     future: F,
 ) -> WorkerTaskControl
@@ -1381,6 +1387,7 @@ where
         };
         let (notify, _success) = completion_flags(kind);
         let outcome_kind = outcome_kind(kind);
+
         #[cfg(feature = "metrics")]
         {
             let metrics = crate::telemetry::Metrics::global();
@@ -1412,6 +1419,31 @@ where
             terminal_owner,
         )
         .await;
+
+        // Close this run in the task's attempt history, using the outcome the
+        // commit settled on: a completion racing a cancel or a timeout lands on
+        // a different terminal kind than the raw classification, and the board
+        // has to agree with the durable worker record. A commit that produced
+        // nothing still closes the attempt with what was classified here, so a
+        // failure to commit cannot leave the task blocked by an open run.
+        // Keyed by worker id, so a run never bound to a task matches nothing.
+        if let Some(task_store) = &task_store {
+            let (resolved, summary_source) = match &commit {
+                Ok(Some((terminal, _))) => (terminal.outcome_kind, terminal.result.as_str()),
+                _ => (outcome_kind, result_text.as_str()),
+            };
+            if let Err(error) = task_store
+                .finish_task_attempt(
+                    &worker_id.to_string(),
+                    resolved.into(),
+                    Some(summary_source),
+                )
+                .await
+            {
+                tracing::warn!(%error, %worker_id, "failed to record the task attempt outcome");
+            }
+        }
+
         let (terminal, newly_committed) = match commit {
             Ok(Some(commit)) => commit,
             Ok(None) => {
@@ -1746,6 +1778,7 @@ pub async fn resume_idle_worker_into_state(
                 Some(opencode_cancellation),
                 Some(directory_claim),
                 oc_secrets_store,
+                Some(state.deps.task_store.clone()),
                 "opencode",
                 async move {
                     let result = worker.run().await.map_err(SpacebotError::from)?;
@@ -1876,6 +1909,7 @@ pub async fn resume_idle_worker_into_state(
                 None,
                 None,
                 secrets_store,
+                Some(state.deps.task_store.clone()),
                 "builtin",
                 worker.run().instrument(worker_span),
             );
@@ -1927,8 +1961,14 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkerCompletionError, WorkerOutcome, map_worker_completion, spawn_worker_task};
-    use crate::conversation::ProcessRunLogger;
+    use super::{
+        WorkerCompletionError, WorkerOutcome, commit_worker_outcome, map_worker_completion,
+        spawn_worker_task,
+    };
+    use crate::conversation::{
+        ProcessRunLogger, WorkerLifecycle, WorkerOutcomeKind, WorkerTerminalOwner,
+    };
+    use crate::tasks::TaskAttemptOutcome;
     use crate::{ProcessEvent, WorkerId};
     use std::sync::Arc;
     use std::time::Duration;
@@ -1963,6 +2003,85 @@ mod tests {
             .await
             .unwrap();
         logger
+    }
+
+    /// A cancel arriving while the worker is already completing commits as
+    /// partial. The attempt has to record what was committed: recording the raw
+    /// classification would put `cancelled` on the board against a worker record
+    /// that says `partial`.
+    #[tokio::test]
+    async fn a_cancel_racing_a_completion_records_what_was_committed() {
+        let worker_id = Uuid::new_v4();
+        let logger = setup_worker(worker_id, "test:race-cancel").await;
+        let lifecycle = logger
+            .read_worker_lifecycle(worker_id)
+            .await
+            .unwrap()
+            .unwrap();
+        logger
+            .claim_worker_completion(worker_id, lifecycle)
+            .await
+            .unwrap();
+
+        let (terminal, committed) = commit_worker_outcome(
+            &logger,
+            worker_id,
+            WorkerOutcomeKind::Cancelled,
+            "cancelled while finishing",
+            None,
+            WorkerTerminalOwner::Cancel,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(committed);
+        assert_eq!(terminal.outcome_kind, WorkerOutcomeKind::Partial);
+        assert_eq!(
+            TaskAttemptOutcome::from(terminal.outcome_kind),
+            TaskAttemptOutcome::Partial
+        );
+        assert_ne!(
+            TaskAttemptOutcome::from(WorkerOutcomeKind::Cancelled),
+            TaskAttemptOutcome::from(terminal.outcome_kind),
+            "the raw classification is what the attempt used to record"
+        );
+    }
+
+    /// The same disagreement in the other direction: a timeout landing on a
+    /// worker already cancelling, with nothing to show for the run, commits as
+    /// cancelled rather than timed out.
+    #[tokio::test]
+    async fn a_timeout_racing_a_cancel_records_what_was_committed() {
+        let worker_id = Uuid::new_v4();
+        let logger = setup_worker(worker_id, "test:race-timeout").await;
+        let lifecycle = logger
+            .read_worker_lifecycle(worker_id)
+            .await
+            .unwrap()
+            .unwrap();
+        logger
+            .transition_worker(worker_id, lifecycle, WorkerLifecycle::Cancelling)
+            .await
+            .unwrap();
+
+        let (terminal, _) = commit_worker_outcome(
+            &logger,
+            worker_id,
+            WorkerOutcomeKind::TimedOut,
+            "timed out",
+            None,
+            WorkerTerminalOwner::Timeout,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(terminal.outcome_kind, WorkerOutcomeKind::Cancelled);
+        assert_eq!(
+            TaskAttemptOutcome::from(terminal.outcome_kind),
+            TaskAttemptOutcome::Cancelled
+        );
     }
 
     #[test]
@@ -2048,6 +2167,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             "builtin",
             async {
                 Err::<WorkerOutcome, crate::Error>(
@@ -2102,6 +2222,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             "builtin",
             async move {
                 started_tx.send(()).expect("test receiver remains active");
@@ -2144,6 +2265,7 @@ mod tests {
             Some(channel_id.clone()),
             run_logger,
             crate::agent::worker::new_worker_transcript_snapshot(),
+            None,
             None,
             None,
             None,
@@ -2191,6 +2313,7 @@ mod tests {
             Some(Arc::<str>::from("durable-channel")),
             run_logger,
             crate::agent::worker::new_worker_transcript_snapshot(),
+            None,
             None,
             None,
             None,

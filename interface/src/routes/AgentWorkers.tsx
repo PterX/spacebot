@@ -5,6 +5,7 @@ import {motion} from "framer-motion";
 import {Markdown} from "@/components/Markdown";
 import {
 	api,
+	apiFetch,
 	type WorkerRunInfo,
 	type WorkerDetailResponse,
 	type TranscriptStep,
@@ -650,7 +651,7 @@ function OpenCodeDirectLink({
 		if (initialDirectory) return;
 		// Fetch directory from the OpenCode session API as fallback.
 		const controller = new AbortController();
-		fetch(`/api/opencode/${port}/session/${sessionId}`, {
+		apiFetch(`/api/opencode/${port}/session/${sessionId}`, {
 			signal: controller.signal,
 		})
 			.then((r) => (r.ok ? r.json() : null))

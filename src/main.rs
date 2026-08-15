@@ -952,6 +952,47 @@ async fn run(
         .await
         .context("failed to migrate legacy projects to instance database")?;
 
+    // Tasks executed before the worktree binding was recorded have a
+    // `task-<number>` worktree on disk that nothing points at. Reconnect them
+    // by name so a retry reuses the worktree instead of rediscovering it.
+    {
+        let mut candidates = Vec::new();
+        match global_project_store.list_projects(None).await {
+            Ok(projects) => {
+                for project in projects {
+                    match global_project_store.list_worktrees(&project.id).await {
+                        Ok(worktrees) => {
+                            candidates.extend(worktrees.into_iter().map(|w| (w.name, w.id)))
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                project_id = %project.id,
+                                %error,
+                                "failed to list worktrees for task binding backfill"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to list projects for task binding backfill");
+            }
+        }
+
+        match global_task_store
+            .backfill_worktree_bindings(&candidates)
+            .await
+        {
+            Ok(bound) if bound > 0 => {
+                tracing::info!(tasks = bound, "bound tasks to their existing worktrees");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "failed to backfill task worktree bindings");
+            }
+        }
+    }
+
     // Start HTTP API server if enabled
     let mut api_state = spacebot::api::ApiState::new_with_provider_sender(
         provider_tx,
@@ -1199,6 +1240,79 @@ async fn run(
     let mut active_channels: HashMap<ActiveChannelKey, ActiveChannel> = HashMap::new();
     let mut deferred_injections: HashMap<ActiveChannelKey, Vec<spacebot::InboundMessage>> =
         HashMap::new();
+
+    // Workers run in-process, so any attempt still open belongs to a run that
+    // died with the previous process. Close them, or the task-scoped spawn
+    // guard would see a live run forever and that task could never be worked
+    // again.
+    //
+    // A run can reach a terminal state and still leave its attempt open: the
+    // worker record lives in the agent database and the attempt in the instance
+    // one, so nothing spans both writes. Where the worker did commit an outcome
+    // the attempt is closed with it, and only the runs nothing decided are swept
+    // as interrupted. This runs after the agents are open because recovering an
+    // outcome means reading the agent database that holds it.
+    if agents_initialized {
+        let live = match global_task_store.live_attempts().await {
+            Ok(live) => live,
+            Err(error) => {
+                tracing::warn!(%error, "failed to read live task attempts");
+                Vec::new()
+            }
+        };
+        for attempt in live {
+            let Some(agent) = attempt
+                .agent_id
+                .as_deref()
+                .and_then(|id| agents.get(&spacebot::AgentId::from(id)))
+            else {
+                continue;
+            };
+            let Ok(worker_id) = attempt.worker_id.parse() else {
+                continue;
+            };
+            let run_logger = spacebot::conversation::ProcessRunLogger::new(agent.db.sqlite.clone());
+            let terminal = match run_logger.read_worker_terminal(worker_id).await {
+                Ok(Some(terminal)) => terminal,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(%error, %worker_id, "failed to read a worker terminal outcome");
+                    continue;
+                }
+            };
+            match global_task_store
+                .finish_task_attempt(
+                    &attempt.worker_id,
+                    terminal.outcome_kind.into(),
+                    Some(&terminal.result),
+                )
+                .await
+            {
+                Ok(true) => tracing::info!(
+                    %worker_id,
+                    outcome = terminal.outcome_kind.as_str(),
+                    "recovered a committed outcome for an attempt left open"
+                ),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(%error, %worker_id, "failed to recover a task attempt outcome");
+                }
+            }
+        }
+
+        match global_task_store.reconcile_interrupted_attempts().await {
+            Ok(closed) if closed > 0 => {
+                tracing::info!(
+                    attempts = closed,
+                    "closed task attempts interrupted by an exit"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "failed to reconcile interrupted task attempts");
+            }
+        }
+    }
 
     // Resume idle interactive workers that survived the restart.
     // For each idle worker, pre-create the channel if needed and spawn
