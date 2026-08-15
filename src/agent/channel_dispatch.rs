@@ -134,15 +134,20 @@ fn classify_worker_completion(
 /// Mirrors the worker's own outcome rather than collapsing to success/failure,
 /// so a task can tell a run that delivered partial work from one that was
 /// cancelled or timed out.
-fn attempt_outcome(kind: WorkerCompletionKind) -> crate::tasks::TaskAttemptOutcome {
+/// Map a committed terminal outcome onto the task attempt history.
+///
+/// Takes the committed kind rather than the raw classification so the attempt
+/// records the same outcome as the durable worker record and the completion
+/// event.
+fn attempt_outcome(kind: WorkerOutcomeKind) -> crate::tasks::TaskAttemptOutcome {
     use crate::tasks::TaskAttemptOutcome as Outcome;
     match kind {
-        WorkerCompletionKind::Success => Outcome::Succeeded,
-        WorkerCompletionKind::Partial => Outcome::Partial,
-        WorkerCompletionKind::Blocked => Outcome::Blocked,
-        WorkerCompletionKind::Cancelled => Outcome::Cancelled,
-        WorkerCompletionKind::Timeout => Outcome::TimedOut,
-        WorkerCompletionKind::Failed => Outcome::Failed,
+        WorkerOutcomeKind::Succeeded => Outcome::Succeeded,
+        WorkerOutcomeKind::Partial => Outcome::Partial,
+        WorkerOutcomeKind::Blocked => Outcome::Blocked,
+        WorkerOutcomeKind::Cancelled => Outcome::Cancelled,
+        WorkerOutcomeKind::TimedOut => Outcome::TimedOut,
+        WorkerOutcomeKind::Failed => Outcome::Failed,
     }
 }
 
@@ -1403,21 +1408,6 @@ where
         let (notify, _success) = completion_flags(kind);
         let outcome_kind = outcome_kind(kind);
 
-        // Close this run in the task's attempt history. Keyed by worker id, so
-        // a run that was never bound to a task simply matches nothing.
-        if let Some(task_store) = &task_store {
-            let summary: String = result_text.chars().take(280).collect();
-            if let Err(error) = task_store
-                .finish_task_attempt(
-                    &worker_id.to_string(),
-                    attempt_outcome(kind),
-                    (!summary.is_empty()).then_some(summary.as_str()),
-                )
-                .await
-            {
-                tracing::warn!(%error, %worker_id, "failed to record the task attempt outcome");
-            }
-        }
         #[cfg(feature = "metrics")]
         {
             let metrics = crate::telemetry::Metrics::global();
@@ -1449,6 +1439,32 @@ where
             terminal_owner,
         )
         .await;
+
+        // Close this run in the task's attempt history, using the outcome the
+        // commit settled on: a completion racing a cancel or a timeout lands on
+        // a different terminal kind than the raw classification, and the board
+        // has to agree with the durable worker record. A commit that produced
+        // nothing still closes the attempt with what was classified here, so a
+        // failure to commit cannot leave the task blocked by an open run.
+        // Keyed by worker id, so a run never bound to a task matches nothing.
+        if let Some(task_store) = &task_store {
+            let (resolved, summary_source) = match &commit {
+                Ok(Some((terminal, _))) => (terminal.outcome_kind, terminal.result.as_str()),
+                _ => (outcome_kind, result_text.as_str()),
+            };
+            let summary: String = summary_source.chars().take(280).collect();
+            if let Err(error) = task_store
+                .finish_task_attempt(
+                    &worker_id.to_string(),
+                    attempt_outcome(resolved),
+                    (!summary.is_empty()).then_some(summary.as_str()),
+                )
+                .await
+            {
+                tracing::warn!(%error, %worker_id, "failed to record the task attempt outcome");
+            }
+        }
+
         let (terminal, newly_committed) = match commit {
             Ok(Some(commit)) => commit,
             Ok(None) => {
@@ -1966,8 +1982,13 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkerCompletionError, WorkerOutcome, map_worker_completion, spawn_worker_task};
-    use crate::conversation::ProcessRunLogger;
+    use super::{
+        WorkerCompletionError, WorkerOutcome, attempt_outcome, commit_worker_outcome,
+        map_worker_completion, spawn_worker_task,
+    };
+    use crate::conversation::{
+        ProcessRunLogger, WorkerLifecycle, WorkerOutcomeKind, WorkerTerminalOwner,
+    };
     use crate::{ProcessEvent, WorkerId};
     use std::sync::Arc;
     use std::time::Duration;
@@ -2002,6 +2023,85 @@ mod tests {
             .await
             .unwrap();
         logger
+    }
+
+    /// A cancel arriving while the worker is already completing commits as
+    /// partial. The attempt has to record what was committed: recording the raw
+    /// classification would put `cancelled` on the board against a worker record
+    /// that says `partial`.
+    #[tokio::test]
+    async fn a_cancel_racing_a_completion_records_what_was_committed() {
+        let worker_id = Uuid::new_v4();
+        let logger = setup_worker(worker_id, "test:race-cancel").await;
+        let lifecycle = logger
+            .read_worker_lifecycle(worker_id)
+            .await
+            .unwrap()
+            .unwrap();
+        logger
+            .claim_worker_completion(worker_id, lifecycle)
+            .await
+            .unwrap();
+
+        let (terminal, committed) = commit_worker_outcome(
+            &logger,
+            worker_id,
+            WorkerOutcomeKind::Cancelled,
+            "cancelled while finishing",
+            None,
+            WorkerTerminalOwner::Cancel,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(committed);
+        assert_eq!(terminal.outcome_kind, WorkerOutcomeKind::Partial);
+        assert_eq!(
+            attempt_outcome(terminal.outcome_kind),
+            crate::tasks::TaskAttemptOutcome::Partial
+        );
+        assert_ne!(
+            attempt_outcome(WorkerOutcomeKind::Cancelled),
+            attempt_outcome(terminal.outcome_kind),
+            "the raw classification is what the attempt used to record"
+        );
+    }
+
+    /// The same disagreement in the other direction: a timeout landing on a
+    /// worker already cancelling, with nothing to show for the run, commits as
+    /// cancelled rather than timed out.
+    #[tokio::test]
+    async fn a_timeout_racing_a_cancel_records_what_was_committed() {
+        let worker_id = Uuid::new_v4();
+        let logger = setup_worker(worker_id, "test:race-timeout").await;
+        let lifecycle = logger
+            .read_worker_lifecycle(worker_id)
+            .await
+            .unwrap()
+            .unwrap();
+        logger
+            .transition_worker(worker_id, lifecycle, WorkerLifecycle::Cancelling)
+            .await
+            .unwrap();
+
+        let (terminal, _) = commit_worker_outcome(
+            &logger,
+            worker_id,
+            WorkerOutcomeKind::TimedOut,
+            "timed out",
+            None,
+            WorkerTerminalOwner::Timeout,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(terminal.outcome_kind, WorkerOutcomeKind::Cancelled);
+        assert_eq!(
+            attempt_outcome(terminal.outcome_kind),
+            crate::tasks::TaskAttemptOutcome::Cancelled
+        );
     }
 
     #[test]
