@@ -1040,6 +1040,13 @@ async fn run(
         .with_context(|| "failed to initialize LLM manager")?,
     );
 
+    // The hard ceiling every request is trimmed to fit. Compaction aims at the
+    // same number, but it only runs where a loop yields; this is enforced on
+    // the request itself, so a loop that never yields cannot exceed it. Raising
+    // `context_window` raises both — set it to what the backend actually
+    // enforces, which is not always what the model advertises.
+    llm_manager.set_default_context_ceiling(config.defaults.context_window);
+
     // Shared embedding model (stateless, agent-agnostic)
     let embedding_cache_dir = config.instance_dir.join("embedding_cache");
     let embedding_model = Arc::new(

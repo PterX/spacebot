@@ -1,5 +1,6 @@
 //! SpacebotModel: Custom CompletionModel implementation that routes through LlmManager.
 
+use crate::agent::compactor::{advance_past_stranded_tool_results, estimate_history_tokens};
 use crate::config::{ApiType, ProviderConfig};
 use crate::llm::manager::LlmManager;
 use crate::llm::routing::{
@@ -62,6 +63,42 @@ pub struct SpacebotModel {
     process_type: Option<String>,
     worker_type: Option<String>,
     usage_accumulator: Option<Arc<Mutex<crate::llm::usage::UsageAccumulator>>>,
+}
+
+/// Share of the ceiling held back for the model's own response.
+const RESPONSE_RESERVE: f32 = 0.15;
+
+/// Tokens a request spends before any history: system prompt and tool schemas
+/// are charged to the same window.
+fn request_overhead_tokens(request: &CompletionRequest) -> usize {
+    let preamble = request.preamble.as_ref().map_or(0, |text| text.len());
+    let tools: usize = request
+        .tools
+        .iter()
+        .map(|tool| tool.name.len() + tool.description.len() + tool.parameters.to_string().len())
+        .sum();
+    (preamble + tools) / 4
+}
+
+/// Drop the oldest turns until the history fits `budget`, returning how many
+/// messages went.
+///
+/// Cuts a quarter at a time so a history barely over budget does not lose far
+/// more than it needs to, and aligns every cut so a tool result is never left
+/// without the call it answers. Returns 0 when no aligned cut can shrink it,
+/// which the caller reports rather than sending a request it knows will fail.
+fn trim_history_to_budget(history: &mut Vec<rig::message::Message>, budget: usize) -> usize {
+    let mut dropped = 0usize;
+    while estimate_history_tokens(history) > budget && history.len() > 2 {
+        let target = (history.len() / 4).max(1);
+        let cut = advance_past_stranded_tool_results(history, target, history.len() - 2);
+        if cut == 0 {
+            break;
+        }
+        history.drain(..cut);
+        dropped += cut;
+    }
+    dropped
 }
 
 impl SpacebotModel {
@@ -191,6 +228,70 @@ impl SpacebotModel {
         );
         request.chat_history = chat_history;
         Ok(())
+    }
+
+    /// Trim a request until it fits the ceiling the provider actually enforces.
+    ///
+    /// Every history a request can be built from passes through here: the
+    /// worker's segments, rig's internal tool loop, branches, the cortex. That
+    /// matters because a budget checked anywhere else can be skipped by a loop
+    /// that does not yield. A worker reached 269k tokens against a 128k
+    /// compaction trigger without the trigger ever being evaluated, because the
+    /// whole run happened inside one segment and the check only ran between
+    /// segments. This is the point that cannot be bypassed.
+    ///
+    /// Cutting here is a backstop, not a replacement for compaction: it drops
+    /// the oldest turns outright, where compaction summarises them first. It
+    /// exists so a run degrades instead of dying.
+    fn enforce_context_ceiling(&self, request: &mut CompletionRequest) {
+        let Some(ceiling) = self.llm_manager.context_ceiling(&self.full_model_name) else {
+            return;
+        };
+
+        // The model needs room to answer, and the system prompt and tool
+        // schemas are charged to the same window as the history.
+        let reserve = (ceiling as f32 * RESPONSE_RESERVE) as usize;
+        let budget = ceiling
+            .saturating_sub(reserve)
+            .saturating_sub(request_overhead_tokens(request));
+        if budget == 0 {
+            return;
+        }
+
+        let mut history: Vec<rig::message::Message> =
+            request.chat_history.iter().cloned().collect();
+        let before = estimate_history_tokens(&history);
+        if before <= budget {
+            return;
+        }
+
+        let dropped = trim_history_to_budget(&mut history, budget);
+
+        if dropped == 0 {
+            tracing::error!(
+                model = %self.full_model_name,
+                estimated = before,
+                budget,
+                "request exceeds the context ceiling and no aligned cut can shrink it"
+            );
+            return;
+        }
+
+        let Ok(chat_history) = OneOrMany::many(history) else {
+            return;
+        };
+
+        tracing::warn!(
+            model = %self.full_model_name,
+            ceiling,
+            estimated_before = before,
+            estimated_after = estimate_history_tokens(
+                &chat_history.iter().cloned().collect::<Vec<_>>()
+            ),
+            dropped_messages = dropped,
+            "trimmed request history to fit the model's context ceiling"
+        );
+        request.chat_history = chat_history;
     }
 
     /// Direct call to the provider (no fallback logic).
@@ -429,6 +530,9 @@ impl CompletionModel for SpacebotModel {
         let start = std::time::Instant::now();
 
         self.repair_request_history(&mut request)?;
+        self.enforce_context_ceiling(&mut request);
+        let sent_tokens =
+            estimate_history_tokens(&request.chat_history.iter().cloned().collect::<Vec<_>>());
 
         let result = async move {
             let Some(routing) = &self.routing else {
@@ -689,6 +793,16 @@ impl CompletionModel for SpacebotModel {
                 .add(extended, &self.full_model_name, &self.provider, cost);
         }
 
+        // A rejection is the only trustworthy measurement of where the ceiling
+        // sits: the published window and the one the backend enforces are
+        // routinely different, and the difference moves without notice.
+        if let Err(ref error) = result
+            && routing::is_context_overflow_error(&error.to_string())
+        {
+            self.llm_manager
+                .note_context_overflow(&self.full_model_name, sent_tokens);
+        }
+
         result
     }
 
@@ -697,6 +811,7 @@ impl CompletionModel for SpacebotModel {
         mut request: CompletionRequest,
     ) -> Result<StreamingCompletionResponse<RawStreamingResponse>, CompletionError> {
         self.repair_request_history(&mut request)?;
+        self.enforce_context_ceiling(&mut request);
 
         let provider_config = self.provider_config_for_current_model().await?;
 
@@ -4935,5 +5050,97 @@ mod tests {
         let msg = format_api_error(status, &body);
         assert!(msg.contains("Google"));
         assert!(msg.contains("invalid schema"));
+    }
+}
+
+#[cfg(test)]
+mod context_trim_tests {
+    use super::trim_history_to_budget;
+    use crate::agent::compactor::estimate_history_tokens;
+    use rig::message::{AssistantContent, Message, UserContent};
+
+    fn assistant_tool_call(id: &str) -> Message {
+        Message::Assistant {
+            id: None,
+            content: rig::OneOrMany::one(AssistantContent::tool_call(
+                id,
+                "shell",
+                serde_json::json!({"command": "cat -n src/agent/worker.rs"}),
+            )),
+        }
+    }
+
+    fn tool_result(id: &str, bytes: usize) -> Message {
+        Message::User {
+            content: rig::OneOrMany::one(UserContent::ToolResult(rig::message::ToolResult {
+                id: id.to_string(),
+                call_id: None,
+                content: rig::OneOrMany::one(rig::message::ToolResultContent::text(
+                    "x".repeat(bytes),
+                )),
+            })),
+        }
+    }
+
+    /// The shape that killed both workers: turns of parallel shell calls, each
+    /// result at the 50,000-byte cap, run until the history is twice the window.
+    fn overflowing_history() -> Vec<Message> {
+        let mut history = vec![Message::from("audit the worker backends")];
+        for turn in 0..8 {
+            for call in 0..4 {
+                let id = format!("call_{turn}_{call}");
+                history.push(assistant_tool_call(&id));
+                history.push(tool_result(&id, 50_000));
+            }
+        }
+        history
+    }
+
+    #[test]
+    fn a_history_already_under_budget_is_left_alone() {
+        let mut history = vec![Message::from("hello")];
+        assert_eq!(trim_history_to_budget(&mut history, 100_000), 0);
+        assert_eq!(history.len(), 1);
+    }
+
+    /// The guarantee the whole change exists for: whatever the loop built, what
+    /// leaves fits.
+    #[test]
+    fn an_overflowing_history_is_brought_under_budget() {
+        let mut history = overflowing_history();
+        let before = estimate_history_tokens(&history);
+        assert!(
+            before > 250_000,
+            "fixture should reproduce the real overflow, got {before}"
+        );
+
+        let dropped = trim_history_to_budget(&mut history, 200_000);
+
+        assert!(dropped > 0);
+        let after = estimate_history_tokens(&history);
+        assert!(after <= 200_000, "history must fit the budget, got {after}");
+        assert!(!history.is_empty());
+    }
+
+    /// A tighter ceiling has to cut harder, not give up.
+    #[test]
+    fn a_small_budget_still_produces_a_sendable_history() {
+        let mut history = overflowing_history();
+        trim_history_to_budget(&mut history, 30_000);
+
+        assert!(estimate_history_tokens(&history) <= 30_000);
+        assert!(!history.is_empty());
+    }
+
+    /// Trimming must not stand a result up without the call it answers.
+    #[test]
+    fn the_retained_head_is_never_a_stranded_result() {
+        let mut history = overflowing_history();
+        trim_history_to_budget(&mut history, 120_000);
+
+        assert!(
+            !crate::agent::compactor::opens_with_tool_result(&history[0]),
+            "the retained history must not open on a tool result"
+        );
     }
 }
