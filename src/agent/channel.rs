@@ -3394,7 +3394,14 @@ impl Channel {
         let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
         let non_empty_option = |value: Option<String>| value.filter(|text| !text.is_empty());
         let routing = rc.routing.load();
-        let model_name = routing.resolve(ProcessType::Channel, None).to_string();
+        // Enforcement is model-specific, so it has to be rendered for the model
+        // the turn will actually use — a conversation override, when set, not
+        // the routing default.
+        let model_name = self
+            .resolved_settings
+            .resolve_model("channel")
+            .unwrap_or_else(|| routing.resolve(ProcessType::Channel, None))
+            .to_string();
         let tool_use_enforcement = rc.tool_use_enforcement.load();
         let direct_mode = self.resolved_settings.delegation == DelegationMode::Direct;
         let execution_mode = if direct_mode {

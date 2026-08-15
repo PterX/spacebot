@@ -51,13 +51,22 @@ impl PromptInputs {
         self
     }
 
-    /// The first input that cannot be safely marked, if any.
+    /// The first input that would make the sentinel split ambiguous, if any.
+    ///
+    /// Inline values are checked too. They are never marked, but they still
+    /// land in the rendered text, and a stray sentinel anywhere in the output
+    /// misaligns every block after it.
     fn colliding_value(&self) -> Option<&'static str> {
-        self.text.iter().find_map(|(name, value)| {
+        let marked = self.text.iter().find_map(|(name, value)| {
             value
                 .as_deref()
                 .is_some_and(blocks::collides_with_sentinels)
                 .then_some(*name)
+        });
+        marked.or_else(|| {
+            self.inline.iter().find_map(|(name, value)| {
+                blocks::collides_with_sentinels(&value.to_string()).then_some(*name)
+            })
         })
     }
 

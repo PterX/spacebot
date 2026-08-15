@@ -627,7 +627,11 @@ export interface PromptRecord {
 		blocks: PromptBlock[];
 	};
 	tools: PromptToolRef[];
-	messages: PromptHistoryMessage[];
+	/**
+	 * Serialized rig messages. The recorder falls back to JSON null when a
+	 * history fails to serialize, so a stored payload can carry null here.
+	 */
+	messages: PromptHistoryMessage[] | null;
 	history_length: number;
 	response: {
 		text: string | null;

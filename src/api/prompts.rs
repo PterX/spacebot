@@ -119,11 +119,16 @@ pub(super) async fn get_prompt_request(
             serde_json::to_value(&record).unwrap_or(serde_json::Value::Null),
         )),
         Ok(None) => Err(StatusCode::NOT_FOUND),
-        // The only error `get` raises is an ambiguous prefix, which is the
-        // caller's to fix by supplying more characters.
-        Err(error) => {
-            tracing::debug!(%error, "prompt record lookup rejected");
+        // An ambiguous prefix is the caller's to fix; a failed query, unreadable
+        // payload or unparseable record is the store failing and must not be
+        // reported as a caller mistake.
+        Err(crate::llm::record::LookupError::Ambiguous(id)) => {
+            tracing::debug!(request_id = %id, "prompt record id is ambiguous");
             Err(StatusCode::CONFLICT)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to load prompt record");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
@@ -183,32 +188,47 @@ pub(super) async fn set_prompt_debug_capture(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<CaptureBody>,
 ) -> Result<Json<CaptureSettings>, StatusCode> {
-    let settings = settings_store(&state, body.agent_id.as_deref())?;
+    let retention = body.retention_days.filter(|days| *days > 0);
 
-    settings
-        .set_prompt_debug_capture(body.enabled)
-        .map_err(|error| {
-            tracing::warn!(%error, "failed to persist prompt capture setting");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    if let Some(days) = body.retention_days.filter(|days| *days > 0) {
-        settings
-            .set_prompt_debug_retention_days(days)
-            .map_err(|error| {
-                tracing::warn!(%error, "failed to persist prompt retention setting");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+    // Capture is an instance-wide switch, so every agent is written and every
+    // agent's live flag is set. Persisting one agent while flipping the flag
+    // for all of them would look correct until a restart, then silently revert
+    // for the agents that were never written.
+    let configs = state.runtime_configs.load();
+    if configs.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
     }
 
-    // The store holds the live flag the model layer reads, so it has to be
-    // told too — persisting alone would not take effect until a restart.
-    for runtime_config in state.runtime_configs.load().values() {
+    for (agent_id, runtime_config) in configs.iter() {
+        let Some(settings) = runtime_config.settings.load().as_ref().clone() else {
+            tracing::warn!(agent_id, "no settings store; prompt capture not persisted");
+            continue;
+        };
+
+        settings
+            .set_prompt_debug_capture(body.enabled)
+            .map_err(|error| {
+                tracing::warn!(%error, agent_id, "failed to persist prompt capture setting");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        if let Some(days) = retention {
+            settings
+                .set_prompt_debug_retention_days(days)
+                .map_err(|error| {
+                    tracing::warn!(%error, agent_id, "failed to persist prompt retention setting");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+        }
+
+        // The store holds the flag the model layer reads, so it has to be told
+        // too — persisting alone would not take effect until a restart.
         if let Some(store) = runtime_config.prompt_records.load().as_ref() {
             store.set_enabled(body.enabled);
         }
     }
 
+    let settings = settings_store(&state, body.agent_id.as_deref())?;
     Ok(Json(CaptureSettings {
         enabled: body.enabled,
         retention_days: settings.prompt_debug_retention_days(),

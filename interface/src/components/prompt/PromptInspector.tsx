@@ -19,6 +19,7 @@ import {DialogContent, DialogRoot} from "@spacedrive/primitives";
 import {
 	LAYER_ORDER,
 	LAYER_STYLES,
+	layerStyle,
 	SOURCE_LABEL,
 	STABILITY_LABEL,
 	byteLength,
@@ -209,8 +210,8 @@ function Usage({record}: {record: PromptRecord}) {
 	const {usage} = record;
 	// A streamed request records no usage — the response is assembled by the
 	// caller, so showing zeros would read as "free" rather than "not measured".
-	const measured =
-		usage.input_tokens > 0 || usage.output_tokens > 0 || record.duration_ms > 0;
+	// Duration is not evidence of that; it is reported in the header regardless.
+	const measured = usage.input_tokens > 0 || usage.output_tokens > 0;
 	if (!measured) return null;
 
 	return (
@@ -255,28 +256,44 @@ function Metric({
  * anyone having to know the on-disk layout.
  */
 function CopyReference({record: {request_id, agent_id}}: {record: PromptRecord}) {
-	const [copied, setCopied] = useState(false);
+	const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
 
 	const copy = useCallback(() => {
 		const short = request_id.slice(0, 8);
 		const reference = [
 			`spacebot prompt show ${short}`,
-			`~/.spacebot/agents/${agent_id}/prompts/*/${request_id}.json`,
+			`~/.spacebot/agents/${agent_id}/data/prompts/*/${request_id}.json`,
 		].join("\n");
-		navigator.clipboard.writeText(reference).then(() => {
-			setCopied(true);
-			setTimeout(() => setCopied(false), 1600);
-		});
+		// Clipboard access is refused outside a secure context and when the
+		// browser denies permission; a silent rejection would leave the reader
+		// pasting whatever was there before.
+		navigator.clipboard
+			?.writeText(reference)
+			.then(() => setState("copied"))
+			.catch((error: unknown) => {
+				console.warn("failed to copy prompt reference", error);
+				setState("failed");
+			})
+			.finally(() => setTimeout(() => setState("idle"), 1600));
 	}, [request_id, agent_id]);
 
 	return (
 		<button
 			type="button"
 			onClick={copy}
-			title="Copy a reference to this request"
-			className="flex items-center gap-1.5 rounded-md border border-app-line/60 px-2 py-1 font-mono text-tiny text-ink-faint transition-colors hover:bg-app-hover hover:text-ink"
+			title={
+				state === "failed"
+					? "Could not copy — clipboard access was denied"
+					: "Copy a reference to this request"
+			}
+			className={cx(
+				"flex items-center gap-1.5 rounded-md border px-2 py-1 font-mono text-tiny transition-colors hover:bg-app-hover hover:text-ink",
+				state === "failed"
+					? "border-status-error/40 text-status-error"
+					: "border-app-line/60 text-ink-faint",
+			)}
 		>
-			{copied ? (
+			{state === "copied" ? (
 				<Check className="size-3 text-status-success" />
 			) : (
 				<Copy className="size-3" />
@@ -668,7 +685,7 @@ function Minimap({
 						className={cx(
 							"absolute inset-x-2 rounded-[2px] opacity-70 transition-opacity hover:opacity-100",
 							row.kind === "block"
-								? LAYER_STYLES[row.block.layer].swatch
+								? layerStyle(row.block.layer).swatch
 								: SECTION_SWATCH[row.id] ?? "bg-ink-faint/40",
 						)}
 					/>
@@ -704,7 +721,7 @@ function BlockSection({
 	registerRef: (node: HTMLDivElement | null) => void;
 }) {
 	const {block, text, share} = row;
-	const style = LAYER_STYLES[block.layer];
+	const style = layerStyle(block.layer);
 
 	return (
 		<div ref={registerRef} className="flex scroll-mt-2">

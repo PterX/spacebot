@@ -222,7 +222,9 @@ function MessageActions({
           Inspect prompt at this turn
         </DropdownMenuItem>
         <DropdownMenuItem
-          onSelect={() => navigator.clipboard.writeText(messageId)}
+          onSelect={() =>
+            navigator.clipboard?.writeText(messageId).catch(console.warn)
+          }
         >
           Copy message id
         </DropdownMenuItem>

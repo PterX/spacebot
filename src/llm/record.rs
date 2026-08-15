@@ -153,6 +153,37 @@ pub struct DebugContext {
     pub blocks: Vec<PromptBlock>,
 }
 
+/// Why a record lookup did not produce a record.
+///
+/// The two cases are answered differently: an ambiguous prefix is the caller's
+/// to fix by supplying more characters, while everything else is the store
+/// failing and must not be reported as a caller mistake.
+#[derive(Debug, thiserror::Error)]
+pub enum LookupError {
+    #[error("request id '{0}' is ambiguous; use more characters")]
+    Ambiguous(String),
+    #[error(transparent)]
+    Store(#[from] anyhow::Error),
+}
+
+impl From<sqlx::Error> for LookupError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Store(error.into())
+    }
+}
+
+impl From<std::io::Error> for LookupError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Store(error.into())
+    }
+}
+
+impl From<serde_json::Error> for LookupError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Store(error.into())
+    }
+}
+
 /// Writes prompt records and maintains their index.
 #[derive(Clone)]
 pub struct PromptRecordStore {
@@ -253,7 +284,7 @@ impl PromptRecordStore {
     /// Prefix resolution exists because a record's id is something a person
     /// copies out of the UI and pastes into a terminal; an ambiguous prefix is
     /// reported rather than resolved arbitrarily.
-    pub async fn get(&self, request_id: &str) -> anyhow::Result<Option<PromptRecord>> {
+    pub async fn get(&self, request_id: &str) -> Result<Option<PromptRecord>, LookupError> {
         let matches: Vec<(String, String)> = sqlx::query_as(
             "SELECT request_id, path FROM prompt_requests
              WHERE request_id = ? OR request_id LIKE ? || '%'
@@ -267,7 +298,7 @@ impl PromptRecordStore {
         let path = match matches.as_slice() {
             [] => return Ok(None),
             [(_, path)] => path.clone(),
-            _ => anyhow::bail!("request id '{request_id}' is ambiguous; use more characters"),
+            _ => return Err(LookupError::Ambiguous(request_id.to_string())),
         };
 
         let full = self.data_dir().join(&path);

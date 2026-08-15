@@ -47,6 +47,23 @@ pub enum PromptCommand {
     },
 }
 
+/// Slice a prompt by a block's byte range, tolerating a range that does not
+/// fit it.
+///
+/// Records are read from disk and may have been written by a different build,
+/// so their offsets are not guaranteed to land on this text's char boundaries.
+/// Indexing directly would panic and take the whole command with it.
+fn block_text(text: &str, start: usize, end: usize) -> &str {
+    if start > end
+        || end > text.len()
+        || !text.is_char_boundary(start)
+        || !text.is_char_boundary(end)
+    {
+        return "<block range does not fit this prompt>";
+    }
+    &text[start..end]
+}
+
 pub async fn run(ctx: &super::Context, command: PromptCommand) -> anyhow::Result<()> {
     let client = ApiClient::from_context(ctx)?;
 
@@ -201,7 +218,10 @@ async fn show(
                 block.tokens,
                 100.0 * bytes as f64 / total as f64,
             );
-            println!("{}", &record.system.text[block.start..block.end]);
+            println!(
+                "{}",
+                block_text(&record.system.text, block.start, block.end)
+            );
         }
     }
 
@@ -256,7 +276,7 @@ async fn diff(
     )?;
 
     let slice = |record: &PromptRecord, start: usize, end: usize| {
-        record.system.text[start..end].to_string()
+        block_text(&record.system.text, start, end).to_string()
     };
 
     let mut rows: Vec<Vec<String>> = Vec::new();

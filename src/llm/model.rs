@@ -341,10 +341,21 @@ fn split_system_prompt(request: &CompletionRequest) -> (String, Vec<&rig::messag
 /// that was trimmed, wrapped, or replaced downstream would leave every byte
 /// range in the map pointing at the wrong content.
 fn block_map_fits(blocks: &[crate::prompts::PromptBlock], preamble: &str) -> bool {
-    match blocks.last() {
-        Some(last) => last.end == preamble.len(),
-        None => false,
+    if blocks.is_empty() {
+        return false;
     }
+
+    // Blocks tile the prompt they were built for, so checking that they still
+    // tile this one catches a map that describes different bytes — not just a
+    // map of the wrong total length.
+    let mut cursor = 0usize;
+    for block in blocks {
+        if block.start != cursor || block.end < block.start {
+            return false;
+        }
+        cursor = block.end;
+    }
+    cursor == preamble.len()
 }
 
 impl SpacebotModel {
@@ -4645,6 +4656,32 @@ mod tests {
     /// Rig prepends an agent's preamble to the history as a system message and
     /// leaves `preamble` unset, so a record that reads the field alone captures
     /// an empty system prompt for every process in the instance.
+    /// A map is only carried when it tiles the prompt it is paired with.
+    /// Matching only the total length would accept a map built for different
+    /// bytes, and every range the inspector draws would be off.
+    #[test]
+    fn block_map_fits_requires_the_blocks_to_tile_the_prompt() {
+        let block = |start: usize, end: usize| crate::prompts::PromptBlock {
+            id: "identity_context".to_string(),
+            layer: crate::prompts::BlockLayer::Identity,
+            stability: crate::prompts::BlockStability::Epoch,
+            source: crate::prompts::BlockSource::File,
+            start,
+            end,
+            chars: end - start,
+            tokens: 0,
+        };
+
+        assert!(block_map_fits(&[block(0, 5), block(5, 10)], "0123456789"));
+        assert!(!block_map_fits(&[], "0123456789"));
+        // Right total length, but starts partway through.
+        assert!(!block_map_fits(&[block(5, 10)], "0123456789"));
+        // Contiguous but short.
+        assert!(!block_map_fits(&[block(0, 5)], "0123456789"));
+        // A gap in the middle.
+        assert!(!block_map_fits(&[block(0, 4), block(5, 10)], "0123456789"));
+    }
+
     #[test]
     fn split_system_prompt_reads_the_leading_system_message() {
         let request = request_with(

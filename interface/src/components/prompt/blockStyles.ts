@@ -53,6 +53,17 @@ export const LAYER_STYLES: Record<
 	},
 };
 
+/**
+ * Look up a layer's styling, tolerating a layer this build does not know.
+ *
+ * `block.layer` comes from a stored record, so the TypeScript union does not
+ * constrain it — a layer added on the Rust side would otherwise dereference
+ * `undefined` and unmount the dialog.
+ */
+export function layerStyle(layer: BlockLayer): (typeof LAYER_STYLES)[BlockLayer] {
+	return LAYER_STYLES[layer] ?? LAYER_STYLES.runtime;
+}
+
 export const LAYER_ORDER: BlockLayer[] = [
 	"identity",
 	"contract",

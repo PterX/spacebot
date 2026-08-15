@@ -2541,6 +2541,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/tasks/{number}/attempts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /tasks/{number}/attempts` — the worker runs attempted against a task.
+         * @description `tasks.worker_id` names only the run executing right now; this is the
+         *     history that says what has already been tried and how it ended.
+         */
+        get: operations["list_task_attempts"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/tasks/{number}/comments": {
         parameters: {
             query?: never;
@@ -4888,6 +4909,36 @@ export interface components {
             message: string;
             success: boolean;
         };
+        /** @description One worker run recorded against a task. */
+        TaskAttempt: {
+            agent_id?: string | null;
+            /**
+             * Format: int64
+             * @description 1 for the first run on this task.
+             */
+            attempt: number;
+            author_id?: string | null;
+            author_type: components["schemas"]["TaskAuthorKind"];
+            channel_id?: string | null;
+            ended_at?: string | null;
+            id: string;
+            outcome?: null | components["schemas"]["TaskAttemptOutcome"];
+            outcome_summary?: string | null;
+            started_at: string;
+            task_id: string;
+            worker_id: string;
+        };
+        TaskAttemptListResponse: {
+            /** @description Worker runs attempted against this task, newest first. */
+            attempts: components["schemas"]["TaskAttempt"][];
+            /** @description One line summarising what has been tried, as prompt context renders it. */
+            summary?: string | null;
+        };
+        /**
+         * @description How a worker run ended, from the task's point of view.
+         * @enum {string}
+         */
+        TaskAttemptOutcome: "succeeded" | "partial" | "blocked" | "failed" | "cancelled" | "timed_out" | "interrupted";
         /**
          * @description Who performed a task mutation or wrote a comment.
          * @enum {string}
@@ -11870,6 +11921,46 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    list_task_attempts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Task number */
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskAttemptListResponse"];
+                };
+            };
+            /** @description Task not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskErrorBody"];
+                };
+            };
+            /** @description Task store not initialized */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskErrorBody"];
+                };
             };
         };
     };

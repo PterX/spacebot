@@ -131,7 +131,7 @@ Token counts are estimates. There is no tokenizer in the dependency tree; `estim
 
 The volume is real and the user has accepted it, so the shape should suit it: index in SQLite, payload on disk.
 
-```
+```text
 <data_dir>/prompts/<YYYY-MM-DD>/<request_id>.json
 ```
 
@@ -151,7 +151,7 @@ One global toggle — `prompt_debug_capture` in the settings store, surfaced in 
 
 Every record has a short id. The inspector's copy button yields a line that resolves without ceremony from a terminal or an agent session:
 
-```
+```text
 spacebot prompt show 7f3a2c1e
 # ~/.spacebot/agents/main/prompts/2026-08-14/7f3a2c1e.json
 ```
@@ -162,21 +162,29 @@ Both forms in the clipboard: the command for humans, the path for agents that wo
 
 ```jsonc
 {
-  "request_id": "7f3a2c1e",
-  "process": { "kind": "worker", "id": "bfd404b0-…", "type": "builtin",
+  "request_id": "7f3a2c1e5d9b4e0a91c2f7a3b8d6e405",
+  "agent_id": "main",
+  "process": { "kind": "worker", "id": "bfd404b0-…", "process_type": "builtin",
                "channel_id": "telegram:8659410676" },
-  "trigger":  { "kind": "spawn_worker", "message_id": 206, "parent": "channel:telegram:…" },
-  "model":    { "name": "openai-chatgpt/gpt-5.6-sol", "provider": "openai-chatgpt", "max_turns": 50 },
-  "system":   { "text": "…", "blocks": [ /* id, layer, stability, source, range, tokens */ ] },
-  "tools":    [ { "name": "shell", "description": "…", "schema_chars": 812 } ],
+  "trigger":  { "kind": "spawn_worker", "message_id": "c03159cc-…",
+                "input": "…", "parent": "channel:telegram:…" },
+  "model":    { "name": "openai-chatgpt/gpt-5.6-sol", "provider": "openai-chatgpt",
+                "max_tokens": null, "temperature": null },
+  "started_at": "2026-08-15T02:08:17.783514Z",
+  "duration_ms": 3184,
+  "system":   { "text": "…", "blocks": [ /* id, layer, stability, source, start, end, chars, tokens */ ] },
+  "tools":    [ { "name": "shell", "description": "…", "schema": {}, "chars": 812 } ],
   "messages": [ /* rig Messages, verbatim */ ],
-  "cache_breakpoints": [ { "target": "system", "offset": 46558 },
-                         { "target": "tools",  "index": 11 } ],
-  "response": { "text": "…", "tool_calls": [], "stop_reason": "end_turn" },
-  "usage":    { "input": 12904, "output": 118, "cached_read": 0, "cached_write": 12904,
-                "cost_usd": 0.021, "duration_ms": 3184 }
+  "history_length": 31,
+  "response": { "text": "…", "tool_calls": [], "error": null },
+  "usage":    { "input_tokens": 12904, "output_tokens": 118, "cached_read_tokens": 0,
+                "cached_write_tokens": 12904, "cost_usd": 0.021 }
 }
 ```
+
+Cache breakpoints are not recorded. The design assumed a per-block cache
+reading; the request carries one `cache_control` on the whole preamble, so
+there is nothing per-block to report — see the stability note above.
 
 ---
 
@@ -184,7 +192,7 @@ Both forms in the clipboard: the command for humans, the path for agents that wo
 
 A modal, as decided — a dedicated screen is not earned yet, and the record format is screen-ready if it ever is.
 
-```
+```text
 ┌───────────────────────────────────────────────────────────────────────┐
 │ ● worker · builtin · gpt-5.6-sol          12,904 in / 118 out · $0.021 │
 │ triggered by  spawn_worker ← channel telegram:8659410676 · msg #206    │

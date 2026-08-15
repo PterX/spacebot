@@ -257,8 +257,18 @@ impl SettingsStore {
     }
 
     /// Whether every outgoing LLM request is recorded for inspection.
+    ///
+    /// An unreadable store reports "off" so capture never starts by accident,
+    /// but the read failure is logged — folding it into the default silently
+    /// makes a broken store look like a deliberate setting.
     pub fn prompt_debug_capture(&self) -> bool {
-        matches!(self.get_raw(PROMPT_DEBUG_CAPTURE_KEY), Ok(value) if value == "true")
+        match self.get_optional(PROMPT_DEBUG_CAPTURE_KEY) {
+            Ok(value) => value.as_deref() == Some("true"),
+            Err(error) => {
+                tracing::warn!(%error, "failed to read prompt capture setting; treating as off");
+                false
+            }
+        }
     }
 
     /// Turn request recording on or off for the whole instance.
@@ -273,8 +283,19 @@ impl SettingsStore {
     /// default rather than as "keep forever", because the payloads are large
     /// and an unbounded directory is the failure mode worth avoiding.
     pub fn prompt_debug_retention_days(&self) -> i64 {
-        self.get_raw(PROMPT_DEBUG_RETENTION_KEY)
-            .ok()
+        let stored = match self.get_optional(PROMPT_DEBUG_RETENTION_KEY) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    default_days = DEFAULT_PROMPT_RETENTION_DAYS,
+                    "failed to read prompt retention setting; using the default"
+                );
+                None
+            }
+        };
+
+        stored
             .and_then(|value| value.parse::<i64>().ok())
             .filter(|days| *days > 0)
             .unwrap_or(DEFAULT_PROMPT_RETENTION_DAYS)

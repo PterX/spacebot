@@ -20,14 +20,23 @@ export function PromptDebugSection() {
 		if (settings) setRetentionDays(settings.retention_days);
 	}, [settings]);
 
+	const [error, setError] = useState<string | null>(null);
+
 	const mutation = useMutation({
 		mutationFn: (next: {enabled: boolean; retentionDays?: number}) =>
 			api.setPromptDebugCapture(next.enabled, {
 				retentionDays: next.retentionDays,
 			}),
+		onMutate: () => setError(null),
 		onSuccess: () => {
 			queryClient.invalidateQueries({queryKey: ["prompt-debug-capture"]});
 			queryClient.invalidateQueries({queryKey: ["promptRequests"]});
+		},
+		// Without this a rejected write leaves the retention buttons showing a
+		// value the server never accepted.
+		onError: (failure: Error) => {
+			setError(failure.message);
+			queryClient.invalidateQueries({queryKey: ["prompt-debug-capture"]});
 		},
 	});
 
@@ -81,6 +90,9 @@ export function PromptDebugSection() {
 									key={days}
 									size="sm"
 									variant={retentionDays === days ? "accent" : "gray"}
+									// Overlapping writes can land out of order, leaving the
+									// selection disagreeing with what was stored last.
+									disabled={mutation.isPending}
 									onClick={() => {
 										setRetentionDays(days);
 										mutation.mutate({enabled, retentionDays: days});
@@ -95,6 +107,12 @@ export function PromptDebugSection() {
 							together.
 						</p>
 					</div>
+
+					{error && (
+						<div className="rounded-md border border-status-error/20 bg-status-error/10 px-3 py-2 text-sm text-status-error">
+							Failed to update prompt capture: {error}
+						</div>
+					)}
 
 					<div className="rounded-lg border border-app-line bg-app-box p-4">
 						<span className="text-sm font-medium text-ink">Block layers</span>

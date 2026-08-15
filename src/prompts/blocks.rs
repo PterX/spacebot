@@ -127,6 +127,15 @@ impl SegmentedPrompt {
     pub fn adopt_appended(&mut self, replacement: String, id: &str) {
         let start = self.text.len();
 
+        // Appending to a prompt that was never mapped would produce a map that
+        // starts partway through the text. Blocks would no longer tile it, and
+        // the inspector would label the appended region while leaving the bytes
+        // above it silently unaccounted for.
+        if self.blocks.is_empty() && !self.text.is_empty() {
+            self.text = replacement;
+            return;
+        }
+
         if !replacement.starts_with(self.text.as_str()) {
             tracing::warn!(
                 block = id,
@@ -428,6 +437,34 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    /// A prompt with no map must stay unmapped rather than gain a map that
+    /// starts partway through it — blocks that do not tile the text make every
+    /// range and proportion downstream describe the wrong bytes.
+    #[test]
+    fn appending_to_an_unmapped_prompt_records_no_block() {
+        let mut prompt = SegmentedPrompt::from("assembled elsewhere".to_string());
+        prompt.append_section("skills_prompt", "## Available Skills");
+
+        assert_eq!(prompt.text, "assembled elsewhere\n\n## Available Skills");
+        assert!(
+            prompt.blocks.is_empty(),
+            "a partial map is worse than no map"
+        );
+    }
+
+    #[test]
+    fn appending_after_a_dropped_map_records_no_block() {
+        let mut prompt = segment(&mark("identity_context", "a"), "channel");
+        assert_eq!(prompt.blocks.len(), 1);
+
+        // A replacement that rewrites mapped bytes drops the map.
+        prompt.adopt_appended("rewritten".to_string(), "tool_use_enforcement");
+        assert!(prompt.blocks.is_empty());
+
+        prompt.append_section("skills_prompt", "## Available Skills");
+        assert!(prompt.blocks.is_empty(), "the map must stay dropped");
     }
 
     #[test]

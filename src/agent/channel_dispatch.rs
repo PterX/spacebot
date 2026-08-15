@@ -190,7 +190,11 @@ pub async fn spawn_branch_from_state(
     let rc = &state.deps.runtime_config;
     let prompt_engine = rc.prompts.load();
     let routing = rc.routing.load();
-    let model_name = routing.resolve(ProcessType::Branch, None).to_string();
+    let model_name = state
+        .model_overrides
+        .resolve_model("branch")
+        .unwrap_or_else(|| routing.resolve(ProcessType::Branch, None))
+        .to_string();
     let tool_use_enforcement = rc.tool_use_enforcement.load();
     let wiki_enabled = state.deps.wiki_store.is_some();
     let mut system_prompt = prompt_engine
@@ -250,7 +254,11 @@ pub(crate) async fn spawn_memory_persistence_branch(
 
     let prompt_engine = deps.runtime_config.prompts.load();
     let routing = deps.runtime_config.routing.load();
-    let model_name = routing.resolve(ProcessType::Branch, None).to_string();
+    let model_name = state
+        .model_overrides
+        .resolve_model("branch")
+        .unwrap_or_else(|| routing.resolve(ProcessType::Branch, None))
+        .to_string();
     let tool_use_enforcement = deps.runtime_config.tool_use_enforcement.load();
     let reflection_worker_ids: Vec<String> = reflection_workers
         .iter()
@@ -773,7 +781,11 @@ async fn spawn_worker_inner(
 
     let browser_config = (**rc.browser_config.load()).clone();
     let routing = rc.routing.load();
-    let model_name = routing.resolve(ProcessType::Worker, None).to_string();
+    let model_name = state
+        .model_overrides
+        .resolve_model("worker")
+        .unwrap_or_else(|| routing.resolve(ProcessType::Worker, None))
+        .to_string();
     let tool_use_enforcement = rc.tool_use_enforcement.load();
     let project_context = build_project_context(&state.deps, &prompt_engine).await;
     let worker_system_prompt = prompt_engine
@@ -1845,7 +1857,11 @@ pub async fn resume_idle_worker_into_state(
             };
             let browser_config = (**rc.browser_config.load()).clone();
             let routing = rc.routing.load();
-            let model_name = routing.resolve(ProcessType::Worker, None).to_string();
+            let model_name = state
+                .model_overrides
+                .resolve_model("worker")
+                .unwrap_or_else(|| routing.resolve(ProcessType::Worker, None))
+                .to_string();
             let tool_use_enforcement = rc.tool_use_enforcement.load();
             let project_context = build_project_context(&state.deps, &prompt_engine).await;
             let mut system_prompt = prompt_engine
