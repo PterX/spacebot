@@ -1,4 +1,4 @@
-import {useEffect, useMemo, useRef} from "react";
+import {useEffect, useMemo, useRef, useState} from "react";
 import {useQuery} from "@tanstack/react-query";
 import {GitBranch, Stop, Wrench, X} from "@phosphor-icons/react";
 import {cx} from "class-variance-authority";
@@ -9,6 +9,7 @@ import {Markdown} from "@/components/Markdown";
 import {ToolCall, pairTranscriptSteps} from "@/components/ToolCall";
 import {formatDuration, formatTimeAgo} from "@/lib/format";
 import {ProviderIcon} from "@/lib/providerIcons";
+import {PromptInspector} from "@/components/prompt/PromptInspector";
 
 export interface ProcessSelection {
 	kind: ProcessKind;
@@ -188,6 +189,7 @@ export function ProcessDetail({agentId, selection, fallback, liveTranscript, onC
 	const rawTranscript = isLive && liveTranscript?.length ? liveTranscript : detail.transcript;
 	const transcript = useMemo(() => withoutDuplicateOutput(rawTranscript ?? null, detail.output ?? null), [rawTranscript, detail.output]);
 	const transcriptRef = useRef<HTMLDivElement>(null);
+	const [inspectorOpen, setInspectorOpen] = useState(false);
 
 	useEffect(() => {
 		if (isLive && transcriptRef.current) transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight;
@@ -219,6 +221,14 @@ export function ProcessDetail({agentId, selection, fallback, liveTranscript, onC
 						{detail.channel_name && <span>{detail.channel_name}</span>}
 					</div>
 				</div>
+				<button
+					type="button"
+					onClick={() => setInspectorOpen(true)}
+					className="rounded-md px-2 py-1 text-tiny text-ink-faint transition-colors hover:bg-app-hover hover:text-ink"
+					title="Inspect the prompts this process sent"
+				>
+					Inspect prompt
+				</button>
 				<button type="button" onClick={onClose} className="rounded-md p-1.5 text-ink-faint hover:bg-app-hover hover:text-ink" aria-label="Close process detail">
 					<X className="size-4" />
 				</button>
@@ -258,6 +268,13 @@ export function ProcessDetail({agentId, selection, fallback, liveTranscript, onC
 				</div>
 			</section>
 		</div>
+
+		<PromptInspector
+			open={inspectorOpen}
+			onOpenChange={setInspectorOpen}
+			agentId={agentId}
+			scope={{kind: "process", processId: selection.id}}
+		/>
 		</div>
 	);
 }

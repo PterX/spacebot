@@ -1041,6 +1041,9 @@ pub struct Channel {
     /// The inbound message currently being processed. Used to pair outbound
     /// responses with the correct platform routing metadata (e.g. Slack thread_ts).
     current_inbound: Option<InboundMessage>,
+    /// Conversation message id the current turn is answering, so a captured
+    /// request can be traced back to the message that caused it.
+    current_message_id: Option<String>,
     /// Conversation ID from the first message (for synthetic re-trigger messages).
     pub conversation_id: Option<String>,
     /// Adapter source captured from the first non-system message.
@@ -1311,6 +1314,7 @@ impl Channel {
             response_tx,
             self_tx,
             current_inbound: None,
+            current_message_id: None,
             conversation_id: None,
             source_adapter: None,
             conversation_context: None,
@@ -1659,14 +1663,17 @@ impl Channel {
         });
     }
 
+    /// Persist an inbound user message and return the id it was stored under.
+    ///
+    /// System messages are not persisted, so they have no id to return.
     fn persist_inbound_user_message(
         &self,
         message: &InboundMessage,
         raw_text: &str,
         saved_attachments: Option<&[channel_attachments::SavedAttachmentMeta]>,
-    ) {
+    ) -> Option<String> {
         if message.source == "system" {
-            return;
+            return None;
         }
         let sender_name = participant_display_name(message);
 
@@ -1681,7 +1688,7 @@ impl Channel {
             message.metadata.clone()
         };
 
-        self.state.conversation_logger.log_user_message(
+        let message_id = self.state.conversation_logger.log_user_message(
             &self.state.channel_id,
             &sender_name,
             &message.sender_id,
@@ -1691,6 +1698,7 @@ impl Channel {
         self.state
             .channel_store
             .upsert(&message.conversation_id, &metadata);
+        Some(message_id)
     }
 
     fn suppress_plaintext_fallback(&self) -> bool {
@@ -2355,13 +2363,14 @@ impl Channel {
                 };
 
                 if message.source != "autonomy" {
-                    self.state.conversation_logger.log_user_message(
-                        &self.state.channel_id,
-                        &sender_name,
-                        &message.sender_id,
-                        &raw_text,
-                        &metadata,
-                    );
+                    self.current_message_id =
+                        Some(self.state.conversation_logger.log_user_message(
+                            &self.state.channel_id,
+                            &sender_name,
+                            &message.sender_id,
+                            &raw_text,
+                            &metadata,
+                        ));
                 }
                 self.state
                     .channel_store
@@ -2659,7 +2668,8 @@ impl Channel {
             .as_ref()
             .map(|data| data.iter().map(|(meta, _)| meta.clone()).collect());
 
-        self.persist_inbound_user_message(&message, &raw_text, saved_metas.as_deref());
+        self.current_message_id =
+            self.persist_inbound_user_message(&message, &raw_text, saved_metas.as_deref());
         self.track_participant_from_message(&message).await;
 
         // Slash-command dispatch. Control commands execute deterministically
@@ -3586,13 +3596,7 @@ impl Channel {
                         } else {
                             "user_message".to_string()
                         },
-                        message_id: self
-                            .state
-                            .reply_target_message_id
-                            .read()
-                            .await
-                            .as_deref()
-                            .and_then(|id| id.parse().ok()),
+                        message_id: self.current_message_id.clone(),
                         input: Some(user_text.to_string()),
                         parent: None,
                     }),

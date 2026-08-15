@@ -537,6 +537,122 @@ export interface PromptCaptureResponse {
 	capture_enabled: boolean;
 }
 
+// --- Prompt records (the inspector) ---
+
+/** Composition layer a block belongs to. Drives its colour in the inspector. */
+export type BlockLayer =
+	| "identity"
+	| "contract"
+	| "capabilities"
+	| "knowledge"
+	| "working"
+	| "runtime";
+
+/** How often a block's bytes are expected to change. */
+export type BlockStability = "static" | "epoch" | "volatile";
+
+export type BlockSource =
+	| "template"
+	| "file"
+	| "store"
+	| "synthesis"
+	| "live_state"
+	| "config";
+
+export interface PromptBlock {
+	id: string;
+	layer: BlockLayer;
+	stability: BlockStability;
+	source: BlockSource;
+	/** Byte offsets into the system prompt. Blocks tile it exactly. */
+	start: number;
+	end: number;
+	chars: number;
+	tokens: number;
+}
+
+export interface PromptRequestSummary {
+	request_id: string;
+	process_kind: string;
+	process_id: string | null;
+	process_type: string | null;
+	channel_id: string | null;
+	message_id: string | null;
+	trigger: string | null;
+	model: string;
+	provider: string;
+	started_at: string;
+	duration_ms: number | null;
+	system_chars: number;
+	history_length: number;
+	tool_count: number;
+	input_tokens: number | null;
+	output_tokens: number | null;
+	cached_tokens: number | null;
+	status: string;
+}
+
+export interface PromptRequestListResponse {
+	capture_enabled: boolean;
+	requests: PromptRequestSummary[];
+}
+
+export interface PromptToolRef {
+	name: string;
+	description: string;
+	schema: unknown;
+	chars: number;
+}
+
+export interface PromptRecord {
+	request_id: string;
+	agent_id: string;
+	process: {
+		kind: string;
+		id: string | null;
+		process_type: string | null;
+		channel_id: string | null;
+	};
+	trigger: {
+		kind: string;
+		message_id: string | null;
+		input: string | null;
+		parent: string | null;
+	};
+	model: {
+		name: string;
+		provider: string;
+		max_tokens: number | null;
+		temperature: number | null;
+	};
+	started_at: string;
+	duration_ms: number;
+	system: {
+		text: string;
+		blocks: PromptBlock[];
+	};
+	tools: PromptToolRef[];
+	messages: PromptHistoryMessage[];
+	history_length: number;
+	response: {
+		text: string | null;
+		tool_calls: string[];
+		error: string | null;
+	};
+	usage: {
+		input_tokens: number;
+		output_tokens: number;
+		cached_read_tokens: number;
+		cached_write_tokens: number;
+		cost_usd: number;
+	};
+}
+
+export interface PromptDebugCaptureSettings {
+	enabled: boolean;
+	retention_days: number;
+}
+
 // --- Memory helper types (extended beyond schema) ---
 
 // Extended MemoryType with additional values not yet in schema
@@ -1879,6 +1995,49 @@ export const api = {
 	channelStatus: () => fetchJson<ChannelStatusResponse>("/channels/status"),
 	inspectPrompt: (channelId: string) =>
 		fetchJson<PromptInspectResponse>(`/channels/prompt/inspect?channel_id=${encodeURIComponent(channelId)}`),
+	listPromptRequests: (
+		params: {
+			agentId?: string;
+			channelId?: string;
+			processId?: string;
+			messageId?: string;
+			limit?: number;
+		} = {},
+	) => {
+		const search = new URLSearchParams();
+		if (params.agentId) search.set("agent_id", params.agentId);
+		if (params.channelId) search.set("channel_id", params.channelId);
+		if (params.processId) search.set("process_id", params.processId);
+		if (params.messageId) search.set("message_id", params.messageId);
+		if (params.limit) search.set("limit", String(params.limit));
+		return fetchJson<PromptRequestListResponse>(`/prompts?${search}`);
+	},
+	getPromptRequest: (requestId: string, agentId?: string) => {
+		const search = new URLSearchParams({ request_id: requestId });
+		if (agentId) search.set("agent_id", agentId);
+		return fetchJson<PromptRecord>(`/prompts/get?${search}`);
+	},
+	getPromptDebugCapture: (agentId?: string) => {
+		const search = new URLSearchParams();
+		if (agentId) search.set("agent_id", agentId);
+		return fetchJson<PromptDebugCaptureSettings>(`/prompts/capture?${search}`);
+	},
+	setPromptDebugCapture: async (
+		enabled: boolean,
+		options: { agentId?: string; retentionDays?: number } = {},
+	) => {
+		const response = await fetch(`${getApiBase()}/prompts/capture`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				enabled,
+				agent_id: options.agentId,
+				retention_days: options.retentionDays,
+			}),
+		});
+		if (!response.ok) throw new Error(`API error: ${response.status}`);
+		return response.json() as Promise<PromptDebugCaptureSettings>;
+	},
 	setPromptCapture: async (channelId: string, enabled: boolean) => {
 		const response = await fetch(`${getApiBase()}/channels/prompt/capture`, {
 			method: "POST",

@@ -22,6 +22,7 @@ import {
 	ApiKeysSection,
 	ServerSection,
 	WorkerLogsSection,
+	PromptDebugSection,
 	OpenCodeSection,
 	UpdatesSection,
 	ChangelogSection,
@@ -777,6 +778,8 @@ export function Settings() {
 							settings={globalSettings}
 							isLoading={globalSettingsLoading}
 						/>
+					) : activeSection === "prompt-debug" ? (
+						<PromptDebugSection />
 					) : activeSection === "updates" ? (
 						<UpdatesSection />
 					) : activeSection === "config-file" ? (

@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS prompt_requests (
     process_type TEXT,
     channel_id TEXT,
     -- Conversation message that triggered the turn, when there was one.
-    message_id INTEGER,
+    message_id TEXT,
     trigger TEXT,
     model TEXT NOT NULL,
     provider TEXT NOT NULL,

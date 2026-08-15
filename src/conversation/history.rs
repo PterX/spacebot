@@ -363,6 +363,10 @@ impl ConversationLogger {
     }
 
     /// Log a user message. Fire-and-forget.
+    ///
+    /// Returns the id assigned to the message so a caller can reference it
+    /// before the write lands — the row is written on a spawned task, but the
+    /// id is decided here.
     pub fn log_user_message(
         &self,
         channel_id: &ChannelId,
@@ -370,9 +374,10 @@ impl ConversationLogger {
         sender_id: &str,
         content: &str,
         metadata: &HashMap<String, serde_json::Value>,
-    ) {
+    ) -> String {
         let pool = self.pool.clone();
         let id = uuid::Uuid::new_v4().to_string();
+        let message_id = id.clone();
         let channel_id = channel_id.to_string();
         let sender_name = sender_name.to_string();
         let sender_id = sender_id.to_string();
@@ -402,6 +407,8 @@ impl ConversationLogger {
                 tracing::warn!(%error, "failed to persist user message");
             }
         });
+
+        message_id
     }
 
     /// Log a bot (assistant) message. Fire-and-forget.

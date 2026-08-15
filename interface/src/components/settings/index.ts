@@ -5,6 +5,7 @@ export {SecretsSection} from "./SecretsSection";
 export {ApiKeysSection} from "./ApiKeysSection";
 export {ServerSection} from "./ServerSection";
 export {WorkerLogsSection} from "./WorkerLogsSection";
+export {PromptDebugSection} from "./PromptDebugSection";
 export {OpenCodeSection} from "./OpenCodeSection";
 export {UpdatesSection} from "./UpdatesSection";
 export {ChangelogSection} from "./ChangelogSection";

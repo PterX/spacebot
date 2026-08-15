@@ -38,7 +38,7 @@ pub(super) struct ListQuery {
     /// Restrict to one branch or worker's requests.
     process_id: Option<String>,
     /// Every request produced by one conversation message.
-    message_id: Option<i64>,
+    message_id: Option<String>,
     #[serde(default = "default_limit")]
     limit: i64,
 }
@@ -66,7 +66,7 @@ pub(super) async fn list_prompt_requests(
     let store = record_store(&state, query.agent_id.as_deref())?;
 
     let rows = match query.message_id {
-        Some(message_id) => store.for_message(message_id).await,
+        Some(ref message_id) => store.for_message(message_id).await,
         None => {
             store
                 .list(

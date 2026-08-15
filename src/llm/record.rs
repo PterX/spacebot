@@ -38,7 +38,7 @@ pub struct Trigger {
     /// Short label: user_message, retrigger, spawn_worker, compaction, cron.
     pub kind: String,
     /// Conversation message that started the turn, when there was one.
-    pub message_id: Option<i64>,
+    pub message_id: Option<String>,
     /// The text the process was prompted with.
     pub input: Option<String>,
     /// Process that started this one, when it was not a user.
@@ -126,7 +126,7 @@ pub struct PromptRequestSummary {
     pub process_id: Option<String>,
     pub process_type: Option<String>,
     pub channel_id: Option<String>,
-    pub message_id: Option<i64>,
+    pub message_id: Option<String>,
     pub trigger: Option<String>,
     pub model: String,
     pub provider: String,
@@ -228,7 +228,7 @@ impl PromptRecordStore {
         .bind(record.process.id.as_deref())
         .bind(record.process.process_type.as_deref())
         .bind(record.process.channel_id.as_deref())
-        .bind(record.trigger.message_id)
+        .bind(record.trigger.message_id.as_deref())
         .bind(&record.trigger.kind)
         .bind(&record.model.name)
         .bind(&record.model.provider)
@@ -319,7 +319,7 @@ impl PromptRecordStore {
     /// A single message can produce several requests — the channel turn, any
     /// branches and workers it spawned, a compaction it triggered — so this
     /// returns all of them rather than assuming one.
-    pub async fn for_message(&self, message_id: i64) -> anyhow::Result<Vec<PromptRequestSummary>> {
+    pub async fn for_message(&self, message_id: &str) -> anyhow::Result<Vec<PromptRequestSummary>> {
         let rows = sqlx::query_as::<_, PromptRequestSummary>(
             "SELECT request_id, process_kind, process_id, process_type, channel_id,
                     message_id, trigger, model, provider, started_at, duration_ms,
@@ -398,7 +398,7 @@ mod tests {
         (PromptRecordStore::new(dir.path(), pool, true), dir)
     }
 
-    fn record(request_id: &str, channel: &str, message_id: Option<i64>) -> PromptRecord {
+    fn record(request_id: &str, channel: &str, message_id: Option<&str>) -> PromptRecord {
         PromptRecord {
             request_id: request_id.to_string(),
             agent_id: "main".to_string(),
@@ -410,7 +410,7 @@ mod tests {
             },
             trigger: Trigger {
                 kind: "user_message".to_string(),
-                message_id,
+                message_id: message_id.map(str::to_string),
                 input: Some("hello".to_string()),
                 parent: None,
             },
@@ -437,7 +437,7 @@ mod tests {
     #[tokio::test]
     async fn round_trips_a_record_through_disk_and_index() {
         let (store, _dir) = store().await;
-        let saved = record("aaaa1111", "telegram:1", Some(7));
+        let saved = record("aaaa1111", "telegram:1", Some("m7"));
         store.save(&saved).await;
 
         let loaded = store
@@ -475,13 +475,17 @@ mod tests {
     #[tokio::test]
     async fn lists_every_request_for_a_message() {
         let (store, _dir) = store().await;
-        store.save(&record("r1", "telegram:1", Some(42))).await;
-        store.save(&record("r2", "telegram:1", Some(42))).await;
-        store.save(&record("r3", "telegram:1", Some(43))).await;
+        store.save(&record("r1", "telegram:1", Some("m42"))).await;
+        store.save(&record("r2", "telegram:1", Some("m42"))).await;
+        store.save(&record("r3", "telegram:1", Some("m43"))).await;
 
-        let found = store.for_message(42).await.expect("for_message");
+        let found = store.for_message("m42").await.expect("for_message");
         assert_eq!(found.len(), 2);
-        assert!(found.iter().all(|row| row.message_id == Some(42)));
+        assert!(
+            found
+                .iter()
+                .all(|row| row.message_id.as_deref() == Some("m42"))
+        );
     }
 
     #[tokio::test]
