@@ -577,3 +577,82 @@ async fn byte_level_prompt_is_stable_across_turns() {
         "system prompt must be byte-identical across turns"
     );
 }
+
+/// The block map must describe the prompt a real channel builds from the real
+/// templates and identity files — not just the synthetic inputs the engine's
+/// own tests use. If the blocks stop tiling, every byte range, token count and
+/// proportion the inspector shows is describing something else.
+#[tokio::test]
+async fn block_map_tiles_a_real_channel_prompt() {
+    let instance = TempDir::new().expect("tempdir");
+    write_pinned_config(instance.path());
+    let deps = bootstrap(instance.path()).await.expect("bootstrap");
+
+    let channel_id: ChannelId = Arc::from("blocks:real");
+    let (response_tx, _) = mpsc::channel(4);
+    let (channel, _channel_tx) = Channel::new(
+        channel_id,
+        ChannelKind::User,
+        deps.clone(),
+        response_tx,
+        deps.event_tx.subscribe(),
+        instance.path().join("screenshots"),
+        instance.path().join("logs"),
+        None,
+        None,
+        standard_settings(),
+        None,
+        None,
+    );
+
+    let segmented = channel
+        .build_system_prompt_segmented()
+        .await
+        .expect("segmented prompt build");
+
+    assert!(
+        !segmented.blocks.is_empty(),
+        "a real channel prompt must produce a block map"
+    );
+
+    let mut cursor = 0usize;
+    for block in &segmented.blocks {
+        assert_eq!(
+            block.start, cursor,
+            "block `{}` leaves a gap or overlaps the previous one",
+            block.id
+        );
+        assert!(
+            segmented.text.is_char_boundary(block.start)
+                && segmented.text.is_char_boundary(block.end),
+            "block `{}` does not land on character boundaries",
+            block.id
+        );
+        assert_eq!(
+            segmented.text[block.start..block.end].chars().count(),
+            block.chars,
+            "block `{}` reports the wrong character count",
+            block.id
+        );
+        cursor = block.end;
+    }
+    assert_eq!(
+        cursor,
+        segmented.text.len(),
+        "blocks must account for every byte of the prompt"
+    );
+
+    // The plain accessor and the segmented one must agree, since the plain one
+    // is what the byte-stability guarantee above is asserted against.
+    let plain = channel.build_system_prompt().await.expect("plain build");
+    assert_eq!(plain, segmented.text);
+
+    // Sentinels are an implementation detail of segmentation and must never
+    // survive into the bytes a provider receives.
+    for sentinel in ['\u{E000}', '\u{E001}', '\u{E002}'] {
+        assert!(
+            !segmented.text.contains(sentinel),
+            "block sentinel {sentinel:?} leaked into the rendered prompt"
+        );
+    }
+}
