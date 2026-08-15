@@ -131,26 +131,6 @@ fn classify_worker_completion(
 
 /// How a run ended, as a task's attempt history records it.
 ///
-/// Mirrors the worker's own outcome rather than collapsing to success/failure,
-/// so a task can tell a run that delivered partial work from one that was
-/// cancelled or timed out.
-/// Map a committed terminal outcome onto the task attempt history.
-///
-/// Takes the committed kind rather than the raw classification so the attempt
-/// records the same outcome as the durable worker record and the completion
-/// event.
-fn attempt_outcome(kind: WorkerOutcomeKind) -> crate::tasks::TaskAttemptOutcome {
-    use crate::tasks::TaskAttemptOutcome as Outcome;
-    match kind {
-        WorkerOutcomeKind::Succeeded => Outcome::Succeeded,
-        WorkerOutcomeKind::Partial => Outcome::Partial,
-        WorkerOutcomeKind::Blocked => Outcome::Blocked,
-        WorkerOutcomeKind::Cancelled => Outcome::Cancelled,
-        WorkerOutcomeKind::TimedOut => Outcome::TimedOut,
-        WorkerOutcomeKind::Failed => Outcome::Failed,
-    }
-}
-
 fn completion_flags(kind: WorkerCompletionKind) -> (bool, bool) {
     let notify = true;
     let success = matches!(
@@ -1452,12 +1432,11 @@ where
                 Ok(Some((terminal, _))) => (terminal.outcome_kind, terminal.result.as_str()),
                 _ => (outcome_kind, result_text.as_str()),
             };
-            let summary: String = summary_source.chars().take(280).collect();
             if let Err(error) = task_store
                 .finish_task_attempt(
                     &worker_id.to_string(),
-                    attempt_outcome(resolved),
-                    (!summary.is_empty()).then_some(summary.as_str()),
+                    resolved.into(),
+                    Some(summary_source),
                 )
                 .await
             {
@@ -1983,12 +1962,13 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        WorkerCompletionError, WorkerOutcome, attempt_outcome, commit_worker_outcome,
-        map_worker_completion, spawn_worker_task,
+        WorkerCompletionError, WorkerOutcome, commit_worker_outcome, map_worker_completion,
+        spawn_worker_task,
     };
     use crate::conversation::{
         ProcessRunLogger, WorkerLifecycle, WorkerOutcomeKind, WorkerTerminalOwner,
     };
+    use crate::tasks::TaskAttemptOutcome;
     use crate::{ProcessEvent, WorkerId};
     use std::sync::Arc;
     use std::time::Duration;
@@ -2058,12 +2038,12 @@ mod tests {
         assert!(committed);
         assert_eq!(terminal.outcome_kind, WorkerOutcomeKind::Partial);
         assert_eq!(
-            attempt_outcome(terminal.outcome_kind),
-            crate::tasks::TaskAttemptOutcome::Partial
+            TaskAttemptOutcome::from(terminal.outcome_kind),
+            TaskAttemptOutcome::Partial
         );
         assert_ne!(
-            attempt_outcome(WorkerOutcomeKind::Cancelled),
-            attempt_outcome(terminal.outcome_kind),
+            TaskAttemptOutcome::from(WorkerOutcomeKind::Cancelled),
+            TaskAttemptOutcome::from(terminal.outcome_kind),
             "the raw classification is what the attempt used to record"
         );
     }
@@ -2099,8 +2079,8 @@ mod tests {
 
         assert_eq!(terminal.outcome_kind, WorkerOutcomeKind::Cancelled);
         assert_eq!(
-            attempt_outcome(terminal.outcome_kind),
-            crate::tasks::TaskAttemptOutcome::Cancelled
+            TaskAttemptOutcome::from(terminal.outcome_kind),
+            TaskAttemptOutcome::Cancelled
         );
     }
 

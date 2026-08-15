@@ -23,6 +23,12 @@ use sqlx::{Row as _, sqlite::SqliteRow};
 /// Hard ceiling on rows returned by a single attempt-history call.
 pub const MAX_ATTEMPT_PAGE: i64 = 100;
 
+/// How much of a run's result is kept on the attempt.
+///
+/// The full result lives on the worker record; this is the line the board and
+/// the prompt context read, and a worker can return a great deal of text.
+const MAX_ATTEMPT_SUMMARY_CHARS: usize = 280;
+
 /// How a worker run ended, from the task's point of view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -69,6 +75,25 @@ impl TaskAttemptOutcome {
     /// Whether this outcome means the work was actually delivered.
     pub fn is_success(self) -> bool {
         matches!(self, Self::Succeeded)
+    }
+}
+
+/// The worker's committed terminal kind is what an attempt records.
+///
+/// There is no `Interrupted` on the worker side: that outcome describes a run
+/// with no terminal record at all, which is the one case this conversion cannot
+/// be reached from.
+impl From<crate::conversation::WorkerOutcomeKind> for TaskAttemptOutcome {
+    fn from(kind: crate::conversation::WorkerOutcomeKind) -> Self {
+        use crate::conversation::WorkerOutcomeKind as Kind;
+        match kind {
+            Kind::Succeeded => Self::Succeeded,
+            Kind::Partial => Self::Partial,
+            Kind::Blocked => Self::Blocked,
+            Kind::Failed => Self::Failed,
+            Kind::Cancelled => Self::Cancelled,
+            Kind::TimedOut => Self::TimedOut,
+        }
     }
 }
 
@@ -256,6 +281,10 @@ impl TaskStore {
         outcome: TaskAttemptOutcome,
         summary: Option<&str>,
     ) -> Result<bool> {
+        let summary: Option<String> = summary
+            .map(|text| text.chars().take(MAX_ATTEMPT_SUMMARY_CHARS).collect())
+            .filter(|text: &String| !text.is_empty());
+
         let affected = sqlx::query(
             "UPDATE task_worker_runs \
              SET outcome_kind = ?, outcome_summary = ?, \
@@ -293,6 +322,21 @@ impl TaskStore {
         rows.iter().map(attempt_from_row).collect()
     }
 
+    /// Every attempt still open, across all tasks.
+    ///
+    /// Read at startup to recover runs whose worker reached a terminal state
+    /// that the attempt never learned about, before the rest are swept.
+    pub async fn live_attempts(&self) -> Result<Vec<TaskAttempt>> {
+        let rows = sqlx::query(&format!(
+            "{ATTEMPT_COLUMNS} WHERE ended_at IS NULL ORDER BY started_at"
+        ))
+        .fetch_all(self.pool())
+        .await
+        .context("failed to list live task attempts")?;
+
+        rows.iter().map(attempt_from_row).collect()
+    }
+
     /// Close attempts left live by a process that died.
     ///
     /// Workers run in-process, so every attempt still open at startup belongs
@@ -301,7 +345,9 @@ impl TaskStore {
     /// mid-run would permanently take that task off the board.
     ///
     /// Recorded as interrupted rather than failed: the process died, which says
-    /// nothing about whether the work was going to succeed.
+    /// nothing about whether the work was going to succeed. Runs that did reach
+    /// a terminal state are closed with it beforehand, from `live_attempts`, so
+    /// this only reaches the ones nothing decided.
     pub async fn reconcile_interrupted_attempts(&self) -> Result<usize> {
         let affected = sqlx::query(
             "UPDATE task_worker_runs \
@@ -456,6 +502,7 @@ pub fn render_prior_attempts(attempts: &[TaskAttempt]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversation::WorkerOutcomeKind;
     use crate::tasks::store::{CreateTaskInput, setup_test_store};
 
     fn task_input(title: &str) -> CreateTaskInput {
@@ -731,6 +778,101 @@ mod tests {
             .expect("history should load");
         assert_eq!(attempts[0].outcome, Some(TaskAttemptOutcome::Succeeded));
         assert_eq!(attempts[0].outcome_summary.as_deref(), Some("done"));
+    }
+
+    /// The two writes that close a run land in different databases, so a worker
+    /// can commit its outcome and the attempt still be open. Startup recovers
+    /// what the worker committed before the sweep runs, or a run that succeeded
+    /// would be recorded as interrupted and an autonomous loop would retry work
+    /// that was already delivered.
+    #[tokio::test]
+    async fn a_committed_outcome_is_recovered_before_the_sweep() {
+        let (store, number) = store_with_task().await;
+        let other = store
+            .create(task_input("swept"))
+            .await
+            .expect("task should be created");
+        store
+            .start_task_attempt(number, start("worker-committed"))
+            .await
+            .expect("start should succeed")
+            .expect("task exists");
+        store
+            .start_task_attempt(other.task_number, start("worker-vanished"))
+            .await
+            .expect("start should succeed")
+            .expect("task exists");
+
+        let live = store
+            .live_attempts()
+            .await
+            .expect("live attempts should load");
+        assert_eq!(live.len(), 2);
+        assert!(live.iter().all(|attempt| attempt.is_live()));
+
+        // What the startup pass does for a run whose worker record has an
+        // outcome; the other worker left nothing behind.
+        store
+            .finish_task_attempt(
+                "worker-committed",
+                WorkerOutcomeKind::Succeeded.into(),
+                Some("shipped it"),
+            )
+            .await
+            .expect("recovery should succeed");
+
+        let swept = store
+            .reconcile_interrupted_attempts()
+            .await
+            .expect("reconcile should succeed");
+        assert_eq!(swept, 1, "only the undecided run is swept");
+
+        let recovered = store
+            .list_task_attempts(number, 10)
+            .await
+            .expect("history should load");
+        assert_eq!(recovered[0].outcome, Some(TaskAttemptOutcome::Succeeded));
+        assert_eq!(recovered[0].outcome_summary.as_deref(), Some("shipped it"));
+
+        let interrupted = store
+            .list_task_attempts(other.task_number, 10)
+            .await
+            .expect("history should load");
+        assert_eq!(
+            interrupted[0].outcome,
+            Some(TaskAttemptOutcome::Interrupted)
+        );
+    }
+
+    /// A worker can return a great deal of text and the board reads this line.
+    #[tokio::test]
+    async fn an_attempt_summary_is_bounded() {
+        let (store, number) = store_with_task().await;
+        store
+            .start_task_attempt(number, start("worker-1"))
+            .await
+            .expect("start should succeed")
+            .expect("task exists");
+        store
+            .finish_task_attempt(
+                "worker-1",
+                TaskAttemptOutcome::Succeeded,
+                Some(&"x".repeat(5_000)),
+            )
+            .await
+            .expect("finish should succeed");
+
+        let attempts = store
+            .list_task_attempts(number, 10)
+            .await
+            .expect("history should load");
+        assert_eq!(
+            attempts[0]
+                .outcome_summary
+                .as_deref()
+                .map(|summary| summary.chars().count()),
+            Some(MAX_ATTEMPT_SUMMARY_CHARS)
+        );
     }
 
     /// A crash mid-run must not take the task off the board for good.
