@@ -395,6 +395,18 @@ function RecordView({record}: {record: PromptRecord}) {
 			share: (block.end - block.start) / totalBytes,
 		}));
 
+		// Processes that assemble their prompt outside the template engine
+		// carry no block map. The prompt is still the point, so it renders
+		// whole rather than not at all.
+		if (visibleBlocks.length === 0 && text.length > 0) {
+			result.push({
+				kind: "divider",
+				id: "system",
+				label: "System prompt",
+				detail: `${text.length.toLocaleString()} chars · no block map`,
+			});
+		}
+
 		if (record.tools.length > 0) {
 			result.push({
 				kind: "divider",
@@ -453,6 +465,11 @@ function RecordView({record}: {record: PromptRecord}) {
 								rowRefs.current[row.id] = node;
 							}}
 						>
+							{row.id === "system" && (
+								<pre className="whitespace-pre-wrap break-words px-4 py-3 font-mono text-[11px] leading-[1.55] text-ink-dull">
+									{text}
+								</pre>
+							)}
 							{row.id === "tools" && <ToolList record={record} />}
 							{row.id === "messages" && <MessageList record={record} />}
 							{row.id === "response" && <ResponseView record={record} />}
@@ -479,16 +496,24 @@ function Minimap({
 	scrollRef: React.RefObject<HTMLDivElement | null>;
 	onJump: (id: string) => void;
 }) {
-	const [viewport, setViewport] = useState({top: 0, height: 0});
+	const [viewport, setViewport] = useState<{top: number; height: number} | null>(
+		null,
+	);
 
 	useEffect(() => {
 		const node = scrollRef.current;
 		if (!node) return;
 		const update = () => {
-			const total = node.scrollHeight || 1;
+			const total = node.scrollHeight;
+			// Nothing to indicate until the content actually overflows; a
+			// fraction of a zero height renders as a stray box.
+			if (!total || node.clientHeight >= total) {
+				setViewport(null);
+				return;
+			}
 			setViewport({
 				top: node.scrollTop / total,
-				height: Math.min(1, node.clientHeight / total),
+				height: node.clientHeight / total,
 			});
 		};
 		update();
@@ -501,9 +526,13 @@ function Minimap({
 		};
 	}, [scrollRef]);
 
+	// Without a block map there is nothing to map. The reading column still
+	// shows the prompt, so a rail of nothing would only mislead.
+	if (blocks.length === 0) return null;
+
 	return (
 		<div className="relative w-11 flex-shrink-0 border-r border-app-line/40 bg-app-dark-box/50 py-2">
-			<div className="flex h-full flex-col gap-px px-2">
+			<div className="flex h-full min-h-0 flex-col gap-px px-2">
 				{blocks.map((block) => {
 					const share = (block.end - block.start) / totalBytes;
 					return (
@@ -512,9 +541,9 @@ function Minimap({
 							type="button"
 							title={`${block.id} — ${block.chars.toLocaleString()} chars`}
 							onClick={() => onJump(`${block.id}-${block.start}`)}
-							style={{flexGrow: Math.max(share, 0.002)}}
+							style={{flexGrow: Math.max(share, 0.002), flexBasis: 0}}
 							className={cx(
-								"w-full rounded-[2px] opacity-70 transition-opacity hover:opacity-100",
+								"min-h-[2px] w-full rounded-[2px] opacity-70 transition-opacity hover:opacity-100",
 								LAYER_STYLES[block.layer].swatch,
 							)}
 						/>
@@ -522,13 +551,15 @@ function Minimap({
 				})}
 			</div>
 
-			<div
-				className="pointer-events-none absolute inset-x-0 rounded-sm border border-ink/25 bg-ink/5"
-				style={{
-					top: `${viewport.top * 100}%`,
-					height: `${Math.max(viewport.height * 100, 2)}%`,
-				}}
-			/>
+			{viewport && (
+				<div
+					className="pointer-events-none absolute inset-x-0 rounded-sm border border-ink/25 bg-ink/5"
+					style={{
+						top: `${viewport.top * 100}%`,
+						height: `${Math.max(viewport.height * 100, 2)}%`,
+					}}
+				/>
+			)}
 		</div>
 	);
 }

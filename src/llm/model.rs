@@ -159,7 +159,7 @@ impl SpacebotModel {
 
         let debug = self.debug_context.clone().unwrap_or_default();
 
-        let messages: Vec<&rig::message::Message> = request.chat_history.iter().collect();
+        let (system_text, messages) = split_system_prompt(request);
         let history_length = messages.len();
         let messages = serde_json::to_value(&messages).unwrap_or(serde_json::Value::Null);
 
@@ -180,13 +180,14 @@ impl SpacebotModel {
             .collect();
 
         let system = crate::llm::record::SystemRef {
-            text: request.preamble.clone().unwrap_or_default(),
             // A block map built for a different prompt would mislabel bytes,
-            // so it is only carried when it describes this preamble.
-            blocks: match request.preamble.as_deref() {
-                Some(preamble) if block_map_fits(&debug.blocks, preamble) => debug.blocks.clone(),
-                _ => Vec::new(),
+            // so it is only carried when it describes this one.
+            blocks: if block_map_fits(&debug.blocks, &system_text) {
+                debug.blocks.clone()
+            } else {
+                Vec::new()
             },
+            text: system_text,
         };
 
         let record = crate::llm::record::PromptRecord {
@@ -263,6 +264,26 @@ fn response_ref_from_choice(
         tool_calls,
         error: None,
     }
+}
+
+/// Separate the assembled system prompt from the conversation it precedes.
+///
+/// Rig does not forward an agent's preamble in `CompletionRequest::preamble`.
+/// `build_completion_request` prepends it to the history as a system message
+/// and leaves the field unset, so for anything built through `AgentBuilder`
+/// the prompt is the leading system message. Requests assembled directly
+/// against a model still use the field, so both are read, and the message is
+/// dropped from the recorded history — it is the prompt, not a turn.
+fn split_system_prompt(request: &CompletionRequest) -> (String, Vec<&rig::message::Message>) {
+    let mut messages: Vec<&rig::message::Message> = request.chat_history.iter().collect();
+
+    if let Some(rig::message::Message::System { content }) = messages.first() {
+        let system = content.clone();
+        messages.remove(0);
+        return (system, messages);
+    }
+
+    (request.preamble.clone().unwrap_or_default(), messages)
 }
 
 /// True when a block map describes exactly the given preamble.
@@ -4332,6 +4353,79 @@ mod tests {
         let error = parse_anthropic_response(body).expect_err("should fail");
         assert!(matches!(error, CompletionError::ResponseError(_)));
         assert!(error.to_string().contains("stop_reason: max_tokens"));
+    }
+
+    fn request_with(chat_history: Vec<Message>, preamble: Option<&str>) -> CompletionRequest {
+        CompletionRequest {
+            model: None,
+            preamble: preamble.map(str::to_string),
+            chat_history: OneOrMany::many(chat_history).expect("history"),
+            documents: Vec::new(),
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            tool_choice: None,
+            additional_params: None,
+            output_schema: None,
+        }
+    }
+
+    /// Rig prepends an agent's preamble to the history as a system message and
+    /// leaves `preamble` unset, so a record that reads the field alone captures
+    /// an empty system prompt for every process in the instance.
+    #[test]
+    fn split_system_prompt_reads_the_leading_system_message() {
+        let request = request_with(
+            vec![
+                Message::system("# Orion\n\nBe useful."),
+                Message::from("hello"),
+            ],
+            None,
+        );
+
+        let (system, messages) = split_system_prompt(&request);
+
+        assert_eq!(system, "# Orion\n\nBe useful.");
+        assert_eq!(
+            messages.len(),
+            1,
+            "the system prompt is not a turn and must leave the history"
+        );
+    }
+
+    #[test]
+    fn split_system_prompt_falls_back_to_the_preamble_field() {
+        let request = request_with(vec![Message::from("hello")], Some("# Orion"));
+
+        let (system, messages) = split_system_prompt(&request);
+
+        assert_eq!(system, "# Orion");
+        assert_eq!(messages.len(), 1);
+    }
+
+    #[test]
+    fn split_system_prompt_tolerates_a_request_with_neither() {
+        let request = request_with(vec![Message::from("hello")], None);
+
+        let (system, messages) = split_system_prompt(&request);
+
+        assert!(system.is_empty());
+        assert_eq!(messages.len(), 1);
+    }
+
+    /// A system message that is not the first entry belongs to the
+    /// conversation, not to the prompt, and must stay in the history.
+    #[test]
+    fn split_system_prompt_ignores_a_later_system_message() {
+        let request = request_with(
+            vec![Message::from("hello"), Message::system("injected note")],
+            None,
+        );
+
+        let (system, messages) = split_system_prompt(&request);
+
+        assert!(system.is_empty());
+        assert_eq!(messages.len(), 2);
     }
 
     #[test]
